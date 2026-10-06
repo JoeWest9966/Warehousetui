@@ -22,11 +22,13 @@ nwt 的发布面:打 `v*` tag → CI 五组合构建 → GitHub Release(附 sha2
 
 | 平台 | 资产 |
 |---|---|
-| linux x86_64 | `nwt_<版本>_linux_x86_64.tar.gz`(runner `ubuntu-latest`) |
-| linux aarch64 | `nwt_<版本>_linux_aarch64.tar.gz`(runner `ubuntu-24.04-arm`) |
-| macos x86_64 | `nwt_<版本>_macos_x86_64.tar.gz`(runner `macos-13`,Intel) |
-| macos aarch64 | `nwt_<版本>_macos_aarch64.tar.gz`(runner `macos-latest`,Apple Silicon) |
+| linux x86_64 | `nwt_<版本>_linux_x86_64.tar.gz`(runner `ubuntu-latest`,原生) |
+| linux aarch64 | `nwt_<版本>_linux_aarch64.tar.gz`(runner `ubuntu-24.04-arm`,原生) |
+| macos x86_64 | `nwt_<版本>_macos_x86_64.tar.gz`(runner `macos-latest` 上**交叉编译** `x86_64-apple-darwin`) |
+| macos aarch64 | `nwt_<版本>_macos_aarch64.tar.gz`(runner `macos-latest`,原生 Apple Silicon) |
 | windows x86_64 | `nwt_<版本>_windows_x86_64.zip`(runner `windows-latest`,唯一 `.zip`) |
+
+> runner 说明:macOS 13(Intel)公共 runner 已不可靠——v0.1.0 首发彩排时排队 47 分钟未获分配,故 macos x86_64 改在 `macos-latest`(Apple Silicon)上交叉编译;产物仍是真 x86_64 二进制,命名契约不变。
 | 校验和 | `checksums.txt` |
 
 - `<版本>` = tag 去掉 `v` 前缀(`v0.1.0` → `0.1.0`)。
@@ -74,6 +76,7 @@ Get-FileHash -Algorithm SHA256 nwt_0.1.0_windows_x86_64.zip
 - Windows:编译运行级([spec #10](https://github.com/JoeWest9966/Warehousetui/issues/10) 的 R3 决定),无 installer、无自动安装;手动 zip。
 - 无代码签名/公证(macOS notarization、Windows Authenticode):V1 不做,靠 sha256 校验兜底。
 - 无自更新命令(`nwt self-update`):保持 ADR-0003 精神,面板不自改。
+- macos x86_64 走交叉编译:不占 Intel runner(见上),代价是构建机与目标机不同架构,二进制未经同架构实跑验证——安装脚本按 checksums 保证完整性,功能风险由 CI 测试面兜底。
 - 包管理器分发(Homebrew / Scoop / AUR):后续票据。
 
 ## 发布记录

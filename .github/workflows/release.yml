@@ -16,27 +16,52 @@ jobs:
     strategy:
       fail-fast: false
       # 5 组合契约(spec #10 / docs/release.md 资产表,install.sh 的探测承诺):
-      #   linux  x86_64  -> ubuntu-latest
-      #   linux  aarch64 -> ubuntu-24.04-arm
-      #   macos  x86_64  -> macos-13(Intel)
-      #   macos  aarch64 -> macos-latest(Apple Silicon)
+      #   linux  x86_64  -> ubuntu-latest(原生)
+      #   linux  aarch64 -> ubuntu-24.04-arm(原生)
+      #   macos  x86_64  -> macos-latest 上交叉编译 x86_64-apple-darwin
+      #                    (macOS 13 Intel 公共 runner 常年枯竭,首发彩排
+      #                     排队 47 分钟未获分配,故改交叉编译;产物是真
+      #                     x86_64 二进制,命名契约不变)
+      #   macos  aarch64 -> macos-latest(原生,Apple Silicon)
       #   windows x86_64 -> windows-latest(唯一 .zip)
-      # 资产名不在这里写死:由下面「推导资产名」按 uname -m 归一后拼出,
-      # 和 install.sh 的请求名同源;release 任务再通配符收齐全部资产。
+      # asset_os/asset_arch/target 显式声明,不靠 uname 猜:
+      # 交叉构建时 uname 报的是宿主编译架构,猜出来的资产名会错。
       matrix:
         include:
           - os: ubuntu-latest
+            asset_os: linux
+            asset_arch: x86_64
+            target: ""
           - os: ubuntu-24.04-arm
+            asset_os: linux
+            asset_arch: aarch64
+            target: ""
           - os: macos-latest
-          - os: macos-13
+            asset_os: macos
+            asset_arch: aarch64
+            target: ""
+          - os: macos-latest
+            asset_os: macos
+            asset_arch: x86_64
+            target: x86_64-apple-darwin
           - os: windows-latest
+            asset_os: windows
+            asset_arch: x86_64
+            target: ""
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: 安装交叉编译目标(target 非空才做)
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+
       - name: 构建 release 二进制
-        run: cargo build --release
+        run: cargo build --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       # 版本号 = tag 去掉 v 前缀(v0.1.0 -> 0.1.0)。
       # tag 与 Cargo.toml 的 version 一致性由发布者 checklist 把关
@@ -51,37 +76,20 @@ jobs:
             echo "::notice::tag $tag 与 Cargo.toml 版本 $cargo_ver 不一致(不阻断发布)"
           fi
 
-      # 拼资产名(契约):nwt_<版本>_<os>_<arch>.tar.gz / windows 出 .zip
+      # 拼资产名(契约):nwt_<版本>_<os>_<arch>.tar.gz / windows 出 .zip。
+      # os/arch 取矩阵显式值;二进制路径按是否交叉编译选 target 子目录。
       - name: 推导资产名
         id: vars
         shell: bash
         run: |
           ver="${GITHUB_REF_NAME#v}"
-          case "$RUNNER_OS" in
-            Linux|macOS)
-              case "$(uname -s)" in
-                Linux)  asset_os=linux ;;
-                Darwin) asset_os=macos ;;
-                *) echo "不支持的 OS: $(uname -s)"; exit 1 ;;
-              esac
-              case "$(uname -m)" in
-                x86_64|amd64)  asset_arch=x86_64 ;;
-                aarch64|arm64) asset_arch=aarch64 ;;
-                *) echo "不支持的架构: $(uname -m)"; exit 1 ;;
-              esac
-              ;;
-            Windows)
-              # R3 决定:Windows 只保证编译运行级,仅出 x86_64 包
-              asset_os=windows
-              asset_arch=x86_64
-              ;;
-            *) echo "不支持的 RUNNER_OS: $RUNNER_OS"; exit 1 ;;
-          esac
-          asset="nwt_${ver}_${asset_os}_${asset_arch}"
-          ext="tar.gz"; [ "$asset_os" = "windows" ] && ext="zip"
+          asset="nwt_${ver}_${{ matrix.asset_os }}_${{ matrix.asset_arch }}"
+          ext="tar.gz"; [ "${{ matrix.asset_os }}" = "windows" ] && ext="zip"
+          dir="target"; [ -n "$TARGET" ] && dir="target/$TARGET"
           echo "asset=${asset}.${ext}" >> "$GITHUB_OUTPUT"
           echo "basename=${asset}" >> "$GITHUB_OUTPUT"
-          echo "产物: ${asset}.${ext}"
+          echo "bindir=${dir}" >> "$GITHUB_OUTPUT"
+          echo "产物: ${asset}.${ext}(二进制目录 ${dir})"
 
       - name: 打包(unix:tar.gz)
         if: runner.os != 'Windows'
@@ -89,7 +97,7 @@ jobs:
         run: |
           asset="${{ steps.vars.outputs.asset }}"
           mkdir -p stage
-          cp target/release/nwt stage/nwt
+          cp "${{ steps.vars.outputs.bindir }}/release/nwt" stage/nwt
           tar -C stage -czf "$asset" nwt
 
       - name: 打包(windows:zip)
