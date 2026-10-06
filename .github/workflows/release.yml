@@ -15,10 +15,20 @@ jobs:
   build:
     strategy:
       fail-fast: false
+      # 5 组合契约(spec #10 / docs/release.md 资产表,install.sh 的探测承诺):
+      #   linux  x86_64  -> ubuntu-latest
+      #   linux  aarch64 -> ubuntu-24.04-arm
+      #   macos  x86_64  -> macos-13(Intel)
+      #   macos  aarch64 -> macos-latest(Apple Silicon)
+      #   windows x86_64 -> windows-latest(唯一 .zip)
+      # 资产名不在这里写死:由下面「推导资产名」按 uname -m 归一后拼出,
+      # 和 install.sh 的请求名同源;release 任务再通配符收齐全部资产。
       matrix:
         include:
           - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
           - os: macos-latest
+          - os: macos-13
           - os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
@@ -113,7 +123,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: 收齐三平台产物
+      - name: 收齐全部构建产物(5 组合)
         uses: actions/download-artifact@v4
         with:
           path: dist
