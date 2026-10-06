@@ -115,6 +115,9 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     if app.assembling {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("装配中:动作已锁定", p.dim()));
+    } else if app.home_input {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
     } else {
         spans.push(Span::styled("  q", p.accent()));
         spans.push(Span::raw(" 退出"));
@@ -146,8 +149,9 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::from("    Enter      确认 / 进入"),
         Line::from("    Esc        返回 / 关闭浮层"),
         Line::from("    t          切换主题"),
+        Line::from("    i          手填 NW_HOME(设置屏)"),
         Line::from("    ?          本帮助"),
-        Line::from("    q          退出(装配态禁用)"),
+        Line::from("    q          退出(装配态 / 输入中禁用)"),
         Line::from(""),
         Line::from(Span::styled(
             "  装配幂等可重入,取消安全;失败永远带证据五字段。",
@@ -278,6 +282,15 @@ mod tests {
         let app = ui_app();
         let s = render_to_string(&app, 40, 10);
         assert!(s.contains("终端太小"));
+    }
+
+    #[test]
+    fn 输入态_hud_给键位提示() {
+        let mut app = ui_app();
+        app.home_input = true;
+        let s = render_to_string(&app, 100, 30);
+        assert!(s.contains("输入中"));
+        assert!(s.contains("Enter 确认"));
     }
 
     #[test]

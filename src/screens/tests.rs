@@ -341,3 +341,65 @@ fn 设置屏_e_请求外部编辑器() {
     )));
     assert!(app.pending_editor);
 }
+
+// ---- #9 设置屏收尾:手填浮层 / config 告警 / 浮层优先级 ----
+
+#[test]
+fn 设置屏_手填浮层渲染() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.home_input = true;
+    app.home_buf = "/data/pi-homes".into();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("手填 NW_HOME"));
+    assert!(s.contains("/data/pi-homes"), "缓冲区原文回显");
+    assert!(s.contains("█"), "块光标可见");
+    assert!(s.contains("Enter 确认"));
+}
+
+#[test]
+fn 设置屏_config解析失败告警() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.config_error =
+        Some("/home/u/.config/warehousetui/config.toml 解析失败:expected `=`".into());
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("解析失败"), "告警出现");
+    assert!(s.contains("config.toml"), "告警带路径");
+    assert!(s.contains("$EDITOR"), "给修复指引");
+    assert!(s.contains("已降级到默认值"), "说明降级不影响使用");
+}
+
+#[test]
+fn 设置屏_config健康时无告警() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.config_error = None;
+    let s = draw(&app, 110, 30);
+    assert!(!s.contains("解析失败"), "健康不该红");
+    assert!(s.contains("解析正常"));
+}
+
+#[test]
+fn 指路屏_不叠config告警() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.engine.found = false;
+    app.config_error = Some("/x/config.toml 解析失败:坏".into());
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("找不到 nw"), "指路屏在场");
+    assert!(!s.contains("解析失败"), "指路屏优先,不叠告警");
+}
+
+#[test]
+fn 输入浮层_盖在指路屏之上() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.engine.found = false;
+    app.home_input = true;
+    app.home_buf = "/srv/pi".into();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("找不到 nw"), "底层指路");
+    assert!(s.contains("手填 NW_HOME"), "浮层盖顶");
+    assert!(s.contains("/srv/pi"));
+}

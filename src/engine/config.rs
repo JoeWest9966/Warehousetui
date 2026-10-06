@@ -44,17 +44,22 @@ pub fn config_path() -> PathBuf {
     config_dir().join(FILE)
 }
 
+/// 从文本装载:解析失败退默认 + 人话证据(load 与测试共用的纯函数)。
+pub fn parse(text: &str) -> (Config, Option<String>) {
+    match toml::from_str::<Config>(text) {
+        Ok(c) => (c, None),
+        Err(e) => (Config::default(), Some(format!("解析失败:{e}"))),
+    }
+}
+
 /// 加载配置:不存在或解析失败都退回默认(解析失败时调用方应提示)。
 pub fn load() -> (Config, Option<String>) {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(text) => match toml::from_str::<Config>(&text) {
-            Ok(c) => (c, None),
-            Err(e) => (
-                Config::default(),
-                Some(format!("{} 解析失败:{e}", path.display())),
-            ),
-        },
+        Ok(text) => {
+            let (c, err) = parse(&text);
+            (c, err.map(|e| format!("{} {e}", path.display())))
+        }
         Err(_) => (Config::default(), None),
     }
 }
@@ -76,6 +81,15 @@ mod tests {
     fn 空配置兜底() {
         let cfg = Config::default();
         assert!(cfg.nw_bin.is_none());
+    }
+
+    #[test]
+    fn 坏_toml_第二返回值非空_好_toml_为_none() {
+        let (_c, err) = parse("nw_home = ");
+        assert!(err.is_some(), "坏 TOML 必须给证据");
+        assert!(err.unwrap().contains("解析失败"));
+        let (_c2, err2) = parse("nw_home = \"/data\"");
+        assert!(err2.is_none(), "好 TOML 不制造噪音");
     }
 
     #[test]

@@ -86,7 +86,8 @@ pub fn discover(
     Err(attempted)
 }
 
-fn expand_tilde(p: &str) -> PathBuf {
+/// `~` 展开(手填 NW_HOME 与发现策略共用同一个规范化器)。
+pub fn expand_tilde(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(rest);

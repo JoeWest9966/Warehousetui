@@ -179,8 +179,10 @@ impl Default for EngineStatus {
 }
 
 /// 组装运行器 + 状态:配置 → 发现 → (真实 | 缺失替身)。
-pub fn boot(explicit: Option<&str>) -> (Arc<dyn CommandRunner>, EngineStatus) {
-    let (cfg, _cfg_err) = config::load();
+/// 返回(运行器, 引擎状态, config 解析错误证据)。
+/// 第三值非空 = config.toml 坏了但已降级到默认,设置屏负责告知。
+pub fn boot(explicit: Option<&str>) -> (Arc<dyn CommandRunner>, EngineStatus, Option<String>) {
+    let (cfg, cfg_err) = config::load();
     let nw_home = std::env::var("NW_HOME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -191,9 +193,9 @@ pub fn boot(explicit: Option<&str>) -> (Arc<dyn CommandRunner>, EngineStatus) {
                 .map(|h| format!("{h}/.nous-warehouse"))
         })
         .unwrap_or_else(|| "~/.nous-warehouse".into());
-    match discover::discover(explicit, &cfg, &nw_home) {
+    let base = match discover::discover(explicit, &cfg, &nw_home) {
         Ok(d) => (
-            Arc::new(RealRunner::new(d.bin.clone())),
+            Arc::new(RealRunner::new(d.bin.clone())) as Arc<dyn CommandRunner>,
             EngineStatus {
                 found: true,
                 bin: Some(d.bin.display().to_string()),
@@ -204,7 +206,7 @@ pub fn boot(explicit: Option<&str>) -> (Arc<dyn CommandRunner>, EngineStatus) {
         Err(attempted) => (
             Arc::new(MissingRunner {
                 attempted: attempted.clone(),
-            }),
+            }) as Arc<dyn CommandRunner>,
             EngineStatus {
                 found: false,
                 bin: None,
@@ -212,7 +214,8 @@ pub fn boot(explicit: Option<&str>) -> (Arc<dyn CommandRunner>, EngineStatus) {
                 attempted,
             },
         ),
-    }
+    };
+    (base.0, base.1, cfg_err)
 }
 
 #[cfg(test)]

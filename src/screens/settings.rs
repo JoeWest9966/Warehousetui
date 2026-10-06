@@ -2,7 +2,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -14,12 +14,20 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let p = &app.palette;
     if !app.engine.found {
         render_signpost(frame, inner, app);
-        return;
+    } else {
+        render_panel(frame, inner, app);
     }
+    // 浮层优先级最低的常屏之上:手填输入浮层盖在指路屏上也成立
+    if app.home_input {
+        render_home_input(frame, area, app);
+    }
+}
 
+/// 引擎就绪时的设置面板。
+fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
+    let p = &app.palette;
     let mut lines = vec![
         Line::from(Span::styled("引擎", p.accent())),
         Line::from(format!(
@@ -30,7 +38,7 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(format!("  版本     nw {}", app.engine_version)),
         Line::from(""),
         Line::from(Span::styled("环境", p.accent())),
-        Line::from(format!("  NW_HOME  {}  (n 轮换)", app.nw_home)),
+        Line::from(format!("  NW_HOME  {}  (n 轮换 / i 手填)", app.nw_home)),
         Line::from(""),
         Line::from(Span::styled("外观", p.accent())),
         Line::from(format!("  主题     {} (t 切换)", app.theme.name())),
@@ -53,9 +61,56 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         "  发现优先级:--nw-bin > 配置 > PATH > $NW_HOME/nw",
         p.dim(),
     )));
+    // config 解析失败告警:人话一句 + 路径 + e 修复指引;健康时给一行安心
+    match app.config_error.as_deref() {
+        Some(err) => {
+            lines.push(Line::from(Span::styled(format!("  ⚠ {err}"), p.warn())));
+            lines.push(Line::from(Span::styled(
+                "    已降级到默认值,其余功能照常;按 e 用 $EDITOR 打开修复",
+                p.dim(),
+            )));
+        }
+        None => lines.push(Line::from(Span::styled("  config 状态  解析正常", p.dim()))),
+    }
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().border_style(p.dim())),
         inner,
+    );
+}
+
+/// 手填输入浮层:缓冲区 + 块光标 + 键位提示。
+fn render_home_input(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let w = 64u16.min(area.width.saturating_sub(4));
+    let h = 7u16.min(area.height.saturating_sub(2));
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(Clear, popup);
+    let cursor = format!("{}█", app.home_buf);
+    let lines = vec![
+        Line::from(Span::styled(cursor, p.text())),
+        Line::from(Span::styled(
+            "  Enter 确认 · Esc/q 放弃 · 退格删字符 · ~ 会展开",
+            p.dim(),
+        )),
+        Line::from(Span::styled(
+            "  生效后与轮换同链:写环境、持久化、刷新 ls",
+            p.dim(),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 手填 NW_HOME ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
     );
 }
 

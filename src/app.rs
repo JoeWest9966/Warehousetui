@@ -147,6 +147,12 @@ pub struct App {
     pub pending_editor: bool,
     /// 启动 splash:800ms 或任意键跳过(R3 决议)。
     pub splash: bool,
+    /// NW_HOME 手填输入模式(设置屏 i 进入;浮层优先级见 on_key)。
+    pub home_input: bool,
+    /// 手填缓冲区(只收可打印字符;上限 HOME_BUF_CAP)。
+    pub home_buf: String,
+    /// config.toml 解析失败的人话证据;None = 配置健康。
+    pub config_error: Option<String>,
 }
 
 impl App {
@@ -156,8 +162,8 @@ impl App {
 
     /// 开机装配:发现引擎(显式 --nw-bin 优先),建状态树。
     pub fn boot(explicit_nw_bin: Option<&str>) -> Self {
-        let (runner, status) = crate::engine::boot(explicit_nw_bin);
-        Self::assemble(runner, status)
+        let (runner, status, cfg_err) = crate::engine::boot(explicit_nw_bin);
+        Self::assemble(runner, status, cfg_err)
     }
 
     /// 测试注入:完全可控的 runner(零真实进程)。
@@ -168,10 +174,14 @@ impl App {
             source: "测试注入",
             attempted: Vec::new(),
         };
-        Self::assemble(runner, status)
+        Self::assemble(runner, status, None)
     }
 
-    fn assemble(runner: Arc<dyn CommandRunner>, engine: EngineStatus) -> Self {
+    fn assemble(
+        runner: Arc<dyn CommandRunner>,
+        engine: EngineStatus,
+        config_error: Option<String>,
+    ) -> Self {
         let cap = term::detect_color_cap();
         let theme = ThemeKind::Warehouse;
         let palette = cached_degrade(theme, cap);
@@ -214,6 +224,9 @@ impl App {
             queue: Vec::new(),
             pending_editor: false,
             splash: true,
+            home_input: false,
+            home_buf: String::new(),
+            config_error,
         }
     }
 
@@ -335,6 +348,11 @@ impl App {
         }
         if self.as_confirm {
             self.on_key_confirm(k);
+            return;
+        }
+        // 浮层优先级:帮助浮层 > 发射确认 > 手填输入 > 指路屏/常屏(见 spec #9)
+        if self.home_input {
+            self.on_key_home_input(k);
             return;
         }
         match k.code {
@@ -460,9 +478,56 @@ impl App {
             KeyCode::Char('t') => self.cycle_theme(),
             // NW_HOME 轮换候选:当前值 > $HOME/.nous-warehouse > 配置里那个
             KeyCode::Char('n') => self.cycle_nw_home(),
+            KeyCode::Char('i') => {
+                self.home_input = true;
+                self.home_buf = self.nw_home.clone();
+                self.push_log("手填 NW_HOME:Enter 确认,Esc/q 放弃");
+            }
             KeyCode::Char('e') => self.pending_editor = true,
             _ => {}
         }
+    }
+
+    /// 手填输入模式的键位:Enter 生效、Esc/q 放弃、Backspace 删、
+    /// 可打印字符入栈(控制字符与带 CONTROL 修饰的键一律忽略)。
+    fn on_key_home_input(&mut self, k: KeyEvent) {
+        const CAP: usize = 512;
+        match k.code {
+            KeyCode::Enter => self.apply_home_input(),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.home_input = false;
+                self.home_buf.clear();
+                self.push_log("取消手填 NW_HOME");
+            }
+            KeyCode::Backspace => {
+                self.home_buf.pop();
+            }
+            KeyCode::Char(c) => {
+                let ctrl = k
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL);
+                if !ctrl && !c.is_control() && self.home_buf.chars().count() < CAP {
+                    self.home_buf.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 手填生效:规范化(去空白 + `~` 展开)→ 与轮换同一条后果链。
+    /// 空值/纯空格拒绝并留证据,不写任何状态、不退输入模式。
+    pub fn apply_home_input(&mut self) {
+        let trimmed = self.home_buf.trim().to_string();
+        if trimmed.is_empty() {
+            self.push_log("NW_HOME 手填被拒:空值,原值保持不变");
+            return;
+        }
+        let expanded = crate::engine::discover::expand_tilde(&trimmed)
+            .display()
+            .to_string();
+        self.home_input = false;
+        self.home_buf.clear();
+        self.apply_nw_home(expanded);
     }
 
     /// 轮换 NW_HOME:写进程环境(子进程继承)、持久化、顺手刷新 ls。
@@ -487,6 +552,12 @@ impl App {
             .position(|c| *c == self.nw_home)
             .unwrap_or(0);
         let next = candidates[(cur + 1) % candidates.len()].clone();
+        self.apply_nw_home(next);
+    }
+
+    /// NW_HOME 生效链(手填与轮换唯一入口):写状态 → 写进程环境供子进程
+    /// 继承 → 持久化 config → 入队一次 ls。
+    pub fn apply_nw_home(&mut self, next: String) {
         self.nw_home = next.clone();
         // 子进程经 std::env 继承 NW_HOME(edition 2021 下 set_var 可用)
         std::env::set_var("NW_HOME", &next);
@@ -729,5 +800,149 @@ mod tests {
         app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
         assert!(!app.assembling);
         assert!(app.as_result.is_some());
+    }
+
+    // ---- #9 NW_HOME 手填输入(App 行为缝) ----
+
+    /// 摸进程环境/配置文件的测试串行化,免得并行互相踩。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn settings_app() -> App {
+        let mut app = fake_app();
+        app.screen = Screen::Settings;
+        app
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.update(Message::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+    }
+
+    #[test]
+    fn 手填_键入回显并生效同链() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut app = settings_app();
+        app.update(Message::Key(key('i')));
+        assert!(app.home_input);
+        type_str(&mut app, "/data/pi-homes");
+        assert_eq!(app.home_buf, app.nw_home.clone() + "/data/pi-homes");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let target = app.nw_home.clone();
+        assert!(target.ends_with("/data/pi-homes"), "新值落进状态树");
+        assert_eq!(std::env::var("NW_HOME").unwrap(), target, "进程环境同步");
+        assert!(
+            app.queue
+                .iter()
+                .any(|a| a.first().map(String::as_str) == Some("ls")),
+            "同链入队 ls"
+        );
+        assert!(!app.home_input && app.home_buf.is_empty(), "用完即退");
+    }
+
+    #[test]
+    fn 手填_q与_esc_放弃且不退出() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let before = settings_app().nw_home;
+        let mut app = settings_app();
+        app.update(Message::Key(key('i')));
+        type_str(&mut app, "/tmp/whatever");
+        app.update(Message::Key(key('q')));
+        assert!(!app.quit, "输入态 q = 放弃,不是退出");
+        assert!(!app.home_input);
+        assert_eq!(app.nw_home, before, "放弃不碰状态");
+        assert!(app.home_buf.is_empty());
+        // Esc 同理
+        let mut app = settings_app();
+        app.update(Message::Key(key('i')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.home_input);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn 手填_空值与纯空格拒绝且留证据() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut app = settings_app();
+        let before = app.nw_home.clone();
+        let queued = app.queue.len();
+        app.update(Message::Key(key('i')));
+        app.home_buf = "   ".into();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.nw_home, before, "拒绝不改状态");
+        assert_eq!(app.queue.len(), queued, "拒绝不入队 ls");
+        assert!(app.home_input, "拒绝后留在输入态可改");
+        assert!(app.log[0].contains("被拒"), "日志留证据");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 手填_tilde展开成绝对路径() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = std::env::var("HOME").unwrap();
+        let mut app = settings_app();
+        app.update(Message::Key(key('i')));
+        app.home_buf = "~/pi-space".into();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.nw_home, format!("{home}/pi-space"));
+    }
+
+    #[test]
+    fn 输入模式_只收可打印字符() {
+        let mut app = settings_app();
+        app.update(Message::Key(key('i')));
+        app.home_buf.clear();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('\u{7}'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.home_buf.is_empty(), "控制字符不入栈");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.home_buf.is_empty(), "带 CONTROL 的键不入栈");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(app.home_buf, "x", "普通可打印字符正常入栈");
+    }
+
+    #[test]
+    fn 手填缓冲区_512上限() {
+        let mut app = settings_app();
+        app.update(Message::Key(key('i')));
+        app.home_buf.clear();
+        type_str(&mut app, &"a".repeat(600));
+        assert_eq!(app.home_buf.chars().count(), 512, "上限防误粘贴");
+    }
+
+    #[test]
+    fn 手填与轮换共用生效链() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut app = settings_app();
+        app.apply_nw_home("/data/shared".into());
+        let a = app.nw_home.clone();
+        let qa = app.queue.len();
+        let mut app2 = settings_app();
+        app2.apply_nw_home("/data/shared".into());
+        assert_eq!(a, app2.nw_home);
+        assert_eq!(app.queue.len(), qa, "两个入口的入队行为一致");
     }
 }
