@@ -18,6 +18,9 @@ pub use overview::render_overview;
 pub use recipes::render_recipes;
 pub use settings::render_settings;
 
+#[cfg(test)]
+mod tests;
+
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     match app.screen {
         crate::app::Screen::Overview => render_overview(frame, area, app),
