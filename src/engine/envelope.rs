@@ -124,7 +124,7 @@ pub struct DoctorResult {
 pub struct ManifestBrief {
     #[serde(default)]
     pub schema: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "lockId")]
     pub lock_id: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
@@ -132,11 +132,11 @@ pub struct ManifestBrief {
     pub recipe: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "runtimeKey")]
     pub runtime_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "installedAt")]
     pub installed_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "convergeHash")]
     pub converge_hash: Option<String>,
     #[serde(default)]
     pub engine: Option<String>,
@@ -187,15 +187,15 @@ pub struct ProfileRow {
     /// ok | degraded | drift | broken,与 doctor rc 一一对应。
     #[serde(default)]
     pub state: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "lockId")]
     pub lock_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "installedAt")]
     pub installed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LockRow {
-    #[serde(default)]
+    #[serde(default, rename = "lockId")]
     pub lock_id: Option<String>,
     #[serde(default)]
     pub recipe: Option<String>,
@@ -203,7 +203,7 @@ pub struct LockRow {
     pub name: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "bakedAt")]
     pub baked_at: Option<String>,
     #[serde(default)]
     pub path: Option<String>,

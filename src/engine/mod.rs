@@ -3,9 +3,23 @@
 //! 本模块是面板与引擎之间的**唯一**缝:Ui 永远经由 [`runner`] 的
 //! 输出与 [`envelope`] 的类型看世界,凭据与环境细节不下渗到 UI。
 
+pub mod commands;
+pub mod config;
+pub mod discover;
 pub mod envelope;
+pub mod runner;
+
+use std::sync::Arc;
 
 use serde::Deserialize;
+
+#[allow(unused_imports)]
+pub use envelope::{
+    CheckResult, ComponentRow, DoctorData, DoctorResult, Envelope, Evidence, LockRow, LsData,
+    ManifestBrief, ProfileRow, RecipeRow, SourceRow, UpData, ValidateData, ValidateSummary,
+};
+#[allow(unused_imports)]
+pub use runner::{CommandRunner, EngineEvent, EngineOutput, FakeRunner, MissingRunner, RealRunner};
 
 /// 检查项通用四态:validate / doctor / source 三处同一套词。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
@@ -39,6 +53,22 @@ impl State {
     /// 是否属于「装好了但没完全好」的降级家族(不算失败)。
     pub fn is_degraded_family(self) -> bool {
         matches!(self, State::Warn | State::Degraded | State::Skip)
+    }
+}
+
+impl From<&str> for State {
+    fn from(s: &str) -> Self {
+        match s {
+            "pass" => State::Pass,
+            "warn" => State::Warn,
+            "fail" => State::Fail,
+            "skip" => State::Skip,
+            "ok" => State::Ok,
+            "degraded" => State::Degraded,
+            "drift" => State::Drift,
+            "broken" => State::Broken,
+            _ => State::Skip,
+        }
     }
 }
 
@@ -90,10 +120,7 @@ impl ExitCode {
             10 => ExitCode::Degraded,
             11 => ExitCode::Drift,
             12 => ExitCode::ManifestBroken,
-            other => {
-                let _ = other;
-                ExitCode::InputInvalid // 未登记码按 3 兜底,与引擎一致
-            }
+            _ => ExitCode::InputInvalid, // 未登记码按 3 兜底,与引擎一致
         }
     }
 
@@ -130,6 +157,64 @@ impl ExitCode {
     }
 }
 
+/// 引擎就绪状态:顶栏与指路屏的共同数据源。
+#[derive(Clone, Debug)]
+pub struct EngineStatus {
+    pub found: bool,
+    pub bin: Option<String>,
+    pub source: &'static str,
+    /// 发现失败时找过的地方(指路素材)。
+    pub attempted: Vec<String>,
+}
+
+impl Default for EngineStatus {
+    fn default() -> Self {
+        Self {
+            found: false,
+            bin: None,
+            source: "未发现",
+            attempted: Vec::new(),
+        }
+    }
+}
+
+/// 组装运行器 + 状态:配置 → 发现 → (真实 | 缺失替身)。
+pub fn boot(explicit: Option<&str>) -> (Arc<dyn CommandRunner>, EngineStatus) {
+    let (cfg, _cfg_err) = config::load();
+    let nw_home = std::env::var("NW_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg.nw_home.clone())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| format!("{h}/.nous-warehouse"))
+        })
+        .unwrap_or_else(|| "~/.nous-warehouse".into());
+    match discover::discover(explicit, &cfg, &nw_home) {
+        Ok(d) => (
+            Arc::new(RealRunner::new(d.bin.clone())),
+            EngineStatus {
+                found: true,
+                bin: Some(d.bin.display().to_string()),
+                source: d.source.label(),
+                attempted: Vec::new(),
+            },
+        ),
+        Err(attempted) => (
+            Arc::new(MissingRunner {
+                attempted: attempted.clone(),
+            }),
+            EngineStatus {
+                found: false,
+                bin: None,
+                source: "未发现",
+                attempted,
+            },
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +235,11 @@ mod tests {
         assert!(State::Warn.is_degraded_family());
         assert!(!State::Fail.is_degraded_family());
         assert!(State::Skip.is_degraded_family());
+    }
+
+    #[test]
+    fn 状态串解析() {
+        assert_eq!(State::from("drift"), State::Drift);
+        assert_eq!(State::from("unknown"), State::Skip);
     }
 }

@@ -51,7 +51,10 @@ fn render_top_bar(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" Warehousetui", p.accent().bold()),
         Span::styled(" · Nous Warehouse 驾驶舱 ", p.dim()),
         Span::raw("  nwt v0.1 · "),
-        Span::styled(app.engine_status.clone(), p.info()),
+        Span::styled(
+            format!("nw {} · {}", app.engine_version, app.engine.source),
+            p.info(),
+        ),
         Span::raw("  │  NW_HOME: "),
         Span::styled(app.nw_home.clone(), p.dim()),
         Span::raw("  "),
