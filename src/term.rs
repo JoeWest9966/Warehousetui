@@ -1,0 +1,174 @@
+//! 终端能力探测、初始化与恢复。
+//!
+//! 能力探测喂给主题做颜色降级;初始化/恢复保证退出与 panic 时
+//! 终端不留残局(raw mode、备用屏幕)。
+
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::style::Color;
+use ratatui::Terminal;
+use std::io::{stdout, Stdout};
+
+pub type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// 面板能用的最小终端尺寸。
+pub const MIN_W: u16 = 80;
+pub const MIN_H: u16 = 24;
+
+/// 终端颜色能力三档。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorCap {
+    Truecolor,
+    C256,
+    C16,
+}
+
+/// 探测当前终端颜色能力:truecolor > 256 > 16。
+pub fn detect_color_cap() -> ColorCap {
+    if let Ok(ct) = std::env::var("COLORTERM") {
+        let ct = ct.to_ascii_lowercase();
+        if ct == "truecolor" || ct == "24bit" {
+            return ColorCap::Truecolor;
+        }
+    }
+    match std::env::var("TERM") {
+        Ok(term) if term.contains("256color") => ColorCap::C256,
+        _ => ColorCap::C16,
+    }
+}
+
+/// RGB → xterm-256 索引(标准量化)。
+pub fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
+    fn cube(v: u8) -> u8 {
+        if v < 48 {
+            0
+        } else if v < 115 {
+            1
+        } else {
+            (v - 35) / 40
+        }
+    }
+    if r == g && g == b {
+        if r < 8 {
+            16
+        } else if r > 248 {
+            231
+        } else {
+            232 + ((r as u16 - 8) / 10) as u8
+        }
+    } else {
+        16 + 36 * cube(r) + 6 * cube(g) + cube(b)
+    }
+}
+
+/// 16 色 ANSI 标准 RGB 值,用于 256→16 的最近邻映射。
+const ANSI16: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (128, 0, 0),
+    (0, 128, 0),
+    (128, 128, 0),
+    (0, 0, 128),
+    (128, 0, 128),
+    (0, 128, 128),
+    (192, 192, 192),
+    (128, 128, 128),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (0, 0, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+fn ansi16_from_rgb(r: u8, g: u8, b: u8) -> Color {
+    let mut best = (0usize, u32::MAX);
+    for (i, (ar, ag, ab)) in ANSI16.iter().enumerate() {
+        let dr = r as i32 - *ar as i32;
+        let dg = g as i32 - *ag as i32;
+        let db = b as i32 - *ab as i32;
+        let d = (dr * dr + dg * dg + db * db) as u32;
+        if d < best.1 {
+            best = (i, d);
+        }
+    }
+    match best.0 {
+        0..=7 => Color::Indexed(best.0 as u8),
+        _ => Color::Indexed(best.0 as u8),
+    }
+}
+
+/// 把一个颜色按终端能力降到该终端能显示的最高保真档。
+pub fn degrade(color: Color, cap: ColorCap) -> Color {
+    match (color, cap) {
+        (Color::Rgb(r, g, b), ColorCap::Truecolor) => Color::Rgb(r, g, b),
+        (Color::Rgb(r, g, b), _) => {
+            let idx = rgb_to_256(r, g, b);
+            match cap {
+                ColorCap::C256 => Color::Indexed(idx),
+                ColorCap::C16 => ansi16_from_rgb(r, g, b),
+                ColorCap::Truecolor => unreachable!(),
+            }
+        }
+        (other, _) => other,
+    }
+}
+
+/// 初始化终端:raw mode + 备用屏幕。失败时调用方负责 restore。
+pub fn init() -> anyhow::Result<Term> {
+    enable_raw_mode()?;
+    let mut out = stdout();
+    crossterm::execute!(out, EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(out))?)
+}
+
+/// 恢复终端到常态。幂等,可重复调用;退出路径和 panic hook 共用。
+pub fn restore() {
+    let mut out = stdout();
+    let _ = crossterm::execute!(out, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
+/// panic 时先恢复终端再打印,避免用户面对一个坏掉的 shell。
+pub fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore();
+        default(info);
+    }));
+}
+
+/// 当前终端尺寸,探测失败按最小尺寸兜底。
+pub fn terminal_size() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or((MIN_W, MIN_H))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 灰度上rgb_256往返合理() {
+        assert_eq!(rgb_to_256(0, 0, 0), 16);
+        assert_eq!(rgb_to_256(255, 255, 255), 231);
+        assert_eq!(rgb_to_256(20, 142, 118), 30);
+    }
+
+    #[test]
+    fn 降级链保留可显示性() {
+        let c = Color::Rgb(0xd9, 0x9a, 0x2b);
+        assert!(matches!(
+            degrade(c, ColorCap::Truecolor),
+            Color::Rgb(_, _, _)
+        ));
+        assert!(matches!(degrade(c, ColorCap::C256), Color::Indexed(_)));
+        assert!(matches!(degrade(c, ColorCap::C16), Color::Indexed(_)));
+    }
+
+    #[test]
+    fn 索引色原样透传() {
+        assert_eq!(degrade(Color::Indexed(7), ColorCap::C16), Color::Indexed(7));
+    }
+}
