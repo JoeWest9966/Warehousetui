@@ -143,6 +143,8 @@ pub struct App {
     pub log: Vec<String>,
     /// 键位处理器排队的引擎命令,由主循环取出执行(键位无 tx)。
     pub queue: Vec<Vec<String>>,
+    /// 设置屏按 e 请求外部编辑器;主循环挂起终端再拉起(见 main)。
+    pub pending_editor: bool,
 }
 
 impl App {
@@ -208,6 +210,7 @@ impl App {
             rc_sel: 0,
             log: vec!["驾驶舱已就绪".into()],
             queue: Vec::new(),
+            pending_editor: false,
         }
     }
 
@@ -450,9 +453,55 @@ impl App {
     }
 
     fn key_settings(&mut self, k: KeyEvent) {
-        if let KeyCode::Char('t') = k.code {
-            self.cycle_theme();
+        match k.code {
+            KeyCode::Char('t') => self.cycle_theme(),
+            // NW_HOME 轮换候选:当前值 > $HOME/.nous-warehouse > 配置里那个
+            KeyCode::Char('n') => self.cycle_nw_home(),
+            KeyCode::Char('e') => self.pending_editor = true,
+            _ => {}
         }
+    }
+
+    /// 轮换 NW_HOME:写进程环境(子进程继承)、持久化、顺手刷新 ls。
+    pub fn cycle_nw_home(&mut self) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
+        let from_cfg = crate::engine::config::load().0.nw_home;
+        let mut candidates: Vec<String> = vec![self.nw_home.clone()];
+        if let Ok(env) = std::env::var("NW_HOME") {
+            if !env.is_empty() {
+                candidates.push(env);
+            }
+        }
+        candidates.push(format!("{home}/.nous-warehouse"));
+        if let Some(c) = from_cfg {
+            candidates.push(c);
+        }
+        // 保序去重:候选永远至少两个(当前值 + 家目录默认)
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|c| seen.insert(c.clone()));
+        let cur = candidates
+            .iter()
+            .position(|c| *c == self.nw_home)
+            .unwrap_or(0);
+        let next = candidates[(cur + 1) % candidates.len()].clone();
+        self.nw_home = next.clone();
+        // 子进程经 std::env 继承 NW_HOME(edition 2021 下 set_var 可用)
+        std::env::set_var("NW_HOME", &next);
+        let mut cfg = crate::engine::config::load().0;
+        cfg.nw_home = Some(next.clone());
+        if let Err(e) = crate::engine::config::save(&cfg) {
+            self.push_log(format!("NW_HOME 持久化失败:{e}"));
+        }
+        self.push_log(format!("NW_HOME 切换到 {next}"));
+        self.refresh_ls();
+    }
+
+    /// 外部编辑器逃逸口(设置屏 e)。返回拉起命令;EDITOR/VISUAL 都缺则 None。
+    pub fn editor_command() -> Option<String> {
+        std::env::var("EDITOR")
+            .ok()
+            .or_else(|| std::env::var("VISUAL").ok())
+            .filter(|s| !s.is_empty())
     }
 
     // ---- 需要 tx 的动作:由主循环调 ----

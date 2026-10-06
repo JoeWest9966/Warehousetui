@@ -30,7 +30,7 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(format!("  版本     nw {}", app.engine_version)),
         Line::from(""),
         Line::from(Span::styled("环境", p.accent())),
-        Line::from(format!("  NW_HOME  {}", app.nw_home)),
+        Line::from(format!("  NW_HOME  {}  (n 轮换)", app.nw_home)),
         Line::from(""),
         Line::from(Span::styled("外观", p.accent())),
         Line::from(format!("  主题     {} (t 切换)", app.theme.name())),
@@ -39,7 +39,7 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled("配置", p.accent())),
         Line::from(format!("  文件     {}", config::config_path().display())),
         Line::from(Span::styled(
-            "  只读展示;V1 不自带编辑器,可用 $EDITOR 打开",
+            "  只读展示;按 e 用 $EDITOR 打开(终端会让出来)",
             p.dim(),
         )),
         Line::from(""),

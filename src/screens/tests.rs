@@ -268,3 +268,76 @@ fn stdout_坏了不碎_给证据与原文() {
     let s = draw(&app, 110, 30);
     assert!(s.contains("不可解析"));
 }
+
+// ---- 补档:警示带 / broken / skip / 设置交互 ----
+
+#[test]
+fn 概览警示带点名漂移派() {
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("警示带"));
+    assert!(s.contains("desk"), "点名漂移的派");
+}
+
+#[test]
+fn 健康屏_broken_档位() {
+    let mut app = fake_app();
+    app.screen = Screen::Health;
+    feed(
+        &mut app,
+        out(
+            &["doctor", "--profile", "desk"],
+            12,
+            r#"{"schema":"nw/doctor.v1","nw":"0.1.0","ok":false,"errors":[{"code":"MANIFEST_BROKEN","exitCode":12,"message":".nw-manifest 损坏","hint":"重新装配"}],"warnings":[],"data":{"results":[{"surface":"manifest","status":"fail","message":"损坏"}],"exit":12}}"#,
+        ),
+    );
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("破损"));
+}
+
+#[test]
+fn 健康屏_skip_是正常态() {
+    let mut app = fake_app();
+    app.screen = Screen::Health;
+    feed(
+        &mut app,
+        out(
+            &["doctor", "--profile", "desk"],
+            0,
+            r#"{"schema":"nw/doctor.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"results":[{"surface":"runtime","status":"skip","message":"sessions/ 缺席"},{"surface":"manifest","status":"pass","message":"在位"}],"exit":0}}"#,
+        ),
+    );
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("○"), "skip 用空心灯");
+    assert!(s.contains("缺席"));
+    assert!(s.contains("全绿"));
+}
+
+#[test]
+fn 设置屏_nw_home_轮换并持久化() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.nw_home = "/tmp/nwt-candidate-a".into();
+    app.cycle_nw_home();
+    assert_ne!(app.nw_home, "/tmp/nwt-candidate-a", "轮换应换值");
+    assert!(
+        app.queue
+            .iter()
+            .any(|a| a.first().map(String::as_str) == Some("ls")),
+        "轮换后刷新 ls"
+    );
+    let s = draw(&app, 110, 30);
+    assert!(s.contains(&app.nw_home));
+}
+
+#[test]
+fn 设置屏_e_请求外部编辑器() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('e'),
+        crossterm::event::KeyModifiers::NONE,
+    )));
+    assert!(app.pending_editor);
+}
