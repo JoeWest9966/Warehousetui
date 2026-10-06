@@ -807,6 +807,16 @@ mod tests {
     /// 摸进程环境/配置文件的测试串行化,免得并行互相踩。
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// 持锁 + 隔离 config 落点:会触发持久化的测试都必须先拿这个。
+    fn env_locked() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::testutil::ConfigGuard,
+    ) {
+        let g = ENV_LOCK.lock().unwrap();
+        let cfg = crate::testutil::ConfigGuard::install();
+        (g, cfg)
+    }
+
     fn settings_app() -> App {
         let mut app = fake_app();
         app.screen = Screen::Settings;
@@ -824,7 +834,7 @@ mod tests {
 
     #[test]
     fn 手填_键入回显并生效同链() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let (_g, _cfg) = env_locked();
         let mut app = settings_app();
         app.update(Message::Key(key('i')));
         assert!(app.home_input);
@@ -890,7 +900,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn 手填_tilde展开成绝对路径() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let (_g, _cfg) = env_locked();
         let home = std::env::var("HOME").unwrap();
         let mut app = settings_app();
         app.update(Message::Key(key('i')));
@@ -935,7 +945,7 @@ mod tests {
 
     #[test]
     fn 手填与轮换共用生效链() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let (_g, _cfg) = env_locked();
         let mut app = settings_app();
         app.apply_nw_home("/data/shared".into());
         let a = app.nw_home.clone();

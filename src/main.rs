@@ -8,6 +8,8 @@ mod app;
 mod engine;
 mod screens;
 mod term;
+#[cfg(test)]
+mod testutil;
 mod theme;
 mod ui;
 

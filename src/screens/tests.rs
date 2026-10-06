@@ -319,6 +319,8 @@ fn 设置屏_nw_home_轮换并持久化() {
     let mut app = fake_app();
     app.screen = Screen::Settings;
     app.nw_home = "/tmp/nwt-candidate-a".into();
+    // 隔离 config 落点:轮换会持久化,不能写开发者真实配置
+    let _cfg = crate::testutil::ConfigGuard::install();
     app.cycle_nw_home();
     assert_ne!(app.nw_home, "/tmp/nwt-candidate-a", "轮换应换值");
     assert!(
