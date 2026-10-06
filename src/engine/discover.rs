@@ -137,10 +137,24 @@ mod tests {
 
     #[test]
     fn 显式优先于一切() {
+        // 用当前测试二进制当「可执行文件」:三平台通吃
+        let me = std::env::current_exe().unwrap();
         let cfg = Config::default();
-        let d = discover(Some("/bin/sh"), &cfg, "/nowhere").unwrap();
+        let d = discover(Some(me.to_str().unwrap()), &cfg, "/nowhere").unwrap();
         assert_eq!(d.source, Source::Flag);
-        assert_eq!(d.bin, PathBuf::from("/bin/sh"));
+        assert_eq!(d.bin, me);
+    }
+
+    #[test]
+    fn 显式给了不可执行的要记录() {
+        let cfg = Config::default();
+        let bogus = if cfg!(windows) {
+            "C:/nope/nw.exe"
+        } else {
+            "/nope/nw"
+        };
+        let err = discover(Some(bogus), &cfg, "/nowhere").unwrap_err();
+        assert!(err.iter().any(|s| s.contains("--nw-bin")));
     }
 
     #[test]
@@ -151,6 +165,7 @@ mod tests {
         assert!(err.iter().any(|s| s.contains("PATH")));
     }
 
+    #[cfg(unix)] // HOME/可执行位是 unix 语义
     #[test]
     fn 家目录兜底命中() {
         let cfg = Config::default();
