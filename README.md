@@ -4,7 +4,28 @@
 
 引擎侧契约冻结——本面板是**纯消费者**:fork `nw` 子进程、解析 stdout 的 JSON envelope、把 stderr 的人话流变成实时日志。面板自己不做装配决策。
 
-## 快速开始
+## 安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JoeWest9966/Warehousetui/main/install.sh | sh
+```
+
+默认装到 `~/.local/bin/nwt`。装完敲 `nwt` 没反应,就是它不在 `PATH`:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # 或 ~/.zshrc
+```
+
+- 先看计划再装:把脚本下载下来跑 `sh install.sh --dry-run`(只打印装什么、装到哪,不落盘)
+- 装到别处:`sh install.sh --prefix DIR`,或 `PREFIX` 环境变量
+- 升级:重跑最上面那行,覆盖即升级
+- 安装前强制校验 sha256,对不上就取消,不留半个二进制
+
+Windows:去 [releases](https://github.com/JoeWest9966/Warehousetui/releases) 手动下载 `nwt_<版本>_windows_x86_64.zip`。支持级是「编译可运行」([spec #10](https://github.com/JoeWest9966/Warehousetui/issues/10) 钉死的 R3 决定;ADR-0002 只定 Rust/ratatui 技术栈,不涉支持级),不提供 installer;资产与校验细节见 [docs/release.md](./docs/release.md)。
+
+> 预编译二进制随首个 tag(v0.1.0)发布后才可用;在那之前请用下面的源码构建。
+
+## 从源码构建
 
 ```bash
 cargo build --release
@@ -12,7 +33,7 @@ cargo build --release
 ./target/release/nwt --nw-bin /path/nw    # 找不到引擎时显式指路
 ```
 
-终端至少 80×24;真彩色自动探测,SSH 下自动降级 256/16 色。
+终端至少 80×24;真彩色自动探测,SSH 下自动降级 256/16 色。发布流程与本地打包复现见 [docs/release.md](./docs/release.md)。
 
 ## 五屏
 
@@ -49,4 +70,5 @@ CI 三平台(ubuntu/macos/windows)跑齐上面四项。
 - 领域词汇:[CONTEXT.md](./CONTEXT.md)
 - 架构决策:[docs/adr/](./docs/adr/)(0001 子进程契约 / 0002 技术栈 / 0003 动作边界)
 - 调研底稿:[docs/research/](./docs/research/)(nw CLI 契约面 / 用户旅程 / 环境验证)
+- 发布矩阵:[docs/release.md](./docs/release.md)(安装 / 校验 / 打 tag 发布)
 - 工单:[GitHub Issues](https://github.com/JoeWest9966/Warehousetui/issues)(wayfinder 蓝图 #1)
