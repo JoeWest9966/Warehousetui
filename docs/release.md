@@ -77,10 +77,13 @@ Get-FileHash -Algorithm SHA256 nwt_0.1.0_windows_x86_64.zip
 - 无代码签名/公证(macOS notarization、Windows Authenticode):V1 不做,靠 sha256 校验兜底。
 - 无自更新命令(`nwt self-update`):保持 ADR-0003 精神,面板不自改。
 - macos x86_64 走交叉编译:不占 Intel runner(见上),代价是构建机与目标机不同架构,二进制未经同架构实跑验证——安装脚本按 checksums 保证完整性,功能风险由 CI 测试面兜底。
+- **仓库私有时匿名安装必然 404**:release 资产与 `raw.githubusercontent.com` 的 install.sh 对匿名请求都返回 404(私有仓库行为)。`curl | sh` 一行装的前提是**仓库公开**;保持私有则需给 install.sh 加 token 认证通道(未实现)。
+- **glibc 基线 2.39**:linux 包在 ubuntu-latest(24.04)构建,老发行版(< glibc 2.39)运行会报 `GLIBC_2.39 not found`。需要更宽兼容时可改 ubuntu-22.04 构建(未实施,彩排实测确认)。
 - 包管理器分发(Homebrew / Scoop / AUR):后续票据。
 
 ## 发布记录
 
 | 日期 | tag | CI run | 备注 |
 |---|---|---|---|
+| 2026-10-06 | v0.1.0 | [37443153354](https://github.com/JoeWest9966/Warehousetui/actions/runs/37443153354) | 首次彩排:5 组合全绿;修复两条彩排问题(macOS x86_64 改交叉编译、runs-on 重复定义)后正式成发布 |
 | 待填 | v0.1.0 | — | 首个正式发布 |
