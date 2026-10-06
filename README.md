@@ -21,7 +21,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # 或 ~/.zshrc
 - 升级:重跑最上面那行,覆盖即升级
 - 安装前强制校验 sha256,对不上就取消,不留半个二进制
 
-Windows:去 [releases](https://github.com/JoeWest9966/Warehousetui/releases) 手动下载 `nwt_<版本>_windows_x86_64.zip`。支持级是「编译可运行」([ADR-0002](./docs/adr/0002-rust-ratatui-stack.md)),不提供 installer;资产与校验细节见 [docs/release.md](./docs/release.md)。
+Windows:去 [releases](https://github.com/JoeWest9966/Warehousetui/releases) 手动下载 `nwt_<版本>_windows_x86_64.zip`。支持级是「编译可运行」([spec #10](https://github.com/JoeWest9966/Warehousetui/issues/10) 钉死的 R3 决定;ADR-0002 只定 Rust/ratatui 技术栈,不涉支持级),不提供 installer;资产与校验细节见 [docs/release.md](./docs/release.md)。
 
 > 预编译二进制随首个 tag(v0.1.0)发布后才可用;在那之前请用下面的源码构建。
 

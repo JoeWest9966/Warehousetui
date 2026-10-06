@@ -12,7 +12,8 @@
 #   <版本>   = release tag 去掉 v 前缀(如 v0.1.0 -> 0.1.0)
 #
 # 本脚本只覆盖 unix。Windows 用户请手动下载 release 里的 zip
-# (Windows 为「编译运行级」支持,见 docs/adr/0002-rust-ratatui-stack.md)。
+# (Windows 为「编译运行级」支持,支持级在 spec 工单 #10 钉死,
+#  ADR-0002 只定技术栈、不涉支持级)。
 #
 # POSIX sh 约束:不用 local / 数组 / [[ ]] / function;函数间用固定前缀的
 # 全局变量传值(见 SYS_OS / SYS_ARCH / VER)。
@@ -73,6 +74,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# ---------- 参数后校验:空值守卫 ----------
+# --prefix="" / --prefix= 传给空串时,PREFIX 为空会让后面的相对路径补全
+# 拼成 "$PWD/",二进制被装进当前目录。空值一律非零退出、说人话。
+[ -n "$PREFIX" ] || die "--prefix 不能是空值(不传就用默认 \$HOME/.local/bin,或用 PREFIX 环境变量)" 2
+[ -n "$VERSION" ] || die "--version 不能是空值(不传默认 latest)" 2
+
 # ---------- 依赖预检:缺什么说什么人话 ----------
 check_deps() {
   command -v curl >/dev/null 2>&1 || die "找不到 curl,请先安装 curl"
@@ -103,12 +110,27 @@ detect_arch() {
   esac
 }
 
-# latest 版本号:GitHub API 取 tag_name,不引 jq 依赖(纯 curl+grep+sed)
+# latest 版本号:两条路,都取不到才死
+#   1) GitHub API 的 /releases/latest 取 tag_name —— 有速率限制
+#   (未认证 60 次/小时),被限流或仓库暂无 release 时会失败;
+#   2) 兜底:对 https://github.com/$REPO/releases/latest 发 HEAD,读 302 的
+#      Location 头(/releases/tag/<tag> 或 /releases/download/<tag>/...),
+#      从里面抠 tag —— 走 HTML 重定向,不吃 API 配额。
+# 全程不引 jq;curl -I 不跟随重定向,只读响应头。
 resolve_latest() {
   LATEST_TAG=$(curl -fsSL --retry 2 "$API_BASE/repos/$REPO/releases/latest" 2>/dev/null \
     | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 \
     | sed 's/.*"\([^"]*\)"$/\1/')
-  [ -n "$LATEST_TAG" ] || die "取不到 latest 版本号($API_BASE 无响应或仓库还没有 release)"
+
+  if [ -z "$LATEST_TAG" ]; then
+    info "GitHub API 没给出 latest 版本号(限流或无 release?),改用 releases/latest 重定向兜底"
+    LATEST_TAG=$(curl -fsSI --retry 2 "https://github.com/$REPO/releases/latest" 2>/dev/null \
+      | tr -d '\r' \
+      | sed -n 's/^[Ll]ocation:[[:space:]]*//p' | head -n 1 \
+      | sed 's#.*/releases/##; s#^tag/##; s#^download/##; s#/.*##')
+  fi
+
+  [ -n "$LATEST_TAG" ] || die "取不到 latest 版本号(GitHub API 与 releases/latest 重定向两条路都失败了:网络不通,或仓库还没有 release?)"
 }
 
 # ---------- 下载与校验 ----------
