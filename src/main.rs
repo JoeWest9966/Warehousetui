@@ -91,8 +91,17 @@ async fn run_loop(
 ) -> Result<()> {
     let mut tick = interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let splash_deadline = std::time::Instant::now() + Duration::from_millis(800);
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
+        if app.splash {
+            // 任意键或 800ms 到点,交棒主界面(首帧已画出)
+            tokio::select! {
+                Some(Event::Key(_)) = rx.recv() => app.splash = false,
+                _ = tokio::time::sleep_until(splash_deadline.into()) => app.splash = false,
+            }
+            continue;
+        }
         if app.quit {
             break;
         }

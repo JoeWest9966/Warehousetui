@@ -17,6 +17,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let p = &app.palette;
 
+    if app.splash {
+        render_splash(frame, area, app);
+        return;
+    }
     if !app.fits(area.width, area.height) {
         render_too_small(frame, area, app);
         return;
@@ -178,6 +182,38 @@ fn render_too_small(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// 启动 splash:复古货架 logo,任意键或 800ms 后交棒。
+fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let art = [
+        "   ┌───────────────────────────────┐   ",
+        "   │  ▄▄   ▄▄   ▄▄   ▄▄   ▄▄   ▄▄  │   ",
+        "   │  ██   ██   ██   ██   ██   ██  │   ",
+        "   │  ▀▀   ▀▀   ▀▀   ▀▀   ▀▀   ▀▀  │   ",
+        "   └───────────────────────────────┘   ",
+        "         N O U S   W A R E H O U S E   ",
+    ];
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    for (i, row) in art.iter().enumerate() {
+        let style = if i == art.len() - 1 {
+            p.accent().bold()
+        } else {
+            p.dim()
+        };
+        lines.push(Line::from(Span::styled(*row, style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "        Warehousetui · Nous Warehouse 驾驶舱",
+        p.text(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "               nwt v0.1 · 按任意键进入",
+        p.dim(),
+    )));
+    frame.render_widget(Paragraph::new(lines).centered(), area);
+}
+
 /// 数据屏共用的外框:标题 + 可选右上角注脚。
 pub fn screen_block<'a>(p: &Palette, title: &'a str, note: Option<String>) -> Block<'a> {
     let mut block = Block::bordered()
@@ -202,9 +238,27 @@ mod tests {
         term.backend().to_string()
     }
 
+    /// 测试默认已经越过 splash(与真实启动流一致:先 splash 再主界面)。
+    fn ui_app() -> App {
+        let mut app = App::new();
+        app.splash = false;
+        app
+    }
+
+    #[test]
+    fn splash_先亮相且可跳过() {
+        let mut app = App::new();
+        assert!(app.splash, "开机先 splash");
+        let s = render_to_string(&app, 100, 30);
+        assert!(s.contains("W A R E H O U S E"));
+        assert!(s.contains("驾驶舱"));
+        app.splash = false; // 任意键/800ms 后交棒
+        assert!(!render_to_string(&app, 100, 30).contains("W A R E H O U S E"));
+    }
+
     #[test]
     fn 壳三件套渲染() {
-        let app = App::new();
+        let app = ui_app();
         let s = render_to_string(&app, 100, 30);
         assert!(s.contains("Warehousetui"));
         assert!(s.contains("NW_HOME"));
@@ -213,7 +267,7 @@ mod tests {
 
     #[test]
     fn 装配态_hud_提示锁定() {
-        let mut app = App::new();
+        let mut app = ui_app();
         app.assembling = true;
         let s = render_to_string(&app, 100, 30);
         assert!(s.contains("装配中"));
@@ -221,14 +275,14 @@ mod tests {
 
     #[test]
     fn 终端过小有提示() {
-        let app = App::new();
+        let app = ui_app();
         let s = render_to_string(&app, 40, 10);
         assert!(s.contains("终端太小"));
     }
 
     #[test]
     fn 帮助浮层可开关() {
-        let mut app = App::new();
+        let mut app = ui_app();
         app.help = true;
         let s = render_to_string(&app, 100, 30);
         assert!(s.contains("帮助"));

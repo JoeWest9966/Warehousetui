@@ -145,6 +145,8 @@ pub struct App {
     pub queue: Vec<Vec<String>>,
     /// 设置屏按 e 请求外部编辑器;主循环挂起终端再拉起(见 main)。
     pub pending_editor: bool,
+    /// 启动 splash:800ms 或任意键跳过(R3 决议)。
+    pub splash: bool,
 }
 
 impl App {
@@ -211,6 +213,7 @@ impl App {
             log: vec!["驾驶舱已就绪".into()],
             queue: Vec::new(),
             pending_editor: false,
+            splash: true,
         }
     }
 

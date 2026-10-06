@@ -119,6 +119,10 @@ impl Palette {
         Style::new().fg(self.dim)
     }
 
+    pub fn text(&self) -> Style {
+        Style::new().fg(self.text)
+    }
+
     pub fn info(&self) -> Style {
         Style::new().fg(self.info)
     }
