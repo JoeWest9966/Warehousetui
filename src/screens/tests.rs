@@ -405,3 +405,86 @@ fn 输入浮层_盖在指路屏之上() {
     assert!(s.contains("手填 NW_HOME"), "浮层盖顶");
     assert!(s.contains("/srv/pi"));
 }
+
+// ---- #22 纵向密度:50 行富余用满(常畅/紧凑两档共用同一 render_*) ----
+
+/// 整行剥掉边框字符后为空 ⇒ 空白行;返回最长连续空白行数。
+fn longest_blank_run(rendered: &str) -> usize {
+    let (mut best, mut cur) = (0usize, 0usize);
+    for line in rendered.lines() {
+        let stripped: String = line
+            .chars()
+            .map(|c| {
+                if matches!(
+                    c,
+                    '│' | '─'
+                        | '┌'
+                        | '┐'
+                        | '└'
+                        | '┘'
+                        | '├'
+                        | '┤'
+                        | '┬'
+                        | '┴'
+                        | '┼'
+                        | ' '
+                ) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if stripped.trim().is_empty() {
+            cur += 1;
+            best = best.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    best
+}
+
+/// 概览「最近日志」:可视行随高度增加(30 行 < 50 行)。
+#[test]
+fn 概览最近日志可视行随高度增加() {
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    for i in 0..60 {
+        app.push_log(format!("动作{i:02}"));
+    }
+    let s30 = draw(&app, 110, 30);
+    let s50 = draw(&app, 110, 50);
+    let n30 = s30.matches("动作").count();
+    let n50 = s50.matches("动作").count();
+    assert!(n30 > 0, "30 行下也能看到最近日志");
+    assert!(
+        n50 > n30,
+        "可视行随高度增加:30 行可见 {n30} 行,50 行可见 {n50} 行"
+    );
+    assert!(s30.contains("最近日志"), "日志区有标题");
+}
+
+/// 高终端无大片空白:派表/日志铺满可用高度(不引限高、不居中)。
+/// 数据给足(40 派 + 60 条流水),断言最长连续空白行 ≤ 3。
+#[test]
+fn 纵向密度_50行高无大片空白() {
+    let mut app = fake_app();
+    let profiles: String = (0..40)
+        .map(|i| format!(r#"{{"name":"p{i:02}","state":"ok","lockId":"l{i:02}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rich = format!(
+        r#"{{"domain":"all","recipes":[{{"name":"research-desk","version":"0.2.0"}}],"components":[],"sources":[],"profiles":[{profiles}],"locks":[{{"lockId":"l00","recipe":"research-desk","bakedAt":"2026-10-01"}}]}}"#
+    );
+    app.ls = Some(serde_json::from_str(&rich).unwrap());
+    for i in 0..60 {
+        app.push_log(format!("动作{i:02}"));
+    }
+    for (w, h) in [(100u16, 50u16), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(s.contains("最近日志"), "{w}×{h} 日志区在场");
+        let run = longest_blank_run(&s);
+        assert!(run <= 3, "{w}×{h} 最长空白行 {run} > 3,富余没用满");
+    }
+}
