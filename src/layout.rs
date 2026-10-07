@@ -193,7 +193,7 @@ fn screen_hits(content: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect,
     let inner = shrink_border(content);
     match app.screen {
         Screen::Overview => overview_hits(inner, app, hits),
-        Screen::Assemble => assemble_hits(inner, app, hits),
+        Screen::Assemble => assemble_hits(inner, app, class, hits),
         Screen::Health => health_hits(inner, app, hits),
         Screen::Recipes => recipes_hits(inner, app, class, hits),
         Screen::Settings => {}
@@ -228,9 +228,34 @@ fn overview_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     row_hits(tbl, 1, ls.profiles.len(), hits, Target::SelectRow);
 }
 
-/// 装配屏:发射仪式浮层短路后,选锁定集列表在 55% 左栏、带边框、首行即数据。
-fn assemble_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
-    if app.assembling || app.as_result.is_some() {
+/// 装配屏:装配运行中给 stderr 日志区产滚轮命中区(#21,几何与
+/// `render_running` 同款分栏);闲置时选锁定集列表在 55% 左栏、
+/// 带边框、首行即数据;结果态/无日志区,不产目标。
+fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    if app.assembling {
+        // 与 render_running_comfy/compact 同一个 Layout:七步栏/进度行
+        // 之外就是日志块,再缩一圈块边框(与 row_hits 的取内层同约定)。
+        let log = match class {
+            SizeClass::Comfy => ratatui::layout::Layout::horizontal([
+                ratatui::layout::Constraint::Length(14),
+                ratatui::layout::Constraint::Min(20),
+            ])
+            .split(area)[1],
+            SizeClass::Compact => ratatui::layout::Layout::vertical([
+                ratatui::layout::Constraint::Length(1),
+                ratatui::layout::Constraint::Min(3),
+            ])
+            .split(area)[1],
+        };
+        let log = shrink_border(log);
+        if log.width > 0 && log.height > 0 {
+            // 方向由滚轮事件在分派时携带;命中区是纯几何,此处的值
+            // 仅为满足 Target 形状(spec #15),不参与语义。
+            hits.push((log, Target::ScrollLog(ScrollDir::Down)));
+        }
+        return;
+    }
+    if app.as_result.is_some() {
         return;
     }
     let (cols, _) = h_split2(area, 55, 45);
@@ -714,5 +739,35 @@ mod tests {
         let a = area(30, 10); // 守卫屏状态:无导航、无列表
         let hits = hitmap(a, &app, size_class(a));
         assert!(hits.is_empty(), "正文不足时不铺命中区");
+    }
+
+    // ---- #21 stderr 日志滚动区:装配运行中才有,与 render_running 同款分栏 ----
+
+    #[test]
+    fn hitmap_stderr日志区_装配运行中产出_闲置不产() {
+        let mut app = test_app();
+        app.screen = Screen::Assemble;
+        app.assembling = true;
+        for (w, h) in [(80, 30), (66, 50)] {
+            let a = area(w, h);
+            let r = first(&hitmap(a, &app, size_class(a)), |t| {
+                matches!(t, Target::ScrollLog(_))
+            })
+            .unwrap_or_else(|| panic!("{w}×{h} 装配运行中应有日志滚动区"));
+            assert!(r.width > 0 && r.height > 0, "{w}×{h} 日志区非空");
+            assert!(
+                r.x + r.width <= a.x + a.width && r.y + r.height <= a.y + a.height,
+                "日志滚动区不越出终端面"
+            );
+        }
+        // 闲置选锁定集:无日志区,滚轮无处可滚(几何来自同一个 assemble_hits)
+        app.assembling = false;
+        let a = area(80, 30);
+        assert!(
+            !hitmap(a, &app, size_class(a))
+                .iter()
+                .any(|(_, t)| matches!(t, Target::ScrollLog(_))),
+            "闲置装配屏不产日志滚动区"
+        );
     }
 }

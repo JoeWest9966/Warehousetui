@@ -254,11 +254,15 @@ fn step_done(app: &App, step: &str) -> bool {
 
 /// stderr 实时日志块,两档共用(只随分栏几何变化);`height` 是日志块自身高度,
 /// 只取可见行数(比旧实现按整屏高多取的部分会被 Paragraph 裁掉,渲染等价)。
+/// `as_log_offset`(#21 滚轮偏移,0=跟随最新)先跳过偏移再取窗——偏移为 0
+/// 时与逐字节旧观感一致;drain 陈旧偏移用 min 钳在窗内。
 fn log_block(app: &App, p: &crate::theme::Palette, height: u16) -> Paragraph<'static> {
+    let offset = app.as_log_offset.min(app.as_log.len());
     let log: Vec<Line> = app
         .as_log
         .iter()
         .rev()
+        .skip(offset)
         .take(height as usize)
         .map(|l| Line::from(l.clone()))
         .collect();

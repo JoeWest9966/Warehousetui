@@ -581,3 +581,31 @@ fn 常畅_内层栏回归_80x30竖轨在场() {
     assert!(s2.contains("┌ 五域 "), "常畅态五域竖轨原样在场");
     assert!(!s2.contains("│ 派(2)"), "常畅态不落紧凑 Tab 行");
 }
+
+// ---- #21 滚轮:stderr 偏移进渲染取窗 ----
+
+#[test]
+fn 日志偏移取窗_跳过偏移行_七步判定不受影响() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_log = (0..10).map(|i| format!("行{i:02}")).collect();
+    // 偏移 0:与既有观感一致,最新一行在窗内
+    let s0 = draw(&app, 80, 30);
+    assert!(s0.contains("行09"), "偏移 0 跟随最新行(既有观感不变)");
+    // 偏移 2:最新两行移出窗,更早的行入窗
+    app.as_log_offset = 2;
+    let s2 = draw(&app, 80, 30);
+    assert!(!s2.contains("行09") && !s2.contains("行08"), "偏移行移出窗");
+    assert!(s2.contains("行07"), "更早的行入窗");
+    assert!(s2.contains("行00"), "窗内仍有更早内容");
+    // 越界/陈旧偏移:min 钳制取窗不 panic;七步判定读全量 as_log,不受取窗影响
+    app.as_log.push("5 写清单 完成".into());
+    app.as_log_offset = 100;
+    let s3 = draw(&app, 80, 30);
+    assert!(!s3.contains("行0"), "取窗钳在日志内,不越界");
+    assert!(
+        s3.contains("✓ 5 写清单"),
+        "七步判定读全量日志:行被移出窗仍打勾"
+    );
+}

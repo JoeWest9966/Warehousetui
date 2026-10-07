@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::engine::{
     commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, LsData, State,
 };
-use crate::layout::{hitmap, size_class, Target};
+use crate::layout::{hitmap, size_class, ScrollDir, Target};
 use crate::term::{self, ColorCap};
 use crate::theme::{cached_degrade, Palette, ThemeKind};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -130,6 +130,9 @@ pub struct App {
     pub as_sel: usize,
     pub as_confirm: bool,
     pub as_log: Vec<String>,
+    /// 装配 stderr 日志的滚轮偏移(#21):0=跟随最新,向上滚增、向下
+    /// 滚减,钳在 [0, len)。只影响 log_block 取窗,七步判定仍读全量。
+    pub as_log_offset: usize,
     pub as_result: Option<EngineOutput>,
 
     // ---- 健康 ----
@@ -226,6 +229,7 @@ impl App {
             as_sel: 0,
             as_confirm: false,
             as_log: Vec::new(),
+            as_log_offset: 0,
             as_result: None,
             hl_mode: HealthMode::Doctor,
             hl_sel: 0,
@@ -265,6 +269,7 @@ impl App {
                 self.assembling = true;
                 self.as_confirm = false;
                 self.as_log.clear();
+                self.as_log_offset = 0; // 新一轮装配从最新一行跟起
                 self.as_result = None;
                 self.push_log(format!("装配启动:{}", args.join(" ")));
             }
@@ -289,15 +294,19 @@ impl App {
         }
     }
 
-    /// 鼠标事件分派（spec #15 ticket #20）：命中区取自与渲染同源的
+    /// 鼠标事件分派（spec #15 ticket #20/#21）：命中区取自与渲染同源的
     /// [`hitmap`]——先借出目标（owned [`Target`]，随即释放对 `self` 的
     /// 不可变借用）再改状态，规避自反借用；只读命中区、不硬编码矩形
-    /// （#17/#18 细化紧凑几何后自动跟随）。只受理左键按下：释放是配对
-    /// 尾巴不二次触发，滚轮归 #21，右键/拖拽不在 V1 范围（ADR-0005）。
+    /// （#17/#18 细化紧凑几何后自动跟随）。左键按下做点击分派，滚轮做
+    /// #21 的移选中/日志翻看；释放是配对尾巴不二次触发，右键/拖拽不在
+    /// V1 范围（ADR-0005）。
     fn on_mouse(&mut self, ev: MouseEvent) {
-        if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
+        let scroll = match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => None,
+            MouseEventKind::ScrollUp => Some(ScrollDir::Up),
+            MouseEventKind::ScrollDown => Some(ScrollDir::Down),
+            _ => return,
+        };
         let size = self.size;
         let hits = hitmap(size, self, size_class(size));
         let pos = Position::new(ev.column, ev.row);
@@ -306,8 +315,19 @@ impl App {
             .find(|(r, _)| r.contains(pos))
             .map(|(_, t)| t)
         else {
-            return; // 点空白:不改任何状态
+            return; // 点/滚空白:不改任何状态
         };
+        // 滚轮(#21):只受理可选列表与装配 stderr 日志区——滚到导航/
+        // 仪式按钮/浮层目标上不动作(滚轮不切屏、不点火、不关浮层);
+        // 方向取自事件,ScrollLog 内的方向不参与分派(命中区纯几何)。
+        if let Some(dir) = scroll {
+            match target {
+                Target::SelectRow(_) => self.wheel_sel(dir),
+                Target::ScrollLog(_) => self.wheel_log(dir),
+                _ => {}
+            }
+            return;
+        }
         match target {
             // 点导航(常畅)/屏 Tab(紧凑)切屏,与 j/k 同语义。
             Target::NavTo(s) => self.screen = s,
@@ -322,11 +342,61 @@ impl App {
             },
             // 仪式「Enter 发射」段:与键盘 Enter 同一路(入队 up、关浮层)。
             Target::Activate => self.launch_selected_lock(),
-            // 帮助「任意处关」与仪式「Esc 返航」:与键盘 Esc 同一路。
+            // 帮助「任意处关」与仪式「Esc 返航」:与键盘 Esc 同一路
+            // (日志区左键无动作,翻看归上面的滚轮分支)。
             Target::DismissPopup => self.dismiss_popup(),
-            // 滚轮日志滚动由 #21 接线,本片不受理。
+            // 左键点日志区不动作;翻看由上面的滚轮分支受理(#21)。
             Target::ScrollLog(_) => {}
         }
+    }
+
+    /// 滚轮在可选列表上移选中(#21):上下各一档,与键盘同步进;
+    /// 边界按票面钉死「到顶/到底不越界、不绕回」——到顶停顶、到底停底,
+    /// 落在 [0, n) (既有键盘代码走 % n 会绕回,那是键盘行为,
+    /// 键盘零回归不动它)。
+    fn wheel_sel(&mut self, dir: ScrollDir) {
+        let (sel, n) = match self.screen {
+            Screen::Overview => {
+                let n = self.ls.as_ref().map(|l| l.profiles.len()).unwrap_or(0);
+                (&mut self.ov_sel, n)
+            }
+            Screen::Assemble => {
+                let n = self.ls.as_ref().map(|l| l.locks.len()).unwrap_or(0);
+                (&mut self.as_sel, n)
+            }
+            Screen::Health => {
+                let n = self
+                    .hl_result
+                    .as_ref()
+                    .map(|r| r.evidence().len())
+                    .unwrap_or(0);
+                (&mut self.hl_sel, n)
+            }
+            Screen::Recipes => {
+                let n = self.domain_len();
+                (&mut self.rc_sel, n)
+            }
+            Screen::Settings => return, // 设置屏无可滚列表
+        };
+        if n == 0 {
+            return;
+        }
+        match dir {
+            ScrollDir::Down => *sel = (*sel + 1).min(n - 1),
+            ScrollDir::Up => *sel = sel.saturating_sub(1),
+        }
+    }
+
+    /// 滚轮在装配 stderr 实时日志区翻看(#21):偏移 0=跟随最新,
+    /// 向上增、向下减,钳在 [0, len)(空日志不动,drain 后的陈旧偏移
+    /// 自愈),与 render log_block 的取窗衔接。
+    fn wheel_log(&mut self, dir: ScrollDir) {
+        let max = self.as_log.len().saturating_sub(1);
+        let cur = self.as_log_offset.min(max);
+        self.as_log_offset = match dir {
+            ScrollDir::Up => (cur + 1).min(max),
+            ScrollDir::Down => cur.saturating_sub(1),
+        };
     }
 
     /// 关闭当前浮层,与键盘 Esc 完全同路:帮助只关灯,发射仪式
@@ -1383,5 +1453,152 @@ mod tests {
         click(&mut app, nav);
         assert_eq!(app.screen, Screen::Settings, "手填浮层下鼠标惰性:不切屏");
         assert_eq!(app.home_buf, "/x", "输入缓冲不被鼠标扰动(故事 16)");
+    }
+
+    // ---- #21 滚轮滚动:列表移选中 + 装配 stderr 偏移 ----
+
+    /// 在命中矩形中心滚一格。
+    fn wheel(app: &mut App, r: Rect, kind: MouseEventKind) {
+        app.update(Message::Mouse(mouse_at(
+            kind,
+            r.x + r.width / 2,
+            r.y + r.height / 2,
+        )));
+    }
+
+    #[test]
+    fn 滚轮移选中_四屏各一档_边界到顶停顶到底停底() {
+        let mut app = mouse_ls_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        // 概览派表(3 派):与键盘同步进;边界按票面不绕回
+        app.screen = Screen::Overview;
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(_)));
+        wheel(&mut app, row, MouseEventKind::ScrollDown);
+        assert_eq!(app.ov_sel, 1, "滚一格 = 键盘 Down 一档");
+        wheel(&mut app, row, MouseEventKind::ScrollDown);
+        wheel(&mut app, row, MouseEventKind::ScrollDown);
+        assert_eq!(app.ov_sel, 2, "到底停底(3 派),不绕回");
+        wheel(&mut app, row, MouseEventKind::ScrollUp);
+        assert_eq!(app.ov_sel, 1, "向上一档");
+        wheel(&mut app, row, MouseEventKind::ScrollUp);
+        wheel(&mut app, row, MouseEventKind::ScrollUp);
+        assert_eq!(app.ov_sel, 0, "到顶停顶,不绕回到 2");
+        // 装配锁定集(2 锁)
+        app.screen = Screen::Assemble;
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(_)));
+        wheel(&mut app, row, MouseEventKind::ScrollDown);
+        assert_eq!(app.as_sel, 1, "装配列表滚一档");
+        wheel(&mut app, row, MouseEventKind::ScrollDown);
+        assert_eq!(app.as_sel, 1, "2 锁到底停底");
+        wheel(&mut app, row, MouseEventKind::ScrollUp);
+        assert_eq!(app.as_sel, 0, "装配列表回顶");
+        // 配方列表(Profiles 域 3 条)
+        app.screen = Screen::Recipes;
+        app.rc_domain = Domain::Profiles;
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(_)));
+        wheel(&mut app, row, MouseEventKind::ScrollDown);
+        assert_eq!(app.rc_sel, 1, "配方列表滚一档");
+        wheel(&mut app, row, MouseEventKind::ScrollUp);
+        assert_eq!(app.rc_sel, 0, "配方列表回顶");
+        // 健康 validate 项(证据两条)
+        app.screen = Screen::Health;
+        app.hl_mode = HealthMode::Validate;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["validate".into(), "--recipe".into(), "x".into()],
+                exit_code: crate::engine::ExitCode::from_number(3),
+                ok: false,
+                stderr_tail: vec![],
+                envelope: Some(
+                    serde_json::from_str(
+                        r#"{"schema":"nw/validate.v1","nw":"0.1.0","ok":false,"errors":[{"code":"A","exitCode":3,"message":"甲","hint":"h","details":{}},{"code":"B","exitCode":3,"message":"乙","hint":"h","details":{}}],"warnings":[],"data":{"results":[],"summary":{"total":2,"pass":0,"warn":0,"fail":2,"skip":0}}}"#,
+                    )
+                    .unwrap(),
+                ),
+                raw_stdout: "".into(),
+                parse_error: None,
+            },
+        ))));
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(_)));
+        wheel(&mut app, row, MouseEventKind::ScrollDown);
+        assert_eq!(app.hl_sel, 1, "健康列表滚一档");
+        wheel(&mut app, row, MouseEventKind::ScrollDown);
+        assert_eq!(app.hl_sel, 1, "健康列表到底停底");
+        // 滚轮只是选中:不入队、不开仪式(安全语义与键盘一致,故事 31)
+        assert!(app.queue.is_empty(), "滚轮不入队");
+        assert!(!app.as_confirm, "滚轮不触发破坏性动作");
+    }
+
+    #[test]
+    fn 滚轮只受理列表与日志区_导航与浮层上滚动不动状态() {
+        let mut app = mouse_ls_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.screen = Screen::Overview;
+        // 滚到竖导航上:不切屏(切屏只归点击/键位)
+        let nav = hit_target(&app, |t| matches!(t, Target::NavTo(Screen::Health)));
+        wheel(&mut app, nav, MouseEventKind::ScrollDown);
+        assert_eq!(app.screen, Screen::Overview, "滚导航不切屏");
+        // 概览「最近日志」等纯文本区不入滚动范围:命中清单里无 ScrollLog
+        assert!(
+            !hitmap(app.size, &app, size_class(app.size))
+                .iter()
+                .any(|(_, t)| matches!(t, Target::ScrollLog(_))),
+            "概览屏不产日志滚动目标(最近日志维持截断)"
+        );
+        wheel(&mut app, Rect::new(60, 20, 8, 3), MouseEventKind::ScrollUp);
+        assert_eq!(app.as_log_offset, 0, "非目标区滚动不产偏移");
+        // 帮助浮层:滚到浮层上不关浮层(浮层优先级对滚轮同样成立)
+        app.help = true;
+        let popup = hit_target(&app, |t| matches!(t, Target::DismissPopup));
+        wheel(&mut app, popup, MouseEventKind::ScrollDown);
+        assert!(app.help, "滚轮不关帮助浮层(点才关)");
+        assert_eq!(app.ov_sel, 0, "浮层下滚动不作用底层列表");
+    }
+
+    #[test]
+    fn 滚轮在stderr日志区_偏移增减_边界不得越界() {
+        // 两档尺寸都覆盖:ScrollLog 区随 render_running 同款分栏产出
+        for (w, h) in [(80, 30), (66, 50)] {
+            let mut app = mouse_ls_app();
+            app.size = Rect::new(0, 0, w, h);
+            app.screen = Screen::Assemble;
+            app.assembling = true;
+            app.as_log = (0..8).map(|i| format!("行{i:02}")).collect();
+            let log = hit_target(&app, |t| matches!(t, Target::ScrollLog(_)));
+            wheel(&mut app, log, MouseEventKind::ScrollUp);
+            assert_eq!(app.as_log_offset, 1, "{w}×{h} 向上翻一格");
+            wheel(&mut app, log, MouseEventKind::ScrollUp);
+            assert_eq!(app.as_log_offset, 2, "{w}×{h} 再翻一格");
+            wheel(&mut app, log, MouseEventKind::ScrollDown);
+            wheel(&mut app, log, MouseEventKind::ScrollDown);
+            wheel(&mut app, log, MouseEventKind::ScrollDown);
+            assert_eq!(app.as_log_offset, 0, "{w}×{h} 回到底部停住,不越界");
+            for _ in 0..20 {
+                wheel(&mut app, log, MouseEventKind::ScrollUp);
+            }
+            assert_eq!(app.as_log_offset, 7, "{w}×{h} 偏移停在 len-1,不越界");
+            assert_eq!(app.as_sel, 0, "滚日志不动选中");
+            assert!(app.queue.is_empty(), "滚日志不入队");
+        }
+        // 空日志:无偏移可言
+        let mut app = mouse_ls_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.screen = Screen::Assemble;
+        app.assembling = true;
+        let log = hit_target(&app, |t| matches!(t, Target::ScrollLog(_)));
+        wheel(&mut app, log, MouseEventKind::ScrollUp);
+        assert_eq!(app.as_log_offset, 0, "空日志滚动不产偏移");
+    }
+
+    #[test]
+    fn 新一轮装配_日志偏移归零() {
+        let mut app = mouse_ls_app();
+        app.as_log = (0..5).map(|i| format!("行{i:02}")).collect();
+        app.as_log_offset = 4;
+        app.spawn_engine(
+            vec!["up".into(), "--lock".into(), "9f8e".into()],
+            &mpsc::unbounded_channel().0,
+        );
+        assert_eq!(app.as_log_offset, 0, "新装配从最新一行跟起");
     }
 }
