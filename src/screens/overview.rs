@@ -27,7 +27,11 @@ pub fn render_overview(frame: &mut Frame, area: Rect, app: &App) {
     let cols =
         Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).split(rows[1]);
     render_profiles(frame, cols[0], app);
-    render_commands(frame, cols[1], app);
+    // 右栏:指令框固定 6 行(边框 2 + 4 条指令),余高全给「最近日志」——
+    // 纵向富余由 Min 吸收、可视行随高度长(不引限高、不居中,票 #22)。
+    let right = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).split(cols[1]);
+    render_commands(frame, right[0], app);
+    render_recent_log(frame, right[1], app);
 
     render_counts(frame, rows[2], app);
     let _ = p;
@@ -176,6 +180,31 @@ fn render_commands(frame: &mut Frame, area: Rect, app: &App) {
         ),
         area,
     );
+}
+
+/// 「最近日志」:动作流水新在前,可视行数 = 框内高度(高终端自动多显示,
+/// 低终端截断旧尾巴;滚动不在本屏范围,见 spec #15 的 Out of Scope)。
+fn render_recent_log(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let block = ratatui::widgets::Block::bordered()
+        .border_style(p.dim())
+        .title(Span::styled(" 最近日志 ", p.dim()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if app.log.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("还没有动作流水。", p.dim())),
+            inner,
+        );
+        return;
+    }
+    let lines: Vec<Line> = app
+        .log
+        .iter()
+        .take(inner.height as usize)
+        .map(|l| Line::from(Span::styled(l.clone(), p.dim())))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_counts(frame: &mut Frame, area: Rect, app: &App) {

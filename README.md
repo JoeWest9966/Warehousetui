@@ -33,7 +33,7 @@ cargo build --release
 ./target/release/nwt --nw-bin /path/nw    # 找不到引擎时显式指路
 ```
 
-终端至少 80×24;真彩色自动探测,SSH 下自动降级 256/16 色。发布流程与本地打包复现见 [docs/release.md](./docs/release.md)。
+终端至少 66×50;宽 ≥ 80 为常畅态(竖左导航),窄于 80 自动切紧凑态(横向屏 Tab),只改排布不改字号;真彩色自动探测,SSH 下自动降级 256/16 色。发布流程与本地打包复现见 [docs/release.md](./docs/release.md)。
 
 ## 五屏
 
@@ -47,6 +47,13 @@ cargo build --release
 
 通用:`j/k` 切屏 · `Enter` 确认 · `Esc` 返回 · `?` 帮助 · `q` 退出(装配态禁用)。
 
+### 鼠标(默认开捕获)
+
+- 点左导航(常畅态)/顶部屏 Tab(紧凑态)切屏;点列表行=选中(与 `↑/↓` 同语义,不触发破坏性动作)。
+- 可选列表上滚轮上下移选中;装配 stderr 实时日志区滚轮回看早先输出。
+- 发射仪式「Enter 发射 / Esc 返航」两段可点;帮助浮层点任意处关;浮层打开时点击不穿透底层。
+- 捕获默认开启的代价:终端原生「拖拽选中 / 右键复制」需按 **Shift**。要还给终端:`--no-mouse` 旗标启动,或设置屏按 `m` 关(写入 `config.mouse_capture`,下次启动生效)。
+
 ## 行为纪律
 
 - **降级 ≠ 失败**:required env 缺失、provider 未就绪是 amber 横幅;`skip` 是正常态(pi 懒创建)。
@@ -59,7 +66,7 @@ cargo build --release
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets     # 59 个单测:契约解析 / 发现策略 / 五屏快照 / 装配四路径
+cargo test --all-targets     # 118 个单测:契约解析 / 发现策略 / 五屏快照 / 装配四路径 / 命中区与响应式两档 / 80×30 整帧 golden
 cargo build --release
 ```
 

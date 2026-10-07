@@ -42,6 +42,14 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled("外观", p.accent())),
         Line::from(format!("  主题     {} (t 切换)", app.theme.name())),
+        Line::from(format!(
+            "  鼠标     {} (m 切换,重启生效)",
+            if app.mouse_enabled {
+                "捕获开"
+            } else {
+                "捕获关"
+            }
+        )),
         Line::from(format!("  终端     {:?}", app.cap)),
         Line::from(""),
         Line::from(Span::styled("配置", p.accent())),

@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Screen};
+use crate::layout::{size_class, SizeClass, NAV_WIDTH};
 use crate::screens;
 use crate::theme::Palette;
 
@@ -51,26 +52,61 @@ fn render_top_bar(frame: &mut Frame, area: Rect, app: &App) {
         "○ 空闲"
     };
     let lamp_style = if app.assembling { p.accent() } else { p.dim() };
-    let line = Line::from(vec![
-        Span::styled(" Warehousetui", p.accent().bold()),
-        Span::styled(" · Nous Warehouse 驾驶舱 ", p.dim()),
-        Span::raw("  nwt v0.1 · "),
-        Span::styled(
-            format!("nw {} · {}", app.engine_version, app.engine.source),
-            p.info(),
-        ),
-        Span::raw("  │  NW_HOME: "),
-        Span::styled(app.nw_home.clone(), p.dim()),
-        Span::raw("  "),
-        Span::styled(lamp, lamp_style),
-    ]);
+    // 紧凑态精简:去副品牌与版本细节,只留装配态灯与 NW_HOME
+    // (ADR-0004「顶栏去副品牌/版本细节」,spec #15 ticket #17)。
+    let line = if size_class(area) == SizeClass::Compact {
+        Line::from(vec![
+            Span::raw("NW_HOME: "),
+            Span::styled(app.nw_home.clone(), p.dim()),
+            Span::raw("  "),
+            Span::styled(lamp, lamp_style),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" Warehousetui", p.accent().bold()),
+            Span::styled(" · Nous Warehouse 驾驶舱 ", p.dim()),
+            Span::raw("  nwt v0.1 · "),
+            Span::styled(
+                format!("nw {} · {}", app.engine_version, app.engine.source),
+                p.info(),
+            ),
+            Span::raw("  │  NW_HOME: "),
+            Span::styled(app.nw_home.clone(), p.dim()),
+            Span::raw("  "),
+            Span::styled(lamp, lamp_style),
+        ])
+    };
     frame.render_widget(Paragraph::new(line).style(p.surface()), area);
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::horizontal([Constraint::Length(12), Constraint::Min(10)]).split(area);
-    render_nav(frame, cols[0], app);
-    screens::render(frame, cols[1], app);
+    // 分叉只读 size_class,不新造判定(ADR-0004)。
+    if size_class(area) == SizeClass::Compact {
+        // 紧凑态:竖左导航折成一行横向屏 Tab,省下的 12 列还给正文。
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
+        render_screen_tabs(frame, rows[0], app);
+        screens::render(frame, rows[1], app);
+    } else {
+        let cols =
+            Layout::horizontal([Constraint::Length(NAV_WIDTH), Constraint::Min(10)]).split(area);
+        render_nav(frame, cols[0], app);
+        screens::render(frame, cols[1], app);
+    }
+}
+
+/// 紧凑态横向屏 Tab 条:一排五屏,顺序同 [`Screen::ALL`],当前屏带选中标记。
+/// 单元文本取自 [`crate::layout::tab_cell`](布局模型)——渲染与命中区同源。
+fn render_screen_tabs(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let spans: Vec<Span> = Screen::ALL
+        .iter()
+        .map(|screen| {
+            let selected = *screen == app.screen;
+            let style = if selected { p.sel().bold() } else { p.dim() };
+            Span::styled(crate::layout::tab_cell(*screen, selected), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(p.surface()), area);
 }
 
 fn render_nav(frame: &mut Frame, area: Rect, app: &App) {
@@ -102,16 +138,21 @@ fn render_nav(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
+    // 紧凑态 HUD 精简:少给提示(去「t 主题」)、去右侧主题标注,
+    // 切屏/确认/帮助/退出四个核心提示保留(ADR-0004,spec #15 ticket #17)。
+    let compact = size_class(area) == SizeClass::Compact;
     let mut spans = vec![
         Span::styled(" j/k", p.accent()),
         Span::raw(" 切屏 "),
         Span::styled("Enter", p.accent()),
         Span::raw(" 确认 "),
-        Span::styled("t", p.accent()),
-        Span::raw(" 主题 "),
-        Span::styled("?", p.accent()),
-        Span::raw(" 帮助 "),
     ];
+    if !compact {
+        spans.push(Span::styled("t", p.accent()));
+        spans.push(Span::raw(" 主题 "));
+    }
+    spans.push(Span::styled("?", p.accent()));
+    spans.push(Span::raw(" 帮助 "));
     if app.assembling {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("装配中:动作已锁定", p.dim()));
@@ -122,15 +163,16 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled("  q", p.accent()));
         spans.push(Span::raw(" 退出"));
     }
-    let right = Span::styled(format!("主题:{} ", app.theme.name()), p.dim());
-    let width = area.width as usize;
-    let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-    let right_len = right.content.len();
-    let pad = width.saturating_sub(left_len + right_len);
-    let mut line = spans;
-    line.push(Span::raw(" ".repeat(pad)));
-    line.push(right);
-    frame.render_widget(Paragraph::new(Line::from(line)).style(p.surface()), area);
+    if !compact {
+        let right = Span::styled(format!("主题:{} ", app.theme.name()), p.dim());
+        let width = area.width as usize;
+        let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
+        let right_len = right.content.len();
+        let pad = width.saturating_sub(left_len + right_len);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(right);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(p.surface()), area);
 }
 
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
@@ -173,7 +215,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
 fn render_too_small(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     let msg = format!(
-        "终端太小:需要至少 {}×{},当前 {}×{}。放大窗口或减小字体。",
+        "终端太小:需要至少 {}×{},当前 {}×{}。调大窗口。",
         crate::term::MIN_W,
         crate::term::MIN_H,
         area.width,
@@ -242,6 +284,60 @@ mod tests {
         term.backend().to_string()
     }
 
+    /// 常畅态 80×30 整帧逐字节 golden(评审 finding-3):仓内既有「快照」
+    /// 全是 contains 断言,只钉「在场」、不钉「没变」;这条把整帧显示内容
+    /// 逐字节钉住——≥80 宽常畅态渲染一变就红(spec #15 的回归基线铁律)。
+    /// 期望值从当前正确渲染生成并经人工核对(顶栏/导航/警示带/派表/指令栏/
+    /// 最近日志/计数卡/HUD 逐行过目);若既有渲染面发生真实回归而改期望,
+    /// 必须与该回归同一次提交并说明——不许为过测试回填。
+    /// 场景全部钉死:with_runner(引擎状态固定「测试注入」)+ splash 关 +
+    /// NW_HOME 置 /nw + ls 固定夹具——CI 三平台 HOME/配置不同也不漂。
+    #[test]
+    fn golden_常畅态_80x30_整帧逐字节() {
+        use crate::engine::FakeRunner;
+        use std::sync::Arc;
+        let ls = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0"}],"components":[{"name":"retention","depends":[]}],"sources":[],"profiles":[{"name":"desk","state":"drift","lockId":"9f8e","installedAt":"2026-10-01"},{"name":"lab","state":"ok","lockId":"a1b2"}],"locks":[{"lockId":"9f8e","recipe":"research-desk","bakedAt":"2026-10-01"}]}"#;
+        let mut app = App::with_runner(Arc::new(FakeRunner::new(&[("ls", 0, ls)])));
+        app.splash = false;
+        app.nw_home = "/nw".into();
+        app.ls = Some(serde_json::from_str(ls).unwrap());
+        let got = crate::testutil::frame_display(&app, 80, 30);
+        let want = r#" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.1 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 概览 ──────────────────────────────────────────────────目标侧日常┐
+│▸ ▸ 概览  ││ ⚠ 警示带 派 desk 需要关注(漂移/破损)                             │
+│  ⚙ 装配  ││┌ 派 (profiles) ────────────────────────────┐┌ 指令 ─────────────┐│
+│  ✚ 健康  │││   派         lockId     装配于      状态  ││ ▸ 跑一次体检   (h)││
+│  ▤ 配方  │││✗  desk       9f8e       2026-10-01  漂移  ││   发起装配…   (a) ││
+│  ✦ 设置  │││●  lab        a1b2       —           ok    ││   浏览配方     (l)││
+│          │││                                           ││   刷新 ls      (r)││
+│          │││                                           │└───────────────────┘│
+│          │││                                           │┌ 最近日志 ─────────┐│
+│          │││                                           ││驾驶舱已就绪       ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          ││└───────────────────────────────────────────┘└───────────────────┘│
+│          ││┌───────────┐┌───────────┐┌────────────┐┌───────────┐┌───────────┐│
+│          │││recipes 1  ││components ││sources 0   ││profiles 2 ││locks 1    ││
+│          │││           ││           ││            ││           ││           ││
+│          ││└───────────┘└───────────┘└────────────┘└───────────┘└───────────┘│
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "#;
+        assert_eq!(
+            got, want,
+            "常畅态 80×30 整帧渲染发生变化(上=got 下=want;见 golden 测试头注的修订纪律)"
+        );
+    }
+
     /// 测试默认已经越过 splash(与真实启动流一致:先 splash 再主界面)。
     fn ui_app() -> App {
         let mut app = App::new();
@@ -284,6 +380,22 @@ mod tests {
         assert!(s.contains("终端太小"));
     }
 
+    /// 新下限:66×50 仍能进驾驶舱;65 宽守卫文案只提「调大窗口」
+    /// (不再建议「减小字体」,那是破坏 CJK 混排的错误自救,spec #15)。
+    #[test]
+    fn 新下限_66宽进入而65宽守卫() {
+        use crate::term::{MIN_H, MIN_W};
+        assert_eq!((MIN_W, MIN_H), (66, 24), "下限 66×24 不回退");
+        let app = ui_app();
+        let ok = render_to_string(&app, 66, 50);
+        assert!(!ok.contains("终端太小"), "66×50 是保证最小,不得弹守卫屏");
+        assert!(ok.contains("概览"), "66×50 下主界面照常渲染");
+        let s = render_to_string(&app, 65, 50);
+        assert!(s.contains("终端太小"), "65 宽仍弹守卫");
+        assert!(s.contains("调大窗口"), "文案提示调大窗口");
+        assert!(!s.contains("减小字体"), "铁律:不再建议减小字体");
+    }
+
     #[test]
     fn 输入态_hud_给键位提示() {
         let mut app = ui_app();
@@ -299,5 +411,103 @@ mod tests {
         app.help = true;
         let s = render_to_string(&app, 100, 30);
         assert!(s.contains("帮助"));
+    }
+
+    /// 紧凑态外壳快照(66×50 保证最小):横向屏 Tab 与正文不重叠不溢出,
+    /// 顶栏/HUD 精简但保留核心提示(spec #15 ticket #17,ADR-0004)。
+    #[test]
+    fn 紧凑态外壳_屏tab条_不重叠不溢出() {
+        let mut app = ui_app();
+        app.nw_home = "/root/.nous-warehouse".into(); // 钉住路径,顶栏宽度确定
+        app.screen = Screen::Health; // 换一屏验证高亮不依赖当前屏
+        let s = render_to_string(&app, 66, 50);
+        let lines: Vec<&str> = s.lines().collect();
+        assert!(lines.len() >= 3, "顶栏 + Tab 条 + 正文至少三行");
+
+        // 行 0 顶栏:精简后只留装配态灯与 NW_HOME,无副品牌/版本细节
+        let top = lines[0];
+        assert!(top.contains("NW_HOME"), "NW_HOME 保留");
+        assert!(top.contains("○ 空闲"), "装配态灯保留");
+        assert!(!top.contains("驾驶舱"), "副品牌去掉了");
+        assert!(!top.contains("nwt v0.1"), "版本细节去掉了");
+
+        // 行 1:横向屏 Tab,五屏齐全、顺序同 Screen::ALL、当前屏带选中标记
+        let tabs = lines[1];
+        let mut last = 0usize;
+        for screen in Screen::ALL {
+            let pos = tabs
+                .find(screen.title())
+                .unwrap_or_else(|| panic!("Tab 条缺屏 {}", screen.title()));
+            assert!(pos > last, "Tab 顺序同 Screen::ALL");
+            last = pos;
+        }
+        assert!(tabs.contains("▸ ✚ 健康"), "当前屏(健康)在 Tab 条带选中标记");
+        // buffer_view 把每行包成 `"…"` 并可能附 `Hidden by…` 调试注记,
+        // 只量行内容本身的显示宽(截掉引号与注记)。
+        let row = tabs.strip_prefix('"').unwrap_or(tabs);
+        let row = row.split('"').next().unwrap_or(row);
+        let w = unicode_width::UnicodeWidthStr::width(row);
+        assert!(w <= 66, "Tab 条不溢出 66 列:width={w} row={row:?}");
+
+        // 正文从行 2 开始:与 Tab 条不重叠
+        let body_start = &lines[2..];
+        assert!(
+            body_start.iter().any(|l| l.contains("健康")),
+            "正文屏块在 Tab 条之下"
+        );
+
+        // HUD(最后一行):保留切屏/确认/帮助/退出,去掉主题提示与右侧主题标注
+        let hud = *lines.last().unwrap();
+        assert!(hud.contains("切屏") && hud.contains("确认"));
+        assert!(hud.contains("帮助") && hud.contains("退出"));
+        assert!(!hud.contains("主题"), "紧凑态 HUD 少给提示、无主题标注");
+    }
+
+    /// j/k 切屏与 Tab 指示同步(紧凑态):选中标记跟到当前屏。
+    #[test]
+    fn 紧凑态_jk切屏与屏tab指示同步() {
+        use crate::app::Message;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = ui_app();
+        let tabs_of = |app: &App| -> String {
+            let s = render_to_string(app, 66, 50);
+            s.lines().nth(1).unwrap().to_string()
+        };
+        assert!(tabs_of(&app).contains("▸ ▸ 概览"), "初始在概览");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )));
+        let tabs = tabs_of(&app);
+        assert!(tabs.contains("▸ ⚙ 装配"), "j 下一屏,标记跟到装配");
+        assert!(!tabs.contains("▸ ▸ 概览"), "概览不再是当前");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::NONE,
+        )));
+        assert!(tabs_of(&app).contains("▸ ▸ 概览"), "k 回概览");
+    }
+
+    /// 五屏 × 紧凑三档压力:任何一屏在 66×50(保证最小)/ 66×24(MIN_H
+    /// 下限)/ 79×24(断点前一列)下都渲染不炸、Tab 条都在(小终端下
+    /// 五屏均可达,spec #15 用户故事 27)。
+    #[test]
+    fn 紧凑态_五屏渲染不炸_且屏tab条常在() {
+        for (w, h) in [(66, 50), (66, 24), (79, 24)] {
+            for screen in Screen::ALL {
+                let mut app = ui_app();
+                app.screen = screen;
+                let s = render_to_string(&app, w, h);
+                let tabs = s.lines().nth(1).unwrap();
+                for t in Screen::ALL {
+                    assert!(
+                        tabs.contains(t.title()),
+                        "{w}×{h} {} 屏的 Tab 条缺 {}",
+                        screen.title(),
+                        t.title()
+                    );
+                }
+            }
+        }
     }
 }

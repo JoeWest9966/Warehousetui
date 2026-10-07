@@ -6,6 +6,7 @@
 
 mod app;
 mod engine;
+pub mod layout;
 mod screens;
 mod term;
 #[cfg(test)]
@@ -37,7 +38,7 @@ fn open_editor(terminal: &mut term::Term, app: &mut App) -> Result<()> {
         Ok(s) => app.push_log(format!("编辑器退出:{s}")),
         Err(e) => app.push_log(format!("拉起 {ed} 失败:{e}")),
     }
-    *terminal = term::init()?;
+    *terminal = term::init(app.mouse_enabled)?;
     Ok(())
 }
 
@@ -55,14 +56,26 @@ fn parse_nw_bin_flag() -> Option<String> {
     None
 }
 
+/// 参数列表里有 --no-mouse 吗(纯函数,单测钉住;argv 由真实入口注入)。
+fn no_mouse_in(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--no-mouse")
+}
+
+/// 解析 --no-mouse 旗标(逃逸两联之一,另一联是设置屏开关)。
+fn parse_no_mouse_flag() -> bool {
+    no_mouse_in(&std::env::args().skip(1).collect::<Vec<_>>())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // --nw-bin 显式指路(发现策略第一级)
     let explicit = parse_nw_bin_flag();
 
     let mut app = App::boot(explicit.as_deref());
+    // --no-mouse 旗标并入(配置一联已在 boot 载入)
+    app.apply_no_mouse_flag(parse_no_mouse_flag());
     term::install_panic_hook();
-    let mut terminal = term::init()?;
+    let mut terminal = term::init(app.mouse_enabled)?;
 
     // 输入线程:crossterm 阻塞读,汇入无界 channel。
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
@@ -95,7 +108,12 @@ async fn run_loop(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let splash_deadline = std::time::Instant::now() + Duration::from_millis(800);
     loop {
-        terminal.draw(|frame| ui::render(frame, app))?;
+        terminal.draw(|frame| {
+            // 每帧把最近终端面记进 app.size,供鼠标命中定标;
+            // 渲染本身保持无副作用(只读 app)。
+            app.size = frame.area();
+            ui::render(frame, app);
+        })?;
         if app.splash {
             // 任意键或 800ms 到点,交棒主界面(首帧已画出)
             tokio::select! {
@@ -116,16 +134,38 @@ async fn run_loop(
             open_editor(terminal, app)?;
         }
         tokio::select! {
-            Some(ev) = rx.recv() => {
-                if let Event::Key(k) = ev {
-                    if k.kind == KeyEventKind::Press {
-                        app.update(Message::Key(k));
-                    }
-                }
-            }
+            Some(ev) = rx.recv() => match ev {
+                Event::Key(k) if k.kind == KeyEventKind::Press => app.update(Message::Key(k)),
+                // 统一事件入口:鼠标与键盘并列(分派由 #20 落地)
+                Event::Mouse(m) => app.update(Message::Mouse(m)),
+                _ => {}
+            },
             Some(ev) = erx.recv() => app.update(Message::Engine(ev)),
             _ = tick.tick(), if app.assembling => app.update(Message::Tick),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_mouse_旗标解析() {
+        assert!(no_mouse_in(&args(&["nwt", "--no-mouse"])), "出现即关");
+        assert!(
+            no_mouse_in(&args(&["--no-mouse", "--nw-bin", "/x/nw"])),
+            "与其他旗标共存"
+        );
+        assert!(!no_mouse_in(&args(&["nwt"])), "不出现不拦");
+        assert!(
+            !no_mouse_in(&args(&["nwt", "--no-mouse=1"])),
+            "只认裸旗标,不认带值变体"
+        );
+    }
 }

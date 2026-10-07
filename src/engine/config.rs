@@ -25,9 +25,20 @@ pub struct Config {
     /// 最近查看的派。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_profile: Option<String>,
+    /// 鼠标捕获开关(默认 true;None = 缺省或坏配置降级)。
+    /// 逃逸两联之另一联是 --no-mouse 旗标(见 ADR-0005)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse_capture: Option<bool>,
     /// 用户自加的键:原样保留,写回时不丢。
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl Config {
+    /// 鼠标捕获解析值:None(缺省)与坏配置降级后的默认皆为开。
+    pub fn mouse_capture_enabled(&self) -> bool {
+        self.mouse_capture.unwrap_or(true)
+    }
 }
 
 pub fn config_dir() -> PathBuf {
@@ -90,6 +101,30 @@ mod tests {
         assert!(err.unwrap().contains("解析失败"));
         let (_c2, err2) = parse("nw_home = \"/data\"");
         assert!(err2.is_none(), "好 TOML 不制造噪音");
+    }
+
+    #[test]
+    fn mouse_capture_缺省为开_显式关保留() {
+        let (cfg, err) = parse("");
+        assert!(err.is_none());
+        assert_eq!(cfg.mouse_capture, None);
+        assert!(cfg.mouse_capture_enabled(), "缺省即开");
+        let (off, _) = parse("mouse_capture = false");
+        assert_eq!(off.mouse_capture, Some(false));
+        assert!(!off.mouse_capture_enabled());
+        // 显式值写回再读,偏好不失忆
+        let text = toml::to_string_pretty(&off).unwrap();
+        let (back, err2) = parse(&text);
+        assert!(err2.is_none());
+        assert_eq!(back.mouse_capture, Some(false), "重启仍生效的落盘语义");
+    }
+
+    #[test]
+    fn mouse_capture_坏配置降级为开() {
+        let (cfg, err) = parse("mouse_capture = ");
+        assert!(err.is_some(), "坏 TOML 必须给证据");
+        assert_eq!(cfg.mouse_capture, None, "降级到默认");
+        assert!(cfg.mouse_capture_enabled(), "解析失败按默认 true 降级");
     }
 
     #[test]

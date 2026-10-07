@@ -405,3 +405,207 @@ fn 输入浮层_盖在指路屏之上() {
     assert!(s.contains("手填 NW_HOME"), "浮层盖顶");
     assert!(s.contains("/srv/pi"));
 }
+
+// ---- #22 纵向密度:50 行富余用满(常畅/紧凑两档共用同一 render_*) ----
+
+/// 整行剥掉边框字符后为空 ⇒ 空白行;返回最长连续空白行数。
+fn longest_blank_run(rendered: &str) -> usize {
+    let (mut best, mut cur) = (0usize, 0usize);
+    for line in rendered.lines() {
+        let stripped: String = line
+            .chars()
+            .map(|c| {
+                if matches!(
+                    c,
+                    '│' | '─'
+                        | '┌'
+                        | '┐'
+                        | '└'
+                        | '┘'
+                        | '├'
+                        | '┤'
+                        | '┬'
+                        | '┴'
+                        | '┼'
+                        | ' '
+                ) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if stripped.trim().is_empty() {
+            cur += 1;
+            best = best.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    best
+}
+
+/// 概览「最近日志」:可视行随高度增加(30 行 < 50 行)。
+#[test]
+fn 概览最近日志可视行随高度增加() {
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    for i in 0..60 {
+        app.push_log(format!("动作{i:02}"));
+    }
+    let s30 = draw(&app, 110, 30);
+    let s50 = draw(&app, 110, 50);
+    let n30 = s30.matches("动作").count();
+    let n50 = s50.matches("动作").count();
+    assert!(n30 > 0, "30 行下也能看到最近日志");
+    assert!(
+        n50 > n30,
+        "可视行随高度增加:30 行可见 {n30} 行,50 行可见 {n50} 行"
+    );
+    assert!(s30.contains("最近日志"), "日志区有标题");
+}
+
+/// 高终端无大片空白:派表/日志铺满可用高度(不引限高、不居中)。
+/// 数据给足(40 派 + 60 条流水),断言最长连续空白行 ≤ 3。
+#[test]
+fn 纵向密度_50行高无大片空白() {
+    let mut app = fake_app();
+    let profiles: String = (0..40)
+        .map(|i| format!(r#"{{"name":"p{i:02}","state":"ok","lockId":"l{i:02}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rich = format!(
+        r#"{{"domain":"all","recipes":[{{"name":"research-desk","version":"0.2.0"}}],"components":[],"sources":[],"profiles":[{profiles}],"locks":[{{"lockId":"l00","recipe":"research-desk","bakedAt":"2026-10-01"}}]}}"#
+    );
+    app.ls = Some(serde_json::from_str(&rich).unwrap());
+    for i in 0..60 {
+        app.push_log(format!("动作{i:02}"));
+    }
+    for (w, h) in [(100u16, 50u16), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(s.contains("最近日志"), "{w}×{h} 日志区在场");
+        let run = longest_blank_run(&s);
+        assert!(run <= 3, "{w}×{h} 最长空白行 {run} > 3,富余没用满");
+    }
+}
+
+// ---- #18 紧凑态内层栏收起(66×50 快照)+ 常畅态回归 ----
+
+/// 66×50 紧凑态:装配七步栏收成一行进度——位置化标记 + 当前阶段名,
+/// 随 stderr 日志推进打 ✓;日志独占余下全部行(不再被 14 列竖栏挤压)。
+#[test]
+fn 紧凑_装配收起一行进度_66x50() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_log = vec![
+        "0 前置 …".into(),
+        "1 引导 …".into(),
+        "2 铺骨架 …".into(),
+        "3 落组件 …".into(),
+    ];
+    let s = draw(&app, 66, 50);
+    assert!(
+        s.contains("七步 ✓✓✓✓▸·· 4 合配置"),
+        "一行进度:4 步完成、当前第 5 步可辨识,原文拿到: {s:?}"
+    );
+    assert!(!s.contains("┌ 七步 "), "七步竖栏必须收起");
+    assert!(
+        s.contains("stderr 实时日志") && s.contains("0 前置 …"),
+        "日志全宽可见,早先行也在(行数变多)"
+    );
+    // 全部完成:七格满✓,不再有未完成的「·」悬挂
+    app.as_log = STEPS_LOG_ALL.iter().map(|s| s.to_string()).collect();
+    let done = draw(&app, 66, 50);
+    assert!(
+        done.contains("七步 ✓✓✓✓✓✓✓ 全部完成"),
+        "七步全完成:满格标记,原文拿到: {done:?}"
+    );
+}
+
+const STEPS_LOG_ALL: [&str; 7] = [
+    "0 前置 …",
+    "1 引导 …",
+    "2 铺骨架 …",
+    "3 落组件 …",
+    "4 合配置 …",
+    "5 写清单 …",
+    "6 自检 …",
+];
+
+/// 66×50 紧凑态:配方五域轨收起为顶部同级 Tab 行,选中态可见;
+/// h/l 切域后 Tab 标记随之移动(可操作)。
+#[test]
+fn 紧凑_配方五域收起tab行_66x50() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    let s = draw(&app, 66, 50);
+    for (label, n) in [
+        ("配方", 1),
+        ("组件", 1),
+        ("外部源", 0),
+        ("派", 2),
+        ("锁定集", 1),
+    ] {
+        assert!(s.contains(&format!("{label}({n})")), "五域 Tab 齐:{label}");
+    }
+    assert!(s.contains("▸ 配方(1)"), "选中域 Tab 高亮可见");
+    assert!(!s.contains("┌ 五域 "), "五域竖轨必须收起");
+    assert!(s.contains("research-desk"), "列表与详情照常");
+    // h/l 切域:Tab 标记移动(键盘可操作,与快照几何无关)
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('l'),
+        crossterm::event::KeyModifiers::NONE,
+    )));
+    let s2 = draw(&app, 66, 50);
+    assert!(!s2.contains("▸ 配方(1)"), "切域后旧 Tab 让位");
+    assert!(s2.contains("▸ 组件(1)"), "l 切到组件,选中态可见");
+}
+
+/// ≥ 断点回归:80×30 常畅态两处内层栏保持既有竖栏(快照基线不回退)。
+#[test]
+fn 常畅_内层栏回归_80x30竖轨在场() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_log = vec!["0 前置 …".into(), "1 引导 …".into()];
+    let s = draw(&app, 80, 30);
+    assert!(s.contains("┌ 七步 "), "常畅态七步竖栏原样在场");
+    assert!(s.contains("✓ 0 前置"), "竖栏逐步打勾原样在场");
+
+    let mut app2 = fake_app();
+    app2.screen = Screen::Recipes;
+    app2.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    let s2 = draw(&app2, 80, 30);
+    assert!(s2.contains("┌ 五域 "), "常畅态五域竖轨原样在场");
+    assert!(!s2.contains("│ 派(2)"), "常畅态不落紧凑 Tab 行");
+}
+
+// ---- #21 滚轮:stderr 偏移进渲染取窗 ----
+
+#[test]
+fn 日志偏移取窗_跳过偏移行_七步判定不受影响() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_log = (0..10).map(|i| format!("行{i:02}")).collect();
+    // 偏移 0:与既有观感一致,最新一行在窗内
+    let s0 = draw(&app, 80, 30);
+    assert!(s0.contains("行09"), "偏移 0 跟随最新行(既有观感不变)");
+    // 偏移 2:最新两行移出窗,更早的行入窗
+    app.as_log_offset = 2;
+    let s2 = draw(&app, 80, 30);
+    assert!(!s2.contains("行09") && !s2.contains("行08"), "偏移行移出窗");
+    assert!(s2.contains("行07"), "更早的行入窗");
+    assert!(s2.contains("行00"), "窗内仍有更早内容");
+    // 越界/陈旧偏移:min 钳制取窗不 panic;七步判定读全量 as_log,不受取窗影响
+    app.as_log.push("5 写清单 完成".into());
+    app.as_log_offset = 100;
+    let s3 = draw(&app, 80, 30);
+    assert!(!s3.contains("行0"), "取窗钳在日志内,不越界");
+    assert!(
+        s3.contains("✓ 5 写清单"),
+        "七步判定读全量日志:行被移出窗仍打勾"
+    );
+}
