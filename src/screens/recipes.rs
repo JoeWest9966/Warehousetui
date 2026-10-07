@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, List, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Domain};
+use crate::layout::{size_class, SizeClass};
 use crate::screens::body;
 
 pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
@@ -13,6 +14,14 @@ pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    match size_class(frame.area()) {
+        SizeClass::Comfy => render_recipes_comfy(frame, inner, app),
+        SizeClass::Compact => render_recipes_compact(frame, inner, app),
+    }
+}
+
+/// 常畅态:五域轨(定宽 14)/ 列表 / 详情三栏,既有外观逐像素不变。
+fn render_recipes_comfy(frame: &mut Frame, inner: Rect, app: &App) {
     let cols = Layout::horizontal([
         Constraint::Length(14),
         Constraint::Percentage(45),
@@ -22,6 +31,38 @@ pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
     render_domain_rail(frame, cols[0], app);
     render_rows(frame, cols[1], app);
     render_detail(frame, cols[2], app);
+}
+
+/// 紧凑态:五域轨收起为顶部一行同级 Tab,竖轨让出的 14 列归内容
+/// (列表/详情按 52:48 分余宽),h/l 切域与选中态经 Tab 行可见(ADR-0004)。
+fn render_recipes_compact(frame: &mut Frame, inner: Rect, app: &App) {
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).split(inner);
+    render_domain_tabs(frame, rows[0], app);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).split(rows[1]);
+    render_rows(frame, cols[0], app);
+    render_detail(frame, cols[1], app);
+}
+
+/// 紧凑态的五域 Tab 行:五域同级一排,选中域 `▸` + 加粗高亮,计数随 tab。
+/// 宽度:五域全名 + 计数 ≈ 48 列,66×50 下内宽 ≥ 48 不截断(窄则尾部截,Tab 不折行)。
+fn render_domain_tabs(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, d) in Domain::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" │ ", p.dim()));
+        }
+        let n = domain_count(app, *d);
+        let sel = *d == app.rc_domain;
+        let label = format!("{}({n})", d.label());
+        if sel {
+            spans.push(Span::styled(format!("▸ {label}"), p.sel().bold()));
+        } else {
+            spans.push(Span::styled(label, p.dim()));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_domain_rail(frame: &mut Frame, area: Rect, app: &App) {

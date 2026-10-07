@@ -93,7 +93,7 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         SizeClass::Comfy => comfy_shell(body, &mut hits),
         SizeClass::Compact => compact_shell(body, &mut hits),
     }
-    screen_hits(body, app, &mut hits);
+    screen_hits(body, app, class, &mut hits);
     hits
 }
 
@@ -142,7 +142,8 @@ fn body_cols(body: Rect) -> Option<(Rect, Rect)> {
 
 /// 当前屏正文内的命中区(列表行 / 浮层),几何与各 `render_*` 同约定:
 /// 先缩 `body()` 屏体边框,再叠各屏自己的分栏与部件边框。
-fn screen_hits(body: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
+/// `class` 决定分栏是否收起(与渲染同一档判定)。
+fn screen_hits(body: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
     let Some((_nav, inner)) = body_cols(body) else {
         return;
     };
@@ -152,7 +153,7 @@ fn screen_hits(body: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         Screen::Overview => overview_hits(inner, app, hits),
         Screen::Assemble => assemble_hits(inner, app, hits),
         Screen::Health => health_hits(inner, app, hits),
-        Screen::Recipes => recipes_hits(inner, app, hits),
+        Screen::Recipes => recipes_hits(inner, app, class, hits),
         Screen::Settings => {}
     }
 }
@@ -214,17 +215,37 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     row_hits(lst, 0, n, hits, Target::SelectRow);
 }
 
-/// 配方屏:五域轨(14 列)/ 列表(45%)/ 详情(41%)三栏同 `render_recipes`,
-/// 列表在中间栏、带边框、首行即数据。
-fn recipes_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
-    let cols = ratatui::layout::Layout::horizontal([
-        ratatui::layout::Constraint::Length(14),
-        ratatui::layout::Constraint::Percentage(45),
-        ratatui::layout::Constraint::Percentage(41),
-    ])
-    .split(area);
-    let lst = shrink_border(cols[1]);
-    row_hits(lst, 0, app.domain_len(), hits, Target::SelectRow);
+/// 配方屏:列表列几何与 `render_recipes` 同档——常畅态在 14 列五域轨右
+/// (45% 栏),紧凑态在 Tab 行之下(52% 栏)。两支都用与渲染同一套
+/// ratatui `Layout` 常量,几何零分歧(#18 收起内层栏后命中自动跟随)。
+fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    let list = match class {
+        SizeClass::Comfy => ratatui::layout::Layout::horizontal([
+            ratatui::layout::Constraint::Length(14),
+            ratatui::layout::Constraint::Percentage(45),
+            ratatui::layout::Constraint::Percentage(41),
+        ])
+        .split(area)[1],
+        SizeClass::Compact => {
+            let rows = ratatui::layout::Layout::vertical([
+                ratatui::layout::Constraint::Length(1),
+                ratatui::layout::Constraint::Min(4),
+            ])
+            .split(area);
+            ratatui::layout::Layout::horizontal([
+                ratatui::layout::Constraint::Percentage(52),
+                ratatui::layout::Constraint::Percentage(48),
+            ])
+            .split(rows[1])[0]
+        }
+    };
+    row_hits(
+        shrink_border(list),
+        0,
+        app.domain_len(),
+        hits,
+        Target::SelectRow,
+    );
 }
 
 /// 发射仪式浮层:与 `render_launch_ritual` 同尺寸居中;「Enter 发射」行给
@@ -501,6 +522,44 @@ mod tests {
             hits.iter().all(|(_, t)| matches!(t, Target::NavTo(_))),
             "手填浮层对鼠标惰性(只剩导航)"
         );
+    }
+
+    #[test]
+    fn hitmap_配方行随尺寸档分栏_66与80两态() {
+        // #18:常畅态配方列表仍在 14 列竖轨右侧(45% 栏),紧凑态随 Tab 行
+        // 收起后落在全宽 52% 栏——几何两支都由 render_recipes 同款
+        // Layout 算出,命中与渲染同源(点哪打哪)。
+        let mut app = test_app();
+        app.screen = Screen::Recipes;
+        app.rc_domain = crate::app::Domain::Profiles; // 测试数据里派有 2 条
+
+        let a80 = area(80, 30);
+        let hits = hitmap(a80, &app, size_class(a80));
+        let comfy_first =
+            first(&hits, |t| matches!(t, Target::SelectRow(0))).expect("常畅态配方行有命中");
+        let a66 = area(66, 50);
+        let hits = hitmap(a66, &app, size_class(a66));
+        let compact_first =
+            first(&hits, |t| matches!(t, Target::SelectRow(0))).expect("紧凑态配方行有命中");
+        assert_eq!(
+            compact_first,
+            Rect::new(14, 4, 25, 1),
+            "紧凑态:Tab 行 1 行 → 列表在 52% 左栏,首行数据自 y=4"
+        );
+        assert_ne!(
+            compact_first, comfy_first,
+            "两档分栏不同:紧凑态不得沿用常畅态几何"
+        );
+        // 常畅态首行仍是竖轨右侧 45% 栏(既有几何,不回退)
+        assert_eq!(
+            comfy_first,
+            Rect::new(28, 3, 24, 1),
+            "常畅态:14 列竖轨 + 45% 栏,首行数据自 y=3"
+        );
+        // 两档所有行命中都落在各自列表区内、不越出 area
+        for (r, _) in hits.iter() {
+            assert!(r.x + r.width <= a66.x + a66.width, "命中区不越界");
+        }
     }
 
     #[test]

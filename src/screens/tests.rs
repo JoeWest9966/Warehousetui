@@ -488,3 +488,96 @@ fn 纵向密度_50行高无大片空白() {
         assert!(run <= 3, "{w}×{h} 最长空白行 {run} > 3,富余没用满");
     }
 }
+
+// ---- #18 紧凑态内层栏收起(66×50 快照)+ 常畅态回归 ----
+
+/// 66×50 紧凑态:装配七步栏收成一行进度——位置化标记 + 当前阶段名,
+/// 随 stderr 日志推进打 ✓;日志独占余下全部行(不再被 14 列竖栏挤压)。
+#[test]
+fn 紧凑_装配收起一行进度_66x50() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_log = vec![
+        "0 前置 …".into(),
+        "1 引导 …".into(),
+        "2 铺骨架 …".into(),
+        "3 落组件 …".into(),
+    ];
+    let s = draw(&app, 66, 50);
+    assert!(
+        s.contains("七步 ✓✓✓✓▸·· 4 合配置"),
+        "一行进度:4 步完成、当前第 5 步可辨识,原文拿到: {s:?}"
+    );
+    assert!(!s.contains("┌ 七步 "), "七步竖栏必须收起");
+    assert!(
+        s.contains("stderr 实时日志") && s.contains("0 前置 …"),
+        "日志全宽可见,早先行也在(行数变多)"
+    );
+    // 全部完成:七格满✓,不再有未完成的「·」悬挂
+    app.as_log = STEPS_LOG_ALL.iter().map(|s| s.to_string()).collect();
+    let done = draw(&app, 66, 50);
+    assert!(
+        done.contains("七步 ✓✓✓✓✓✓✓ 全部完成"),
+        "七步全完成:满格标记,原文拿到: {done:?}"
+    );
+}
+
+const STEPS_LOG_ALL: [&str; 7] = [
+    "0 前置 …",
+    "1 引导 …",
+    "2 铺骨架 …",
+    "3 落组件 …",
+    "4 合配置 …",
+    "5 写清单 …",
+    "6 自检 …",
+];
+
+/// 66×50 紧凑态:配方五域轨收起为顶部同级 Tab 行,选中态可见;
+/// h/l 切域后 Tab 标记随之移动(可操作)。
+#[test]
+fn 紧凑_配方五域收起tab行_66x50() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    let s = draw(&app, 66, 50);
+    for (label, n) in [
+        ("配方", 1),
+        ("组件", 1),
+        ("外部源", 0),
+        ("派", 2),
+        ("锁定集", 1),
+    ] {
+        assert!(s.contains(&format!("{label}({n})")), "五域 Tab 齐:{label}");
+    }
+    assert!(s.contains("▸ 配方(1)"), "选中域 Tab 高亮可见");
+    assert!(!s.contains("┌ 五域 "), "五域竖轨必须收起");
+    assert!(s.contains("research-desk"), "列表与详情照常");
+    // h/l 切域:Tab 标记移动(键盘可操作,与快照几何无关)
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('l'),
+        crossterm::event::KeyModifiers::NONE,
+    )));
+    let s2 = draw(&app, 66, 50);
+    assert!(!s2.contains("▸ 配方(1)"), "切域后旧 Tab 让位");
+    assert!(s2.contains("▸ 组件(1)"), "l 切到组件,选中态可见");
+}
+
+/// ≥ 断点回归:80×30 常畅态两处内层栏保持既有竖栏(快照基线不回退)。
+#[test]
+fn 常畅_内层栏回归_80x30竖轨在场() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_log = vec!["0 前置 …".into(), "1 引导 …".into()];
+    let s = draw(&app, 80, 30);
+    assert!(s.contains("┌ 七步 "), "常畅态七步竖栏原样在场");
+    assert!(s.contains("✓ 0 前置"), "竖栏逐步打勾原样在场");
+
+    let mut app2 = fake_app();
+    app2.screen = Screen::Recipes;
+    app2.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    let s2 = draw(&app2, 80, 30);
+    assert!(s2.contains("┌ 五域 "), "常畅态五域竖轨原样在场");
+    assert!(!s2.contains("│ 派(2)"), "常畅态不落紧凑 Tab 行");
+}
