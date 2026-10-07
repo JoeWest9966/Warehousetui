@@ -284,6 +284,60 @@ mod tests {
         term.backend().to_string()
     }
 
+    /// 常畅态 80×30 整帧逐字节 golden(评审 finding-3):仓内既有「快照」
+    /// 全是 contains 断言,只钉「在场」、不钉「没变」;这条把整帧显示内容
+    /// 逐字节钉住——≥80 宽常畅态渲染一变就红(spec #15 的回归基线铁律)。
+    /// 期望值从当前正确渲染生成并经人工核对(顶栏/导航/警示带/派表/指令栏/
+    /// 最近日志/计数卡/HUD 逐行过目);若既有渲染面发生真实回归而改期望,
+    /// 必须与该回归同一次提交并说明——不许为过测试回填。
+    /// 场景全部钉死:with_runner(引擎状态固定「测试注入」)+ splash 关 +
+    /// NW_HOME 置 /nw + ls 固定夹具——CI 三平台 HOME/配置不同也不漂。
+    #[test]
+    fn golden_常畅态_80x30_整帧逐字节() {
+        use crate::engine::FakeRunner;
+        use std::sync::Arc;
+        let ls = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0"}],"components":[{"name":"retention","depends":[]}],"sources":[],"profiles":[{"name":"desk","state":"drift","lockId":"9f8e","installedAt":"2026-10-01"},{"name":"lab","state":"ok","lockId":"a1b2"}],"locks":[{"lockId":"9f8e","recipe":"research-desk","bakedAt":"2026-10-01"}]}"#;
+        let mut app = App::with_runner(Arc::new(FakeRunner::new(&[("ls", 0, ls)])));
+        app.splash = false;
+        app.nw_home = "/nw".into();
+        app.ls = Some(serde_json::from_str(ls).unwrap());
+        let got = crate::testutil::frame_display(&app, 80, 30);
+        let want = r#" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.1 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 概览 ──────────────────────────────────────────────────目标侧日常┐
+│▸ ▸ 概览  ││ ⚠ 警示带 派 desk 需要关注(漂移/破损)                             │
+│  ⚙ 装配  ││┌ 派 (profiles) ────────────────────────────┐┌ 指令 ─────────────┐│
+│  ✚ 健康  │││   派         lockId     装配于      状态  ││ ▸ 跑一次体检   (h)││
+│  ▤ 配方  │││✗  desk       9f8e       2026-10-01  漂移  ││   发起装配…   (a) ││
+│  ✦ 设置  │││●  lab        a1b2       —           ok    ││   浏览配方     (l)││
+│          │││                                           ││   刷新 ls      (r)││
+│          │││                                           │└───────────────────┘│
+│          │││                                           │┌ 最近日志 ─────────┐│
+│          │││                                           ││驾驶舱已就绪       ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          │││                                           ││                   ││
+│          ││└───────────────────────────────────────────┘└───────────────────┘│
+│          ││┌───────────┐┌───────────┐┌────────────┐┌───────────┐┌───────────┐│
+│          │││recipes 1  ││components ││sources 0   ││profiles 2 ││locks 1    ││
+│          │││           ││           ││            ││           ││           ││
+│          ││└───────────┘└───────────┘└────────────┘└───────────┘└───────────┘│
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "#;
+        assert_eq!(
+            got, want,
+            "常畅态 80×30 整帧渲染发生变化(上=got 下=want;见 golden 测试头注的修订纪律)"
+        );
+    }
+
     /// 测试默认已经越过 splash(与真实启动流一致:先 splash 再主界面)。
     fn ui_app() -> App {
         let mut app = App::new();

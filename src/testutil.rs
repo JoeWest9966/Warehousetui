@@ -36,6 +36,40 @@ impl Drop for ConfigGuard {
     }
 }
 
+/// 整帧的真显示内容(逐格拚行;字节级 golden 与列级命中断言共用)。
+/// `TestBackend::to_string` 带引号与隐藏格注记,不能当裸行用;宽字符
+/// 占两格,第二格是隐藏延续格,跳过——拼出的行即肉眼所见(ADR-0005
+/// 「渲染与命中同源」的测量基准)。
+pub fn frame_display(app: &crate::app::App, w: u16, h: u16) -> String {
+    use crate::ui::render;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use unicode_width::UnicodeWidthStr;
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| render(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    (0..h)
+        .map(|y| {
+            let mut line = String::new();
+            let mut x: u16 = 0;
+            while x < w {
+                let sym = buf
+                    .cell((x, y))
+                    .map(|c| c.symbol().to_string())
+                    .unwrap_or_default();
+                let wd = UnicodeWidthStr::width(sym.as_str());
+                line.push_str(&sym);
+                x = x.saturating_add(1);
+                if wd >= 2 {
+                    x = x.saturating_add(u16::try_from(wd - 1).unwrap_or(0));
+                }
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

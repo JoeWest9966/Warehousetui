@@ -95,7 +95,7 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         return hits;
     }
     if app.as_confirm {
-        ritual_hits(body, &mut hits);
+        ritual_hits(body, class, &mut hits);
         return hits;
     }
     // 手填 NW_HOME 浮层对鼠标惰性:打字仍走键盘;浮层打开期间鼠标
@@ -322,13 +322,30 @@ pub const RITUAL_KEY_LAUNCH: &str = "  Enter 发射 ";
 pub const RITUAL_KEY_GAP: &str = "   ";
 pub const RITUAL_KEY_RETURN: &str = "Esc 返航 ";
 
-/// 发射仪式浮层:与 `render_launch_ritual` 同尺寸居中;底部键位行按渲染
-/// 同一文案对半分——「Enter 发射」段给 [`Target::Activate`](点=入队 up),
-/// 「Esc 返航」段给 [`Target::DismissPopup`](点=取消并留日志);段与段之间
+/// 发射仪式浮层:与 `render_launch_ritual` 同尺寸、在**正文区**内居中;
+/// 底部键位行按渲染同一文案对半分——「Enter 发射」段给
+/// [`Target::Activate`](点=入队 up),「Esc 返航」段给
+/// [`Target::DismissPopup`](点=取消并留日志);段与段之间
 /// 不重叠、不留歧义区。浮层外无任何命中区(浮层优先级对鼠标同样成立)。
-fn ritual_hits(area: Rect, hits: &mut Vec<(Rect, Target)>) {
+///
+/// 居中基准必须与渲染同源:`render_assemble` 的浮层画在 `render_body`
+/// 分出的**正文列**里(常畅已去左导航轨、紧凑已去 Tab 行)。早先直接用
+/// body 居中,常畅态恒差一个导航列宽(80 宽差 6 列——点渲染出来的「射」
+/// 会落进返航段),紧凑态奇数高度还会差一行;两处偏差由列级测试钉住。
+fn ritual_hits(body: Rect, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
     use unicode_width::UnicodeWidthStr;
-    let popup = popup_rect(area, 60, 14);
+    // 与 `render_body` 同款分出正文区,再在其内居中(布局模型只读 size_class)。
+    let content = match class {
+        SizeClass::Comfy => match body_cols(body) {
+            Some((_, inner)) => inner,
+            None => return,
+        },
+        SizeClass::Compact => match body_below_tabs(body) {
+            Some(inner) => inner,
+            None => return,
+        },
+    };
+    let popup = popup_rect(content, 60, 14);
     // 与渲染同一套行序:block 内 10 行(空/四字段/空/两行说明/空/键位行),
     // 键位行是第 9 行 ⇒ 绝对 y = popup.y + 1(边框) + 9;行在场需内高 ≥ 10。
     if popup.height < 12 {
@@ -664,19 +681,21 @@ mod tests {
         app.as_confirm = true;
         let a = area(80, 30);
         let hits = hitmap(a, &app, size_class(a));
-        // popup 居中:x=(80-60)/2=10,y=1+(28-14)/2=8;键位行是 block 内
-        // 第 9 行 ⇒ y=8+1(边框)+9=18;两段起止贴渲染文案(内层首列 11 起,
-        // 宽 = RITUAL_KEY_* 同一串量宽)。y 修正自 #16 期的 +12(错位两行)。
+        // popup 在正文列内居中(常畅去左导航轨):x=12+(68-60)/2=16,
+        // y=1+(28-14)/2=8;键位行是 block 内第 9 行 ⇒ y=8+1(边框)+9=18;
+        // 两段起止贴渲染文案(内层首列 17 起,宽 = RITUAL_KEY_* 同一串量宽)。
+        // y 修正自 #16 期的 +12(错位两行);x 修正自评审 finding-1 的
+        // 恒偏导航列宽(旧期望 11/27 → 17/33,点射落进返航段的错位)。
         let act = first(&hits, |t| *t == Target::Activate).expect("发射段可点");
         assert_eq!(
             act,
-            Rect::new(11, 18, 13, 1),
+            Rect::new(17, 18, 13, 1),
             "发射段贴渲染「Enter 发射」文案"
         );
         let back = first(&hits, |t| *t == Target::DismissPopup).expect("返航段可点");
         assert_eq!(
             back,
-            Rect::new(27, 18, 9, 1),
+            Rect::new(33, 18, 9, 1),
             "返航段贴渲染「Esc 返航」文案"
         );
         assert!(act.x + act.width < back.x, "两段不重叠,段间空隙不歧义");
@@ -691,6 +710,74 @@ mod tests {
             row.contains("Enter 发射") && row.contains("Esc 返航"),
             "键位文案与命中同处 y=18"
         );
+    }
+
+    /// 仪式键位行的列级同源断言:渲染整段 RITUAL_KEY_LAUNCH 的起始列
+    /// == 命中 Activate 矩形的 x,且渲染「射」字所在列落在 Activate 内
+    /// (评审 finding-1 的 6 列错位正是行级 contains 断言漏掉的)。
+    fn assert_ritual_column_aligned(app: &App, w: u16, h: u16) {
+        use unicode_width::UnicodeWidthChar;
+        let a = area(w, h);
+        let hits = hitmap(a, app, size_class(a));
+        let act = first(&hits, |t| *t == Target::Activate).expect("发射段可点");
+        // 与 golden 同一把尺:整帧真显示串(testutil::frame_display),
+        // to_string 的引号/隐藏格注记不能当裸行。
+        let frame = crate::testutil::frame_display(app, w, h);
+        let row = frame
+            .split('\n')
+            .nth(act.y as usize)
+            .expect("命中行在渲染中在场");
+        let idx = row
+            .find(RITUAL_KEY_LAUNCH)
+            .expect("渲染行铺着整段发射键位文案");
+        let col: u16 = row[..idx]
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+            .sum();
+        assert_eq!(
+            col, act.x,
+            "渲染整段 RITUAL_KEY_LAUNCH 起始列 {col} == 命中 Activate.x {}({w}×{h})",
+            act.x
+        );
+        // 「点射即发射」:可见的「射」字列必须落在 Activate 矩形内
+        // (修复前恒偏导航列宽 6 列,「射」落进返航段)。
+        let idx = row.find('射').expect("渲染含「射」字");
+        let glyph: u16 = row[..idx]
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+            .sum();
+        assert!(
+            act.x <= glyph && glyph < act.x + act.width,
+            "「射」列 {glyph} 落在 Activate {}..{} 内({w}×{h})",
+            act.x,
+            act.x + act.width
+        );
+    }
+
+    #[test]
+    fn hitmap_仪式列级同源_常畅80x30() {
+        let mut app = test_app();
+        app.screen = Screen::Assemble;
+        app.as_confirm = true;
+        assert_ritual_column_aligned(&app, 80, 30);
+    }
+
+    #[test]
+    fn hitmap_仪式列级同源_紧凑66x50() {
+        let mut app = test_app();
+        app.screen = Screen::Assemble;
+        app.as_confirm = true;
+        assert_ritual_column_aligned(&app, 66, 50);
+    }
+
+    #[test]
+    fn hitmap_仪式列级同源_紧凑66x31奇数高() {
+        // 评审 finding-1 附带:奇数高度下旧代码居中在 body(未去 Tab 行),
+        // 命中行比渲染行高 1;同根因,同一把尺钉住。
+        let mut app = test_app();
+        app.screen = Screen::Assemble;
+        app.as_confirm = true;
+        assert_ritual_column_aligned(&app, 66, 31);
     }
 
     #[test]
