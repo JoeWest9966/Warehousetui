@@ -159,9 +159,10 @@ fn render_launch_ritual(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Enter 发射 ", p.accent().bold()),
-            Span::raw("   "),
-            Span::styled("Esc 返航 ", p.dim()),
+            // 三段文案与命中分半同源(layout::RITUAL_KEY_*),点哪打哪
+            Span::styled(crate::layout::RITUAL_KEY_LAUNCH, p.accent().bold()),
+            Span::raw(crate::layout::RITUAL_KEY_GAP),
+            Span::styled(crate::layout::RITUAL_KEY_RETURN, p.dim()),
         ]),
     ];
     frame.render_widget(

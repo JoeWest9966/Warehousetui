@@ -6,8 +6,8 @@
 //! 对齐（常畅态 `80×30` 快照是回归基线，排布一改即回归）。
 //!
 //! 常畅态：导航 / 各屏列表行 / 发射仪式 / 帮助浮层；紧凑态外壳（横向
-//! 屏 Tab）由 ticket #17 落地并与渲染同源；命中分派由 ticket #20 接线，
-//! 滚轮由 #21，紧凑态内层栏（七步 / 五域）随 #18 跟随。
+//! 屏 Tab）由 ticket #17 落地并与渲染同源；命中分派见 `App::on_mouse`
+//! （ticket #20），滚轮由 #21，紧凑态内层栏（七步 / 五域）随 #18 跟随。
 
 use ratatui::layout::Rect;
 
@@ -98,7 +98,12 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         ritual_hits(body, &mut hits);
         return hits;
     }
-    // 手填 NW_HOME 浮层对鼠标惰性：不给它专属命中区（打字仍走键盘）。
+    // 手填 NW_HOME 浮层对鼠标惰性:打字仍走键盘;浮层打开期间鼠标
+    // 不分派任何命中区——浮层打开时点击只作用于浮层,不误触底层
+    // (spec #15 故事 14/16)。
+    if app.home_input {
+        return hits;
+    }
     match class {
         SizeClass::Comfy => {
             comfy_shell(body, &mut hits);
@@ -285,15 +290,42 @@ fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, T
     );
 }
 
-/// 发射仪式浮层:与 `render_launch_ritual` 同尺寸居中;「Enter 发射」行给
-/// 整宽命中区(Activate),浮层外无任何命中区(浮层优先级对鼠标同样成立)。
+/// 发射仪式键位行的三段文案:渲染与命中共用(与 [`tab_cell`] 同法,
+/// 点哪打哪)——`assemble::render_launch_ritual` 用同一组常量铺行,
+/// [`ritual_hits`] 按同一组量宽分半。
+pub const RITUAL_KEY_LAUNCH: &str = "  Enter 发射 ";
+pub const RITUAL_KEY_GAP: &str = "   ";
+pub const RITUAL_KEY_RETURN: &str = "Esc 返航 ";
+
+/// 发射仪式浮层:与 `render_launch_ritual` 同尺寸居中;底部键位行按渲染
+/// 同一文案对半分——「Enter 发射」段给 [`Target::Activate`](点=入队 up),
+/// 「Esc 返航」段给 [`Target::DismissPopup`](点=取消并留日志);段与段之间
+/// 不重叠、不留歧义区。浮层外无任何命中区(浮层优先级对鼠标同样成立)。
 fn ritual_hits(area: Rect, hits: &mut Vec<(Rect, Target)>) {
+    use unicode_width::UnicodeWidthStr;
     let popup = popup_rect(area, 60, 14);
-    // 与渲染同一套行序:12 个内容行之后是「Enter 发射 / Esc 返航」行。
-    if popup.height > 13 {
+    // 与渲染同一套行序:block 内 10 行(空/四字段/空/两行说明/空/键位行),
+    // 键位行是第 9 行 ⇒ 绝对 y = popup.y + 1(边框) + 9;行在场需内高 ≥ 10。
+    if popup.height < 12 {
+        return;
+    }
+    let y = popup.y + 10;
+    // 发射段自内层首列起(popup.x+1),含文案宽;返航段接在段间空隙之后。
+    let inner_x = popup.x.saturating_add(1);
+    let launch_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_LAUNCH)).unwrap_or(0);
+    let gap_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_GAP)).unwrap_or(0);
+    let return_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_RETURN)).unwrap_or(0);
+    let launch_end = (inner_x.saturating_add(launch_w)).min(popup.x + popup.width);
+    let launch_w = launch_end.saturating_sub(inner_x);
+    if launch_w > 0 {
+        hits.push((Rect::new(inner_x, y, launch_w, 1), Target::Activate));
+    }
+    let return_x = launch_end.saturating_add(gap_w);
+    let right_end = (return_x.saturating_add(return_w)).min(popup.x + popup.width);
+    if return_x < right_end {
         hits.push((
-            Rect::new(popup.x, popup.y + 12, popup.width, 1),
-            Target::Activate,
+            Rect::new(return_x, y, right_end - return_x, 1),
+            Target::DismissPopup,
         ));
     }
 }
@@ -563,7 +595,7 @@ mod tests {
     fn hitmap_弹层优先级_浮层外无底层命中区() {
         let mut app = test_app();
         let a = area(80, 30);
-        // 发射仪式:只有仪式内的 Activate,导航/列表全部让位
+        // 发射仪式:只有键位行两段(发射/返航),导航/列表全部让位
         app.as_confirm = true;
         app.screen = Screen::Assemble;
         let hits = hitmap(a, &app, size_class(a));
@@ -572,8 +604,9 @@ mod tests {
             "仪式「Enter 发射」行可点"
         );
         assert!(
-            hits.iter().all(|(_, t)| matches!(t, Target::Activate)),
-            "浮层打开:底层点击不命中"
+            hits.iter()
+                .all(|(_, t)| matches!(t, Target::Activate | Target::DismissPopup)),
+            "浮层打开:只有仪式两段(发射/返航),底层点击不命中(#20 返航亦可点)"
         );
         // 帮助浮层:任意处关闭
         app.as_confirm = false;
@@ -594,8 +627,44 @@ mod tests {
         app.screen = Screen::Settings;
         let hits = hitmap(a, &app, size_class(a));
         assert!(
-            hits.iter().all(|(_, t)| matches!(t, Target::NavTo(_))),
-            "手填浮层对鼠标惰性(只剩导航)"
+            hits.is_empty(),
+            "手填浮层对鼠标惰性:零命中区(#20 不分派,故事 16)"
+        );
+    }
+
+    #[test]
+    fn hitmap_仪式键位行_发射返航分半_与渲染同一行() {
+        let mut app = test_app();
+        app.screen = Screen::Assemble;
+        app.as_confirm = true;
+        let a = area(80, 30);
+        let hits = hitmap(a, &app, size_class(a));
+        // popup 居中:x=(80-60)/2=10,y=1+(28-14)/2=8;键位行是 block 内
+        // 第 9 行 ⇒ y=8+1(边框)+9=18;两段起止贴渲染文案(内层首列 11 起,
+        // 宽 = RITUAL_KEY_* 同一串量宽)。y 修正自 #16 期的 +12(错位两行)。
+        let act = first(&hits, |t| *t == Target::Activate).expect("发射段可点");
+        assert_eq!(
+            act,
+            Rect::new(11, 18, 13, 1),
+            "发射段贴渲染「Enter 发射」文案"
+        );
+        let back = first(&hits, |t| *t == Target::DismissPopup).expect("返航段可点");
+        assert_eq!(
+            back,
+            Rect::new(27, 18, 9, 1),
+            "返航段贴渲染「Esc 返航」文案"
+        );
+        assert!(act.x + act.width < back.x, "两段不重叠,段间空隙不歧义");
+        assert!(hits.iter().all(|(r, _)| r.y == 18), "仪式只产键位行");
+        // 渲染同源:键位文案就在命中同一行(点哪打哪)
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(a.width, a.height)).unwrap();
+        term.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let s = term.backend().to_string();
+        let row = s.split('\n').nth(18).expect("第 18 行在场");
+        assert!(
+            row.contains("Enter 发射") && row.contains("Esc 返航"),
+            "键位文案与命中同处 y=18"
         );
     }
 

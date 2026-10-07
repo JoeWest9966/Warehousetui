@@ -9,10 +9,11 @@ use tokio::sync::mpsc;
 use crate::engine::{
     commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, LsData, State,
 };
+use crate::layout::{hitmap, size_class, Target};
 use crate::term::{self, ColorCap};
 use crate::theme::{cached_degrade, Palette, ThemeKind};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-use ratatui::layout::Rect;
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 
 /// 五块屏幕,左竖导航的顺序即数组顺序。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -288,11 +289,56 @@ impl App {
         }
     }
 
-    /// 鼠标事件分派:命中区取自与渲染同源的 layout::hitmap,
-    /// 分派语义(点导航/列表行/浮层按钮)由 #20 落地。
-    /// #19 只把 Event::Mouse 接进统一入口,此处先接住、不改任何
-    /// 状态——键盘流程零回归。
-    fn on_mouse(&mut self, _ev: MouseEvent) {}
+    /// 鼠标事件分派（spec #15 ticket #20）：命中区取自与渲染同源的
+    /// [`hitmap`]——先借出目标（owned [`Target`]，随即释放对 `self` 的
+    /// 不可变借用）再改状态，规避自反借用；只读命中区、不硬编码矩形
+    /// （#17/#18 细化紧凑几何后自动跟随）。只受理左键按下：释放是配对
+    /// 尾巴不二次触发，滚轮归 #21，右键/拖拽不在 V1 范围（ADR-0005）。
+    fn on_mouse(&mut self, ev: MouseEvent) {
+        if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        let size = self.size;
+        let hits = hitmap(size, self, size_class(size));
+        let pos = Position::new(ev.column, ev.row);
+        let Some(target) = hits
+            .into_iter()
+            .find(|(r, _)| r.contains(pos))
+            .map(|(_, t)| t)
+        else {
+            return; // 点空白:不改任何状态
+        };
+        match target {
+            // 点导航(常畅)/屏 Tab(紧凑)切屏,与 j/k 同语义。
+            Target::NavTo(s) => self.screen = s,
+            // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
+            // 命中区只产自当前屏,按 self.screen 路由对应选中态。
+            Target::SelectRow(i) => match self.screen {
+                Screen::Overview => self.ov_sel = i,
+                Screen::Assemble => self.as_sel = i,
+                Screen::Health => self.hl_sel = i,
+                Screen::Recipes => self.rc_sel = i,
+                Screen::Settings => {}
+            },
+            // 仪式「Enter 发射」段:与键盘 Enter 同一路(入队 up、关浮层)。
+            Target::Activate => self.launch_selected_lock(),
+            // 帮助「任意处关」与仪式「Esc 返航」:与键盘 Esc 同一路。
+            Target::DismissPopup => self.dismiss_popup(),
+            // 滚轮日志滚动由 #21 接线,本片不受理。
+            Target::ScrollLog(_) => {}
+        }
+    }
+
+    /// 关闭当前浮层,与键盘 Esc 完全同路:帮助只关灯,发射仪式
+    /// 「返航」取消并留日志(鼠标/键盘共用,语义不许漂移)。
+    fn dismiss_popup(&mut self) {
+        if self.help {
+            self.help = false;
+        } else if self.as_confirm {
+            self.as_confirm = false;
+            self.push_log("发射取消");
+        }
+    }
 
     fn on_engine(&mut self, ev: EngineEvent) {
         match ev {
@@ -362,7 +408,7 @@ impl App {
     fn on_key(&mut self, k: KeyEvent) {
         if self.help {
             match k.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => self.help = false,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => self.dismiss_popup(),
                 _ => {}
             }
             return;
@@ -391,10 +437,7 @@ impl App {
     fn on_key_confirm(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Enter => self.launch_selected_lock(),
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.as_confirm = false;
-                self.push_log("发射取消");
-            }
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
             _ => {}
         }
     }
@@ -1025,11 +1068,13 @@ mod tests {
             app.queue.len(),
             app.home_input,
         );
-        // 点击/滚轮/释放都灌进统一入口:当前只接住(#20 才分派)
+        // 点击/滚轮/释放都灌进统一入口。坐标取顶栏行(#16 钉住的
+        // 「顶栏无命中区」):#20 分派上线后,点无命中区仍零变化;
+        // 分派语义见下方 #20 测试。
         for ev in [
-            mouse_at(MouseEventKind::Down(MouseButton::Left), 3, 10),
-            mouse_at(MouseEventKind::ScrollDown, 5, 12),
-            mouse_at(MouseEventKind::Up(MouseButton::Left), 3, 10),
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 3, 0),
+            mouse_at(MouseEventKind::ScrollDown, 5, 0),
+            mouse_at(MouseEventKind::Up(MouseButton::Left), 3, 0),
         ] {
             app.update(Message::Mouse(ev));
         }
@@ -1044,7 +1089,7 @@ mod tests {
                 app.home_input,
             ),
             before,
-            "接线不分派:状态与入队原样(键盘零回归)"
+            "点无命中区不分派:状态与入队原样(键盘零回归)"
         );
         assert_eq!(
             app.size,
@@ -1077,5 +1122,266 @@ mod tests {
         assert!(app.mouse_enabled, "再按翻回开");
         let (cfg2, _) = crate::engine::config::load();
         assert_eq!(cfg2.mouse_capture, Some(true));
+    }
+
+    // ---- #20 命中分派:点哪打哪(坐标取自布局模型,不硬编码矩形) ----
+
+    /// 同一夹具(3 派 + 2 锁定集):概览/装配/配方/健康四屏都有可点行,
+    /// 且概览第 3 行(y=6)落在帮助浮层内——浮层点击优先的测试前置。
+    fn mouse_ls_app() -> App {
+        let mut app = fake_app();
+        app.ls = Some(
+            serde_json::from_str::<LsData>(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[{"name":"desk","state":"drift","lockId":"9f8e"},{"name":"lab","state":"ok","lockId":"a1b2"},{"name":"zen","state":"ok","lockId":"c3d4"}],"locks":[{"lockId":"9f8e","recipe":"research-desk","bakedAt":"2026-10-01"},{"lockId":"a1b2","recipe":"research-desk","bakedAt":"2026-10-02"}]}"#,
+            )
+            .unwrap(),
+        );
+        app
+    }
+
+    /// 取某目标的命中矩形(与渲染同源的布局模型,点哪拿哪)。
+    fn hit_target(app: &App, pred: impl Fn(&Target) -> bool) -> Rect {
+        let class = size_class(app.size);
+        hitmap(app.size, app, class)
+            .into_iter()
+            .find(|(_, t)| pred(t))
+            .map(|(r, _)| r)
+            .expect("该目标必须有命中区")
+    }
+
+    /// 左键单击矩形中心(Down;释放不参与分派)。
+    fn click(app: &mut App, r: Rect) {
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            r.x + r.width / 2,
+            r.y + r.height / 2,
+        )));
+    }
+
+    #[test]
+    fn 点导航与屏tab切屏_两档同语义() {
+        let mut app = mouse_ls_app();
+        app.screen = Screen::Overview;
+        // 常畅态:点竖左导航
+        app.size = Rect::new(0, 0, 80, 30);
+        let nav = hit_target(&app, |t| matches!(t, Target::NavTo(Screen::Health)));
+        click(&mut app, nav);
+        assert_eq!(app.screen, Screen::Health, "点常畅态竖导航切屏");
+        // 紧凑态:点顶部横向屏 Tab
+        app.size = Rect::new(0, 0, 66, 50);
+        let tab = hit_target(&app, |t| matches!(t, Target::NavTo(Screen::Recipes)));
+        click(&mut app, tab);
+        assert_eq!(app.screen, Screen::Recipes, "点紧凑态屏 Tab 切屏");
+        // 释放(Up)不参与分派,不二次触发
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Up(MouseButton::Left),
+            tab.x,
+            tab.y,
+        )));
+        assert_eq!(app.screen, Screen::Recipes, "Up 不分派");
+        // 非左键不在 V1 范围,不改状态(ADR-0005 右键/拖拽未纳入)
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Right),
+            tab.x,
+            tab.y,
+        )));
+        assert_eq!(app.screen, Screen::Recipes, "右键不分派");
+    }
+
+    #[test]
+    fn 点列表行选中_当前屏对应选中态() {
+        let mut app = mouse_ls_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        // 概览派表
+        app.screen = Screen::Overview;
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        click(&mut app, row);
+        assert_eq!(app.ov_sel, 1, "概览派表点行选中");
+        // 装配锁定集
+        app.screen = Screen::Assemble;
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        click(&mut app, row);
+        assert_eq!(app.as_sel, 1, "装配锁定集点行选中");
+        // 配方列表(切到有数据的域)
+        app.screen = Screen::Recipes;
+        app.rc_domain = Domain::Profiles;
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        click(&mut app, row);
+        assert_eq!(app.rc_sel, 1, "配方列表点行选中");
+        // 健康 validate 项(证据两条)
+        app.screen = Screen::Health;
+        app.hl_mode = HealthMode::Validate;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["validate".into(), "--recipe".into(), "x".into()],
+                exit_code: crate::engine::ExitCode::from_number(3),
+                ok: false,
+                stderr_tail: vec![],
+                envelope: Some(
+                    serde_json::from_str(
+                        r#"{"schema":"nw/validate.v1","nw":"0.1.0","ok":false,"errors":[{"code":"A","exitCode":3,"message":"甲","hint":"h","details":{}},{"code":"B","exitCode":3,"message":"乙","hint":"h","details":{}}],"warnings":[],"data":{"results":[],"summary":{"total":2,"pass":0,"warn":0,"fail":2,"skip":0}}}"#,
+                    )
+                    .unwrap(),
+                ),
+                raw_stdout: "".into(),
+                parse_error: None,
+            },
+        ))));
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        click(&mut app, row);
+        assert_eq!(app.hl_sel, 1, "健康 validate 项点行选中");
+        // 点行只是选中:不入队、不开仪式(安全语义与键盘一致,故事 31)
+        assert!(app.queue.is_empty(), "点行不入队");
+        assert!(!app.as_confirm, "点行不触发破坏性动作");
+    }
+
+    #[test]
+    fn 点空白不改状态_顶栏与hud行() {
+        let mut app = mouse_ls_app();
+        app.screen = Screen::Overview;
+        app.size = Rect::new(0, 0, 80, 30);
+        let before = (
+            app.screen,
+            app.ov_sel,
+            app.as_sel,
+            app.rc_sel,
+            app.hl_sel,
+            app.queue.len(),
+            app.as_confirm,
+            app.help,
+        );
+        // 顶栏(y=0)与 HUD(y=29)都不在命中区内(#16 钉住)
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            0,
+        )));
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            79,
+            29,
+        )));
+        assert_eq!(
+            (
+                app.screen,
+                app.ov_sel,
+                app.as_sel,
+                app.rc_sel,
+                app.hl_sel,
+                app.queue.len(),
+                app.as_confirm,
+                app.help,
+            ),
+            before,
+            "点空白零变化"
+        );
+    }
+
+    #[test]
+    fn 点发射入队up_点返航取消留日志() {
+        let mut app = mouse_ls_app();
+        app.screen = Screen::Assemble;
+        app.size = Rect::new(0, 0, 80, 30);
+        // 发射:与键盘 Enter 同路
+        app.as_confirm = true;
+        let act = hit_target(&app, |t| *t == Target::Activate);
+        click(&mut app, act);
+        assert_eq!(
+            app.queue.last().unwrap(),
+            &vec!["up".to_string(), "--lock".into(), "9f8e".into()],
+            "点发射与 Enter 同路入队 up"
+        );
+        assert!(!app.as_confirm, "发射后仪式关闭");
+        // 返航:与键盘 Esc 同路,取消并留日志、不入队
+        app.as_confirm = true;
+        let back = hit_target(&app, |t| *t == Target::DismissPopup);
+        let qlen = app.queue.len();
+        click(&mut app, back);
+        assert!(!app.as_confirm, "点返航关闭仪式");
+        assert_eq!(app.queue.len(), qlen, "返航不入队");
+        assert!(
+            app.log.iter().any(|l| l.contains("发射取消")),
+            "返航留日志:发射取消"
+        );
+    }
+
+    #[test]
+    fn 点帮助任意处关_浮层外点击不作用底层() {
+        let mut app = mouse_ls_app();
+        app.screen = Screen::Overview;
+        app.size = Rect::new(0, 0, 80, 30);
+        // 先拿到帮助浮层下压着的导航矩形(浮层打开时命中区只剩浮层)
+        let nav = hit_target(&app, |t| matches!(t, Target::NavTo(Screen::Health)));
+        // 浮层外(导航上)点击:浮层吞掉,底层不作用、浮层不关
+        app.help = true;
+        click(&mut app, nav);
+        assert!(app.help, "浮层外点击不关闭浮层");
+        assert_eq!(app.screen, Screen::Overview, "浮层外点击不切屏(不误触底层)");
+        // 浮层内点击:关闭(点任意处,与 Esc/?/q 同语义)
+        let dm = hit_target(&app, |t| *t == Target::DismissPopup);
+        click(&mut app, dm);
+        assert!(!app.help, "点帮助浮层任意处关闭");
+        // 帮助浮层盖着的派表行(行心落在浮层内,行心定位用上一段拿到的
+        // 浮层矩形 dm):点那里只关浮层,选中不动——浮层内点击优先、不穿透到底层
+        let class = size_class(app.size);
+        let row = hitmap(app.size, &app, class)
+            .iter()
+            .find(|(r, t)| {
+                matches!(t, Target::SelectRow(_))
+                    && dm.contains(Position::new(r.x + r.width / 2, r.y + r.height / 2))
+            })
+            .map(|(r, _)| *r)
+            .expect("浮层内有被盖住的派表行");
+        app.help = true;
+        click(&mut app, row);
+        assert!(!app.help, "浮层内点击生效:帮助关闭");
+        assert_eq!(app.ov_sel, 0, "浮层内点击不穿透到列表选中");
+    }
+
+    #[test]
+    fn 装配态下点击_无点火与选中目标() {
+        let mut app = mouse_ls_app();
+        app.screen = Screen::Assemble;
+        app.size = Rect::new(0, 0, 80, 30);
+        app.assembling = true;
+        // 运行视图替换选集列表(assemble_hits 随渲染同档短路):命中区里
+        // 既无 Activate 也无 SelectRow——鼠标无从点火/改选,与键盘 Enter 的
+        // !assembling 门控、引擎侧 profile 级并发锁同一约束(故事 17)
+        let class = size_class(app.size);
+        let hits = hitmap(app.size, &app, class);
+        assert!(
+            hits.iter().all(|(_, t)| *t != Target::Activate),
+            "装配态无 Activate 命中区"
+        );
+        assert!(
+            hits.iter().all(|(_, t)| !matches!(t, Target::SelectRow(_))),
+            "装配态无列表选中目标(运行视图)"
+        );
+        // 点原本是列表的位置:零变化
+        let before = (app.as_sel, app.queue.len(), app.assembling);
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            30,
+            10,
+        )));
+        assert_eq!(
+            (app.as_sel, app.queue.len(), app.assembling),
+            before,
+            "装配态点击零变化"
+        );
+    }
+
+    #[test]
+    fn 手填浮层下点击_不改任何状态() {
+        let mut app = mouse_ls_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.screen = Screen::Settings;
+        // 拿到浮层下压着的导航矩形(浮层未开时)
+        let nav = hit_target(&app, |t| matches!(t, Target::NavTo(Screen::Health)));
+        app.home_input = true;
+        app.home_buf = "/x".into();
+        click(&mut app, nav);
+        assert_eq!(app.screen, Screen::Settings, "手填浮层下鼠标惰性:不切屏");
+        assert_eq!(app.home_buf, "/x", "输入缓冲不被鼠标扰动(故事 16)");
     }
 }
