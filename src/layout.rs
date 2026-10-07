@@ -1,13 +1,13 @@
-//! 纯「布局模型」:尺寸档判定 + 鼠标命中区清单(spec #15 / ADR-0004、ADR-0005)。
+//! 纯「布局模型」：尺寸档判定 + 鼠标命中区清单（spec #15 / ADR-0004、ADR-0005）。
 //!
 //! 无 I/O、无终端依赖、不需要真实终端即可单测。渲染与鼠标命中测试
-//! 共用同一份几何:命中区由本模块纯函数产出,按与 [`crate::ui`] /
+//! 共用同一份几何：命中区由本模块纯函数产出，按与 [`crate::ui`] /
 //! [`crate::screens`] 相同的排布约定独立算出——两者以同一套排布常量
-//! 对齐(常畅态 `80×30` 快照是回归基线,排布一改即回归)。
+//! 对齐（常畅态 `80×30` 快照是回归基线，排布一改即回归）。
 //!
-//! 本片(ticket #16)只落骨骼:`size_class` 判定 + 常畅态真实命中区
-//! (导航 / 各屏列表行 / 发射仪式 / 帮助浮层)+ 紧凑态占位;命中分派
-//! 由 ticket #20 接线,滚轮由 #21。
+//! 常畅态：导航 / 各屏列表行 / 发射仪式 / 帮助浮层；紧凑态外壳（横向
+//! 屏 Tab）由 ticket #17 落地并与渲染同源；命中分派由 ticket #20 接线，
+//! 滚轮由 #21，紧凑态内层栏（七步 / 五域）随 #18 跟随。
 
 use ratatui::layout::Rect;
 
@@ -50,7 +50,7 @@ pub enum SizeClass {
     Compact,
 }
 
-/// 尺寸档判定:`width < BREAKPOINT` ⇒ 紧凑态,否则常畅态。
+/// 尺寸档判定：`width < BREAKPOINT` ⇒ 紧凑态，否则常畅态。
 pub fn size_class(area: Rect) -> SizeClass {
     if area.width < BREAKPOINT {
         SizeClass::Compact
@@ -59,18 +59,28 @@ pub fn size_class(area: Rect) -> SizeClass {
     }
 }
 
-/// 命中区清单:渲染与鼠标命中测试共用的同一份几何。
+/// 紧凑态屏 Tab 的单元文本：标记 + 图标 + 标题 + 尾随分隔空格。
 ///
-/// `area` 是当前终端面(即壳 `ui::render` 收到的帧区域)。
-/// 只给**当前屏**的列表行做命中区(点其他屏的空白处不命中);
+/// [`crate::ui::render_screen_tabs`]（渲染）与 [`compact_shell`]（命中）
+/// 都以这一个字符串为准——单元宽 = 它的显示宽度，几何永不分歧。
+pub fn tab_cell(screen: Screen, selected: bool) -> String {
+    let marker = if selected { "▸" } else { " " };
+    format!("{marker} {} {} ", screen.icon(), screen.title())
+}
+
+/// 命中区清单：渲染与鼠标命中测试共用的同一份几何。
+///
+/// `area` 是当前终端面（即壳 `ui::render` 收到的帧区域）。
+/// 只给**当前屏**的列表行做命中区（点其他屏的空白处不命中）；
 /// 命中区一律不越出 `area`。
 ///
-/// 紧凑态命中区几何是**占位**:此片只定骨骼,紧凑态排布(#17/#18 收起
-/// 内层栏)落地后按同一排布约定在本函数内跟随——判据仍只读 `size_class`,
-/// 调用方(#20)不硬编码矩形。
+/// 外壳几何按 `size_class` 分叉：常畅态竖左导航轨，紧凑态一行横向
+/// 屏 Tab（#17 落地）；正文在紧凑态全宽（Tab 条之下）。紧凑态各屏
+/// 内层栏（七步 / 五域，#18）收起后，对应 `*_hits` 在本函数内跟随——
+/// 判据仍只读 `size_class`，调用方（#20）不硬编码矩形。
 pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
-    // 守卫屏同款门控:装不下主界面时面板只画「终端太小」,无可点区域
-    // (与 `ui::render` 的 `fits` 判定同源;低于 66 宽不做新排布)。
+    // 守卫屏同款门控：装不下主界面时面板只画「终端太小」，无可点区域
+    // （与 `ui::render` 的 `fits` 判定同源；低于 66 宽不做新排布）。
     if !app.fits(area.width, area.height) {
         return Vec::new();
     }
@@ -78,8 +88,8 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
     let Some(body) = area_pad(area, 1) else {
         return hits;
     };
-    // 浮层优先级对鼠标同样成立:弹层打开时只有弹层自己的命中区,
-    // 底层导航/列表不产出(点弹层外不作用底层)。
+    // 浮层优先级对鼠标同样成立：弹层打开时只有弹层自己的命中区，
+    // 底层导航/列表不产出（点弹层外不作用底层）。
     if app.help {
         help_hits(body, &mut hits);
         return hits;
@@ -88,12 +98,21 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         ritual_hits(body, &mut hits);
         return hits;
     }
-    // 手填 NW_HOME 浮层对鼠标惰性:不给它专属命中区(打字仍走键盘)。
+    // 手填 NW_HOME 浮层对鼠标惰性：不给它专属命中区（打字仍走键盘）。
     match class {
-        SizeClass::Comfy => comfy_shell(body, &mut hits),
-        SizeClass::Compact => compact_shell(body, &mut hits),
+        SizeClass::Comfy => {
+            comfy_shell(body, &mut hits);
+            if let Some((_nav, inner)) = body_cols(body) {
+                screen_hits(inner, app, class, &mut hits);
+            }
+        }
+        SizeClass::Compact => {
+            compact_shell(body, app.screen, &mut hits);
+            if let Some(inner) = body_below_tabs(body) {
+                screen_hits(inner, app, class, &mut hits);
+            }
+        }
     }
-    screen_hits(body, app, class, &mut hits);
     hits
 }
 
@@ -122,13 +141,34 @@ fn comfy_shell(body: Rect, hits: &mut Vec<(Rect, Target)>) {
     }
 }
 
-/// 紧凑态外壳占位:竖左导航轨折成横向屏 Tab 是 #17 的事,本片先按现行
-/// 几何铺出导航命中区,保证 #20 接线时两档都有落点、几何后续同源跟随。
-fn compact_shell(body: Rect, hits: &mut Vec<(Rect, Target)>) {
-    comfy_shell(body, hits)
+/// 紧凑态外壳：竖左导航折成 `body` 首行的横向屏 Tab（顺序同
+/// [`Screen::ALL`]，当前屏高亮）。单元矩形按与渲染同一个
+/// [`tab_cell`] 字符串量宽——渲染与命中同源，点哪打哪（ADR-0005）。
+fn compact_shell(body: Rect, current: Screen, hits: &mut Vec<(Rect, Target)>) {
+    use unicode_width::UnicodeWidthStr;
+    let end = body.x.saturating_add(body.width);
+    let mut x = body.x;
+    for screen in Screen::ALL {
+        if x >= end {
+            break;
+        }
+        let cell = tab_cell(screen, screen == current);
+        let w = (UnicodeWidthStr::width(cell.as_str()) as u16).min(end - x);
+        if w == 0 {
+            break;
+        }
+        hits.push((Rect::new(x, body.y, w, 1), Target::NavTo(screen)));
+        x += w;
+    }
 }
 
-/// 分出正文区:左侧导航轨 [`NAV_WIDTH`] 列,余下为屏幕内容。
+/// 紧凑态正文区：Tab 条占 `body` 首行，其余全宽归正文
+/// （省下的导航列还给内容，spec #15 用户故事 4）。
+fn body_below_tabs(body: Rect) -> Option<Rect> {
+    (body.height > 1).then(|| Rect::new(body.x, body.y + 1, body.width, body.height - 1))
+}
+
+/// 常畅态分出正文区：左侧导航轨 [`NAV_WIDTH`] 列，余下为屏幕内容。
 fn body_cols(body: Rect) -> Option<(Rect, Rect)> {
     let nav_w = NAV_WIDTH.min(body.width);
     if body.width <= nav_w + 1 {
@@ -140,15 +180,12 @@ fn body_cols(body: Rect) -> Option<(Rect, Rect)> {
     ))
 }
 
-/// 当前屏正文内的命中区(列表行 / 浮层),几何与各 `render_*` 同约定:
-/// 先缩 `body()` 屏体边框,再叠各屏自己的分栏与部件边框。
-/// `class` 决定分栏是否收起(与渲染同一档判定)。
-fn screen_hits(body: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
-    let Some((_nav, inner)) = body_cols(body) else {
-        return;
-    };
-    // `screens::render_*` 第一步都是 `body(app, note)` 边框,先缩一圈。
-    let inner = shrink_border(inner);
+/// 当前屏正文内的命中区（列表行 / 浮层），`content` 是正文区（常畅态
+/// 已去掉左导航轨、紧凑态已去掉 Tab 条），几何与各 `render_*` 同约定：
+/// 先缩 `body()` 屏体边框，再叠各屏自己的分栏与部件边框。
+fn screen_hits(content: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    // `screens::render_*` 第一步都是 `body(app, note)` 边框，先缩一圈。
+    let inner = shrink_border(content);
     match app.screen {
         Screen::Overview => overview_hits(inner, app, hits),
         Screen::Assemble => assemble_hits(inner, app, hits),
@@ -473,15 +510,53 @@ mod tests {
         check(&hits, a, "66×50");
         assert!(
             hits.iter().any(|(_, t)| matches!(t, Target::NavTo(_))),
-            "紧凑态占位:导航命中区先铺好(#17 折成 Tab 后几何同源跟随)"
+            "紧凑态:导航命中区 = 横向屏 Tab(#17)"
         );
         app.screen = Screen::Overview;
         let hits = hitmap(a, &app, class);
         assert_eq!(
             first(&hits, |t| matches!(t, Target::SelectRow(0))),
-            Some(Rect::new(14, 5, 33, 1)),
-            "紧凑态 66 宽:屏体边框 → 警示带 → 68% 分栏在窄屏的整数落点"
+            Some(Rect::new(2, 6, 42, 1)),
+            "紧凑态 66 宽:Tab 条让出首行,导航列还给正文后——屏体边框 → 警示带 → 68% 分栏的整数落点"
         );
+    }
+
+    /// #17 落地后紧凑态外壳的真实几何:一行横向屏 Tab,
+    /// 顺序同 Screen::ALL、单元宽与渲染同一个 `tab_cell`。
+    #[test]
+    fn hitmap_紧凑态_屏tab条几何与渲染同源() {
+        let mut app = test_app();
+        let a = area(66, 50);
+        let hits = hitmap(a, &app, size_class(a));
+        let nav: Vec<_> = hits
+            .iter()
+            .filter(|(_, t)| matches!(t, Target::NavTo(_)))
+            .collect();
+        assert_eq!(nav.len(), 5, "五屏 Tab 齐全");
+        let mut x = 0u16;
+        for (i, screen) in Screen::ALL.iter().enumerate() {
+            let (r, t) = nav[i];
+            assert_eq!(*t, Target::NavTo(*screen), "Tab 顺序同 Screen::ALL");
+            assert_eq!(r.y, 1, "Tab 条在 body 首行(顶栏之下)");
+            assert_eq!(r.x, x, "Tab 单元首尾相接不重叠");
+            let cell = tab_cell(*screen, *screen == app.screen);
+            assert_eq!(
+                r.width,
+                unicode_width::UnicodeWidthStr::width(cell.as_str()) as u16,
+                "命中区宽 = 渲染同一个 tab_cell 的显示宽(点哪打哪)"
+            );
+            x += r.width;
+        }
+        assert!(x <= a.width, "Tab 条不溢出终端");
+        // 切屏后选中标记跟着走:重算命中区,单元宽不因高亮改变
+        app.screen = Screen::Recipes;
+        let hits2 = hitmap(a, &app, size_class(a));
+        let x_after: u16 = hits2
+            .iter()
+            .filter(|(_, t)| matches!(t, Target::NavTo(_)))
+            .map(|(r, _)| r.width)
+            .sum();
+        assert_eq!(x, x_after, "j/k 切屏不改变 Tab 条几何");
     }
 
     #[test]
@@ -543,8 +618,10 @@ mod tests {
             first(&hits, |t| matches!(t, Target::SelectRow(0))).expect("紧凑态配方行有命中");
         assert_eq!(
             compact_first,
-            Rect::new(14, 4, 25, 1),
-            "紧凑态:Tab 行 1 行 → 列表在 52% 左栏,首行数据自 y=4"
+            // #17 落地真实紧凑外壳后:竖导航列还给正文(x 14→2)、Tab 条让出
+            // 首行(y 4→5);栏内 52% 分栏由 render_recipes 同款 Layout 算出。
+            Rect::new(2, 5, 31, 1),
+            "紧凑态:真实 Tab 行 + 全宽正文 → 列表在 52% 左栏,首行数据自 y=5"
         );
         assert_ne!(
             compact_first, comfy_first,
