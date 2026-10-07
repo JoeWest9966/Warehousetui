@@ -11,7 +11,8 @@ use crate::engine::{
 };
 use crate::term::{self, ColorCap};
 use crate::theme::{cached_degrade, Palette, ThemeKind};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use ratatui::layout::Rect;
 
 /// 五块屏幕,左竖导航的顺序即数组顺序。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,6 +99,7 @@ pub enum HealthMode {
 #[derive(Clone, Debug)]
 pub enum Message {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Engine(EngineEvent),
     Tick,
 }
@@ -153,6 +155,12 @@ pub struct App {
     pub home_buf: String,
     /// config.toml 解析失败的人话证据;None = 配置健康。
     pub config_error: Option<String>,
+    /// 鼠标捕获是否开启(默认开;两联 = 配置 mouse_capture + --no-mouse,
+    /// 见 ADR-0005)。term::init 按此门控捕获序列。
+    pub mouse_enabled: bool,
+    /// 最近一次渲染的终端面,供命中定标(主循环每帧刷新;
+    /// 命中几何见 layout::hitmap)。
+    pub size: Rect,
 }
 
 impl App {
@@ -163,7 +171,11 @@ impl App {
     /// 开机装配:发现引擎(显式 --nw-bin 优先),建状态树。
     pub fn boot(explicit_nw_bin: Option<&str>) -> Self {
         let (runner, status, cfg_err) = crate::engine::boot(explicit_nw_bin);
-        Self::assemble(runner, status, cfg_err)
+        let mut app = Self::assemble(runner, status, cfg_err);
+        // 鼠标捕获两联之配置一联(缺省/坏配置降级 → 开);
+        // --no-mouse 旗标由 main 另行并入(apply_no_mouse_flag)。
+        app.mouse_enabled = crate::engine::config::load().0.mouse_capture_enabled();
+        app
     }
 
     /// 测试注入:完全可控的 runner(零真实进程)。
@@ -227,6 +239,8 @@ impl App {
             home_input: false,
             home_buf: String::new(),
             config_error,
+            mouse_enabled: true,
+            size: Rect::default(),
         }
     }
 
@@ -268,10 +282,17 @@ impl App {
     pub fn update(&mut self, msg: Message) {
         match msg {
             Message::Key(k) => self.on_key(k),
+            Message::Mouse(ev) => self.on_mouse(ev),
             Message::Engine(ev) => self.on_engine(ev),
             Message::Tick => self.blink = !self.blink,
         }
     }
+
+    /// 鼠标事件分派:命中区取自与渲染同源的 layout::hitmap,
+    /// 分派语义(点导航/列表行/浮层按钮)由 #20 落地。
+    /// #19 只把 Event::Mouse 接进统一入口,此处先接住、不改任何
+    /// 状态——键盘流程零回归。
+    fn on_mouse(&mut self, _ev: MouseEvent) {}
 
     fn on_engine(&mut self, ev: EngineEvent) {
         match ev {
@@ -484,7 +505,31 @@ impl App {
                 self.push_log("手填 NW_HOME:Enter 确认,Esc/q 放弃");
             }
             KeyCode::Char('e') => self.pending_editor = true,
+            KeyCode::Char('m') => self.toggle_mouse_capture(),
             _ => {}
+        }
+    }
+
+    /// 逃逸两联之一:设置屏 m 开关。翻状态 + 持久化 config
+    /// (重启生效);会话内不重配活动终端——运行时热键已被砍掉(ADR-0005)。
+    pub fn toggle_mouse_capture(&mut self) {
+        self.mouse_enabled = !self.mouse_enabled;
+        let mut cfg = crate::engine::config::load().0;
+        cfg.mouse_capture = Some(self.mouse_enabled);
+        if let Err(e) = crate::engine::config::save(&cfg) {
+            self.push_log(format!("鼠标捕获偏好持久化失败:{e}"));
+        }
+        self.push_log(format!(
+            "鼠标捕获偏好:{}(重启生效)",
+            if self.mouse_enabled { "开" } else { "关" }
+        ));
+    }
+
+    /// 逃逸两联之一:--no-mouse 旗标并入(只收紧不放松,已在
+    /// 运行中开启的捕获不会被旗标回开)。
+    pub fn apply_no_mouse_flag(&mut self, no_mouse: bool) {
+        if no_mouse {
+            self.mouse_enabled = false;
         }
     }
 
@@ -686,7 +731,7 @@ impl Default for App {
 mod tests {
     use super::*;
     use crate::engine::FakeRunner;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
     use std::sync::Arc;
 
     fn key(c: char) -> KeyEvent {
@@ -954,5 +999,83 @@ mod tests {
         app2.apply_nw_home("/data/shared".into());
         assert_eq!(a, app2.nw_home);
         assert_eq!(app.queue.len(), qa, "两个入口的入队行为一致");
+    }
+
+    // ---- #19 鼠标接线:统一事件入口 + 逃逸两联 ----
+
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn 鼠标消息灌入_状态不动_不panic() {
+        let mut app = fake_app();
+        app.size = Rect::new(0, 0, 66, 50);
+        let before = (
+            app.screen,
+            app.ov_sel,
+            app.as_sel,
+            app.rc_sel,
+            app.hl_sel,
+            app.queue.len(),
+            app.home_input,
+        );
+        // 点击/滚轮/释放都灌进统一入口:当前只接住(#20 才分派)
+        for ev in [
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 3, 10),
+            mouse_at(MouseEventKind::ScrollDown, 5, 12),
+            mouse_at(MouseEventKind::Up(MouseButton::Left), 3, 10),
+        ] {
+            app.update(Message::Mouse(ev));
+        }
+        assert_eq!(
+            (
+                app.screen,
+                app.ov_sel,
+                app.as_sel,
+                app.rc_sel,
+                app.hl_sel,
+                app.queue.len(),
+                app.home_input,
+            ),
+            before,
+            "接线不分派:状态与入队原样(键盘零回归)"
+        );
+        assert_eq!(
+            app.size,
+            Rect::new(0, 0, 66, 50),
+            "size 是定标面,不被事件改写"
+        );
+    }
+
+    #[test]
+    fn no_mouse_旗标改变_mouse_enabled() {
+        let mut app = fake_app();
+        assert!(app.mouse_enabled, "默认开");
+        app.apply_no_mouse_flag(false);
+        assert!(app.mouse_enabled, "无旗标不动");
+        app.apply_no_mouse_flag(true);
+        assert!(!app.mouse_enabled, "--no-mouse 关掉捕获");
+    }
+
+    #[test]
+    fn 设置屏_m_开关改变_mouse_enabled_并持久化() {
+        let (_g, _cfg) = env_locked();
+        let mut app = settings_app();
+        assert!(app.mouse_enabled, "默认开");
+        app.update(Message::Key(key('m')));
+        assert!(!app.mouse_enabled, "设置开关改变 mouse_enabled");
+        let (cfg, _) = crate::engine::config::load();
+        assert_eq!(cfg.mouse_capture, Some(false), "写入 config,重启仍生效");
+        assert!(app.log[0].contains("鼠标捕获"), "日志留证据");
+        app.update(Message::Key(key('m')));
+        assert!(app.mouse_enabled, "再按翻回开");
+        let (cfg2, _) = crate::engine::config::load();
+        assert_eq!(cfg2.mouse_capture, Some(true));
     }
 }

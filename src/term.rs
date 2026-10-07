@@ -118,17 +118,40 @@ pub fn degrade(color: Color, cap: ColorCap) -> Color {
     }
 }
 
-/// 初始化终端:raw mode + 备用屏幕。失败时调用方负责 restore。
-pub fn init() -> anyhow::Result<Term> {
+/// 鼠标捕获开启序列(纯函数:`enabled=false` → 空串)。
+///
+/// init 与单测共用同一来源——关闭即一个字节都不发,终端保留原生
+/// 「拖拽选中/右键复制」;这是逃逸两联(另一联 --no-mouse)的落点(ADR-0005)。
+pub fn mouse_capture_ansi(enabled: bool) -> String {
+    if !enabled {
+        return String::new();
+    }
+    use crossterm::Command;
+    let mut buf = String::new();
+    let _ = crossterm::event::EnableMouseCapture.write_ansi(&mut buf);
+    buf
+}
+
+/// 初始化终端:raw mode + 备用屏幕 + 鼠标捕获(由 mouse_enabled 门控)。
+/// 失败时调用方负责 restore。
+pub fn init(mouse_enabled: bool) -> anyhow::Result<Term> {
     enable_raw_mode()?;
     let mut out = stdout();
     crossterm::execute!(out, EnterAlternateScreen)?;
+    let capture = mouse_capture_ansi(mouse_enabled);
+    if !capture.is_empty() {
+        use std::io::Write;
+        out.write_all(capture.as_bytes())?;
+    }
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
 /// 恢复终端到常态。幂等,可重复调用;退出路径和 panic hook 共用。
+/// 释放鼠标捕获无条件发(未开启时该序列是无害的模式复位),保证
+/// 任何退出路径都不把捕获状态遗留给用户的 shell。
 pub fn restore() {
     let mut out = stdout();
+    let _ = crossterm::execute!(out, crossterm::event::DisableMouseCapture);
     let _ = crossterm::execute!(out, LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
@@ -172,5 +195,15 @@ mod tests {
     #[test]
     fn 索引色原样透传() {
         assert_eq!(degrade(Color::Indexed(7), ColorCap::C16), Color::Indexed(7));
+    }
+
+    #[test]
+    fn 鼠标捕获序列_由开关门控() {
+        let on = mouse_capture_ansi(true);
+        assert!(!on.is_empty(), "开必须发捕获序列");
+        assert!(on.contains("?1000h"), "点击追踪到位");
+        assert!(on.contains("?1006h"), "SGR 坐标到位");
+        let off = mouse_capture_ansi(false);
+        assert!(off.is_empty(), "关 = 一个字节都不发,原生选中/复制不被接管");
     }
 }
