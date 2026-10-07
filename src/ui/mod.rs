@@ -173,7 +173,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
 fn render_too_small(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     let msg = format!(
-        "终端太小:需要至少 {}×{},当前 {}×{}。放大窗口或减小字体。",
+        "终端太小:需要至少 {}×{},当前 {}×{}。调大窗口。",
         crate::term::MIN_W,
         crate::term::MIN_H,
         area.width,
@@ -282,6 +282,22 @@ mod tests {
         let app = ui_app();
         let s = render_to_string(&app, 40, 10);
         assert!(s.contains("终端太小"));
+    }
+
+    /// 新下限:66×50 仍能进驾驶舱;65 宽守卫文案只提「调大窗口」
+    /// (不再建议「减小字体」,那是破坏 CJK 混排的错误自救,spec #15)。
+    #[test]
+    fn 新下限_66宽进入而65宽守卫() {
+        use crate::term::{MIN_H, MIN_W};
+        assert_eq!((MIN_W, MIN_H), (66, 24), "下限 66×24 不回退");
+        let app = ui_app();
+        let ok = render_to_string(&app, 66, 50);
+        assert!(!ok.contains("终端太小"), "66×50 是保证最小,不得弹守卫屏");
+        assert!(ok.contains("概览"), "66×50 下主界面照常渲染");
+        let s = render_to_string(&app, 65, 50);
+        assert!(s.contains("终端太小"), "65 宽仍弹守卫");
+        assert!(s.contains("调大窗口"), "文案提示调大窗口");
+        assert!(!s.contains("减小字体"), "铁律:不再建议减小字体");
     }
 
     #[test]

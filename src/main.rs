@@ -6,6 +6,7 @@
 
 mod app;
 mod engine;
+pub mod layout;
 mod screens;
 mod term;
 #[cfg(test)]

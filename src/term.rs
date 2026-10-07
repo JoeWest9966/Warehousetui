@@ -13,8 +13,10 @@ use std::io::{stdout, Stdout};
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
-/// 面板能用的最小终端尺寸。
-pub const MIN_W: u16 = 80;
+/// 面板能用的最小终端尺寸(保证下限,支持到 66×50;spec #15)。
+/// 宽度断点另有单一常量 [`crate::layout::BREAKPOINT`],别混:
+/// 这里是「还能不能开」,那里是「换不换装」。
+pub const MIN_W: u16 = 66;
 pub const MIN_H: u16 = 24;
 
 /// 终端颜色能力三档。
