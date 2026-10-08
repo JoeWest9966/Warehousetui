@@ -138,6 +138,63 @@ impl DataRootCause {
     }
 }
 
+/// 外部源登记两段式(spec #25,ADR-0006)的第一段状态机(工单 #30):
+/// 输入 → 预审 → 确认;落账段(Enter → `--yes`)是 #31 的下一段。
+/// 任一态 Esc 返航(与既有返航同义),返航不留半条记录。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegState {
+    /// 未登记;外部源域常态。
+    Idle,
+    /// 填 repo 链接(通用单行输入态机)。
+    RepoInput,
+    /// 选 kind(skill / extension)。
+    KindPick,
+    /// 预审已下发(不带 `--yes`,文件不落),等回音。
+    PreAudit,
+    /// 预审回音已呈现(条目 + 验收 + 拟落账),可审阅、可返航。
+    Review,
+}
+
+/// 登记类别二选一(引擎 `--kind` 槽位;所配 0.1.0 无 category,记录
+/// 落「未分类」——类别输入一律不给,spec #25)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegKind {
+    Skill,
+    Extension,
+}
+
+impl RegKind {
+    pub const ALL: [RegKind; 2] = [RegKind::Skill, RegKind::Extension];
+
+    /// 引擎 `--kind` 字面。
+    pub fn word(self) -> &'static str {
+        match self {
+            RegKind::Skill => "skill",
+            RegKind::Extension => "extension",
+        }
+    }
+
+    /// 选项行文案。
+    pub fn label(self) -> &'static str {
+        self.word()
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            RegKind::Skill => 0,
+            RegKind::Extension => 1,
+        }
+    }
+
+    pub fn from_index(i: usize) -> Self {
+        if i == 0 {
+            RegKind::Skill
+        } else {
+            RegKind::Extension
+        }
+    }
+}
+
 /// 全局消息。引擎事件与动画心跳都在这里。
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -191,6 +248,16 @@ pub struct App {
     // ---- 配方 ----
     pub rc_domain: Domain,
     pub rc_sel: usize,
+    /// 外部源登记·预审段状态机(spec #25 / 工单 #30)。
+    pub reg_state: RegState,
+    /// repo 链接缓冲(通用单行输入态机,[`input::BUF_CAP`] 封顶)。
+    pub reg_repo_buf: String,
+    /// 已选 kind;默认 skill(选完 Enter 才下发)。
+    pub reg_kind: RegKind,
+    /// kind 选项选中行(↑/↓ 与鼠标点行同源)。
+    pub reg_kind_sel: usize,
+    /// 预审回音(确认态呈现;为 None 时 Review 不成立)。
+    pub reg_result: Option<EngineOutput>,
 
     /// 最近动作流水,概览屏右下「最近日志」。
     pub log: Vec<String>,
@@ -295,6 +362,11 @@ impl App {
             hl_loading: false,
             rc_domain: Domain::Recipes,
             rc_sel: 0,
+            reg_state: RegState::Idle,
+            reg_repo_buf: String::new(),
+            reg_kind: RegKind::Skill,
+            reg_kind_sel: 0,
+            reg_result: None,
             log: vec!["驾驶舱已就绪".into()],
             queue: Vec::new(),
             pending_editor: false,
@@ -408,15 +480,30 @@ impl App {
             Target::NavTo(s) => self.screen = s,
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
-            Target::SelectRow(i) => match self.screen {
-                Screen::Overview => self.ov_sel = i,
-                Screen::Assemble => self.as_sel = i,
-                Screen::Health => self.hl_sel = i,
-                Screen::Recipes => self.rc_sel = i,
-                Screen::Settings => {}
-            },
-            // 仪式「Enter 发射」段:与键盘 Enter 同一路(入队 up、关浮层)。
-            Target::Activate => self.launch_selected_lock(),
+            // 登记 kind 选项行在场时优先于配方列表(弹层优先级)。
+            Target::SelectRow(i) => {
+                if self.reg_state == RegState::KindPick {
+                    self.reg_kind_sel = i.min(RegKind::ALL.len() - 1);
+                    self.reg_kind = RegKind::from_index(self.reg_kind_sel);
+                    return;
+                }
+                match self.screen {
+                    Screen::Overview => self.ov_sel = i,
+                    Screen::Assemble => self.as_sel = i,
+                    Screen::Health => self.hl_sel = i,
+                    Screen::Recipes => self.rc_sel = i,
+                    Screen::Settings => {}
+                }
+            }
+            // 仪式「Enter 发射」段:与键盘 Enter 同一路(入队 up、关浮层);
+            // kind 选择屏的「Enter 预审」段同款(入队不带 --yes 的 register)。
+            Target::Activate => {
+                if self.reg_state == RegState::KindPick {
+                    self.dispatch_register();
+                } else {
+                    self.launch_selected_lock();
+                }
+            }
             // 帮助「任意处关」与仪式「Esc 返航」:与键盘 Esc 同一路
             // (日志区左键无动作,翻看归上面的滚轮分支)。
             Target::DismissPopup => self.dismiss_popup(),
@@ -448,6 +535,17 @@ impl App {
                 (&mut self.hl_sel, n)
             }
             Screen::Recipes => {
+                // kind 选项行的滚轮移选项(与 ↑/↓ 同步进,弹层优先级)
+                if self.reg_state == RegState::KindPick {
+                    let n = RegKind::ALL.len();
+                    let cur = self.reg_kind_sel.min(n - 1);
+                    self.reg_kind_sel = match dir {
+                        ScrollDir::Down => (cur + 1).min(n - 1),
+                        ScrollDir::Up => cur.saturating_sub(1),
+                    };
+                    self.reg_kind = RegKind::from_index(self.reg_kind_sel);
+                    return;
+                }
                 let n = self.domain_len();
                 (&mut self.rc_sel, n)
             }
@@ -482,6 +580,9 @@ impl App {
         } else if self.as_confirm {
             self.as_confirm = false;
             self.push_log("发射取消");
+        } else if self.reg_state != RegState::Idle {
+            // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
+            self.cancel_register();
         }
     }
 
@@ -546,6 +647,22 @@ impl App {
                 self.push_log(format!("{cmd} 复核完成"));
                 self.hl_result = Some(out);
             }
+            // 登记预审回音(#30):只认真实登记 argv(带 --repo/--kind 等
+            // 旗标)——精确的无参探针仍归 `_` 的能力回音路;流程已返航的
+            // 回音按状态丢弃,不幽灵重开。
+            "source"
+                if out.args.get(1).map(String::as_str) == Some("register")
+                    && Capability::from_probe(&out.args).is_none() =>
+            {
+                if self.reg_state == RegState::PreAudit {
+                    let headline = out.headline().to_string();
+                    self.reg_result = Some(out);
+                    self.reg_state = RegState::Review;
+                    self.push_log(format!("登记预审完成:{headline}"));
+                } else {
+                    self.push_log("登记预审回音已丢弃(流程已返航)");
+                }
+            }
             // 能力探测回音(#29):只认精确探针 argv——真实的
             // `source register --repo …`(#30)不落此路,其结果留给 #30 路由。
             _ => {
@@ -587,6 +704,26 @@ impl App {
         if self.data_input {
             self.on_key_data_input(k);
             return;
+        }
+        // 登记两段式(#30):输入 → 预审 → 确认,浮层优先级接在手填之后
+        match self.reg_state {
+            RegState::RepoInput => {
+                self.on_key_reg_repo(k);
+                return;
+            }
+            RegState::KindPick => {
+                self.on_key_reg_kind(k);
+                return;
+            }
+            RegState::PreAudit => {
+                self.on_key_reg_preaudit(k);
+                return;
+            }
+            RegState::Review => {
+                self.on_key_reg_review(k);
+                return;
+            }
+            RegState::Idle => {}
         }
         match k.code {
             KeyCode::Char('q') if !self.assembling => self.quit = true,
@@ -687,6 +824,9 @@ impl App {
                 self.rc_domain = next_domain(self.rc_domain);
                 self.rc_sel = 0;
             }
+            // 外部源域登记入口(#30):两道门在 start_register 里把守,
+            // 不可用时只留一句指路,不进流程。
+            KeyCode::Char('r') if self.rc_domain == Domain::Sources => self.start_register(),
             KeyCode::Down => {
                 let n = self.domain_len();
                 if n > 0 {
@@ -822,6 +962,160 @@ impl App {
             self.ls = None; // 陈旧五域不冒充新根的内容
             self.push_log(format!("ls 未下发:{}", self.data_root_gate_msg()));
         }
+    }
+
+    // ---- 外部源登记·预审段(spec #25 / 工单 #30) ----
+
+    /// 登记入口可用性(#27 数据仓根 + #29 能力门两道,互不冒充):
+    /// 根不可用时五域入口本身已走根指路;引擎无 source 能力时入口禁用
+    /// 并给能力指路。两态都不会启动登记流程。
+    pub fn reg_entry_enabled(&self) -> bool {
+        self.data_root_cause().is_none() && self.capabilities.enabled(Capability::SourceRegister)
+    }
+
+    /// 入口不可用时的一句指路(与入口行提示同源)。
+    pub fn reg_gate_hint(&self) -> String {
+        match self.data_root_cause() {
+            Some(_) => self.data_root_gate_msg(),
+            None => capability::GATE_HINT.to_string(),
+        }
+    }
+
+    /// 配方屏外部源域发起登记(键 `r`):先过两道门,再进输入态。
+    pub fn start_register(&mut self) {
+        if !self.reg_entry_enabled() {
+            self.push_log(format!("登记入口不可用:{}", self.reg_gate_hint()));
+            return;
+        }
+        if self.reg_state != RegState::Idle {
+            return; // 流程进行中不重入
+        }
+        self.reg_state = RegState::RepoInput;
+        self.reg_repo_buf.clear();
+        self.reg_kind = RegKind::Skill;
+        self.reg_kind_sel = 0;
+        self.reg_result = None;
+        self.push_log("登记外部源:填 repo 链接,Enter 确认,Esc/q 放弃");
+    }
+
+    /// 输入态键位:键入分发归通用态机 [`input::on_key`](与 NW_HOME /
+    /// 数据仓根手填同一条),本函数只接登记的后果链。
+    fn on_key_reg_repo(&mut self, k: KeyEvent) {
+        match input::on_key(&mut self.reg_repo_buf, k) {
+            InputAction::Submit => self.apply_reg_repo(),
+            InputAction::Cancel => self.cancel_register(),
+            InputAction::Edited | InputAction::Ignored => {}
+        }
+    }
+
+    /// repo 链接提交:格式非法**当场拒绝并留驻可改**(不等引擎跑一趟);
+    /// 合法则进 kind 选择。
+    fn apply_reg_repo(&mut self) {
+        let Some(trimmed) = input::normalize(&self.reg_repo_buf) else {
+            self.push_log("登记被拒:repo 链接为空,留输入态可改");
+            return;
+        };
+        if !valid_repo_link(&trimmed) {
+            self.push_log(format!(
+                "登记被拒:\"{trimmed}\" 不是合法 repo 链接(owner/repo、https://github.com/owner/repo 或 git@github.com:owner/repo.git),留输入态可改"
+            ));
+            return;
+        }
+        self.reg_repo_buf = trimmed;
+        self.reg_state = RegState::KindPick;
+        self.reg_kind = RegKind::Skill;
+        self.reg_kind_sel = 0;
+        self.push_log("选 kind:↑/↓ 或 s/e 选择,Enter 预审,Esc 返航");
+    }
+
+    /// kind 选择态键位:↑/↓ 移选中、s/e 直选、Enter 预审、Esc 返航。
+    fn on_key_reg_kind(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.reg_kind_sel = self.reg_kind_sel.saturating_sub(1);
+                self.reg_kind = RegKind::from_index(self.reg_kind_sel);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.reg_kind_sel = (self.reg_kind_sel + 1).min(RegKind::ALL.len() - 1);
+                self.reg_kind = RegKind::from_index(self.reg_kind_sel);
+            }
+            KeyCode::Char('s') => {
+                self.reg_kind_sel = 0;
+                self.reg_kind = RegKind::Skill;
+            }
+            KeyCode::Char('e') => {
+                self.reg_kind_sel = 1;
+                self.reg_kind = RegKind::Extension;
+            }
+            KeyCode::Enter => self.dispatch_register(),
+            KeyCode::Esc => self.cancel_register(),
+            _ => {}
+        }
+    }
+
+    /// 预审回音态:等引擎跑完;Esc 仍可返航(回音到达时按状态丢弃,
+    /// 不会幽灵重开),其余键不动作。
+    fn on_key_reg_preaudit(&mut self, k: KeyEvent) {
+        if matches!(k.code, KeyCode::Esc) {
+            self.cancel_register();
+        }
+    }
+
+    /// 确认态键位:审阅;Esc 返航。Enter 落账是 #31 的下一段
+    /// (`--yes` 只可能由那时的图形确认触发),本票不下发任何写命令。
+    fn on_key_reg_review(&mut self, k: KeyEvent) {
+        if matches!(k.code, KeyCode::Esc) {
+            self.cancel_register();
+        }
+    }
+
+    /// 下发预审:不带 `--yes`、不带 `--category`(类别输入不给),
+    /// `--root` 指数据仓根;下发前重过两道门(入口状态可能已变)。
+    pub fn dispatch_register(&mut self) {
+        if !self.reg_entry_enabled() {
+            self.push_log(format!("登记不下发:{}", self.reg_gate_hint()));
+            self.cancel_register();
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("登记不下发:{}", self.data_root_gate_msg()));
+            self.cancel_register();
+            return;
+        };
+        let repo = self.reg_repo_buf.clone();
+        let kind = self.reg_kind.word().to_string();
+        self.reg_state = RegState::PreAudit;
+        self.reg_result = None;
+        self.queue
+            .push(commands::source_register_preaudit(&repo, &kind, &root));
+        self.push_log(format!(
+            "登记预审已入队:source register --repo {repo} --kind {kind}(不带 --yes,文件不落)"
+        ));
+    }
+
+    /// 返航:任一态 Esc 同义,状态清空不留半条记录(结果丢弃);
+    /// 键盘 Esc 与鼠标点「Esc 返航」段同路同语(经 [`App::dismiss_popup`])。
+    pub fn cancel_register(&mut self) {
+        self.reg_state = RegState::Idle;
+        self.reg_repo_buf.clear();
+        self.reg_result = None;
+        self.push_log("登记返航");
+    }
+
+    /// 落账闸(呈现口径):预审通过 = rc 0 且验收无 fail 且 data 可定型。
+    /// #31 的 `--yes` 下发必先过此闸;预审失败态在确认屏明示不可落账。
+    pub fn reg_can_commit(&self) -> bool {
+        let Some(out) = self.reg_result.as_ref() else {
+            return false;
+        };
+        if !out.ok {
+            return false;
+        }
+        out.envelope
+            .as_ref()
+            .and_then(|e| e.data_as::<crate::engine::RegisterData>())
+            .map(|d| !d.has_fail())
+            .unwrap_or(false)
     }
 
     /// 轮换 NW_HOME:写进程环境(子进程继承)、持久化、顺手刷新 ls。
@@ -994,6 +1288,40 @@ impl App {
             },
         }
     }
+}
+
+/// repo 链接形状检查(spec #25:owner/repo · https://github.com/… ·
+/// git@github.com:…,非 GitHub 拒)。面板侧快一拍拒绝,免得操作者
+/// 等引擎跑一趟才发现写错(#30 故事 14);真正的守门人仍是引擎。
+pub fn valid_repo_link(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return false;
+    }
+    if let Some(rest) = t.strip_prefix("https://github.com/") {
+        return is_owner_repo(rest.trim_end_matches(".git"));
+    }
+    if let Some(rest) = t.strip_prefix("git@github.com:") {
+        return is_owner_repo(rest.trim_end_matches(".git"));
+    }
+    // 其余带协议/其它主机的写法一律不在面板放行(非 GitHub 拒)
+    if t.starts_with("http") || t.starts_with("git@") || t.contains("://") {
+        return false;
+    }
+    is_owner_repo(t)
+}
+
+fn is_owner_repo(t: &str) -> bool {
+    let mut parts = t.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let seg = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    seg(owner) && seg(repo)
 }
 
 fn prev_domain(d: Domain) -> Domain {
@@ -2162,5 +2490,385 @@ mod tests {
         assert!(!app.help, "帮助浮层可关");
         app.update(Message::Key(key('j')));
         assert_ne!(app.screen, Screen::Settings, "探测失败后仍可切屏");
+    }
+
+    // ---- #30 外部源登记·预审段(五路回放 + 入口门 + 两段命中) ----
+
+    /// 预审成功夹具:所配 0.1.0 的 data 形状——条目(名字+路径)、
+    /// 验收 5(+1) 冻结 id、拟落账记录;written=false 即「文件不落」。
+    const REG_OK: &str = r#"{"schema":"nw/source-register.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"repo":"https://github.com/owner/tiny-skills","kind":"skill","name":"tiny-skills","category":[],"commit":"abc1234","entries":[{"name":"greeter","path":"skills/greeter/SKILL.md"},{"name":"scanner","path":"skills/scanner/SKILL.md"}],"acceptance":[{"id":"register.repo_structure","status":"pass","message":"扫到 2 个 skill 条目"},{"id":"register.frontmatter","status":"pass","message":"2 个 SKILL.md frontmatter 合法"},{"id":"register.name_unique","status":"pass","message":"2 个条目名互不重复"},{"id":"register.metadata_ignored","status":"pass","message":"按规则跳过 1 项元数据"},{"id":"register.extension_manifest","status":"skip","message":"仅 --kind extension 适用"},{"id":"register.confirmed","status":"skip","message":"未给 --yes:拟落账进这份 JSON,文件不落(#19 确认闸)"}],"catalogPath":"/data/root/catalog.json","written":false,"updated":false,"action":""}}"#;
+
+    /// 验收有 fail 的预审:rc 3、ok false,第 2 条 frontmatter 败。
+    const REG_FAIL: &str = r#"{"schema":"nw/source-register.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"验收有 1 条 fail,拒绝落账","hint":"修好条目再登记"}],"warnings":[],"data":{"repo":"owner/broken","kind":"skill","name":"broken","category":[],"commit":"","entries":[{"name":"bad","path":"skills/bad/SKILL.md"}],"acceptance":[{"id":"register.repo_structure","status":"pass","message":"扫到 1 个条目"},{"id":"register.frontmatter","status":"fail","message":"SKILL.md frontmatter 缺 name","path":"skills/bad/SKILL.md"},{"id":"register.confirmed","status":"skip","message":"未给 --yes:拟落账进这份 JSON,文件不落(#19 确认闸)"}],"catalogPath":"/data/root/catalog.json","written":false,"updated":false,"action":""}}"#;
+
+    /// rc≠0 但验收区空(取回失败等):errors 带人话,ok false。
+    const REG_RC3: &str = r#"{"schema":"nw/source-register.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"取回 https://github.com/owner/nope 失败(git clone)","hint":"认证: gh auth status;或仓库名写错"}],"warnings":[],"data":{"repo":"owner/nope","kind":"skill","name":"nope","category":[],"commit":"","entries":[],"acceptance":[],"catalogPath":"/data/root/catalog.json","written":false,"updated":false,"action":""}}"#;
+
+    /// 登记夹具:能力齐备 + 直达外部源域(入口三前提就位)。
+    fn reg_app(rules: &[(&str, i32, &str)]) -> App {
+        let mut app = App::with_runner(Arc::new(FakeRunner::new(rules)));
+        app.capabilities
+            .record(Capability::SourceRegister, Probe::Available);
+        app.splash = false;
+        app.screen = Screen::Recipes;
+        app.rc_domain = Domain::Sources;
+        app
+    }
+
+    /// r 发起 → 填链 → Enter:走到 kind 选择态(合法链接才走得到)。
+    fn reg_to_kindpick(app: &mut App, link: &str) {
+        app.update(Message::Key(key('r')));
+        assert_eq!(app.reg_state, RegState::RepoInput, "入口键进输入态");
+        type_str(app, link);
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::KindPick, "合法链接进 kind 选择");
+    }
+
+    /// 按当前队尾 argv 回放回音并灌进 update(与 #28 的既有先例同款)。
+    async fn reg_feed(app: &mut App, json: &str, rc: i32) {
+        let argv = app.queue.last().expect("队尾有预审 argv").clone();
+        let runner = FakeRunner::new(&[("source register", rc, json)]);
+        let out = runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+    }
+
+    #[test]
+    fn 登记入口_看得见_指路键位与列表行() {
+        let mut app = reg_app(&[]);
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+            )
+            .unwrap(),
+        );
+        // 输入态 HUD 指路
+        app.update(Message::Key(key('r')));
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("登记填链"), "输入态 HUD 指路可见:{s}");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        // 列表行(能力齐备时)给发起键位
+        let s2 = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s2.contains("按 r 登记新外部源"), "列表行可见键位:{s2}");
+        // 帮助浮层列键位
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        let h = crate::testutil::frame_display(&app, 110, 30);
+        assert!(h.contains("登记外部源"), "帮助浮层列键位:{h}");
+    }
+
+    #[tokio::test]
+    async fn 登记预审_成功路_argv不带_yes_回音进确认态() {
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        reg_to_kindpick(&mut app, "owner/tiny-skills");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::PreAudit, "Enter 下发预审");
+        let argv = app.queue.last().expect("预审入队").clone();
+        assert_eq!(argv[..2], ["source", "register"]);
+        assert!(
+            !argv.iter().any(|s| s == "--yes"),
+            "预审铁律:argv 不带 --yes(文件不落):{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--root"),
+            "--root 指数据仓根:{argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--category"),
+            "类别输入不给(0.1.0 无该能力)"
+        );
+        reg_feed(&mut app, REG_OK, 0).await;
+        assert_eq!(app.reg_state, RegState::Review, "回音进确认态");
+        assert!(app.reg_can_commit(), "无 fail 且 rc 0:闸口径放行");
+    }
+
+    #[tokio::test]
+    async fn 登记预审_验收fail_不进下一步_屏上见败因() {
+        let mut app = reg_app(&[("source register", 3, REG_FAIL)]);
+        reg_to_kindpick(&mut app, "owner/broken");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        reg_feed(&mut app, REG_FAIL, 3).await;
+        assert_eq!(app.reg_state, RegState::Review, "失败也要呈现");
+        assert!(!app.reg_can_commit(), "验收有 fail 不可落账");
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("不可落账"), "闸结论可见:{s}");
+        assert!(s.contains("register.frontmatter"), "按冻结 id 呈现:{s}");
+        assert!(s.contains("败"), "fail 逐条可见:{s}");
+        // 确认态没有绑定 Enter:本票根本不给「进入下一步」的键路
+        let qlen = app.queue.len();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.queue.len(), qlen, "fail 态按 Enter 不下发任何命令");
+    }
+
+    #[tokio::test]
+    async fn 登记预审_rc非0_不进下一步_人话可见() {
+        let mut app = reg_app(&[("source register", 3, REG_RC3)]);
+        reg_to_kindpick(&mut app, "owner/nope");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        reg_feed(&mut app, REG_RC3, 3).await;
+        assert_eq!(app.reg_state, RegState::Review);
+        assert!(!app.reg_can_commit(), "退出码非 0 不可落账");
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("不可落账"), "闸结论可见:{s}");
+        assert!(s.contains("取回"), "引擎人话原样呈现:{s}");
+    }
+
+    #[test]
+    fn 未设数据仓根_登记入口不给_指路与缺能力分说() {
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        app.data_root = None;
+        app.update(Message::Key(key('r')));
+        assert_eq!(app.reg_state, RegState::Idle, "缺根不进流程");
+        assert!(
+            app.log[0].contains("数据仓"),
+            "指路说数据仓:{:?}",
+            app.log[0]
+        );
+        assert!(
+            !app.log[0].contains("引擎能力"),
+            "缺根指路不冒充缺能力:{:?}",
+            app.log[0]
+        );
+        assert!(app.queue.is_empty(), "缺根不下发命令");
+    }
+
+    #[test]
+    fn 引擎无source能力_入口禁用并指路_列表行可见禁用() {
+        let mut app = reg_app(&[]);
+        app.capabilities
+            .record(Capability::SourceRegister, Probe::Unavailable);
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+            )
+            .unwrap(),
+        );
+        app.update(Message::Key(key('r')));
+        assert_eq!(app.reg_state, RegState::Idle, "缺能力不进流程");
+        assert!(
+            app.log[0].contains("引擎能力") && app.log[0].contains("面板坏了"),
+            "指路说缺的是引擎能力:{:?}",
+            app.log[0]
+        );
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("登记禁用"), "外部源域列表行可见禁用指路:{s}");
+        assert!(app.queue.is_empty(), "缺能力不下发命令");
+    }
+
+    #[test]
+    fn repo链接_当场拒绝留改_合法才进下一步() {
+        let mut app = reg_app(&[]);
+        app.update(Message::Key(key('r')));
+        type_str(&mut app, "not a repo");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::RepoInput, "非法格式当场拒绝留驻");
+        assert!(app.log[0].contains("被拒"), "拒绝留证据:{:?}", app.log[0]);
+        assert!(!app.reg_repo_buf.is_empty(), "缓冲不丢,可改");
+        // 清掉重填(退格是通用态机行为,这里只造夹具)
+        while !app.reg_repo_buf.is_empty() {
+            app.update(Message::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            )));
+        }
+        type_str(&mut app, "owner/tiny-skills");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::KindPick, "改对了就放行");
+    }
+
+    #[test]
+    fn repo链接形状_三收三拒() {
+        for ok in [
+            "owner/repo",
+            "https://github.com/owner/repo",
+            "git@github.com:owner/repo.git",
+            "https://github.com/a/b.git",
+        ] {
+            assert!(valid_repo_link(ok), "应放行:{ok}");
+        }
+        for bad in [
+            "owner",
+            "owner/repo/extra",
+            "http://github.com/o/r",
+            "https://gitlab.com/o/r",
+            "owner/repo with space",
+            "",
+        ] {
+            assert!(!valid_repo_link(bad), "应拒绝:{bad:?}");
+        }
+    }
+
+    #[test]
+    fn kind二选一_s与e键与方向键_argv带所选kind() {
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        reg_to_kindpick(&mut app, "owner/ext");
+        app.update(Message::Key(key('e')));
+        assert_eq!(app.reg_kind, RegKind::Extension, "e 选 extension");
+        app.update(Message::Key(key('s')));
+        assert_eq!(app.reg_kind, RegKind::Skill, "s 选 skill");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let argv = app.queue.last().expect("入队").clone();
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--kind" && w[1] == "skill"),
+            "--kind 随所选项:{argv:?}"
+        );
+        assert!(!argv.iter().any(|s| s == "--yes"), "仍不带 --yes");
+    }
+
+    #[tokio::test]
+    async fn 各态返航_不留半条记录_and_迟到回音不重开() {
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        // 输入态
+        app.update(Message::Key(key('r')));
+        type_str(&mut app, "owner/x");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Idle, "输入态 Esc 返航");
+        assert!(app.reg_repo_buf.is_empty(), "缓冲清空不留痕");
+        // kind 态
+        reg_to_kindpick(&mut app, "owner/x");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Idle, "kind 态 Esc 返航");
+        // 确认态
+        reg_to_kindpick(&mut app, "owner/x");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        reg_feed(&mut app, REG_OK, 0).await;
+        assert_eq!(app.reg_state, RegState::Review);
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Idle, "确认态 Esc 返航");
+        assert!(app.reg_result.is_none(), "返航不留半条回音");
+        assert!(app.log[0].contains("登记返航"), "返航留日志");
+        // 迟到的回音不幽灵重开
+        let argv = vec!["source".into(), "register".into()];
+        let out = FakeRunner::new(&[("source register", 0, REG_OK)])
+            .run(&argv)
+            .await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert_eq!(app.reg_state, RegState::Idle, "已返航的回音丢弃");
+    }
+
+    #[tokio::test]
+    async fn 确认屏_条目验收拟落账与待定原样呈现_两档不炸() {
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        reg_to_kindpick(&mut app, "owner/tiny-skills");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        reg_feed(&mut app, REG_OK, 0).await;
+        assert_eq!(app.reg_state, RegState::Review);
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("greeter"), "条目名呈现:{s}");
+        assert!(s.contains("skills/greeter/SKILL.md"), "条目路径呈现:{s}");
+        assert!(s.contains("register.confirmed"), "冻结 id 原样:{s}");
+        assert!(s.contains("待定"), "未确认显示待定不是错误:{s}");
+        assert!(s.contains("拟落账"), "拟落账记录呈现:{s}");
+        assert!(s.contains("文件不落"), "预审不落文件可见:{s}");
+        assert!(s.contains("预审通过"), "闸结论可见:{s}");
+        // 紧凑档(80×50)不炸且仍见确认屏
+        let c = crate::testutil::frame_display(&app, 80, 50);
+        assert!(c.contains("预审确认"), "紧凑档确认屏可见:{c}");
+    }
+
+    #[tokio::test]
+    async fn 确认屏_不认识的schema_需升级且不可落账() {
+        const REG_V2: &str = r#"{"schema":"nw/source-register.v2","nw":"9.9.9","ok":true,"errors":[],"warnings":[],"data":{"whatever":1}}"#;
+        let mut app = reg_app(&[("source register", 0, REG_V2)]);
+        reg_to_kindpick(&mut app, "owner/x");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        reg_feed(&mut app, REG_V2, 0).await;
+        assert_eq!(app.reg_state, RegState::Review);
+        assert!(!app.reg_can_commit(), "需升级的回音不可落账");
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("不可定型"), "不可定型可见:{s}");
+        assert!(s.contains("nw/source-register.v2"), "schema 原文可见:{s}");
+        assert!(s.contains("9.9.9"), "nw 版本可见:{s}");
+    }
+
+    #[tokio::test]
+    async fn 登记两段命中_点选项与预审与返航_与键盘同路() {
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        app.size = Rect::new(0, 0, 110, 30);
+        reg_to_kindpick(&mut app, "owner/tiny-skills");
+        // 输入态:浮层未就位(命中零散件,后续态机自己收)
+        // kind 屏:点第二选项行 = 选中 extension
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        click(&mut app, row);
+        assert_eq!(app.reg_kind, RegKind::Extension, "点行选中");
+        // 点 Enter 预审段 = 下发(与 Enter 同路);argv 仍不带 --yes
+        let act = hit_target(&app, |t| *t == Target::Activate);
+        click(&mut app, act);
+        assert_eq!(app.reg_state, RegState::PreAudit, "点预审段同路");
+        let argv = app.queue.last().expect("入队").clone();
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--kind" && w[1] == "extension"),
+            "点选中与键选同路:{argv:?}"
+        );
+        assert!(!argv.iter().any(|s| s == "--yes"), "点选也绝不带 --yes");
+        // 回音 → 确认态;点屏任意处 = 返航
+        let runner = FakeRunner::new(&[("source register", 0, REG_OK)]);
+        let out = runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert_eq!(app.reg_state, RegState::Review);
+        let dm = hit_target(&app, |t| *t == Target::DismissPopup);
+        click(&mut app, dm);
+        assert_eq!(app.reg_state, RegState::Idle, "确认态点屏 = 返航");
+    }
+
+    #[test]
+    fn 登记kind屏_滚轮只移选项_不下发不越界() {
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        reg_to_kindpick(&mut app, "owner/x");
+        let qlen = app.queue.len();
+        app.wheel_sel(ScrollDir::Down);
+        assert_eq!(app.reg_kind, RegKind::Extension, "滚轮下移选中 extension");
+        app.wheel_sel(ScrollDir::Down);
+        assert_eq!(app.reg_kind, RegKind::Extension, "到末项不越界(两行选项)");
+        app.wheel_sel(ScrollDir::Up);
+        assert_eq!(app.reg_kind, RegKind::Skill, "滚轮上移回 skill");
+        assert_eq!(app.queue.len(), qlen, "滚轮不下发命令");
     }
 }

@@ -56,6 +56,23 @@ pub fn version() -> Vec<String> {
     vec!["--version".to_string()]
 }
 
+/// 外部源登记·预审段(spec #25 ticket #30):扫描 + 验收 5(+1) 条,
+/// 拟落账记录进 JSON,**文件不落**——铁律是不带 `--yes`(确认闸),
+/// 本函数连 `--yes` 的位置都没有,从类型层面杜绝预审误落账。
+/// `--root` 指数据仓根(与 `ls --repo` 同义的本地仓根槽位)。
+pub fn source_register_preaudit(repo: &str, kind: &str, root: &str) -> Vec<String> {
+    vec![
+        "source".into(),
+        "register".into(),
+        "--repo".into(),
+        repo.to_string(),
+        "--kind".into(),
+        kind.to_string(),
+        "--root".into(),
+        root.to_string(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +103,27 @@ mod tests {
         // 签名里没有 Option:想不带 --repo 都写不出来
         let a = ls(".");
         assert_eq!(a[1], "--repo");
+    }
+
+    #[test]
+    fn 登记预审_永不带_yes_根槽位指数据仓根() {
+        let a = source_register_preaudit("owner/repo", "skill", "/data/root");
+        assert_eq!(
+            a,
+            vec![
+                "source",
+                "register",
+                "--repo",
+                "owner/repo",
+                "--kind",
+                "skill",
+                "--root",
+                "/data/root"
+            ]
+        );
+        assert!(
+            !a.iter().any(|s| s == "--yes"),
+            "预审段铁律:argv 里不许出现 --yes(文件不落)"
+        );
     }
 }

@@ -104,6 +104,12 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
     if app.home_input || app.data_input {
         return hits;
     }
+    // 登记两段式(#30):输入/等回音态同手填浮层惰性;kind 选择与
+    // 确认态只产浮层命中区(弹层优先级,底层不产出)。
+    if app.reg_state != crate::app::RegState::Idle {
+        register_hits(body, class, app, &mut hits);
+        return hits;
+    }
     match class {
         SizeClass::Comfy => {
             comfy_shell(body, &mut hits);
@@ -322,6 +328,19 @@ pub const RITUAL_KEY_LAUNCH: &str = "  Enter 发射 ";
 pub const RITUAL_KEY_GAP: &str = "   ";
 pub const RITUAL_KEY_RETURN: &str = "Esc 返航 ";
 
+/// 登记 kind 选择屏键位行的左段(与 RITUAL_KEY_* 同法,渲染与命中
+/// 共用):右段直接复用 [`RITUAL_KEY_RETURN`],段间仍用 [`RITUAL_KEY_GAP`]。
+pub const REG_KEY_KIND_LAUNCH: &str = "  Enter 预审 ";
+
+/// 登记三个浮层的尺寸(spec #25 / 工单 #30):渲染与命中同一组常量,
+/// 几何零分歧;`popup_rect` 的收窄规则两边同用。
+pub const REG_INPUT_W: u16 = 64;
+pub const REG_INPUT_H: u16 = 7;
+pub const REG_KIND_W: u16 = 56;
+pub const REG_KIND_H: u16 = 9;
+pub const REG_REVIEW_W: u16 = 76;
+pub const REG_REVIEW_H: u16 = 24;
+
 /// 发射仪式浮层:与 `render_launch_ritual` 同尺寸、在**正文区**内居中;
 /// 底部键位行按渲染同一文案对半分——「Enter 发射」段给
 /// [`Target::Activate`](点=入队 up),「Esc 返航」段给
@@ -333,17 +352,9 @@ pub const RITUAL_KEY_RETURN: &str = "Esc 返航 ";
 /// body 居中,常畅态恒差一个导航列宽(80 宽差 6 列——点渲染出来的「射」
 /// 会落进返航段),紧凑态奇数高度还会差一行;两处偏差由列级测试钉住。
 fn ritual_hits(body: Rect, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
-    use unicode_width::UnicodeWidthStr;
     // 与 `render_body` 同款分出正文区,再在其内居中(布局模型只读 size_class)。
-    let content = match class {
-        SizeClass::Comfy => match body_cols(body) {
-            Some((_, inner)) => inner,
-            None => return,
-        },
-        SizeClass::Compact => match body_below_tabs(body) {
-            Some(inner) => inner,
-            None => return,
-        },
+    let Some(content) = popup_content(body, class) else {
+        return;
     };
     let popup = popup_rect(content, 60, 14);
     // 与渲染同一套行序:block 内 10 行(空/四字段/空/两行说明/空/键位行),
@@ -352,23 +363,85 @@ fn ritual_hits(body: Rect, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
         return;
     }
     let y = popup.y + 10;
-    // 发射段自内层首列起(popup.x+1),含文案宽;返航段接在段间空隙之后。
-    let inner_x = popup.x.saturating_add(1);
-    let launch_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_LAUNCH)).unwrap_or(0);
-    let gap_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_GAP)).unwrap_or(0);
-    let return_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_RETURN)).unwrap_or(0);
-    let launch_end = (inner_x.saturating_add(launch_w)).min(popup.x + popup.width);
-    let launch_w = launch_end.saturating_sub(inner_x);
-    if launch_w > 0 {
-        hits.push((Rect::new(inner_x, y, launch_w, 1), Target::Activate));
+    two_key_segments(popup, y, RITUAL_KEY_LAUNCH, RITUAL_KEY_RETURN, hits);
+}
+
+/// 正文区(常畅去左导航轨 / 紧凑去 Tab 条):浮层命中的居中基准,
+/// 与 `render_body` 分给各屏的区域几何零分歧。
+fn popup_content(body: Rect, class: SizeClass) -> Option<Rect> {
+    match class {
+        SizeClass::Comfy => body_cols(body).map(|(_, inner)| inner),
+        SizeClass::Compact => body_below_tabs(body),
     }
-    let return_x = launch_end.saturating_add(gap_w);
-    let right_end = (return_x.saturating_add(return_w)).min(popup.x + popup.width);
-    if return_x < right_end {
+}
+
+/// 键位行两段命中:左段(确认动作)→ [`RITUAL_KEY_GAP`] → 右段(返航);
+/// 渲染按同一组文案同一顺序铺行,段间不重叠、不留歧义区。
+/// 发射仪式与登记 kind 选择屏共用此分法(点哪打哪)。
+fn two_key_segments(popup: Rect, y: u16, left: &str, right: &str, hits: &mut Vec<(Rect, Target)>) {
+    use unicode_width::UnicodeWidthStr;
+    let inner_x = popup.x.saturating_add(1);
+    let left_w = u16::try_from(UnicodeWidthStr::width(left)).unwrap_or(0);
+    let gap_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_GAP)).unwrap_or(0);
+    let right_w = u16::try_from(UnicodeWidthStr::width(right)).unwrap_or(0);
+    let left_end = (inner_x.saturating_add(left_w)).min(popup.x + popup.width);
+    let left_w = left_end.saturating_sub(inner_x);
+    if left_w > 0 {
+        hits.push((Rect::new(inner_x, y, left_w, 1), Target::Activate));
+    }
+    let right_x = left_end.saturating_add(gap_w);
+    let right_end = (right_x.saturating_add(right_w)).min(popup.x + popup.width);
+    if right_x < right_end {
         hits.push((
-            Rect::new(return_x, y, right_end - return_x, 1),
+            Rect::new(right_x, y, right_end - right_x, 1),
             Target::DismissPopup,
         ));
+    }
+}
+
+/// 登记浮层(#30):几何与 `recipes::render_register_overlay` 同一组
+/// 常量、同一 `popup_rect` 居中基准。输入/等回音态鼠标惰性(同手填
+/// 浮层先例);kind 选项两行产 [`Target::SelectRow`] 选中 + 键位行两段
+/// (Activate 预审 / Dismiss 返航);确认态整屏点任意处 = 返航
+/// (同帮助浮层先例)。浮层外不产出任何命中区(弹层优先级)。
+fn register_hits(
+    body: Rect,
+    class: SizeClass,
+    app: &crate::app::App,
+    hits: &mut Vec<(Rect, Target)>,
+) {
+    let Some(content) = popup_content(body, class) else {
+        return;
+    };
+    match app.reg_state {
+        crate::app::RegState::Idle | crate::app::RegState::RepoInput => {}
+        crate::app::RegState::PreAudit => {} // 等回音:无处可点,同惰性
+        crate::app::RegState::KindPick => {
+            let popup = popup_rect(content, REG_KIND_W, REG_KIND_H);
+            if popup.height < REG_KIND_H {
+                return; // 收窄后行序不再可信,不产命中
+            }
+            let inner = shrink_border(popup);
+            // 与渲染同序:内层首行是标题行,其后是 kind 选项两行,
+            // 末行是键位行(渲染把键位行钉在内层最后一行)。
+            for i in 0..crate::app::RegKind::ALL.len() as u16 {
+                let y = inner.y.saturating_add(1 + i);
+                if y < inner.y + inner.height {
+                    hits.push((
+                        Rect::new(inner.x, y, inner.width, 1),
+                        Target::SelectRow(i as usize),
+                    ));
+                }
+            }
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(popup, key_y, REG_KEY_KIND_LAUNCH, RITUAL_KEY_RETURN, hits);
+        }
+        crate::app::RegState::Review => {
+            let popup = popup_rect(content, REG_REVIEW_W, REG_REVIEW_H);
+            if popup.width > 0 && popup.height > 0 {
+                hits.push((popup, Target::DismissPopup)); // 点任意处 = 返航
+            }
+        }
     }
 }
 
@@ -377,8 +450,9 @@ fn help_hits(area: Rect, hits: &mut Vec<(Rect, Target)>) {
     hits.push((popup_rect(area, 44, 18), Target::DismissPopup));
 }
 
-/// 与壳/浮层渲染同款的居中弹层矩形。
-fn popup_rect(area: Rect, w: u16, h: u16) -> Rect {
+/// 与壳/浮层渲染同款的居中弹层矩形(`recipes` 登记浮层渲染直接调用,
+/// 与命中侧同一个函数——居中与收窄规则永不分歧)。
+pub(crate) fn popup_rect(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width.saturating_sub(4));
     let h = h.min(area.height.saturating_sub(2));
     Rect::new(
