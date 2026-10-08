@@ -4,7 +4,7 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use crate::app::{App, HealthMode, Message, Screen};
-use crate::engine::{EngineEvent, EngineOutput, ExitCode, FakeRunner};
+use crate::engine::{CommandRunner, EngineEvent, EngineOutput, ExitCode, FakeRunner};
 use crate::screens::render;
 use std::sync::Arc;
 
@@ -607,5 +607,41 @@ fn 日志偏移取窗_跳过偏移行_七步判定不受影响() {
     assert!(
         s3.contains("✓ 5 写清单"),
         "七步判定读全量日志:行被移出窗仍打勾"
+    );
+}
+
+// ---- #28 契约守卫:不认识的 schema 走证据面板呈现 ----
+
+#[tokio::test]
+async fn 契约守卫_健康屏证据面板显示需升级且不渲染旧形状() {
+    const UNKNOWN_DOCTOR: &str = r#"{"schema":"nw/doctor.v2","nw":"9.9.9","ok":false,"errors":[{"code":"MANIFEST_BROKEN","exitCode":12,"message":"引擎自己的话","hint":"h","details":{}}],"warnings":[],"data":{"results":[{"surface":"manifest","status":"fail","message":"旧形状"}],"exit":12}}"#;
+    let runner = Arc::new(FakeRunner::new(&[("doctor", 12, UNKNOWN_DOCTOR)]));
+    let mut app = App::with_runner(runner.clone());
+    app.screen = Screen::Health;
+    let args = vec!["doctor".to_string(), "--profile".into(), "desk".into()];
+    let out = runner.run(&args).await;
+    feed(&mut app, out);
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("需升级 nw"), "证据面板顶着守卫结论");
+    assert!(s.contains("nw/doctor.v2"), "收到的 schema 原文");
+    assert!(s.contains("9.9.9"), "引擎版本");
+    assert!(s.contains("SCHEMA_UNKNOWN"), "五字段 code 原样呈现");
+    assert!(!s.contains("旧形状"), "data 不按旧形状降级解析");
+    assert!(
+        !s.contains("引擎自己的话"),
+        "不认识的 envelope 引擎原话不采信"
+    );
+}
+
+#[test]
+fn 设置屏_引擎版本行常驻_复用既有版本调用() {
+    let mut app = fake_app();
+    app.engine_version = "0.1.0".into();
+    app.screen = Screen::Settings;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("版本"), "设置屏有版本行");
+    assert!(
+        s.contains("nw 0.1.0"),
+        "操作者在设置屏能看到面板在跟谁说话(不新增通道)"
     );
 }

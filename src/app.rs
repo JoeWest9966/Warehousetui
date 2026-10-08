@@ -1601,4 +1601,31 @@ mod tests {
         );
         assert_eq!(app.as_log_offset, 0, "新装配从最新一行跟起");
     }
+
+    // ---- #28 契约守卫:不认识的 schema 不入状态树、日志给结论、面板照常 ----
+
+    #[tokio::test]
+    async fn 未知_schema_ls_不入状态树_日志给需升级_面板其余照常() {
+        const UNKNOWN_LS: &str = r#"{"schema":"nw/ls.v2","nw":"9.9.9","ok":true,"errors":[],"warnings":[],"data":{"domain":"all","recipes":[{"name":"x"}]}}"#;
+        let runner = Arc::new(FakeRunner::new(&[("ls", 0, UNKNOWN_LS)]));
+        let mut app = App::with_runner(runner.clone());
+        let args = vec!["ls".to_string()];
+        let out = runner.run(&args).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert!(app.ls.is_none(), "不认识的 schema 不按旧形状入状态树");
+        let log0 = app.log[0].clone();
+        assert!(
+            log0.contains("需升级 nw") && log0.contains("nw/ls.v2") && log0.contains("9.9.9"),
+            "概览最近日志一句含需升级 + schema 原文 + 引擎版本:{log0}"
+        );
+        assert!(
+            !log0.contains("数据仓根") && !log0.contains("能力"),
+            "schema 指路不冒充另两种指路"
+        );
+        // 其余部分仍可操作:切屏、开帮助都不受阻
+        app.update(Message::Key(key('j')));
+        assert_eq!(app.screen, Screen::Assemble, "契约守卫不冻结面板");
+        app.update(Message::Key(key('?')));
+        assert!(app.help, "帮助浮层照常");
+    }
 }
