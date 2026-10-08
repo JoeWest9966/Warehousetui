@@ -22,6 +22,9 @@ pub enum Capability {
     SourceRegister,
     /// 外部源复核(只读,漂移结论落健康屏):`nw source recheck`。
     SourceRecheck,
+    /// 配方烘焙(作者侧,建议命令的来源):`nw recipe bake`。
+    /// 探针无参即在「恰好要一个配方」处被拒(rc 3 + `nw/bake.v1` envelope),不写任何文件。
+    RecipeBake,
     /// 类别(上游 master 有、所配 0.1.0 无):`nw category`。
     Category,
     /// vps(上游 master 有、所配 0.1.0 无):`nw vps`。
@@ -30,9 +33,10 @@ pub enum Capability {
 
 impl Capability {
     /// 面板入口清单(设置屏按此渲染,顺序即显示顺序)。
-    pub const ALL: [Capability; 4] = [
+    pub const ALL: [Capability; 5] = [
         Capability::SourceRegister,
         Capability::SourceRecheck,
+        Capability::RecipeBake,
         Capability::Category,
         Capability::Vps,
     ];
@@ -42,18 +46,21 @@ impl Capability {
         match self {
             Capability::SourceRegister => "外部源登记",
             Capability::SourceRecheck => "外部源复核",
+            Capability::RecipeBake => "配方烘焙",
             Capability::Category => "类别",
             Capability::Vps => "vps",
         }
     }
 
     /// 探针 argv:一次无害调用(不带 --yes / --repo 等会动文件的旗标)。
-    /// 实测四条探针在 0.1.0 上皆为纯读:register 无参在旗标校验处即拒,
-    /// recheck 只读编目,未知子命令直接回 usage。
+    /// 实测五条探针在 0.1.0 上皆为纯读:register 无参在旗标校验处即拒,
+    /// recheck 只读编目,recipe bake 无参在「恰好要一个配方」处即拒,
+    /// 未知子命令直接回 usage。
     pub fn probe_args(self) -> Vec<String> {
         match self {
             Capability::SourceRegister => vec!["source".into(), "register".into()],
             Capability::SourceRecheck => vec!["source".into(), "recheck".into()],
+            Capability::RecipeBake => vec!["recipe".into(), "bake".into()],
             Capability::Category => vec!["category".into()],
             Capability::Vps => vec!["vps".into()],
         }

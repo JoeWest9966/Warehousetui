@@ -34,6 +34,8 @@ pub enum Target {
     ScrollLog(ScrollDir),
     /// 点帮助浮层任意处关闭。
     DismissPopup,
+    /// 点配方域建议命令键位行 = 取用(只读选中;#39,与键盘 `c` 同路)。
+    CopySuggest,
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -319,6 +321,40 @@ fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, T
         hits,
         Target::SelectRow,
     );
+    // 配方域建议命令键位行(#39):与渲染同一套分栏常量算出详情栏,取其内层
+    // 末行;三前提不齐时命中侧不放行(与登记落账闸同一种纪律)。
+    if app.rc_domain == crate::app::Domain::Recipes
+        && app.data_root_cause().is_none()
+        && app.bake_suggest_gate().is_ok()
+    {
+        let detail = match class {
+            SizeClass::Comfy => ratatui::layout::Layout::horizontal([
+                ratatui::layout::Constraint::Length(14),
+                ratatui::layout::Constraint::Percentage(45),
+                ratatui::layout::Constraint::Percentage(41),
+            ])
+            .split(area)[2],
+            SizeClass::Compact => {
+                let rows = ratatui::layout::Layout::vertical([
+                    ratatui::layout::Constraint::Length(1),
+                    ratatui::layout::Constraint::Min(4),
+                ])
+                .split(area);
+                ratatui::layout::Layout::horizontal([
+                    ratatui::layout::Constraint::Percentage(52),
+                    ratatui::layout::Constraint::Percentage(48),
+                ])
+                .split(rows[1])[1]
+            }
+        };
+        let d = shrink_border(detail);
+        if d.height > 0 && d.width > 0 {
+            hits.push((
+                Rect::new(d.x, d.y + d.height - 1, d.width, 1),
+                Target::CopySuggest,
+            ));
+        }
+    }
 }
 
 /// 发射仪式键位行的三段文案:渲染与命中共用(与 [`tab_cell`] 同法,

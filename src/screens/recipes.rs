@@ -235,9 +235,103 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// 详情栏内层行数(块边框各占一行):键位行钉末行按它算。
+fn inner_h(area: Rect) -> usize {
+    (area.height.saturating_sub(2)) as usize
+}
+
+/// 详情栏内层显示宽(块边框各占一列):折行/截断都按它算,
+/// 紧凑态 66×50 与常畅态各自落到自己的宽度,不写死。
+fn inner_w(area: Rect) -> usize {
+    (area.width.saturating_sub(2)) as usize
+}
+
+/// 配方域建议命令区(spec #33 / 工单 #39,ADR-0003)。
+///
+/// 纯函数:选中配方行 + 数据仓根 + 能力结论进,展示行出——无 IO、不推导。
+/// 三种缺前提各有可区分指路,**绝不渲染半条命令**;给得出时把既有那句
+/// 「改它要走 bake」与命令合成一处(界面不说两遍话),并标明这是**建议命令**、
+/// 执行权在操作者手里。
+fn bake_suggest_lines(
+    p: &crate::theme::Palette,
+    app: &App,
+    r: &crate::engine::RecipeRow,
+    w: usize,
+) -> Vec<Line<'static>> {
+    let recipe = (r.name.as_str(), r.version.as_deref());
+    let mut lines = vec![Line::from(Span::styled(
+        "建议命令 · 执行权在你",
+        p.accent(),
+    ))];
+    match crate::engine::commands::recipe_bake_suggest(
+        Some(recipe),
+        app.usable_data_root().as_deref(),
+        app.capabilities
+            .enabled(crate::engine::Capability::RecipeBake),
+    ) {
+        Ok(s) => {
+            for (i, ln) in wrap(&s.display, w.saturating_sub(4)).iter().enumerate() {
+                let indent = if i == 0 { "  " } else { "    " };
+                let style = if app.rc_bake_sel {
+                    p.sel().bold()
+                } else {
+                    p.text()
+                };
+                lines.push(Line::from(Span::styled(format!("{indent}{ln}"), style)));
+            }
+            // 退出码含义可查,且出处是引擎自身——面板不内置第二份真相。
+            // 三行都按内层宽折行:66×50 的详情内层只有 29 列,裁掉尾部
+            // 等于把「面板不代跑」与退出码表看不全(紧凑态不溢出铁律)。
+            let notes = [
+                "面板不代跑;不填 --out 引擎落 <配方目录>/../baked/nw-assemble.sh".to_string(),
+                "退出码 0 成功 · 2 环境缺失 · 3 输入无效/校验失败 · 4 装配失败".to_string(),
+                format!(
+                    "—— 口径出自引擎自身(nw {}),面板不内置第二份真相。",
+                    app.engine_version
+                ),
+            ];
+            for n in &notes {
+                for ln in wrap(n, w.saturating_sub(2)) {
+                    lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+                }
+            }
+        }
+        Err(g) => {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ {}", g.title()),
+                p.warn().bold(),
+            )));
+            for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
+                lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+            }
+        }
+    }
+    lines
+}
+
+/// 配方域为空(空数据仓)或选中行不是配方:给人话指路,不摆空框、
+/// 不给半条命令(#39 用户故事 15)。
+fn bake_empty_lines(p: &crate::theme::Palette, app: &App, w: usize) -> Vec<Line<'static>> {
+    let gate = app.bake_suggest_gate().err();
+    let mut lines = vec![Line::from(Span::styled(
+        "配方域为空:数据仓里还没有配方。",
+        p.dim(),
+    ))];
+    if let Some(g) = gate {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ {}", g.title()),
+            p.warn().bold(),
+        )));
+        for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
+            lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+        }
+    }
+    lines
+}
+
 fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let lines: Vec<Line> = if app.data_root_cause().is_some() {
+    let mut lines: Vec<Line> = if app.data_root_cause().is_some() {
         vec![Line::from(Span::styled(
             "根不对,详情未读取——先按指路设好数据仓根。",
             p.dim(),
@@ -250,20 +344,20 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                     .recipes
                     .get(app.rc_sel)
                     .map(|r| {
-                        vec![
+                        // 建议命令区(#39)与选中行联动重算;键位行钉在内层
+                        // 末行(命中侧同几何,见 layout::recipes_hits)。
+                        let mut v = vec![
                             Line::from(format!("名称   {}", r.name)),
                             Line::from(format!(
                                 "版本   {}",
-                                r.version.clone().unwrap_or_else(|| "—".into())
+                                r.version.clone().unwrap_or_else(|| "——".into())
                             )),
                             Line::from(""),
-                            Line::from(Span::styled(
-                                "配方是仓库里的一等公民;改它要走 bake。",
-                                p.dim(),
-                            )),
-                        ]
+                        ];
+                        v.extend(bake_suggest_lines(p, app, r, inner_w(area)));
+                        v
                     })
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| bake_empty_lines(p, app, inner_w(area))),
                 Domain::Locks => l
                     .locks
                     .get(app.rc_sel)
@@ -313,6 +407,27 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
             },
         }
     };
+    // 配方域建议命令的键位行(#39):钉在详情内层**末行**——与
+    // `layout::recipes_hits` 的同一行几何对齐(点哪打哪)。缺前提时也铺
+    // (文案说清要先补前提),但命中侧不放行,与登记落账闸同一种纪律。
+    if app.rc_domain == Domain::Recipes && app.data_root_cause().is_none() {
+        let budget = inner_h(area);
+        if lines.len() >= budget {
+            lines.truncate(budget.saturating_sub(1));
+        }
+        while lines.len() < budget.saturating_sub(1) {
+            lines.push(Line::from(""));
+        }
+        let ready = app.bake_suggest_gate().is_ok();
+        let (text, style) = if !ready {
+            ("  c 取用(先补上前提)  ", p.dim())
+        } else if app.rc_bake_sel {
+            ("  c 已选中:可复制命令  ", p.accent().bold())
+        } else {
+            ("  c 取用(只读选中)  ", p.accent())
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
