@@ -9,6 +9,28 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+/// 契约守卫(#28):面板**认识**的 envelope schema 集合。
+///
+/// 只收面板认识其 data 形状、或明确知道其存在的引擎 schema(调研底稿
+/// §3 的 `nw/<cmd>.v1` 全集)。不在集合里的一律走「需升级 nw」证据:
+/// 不 panic、不按旧形状降级解析(`data_as` 直接返回 None)。
+/// 这是面板自己的契约知识,不是引擎能力表(那是 #29 的探测门)。
+const KNOWN_SCHEMAS: [&str; 8] = [
+    "nw/validate.v1",
+    "nw/up.v1",
+    "nw/doctor.v1",
+    "nw/bake.v1",
+    "nw/recipe-new.v1",
+    "nw/ls.v1",
+    "nw/source-register.v1",
+    "nw/source-recheck.v1",
+];
+
+/// schema 是否在面板认识的集合内(契约守卫的判据)。
+fn is_known_schema(schema: &str) -> bool {
+    KNOWN_SCHEMAS.contains(&schema)
+}
+
 /// 错误/警告条目五字段。warnings 的 code 可缺。
 #[derive(Clone, Debug, Deserialize)]
 pub struct Evidence {
@@ -33,11 +55,47 @@ pub struct Envelope {
     #[serde(default)]
     pub warnings: Vec<Evidence>,
     pub data: Value,
+    /// 契约守卫证据(#28):schema 不在认识集合时由 [`Envelope::apply_schema_guard`]
+    /// 在解析点合成,非空即「按旧形状解析」被禁止。serde 跳过——它是面板的
+    /// 结论,不是引擎的原话,不参与反序列化。
+    #[serde(skip)]
+    pub schema_guard: Option<Evidence>,
 }
 
 impl Envelope {
-    /// 按 schema 拆出 data 的定型视图;形状不匹配时返回 None(UI 走证据展示)。
+    /// 契约守卫:这次给的 schema 面板认不认识。
+    pub fn schema_known(&self) -> bool {
+        is_known_schema(&self.schema)
+    }
+
+    /// 契约守卫:schema 不认识时合成「需升级 nw」五字段证据(带收到的
+    /// schema 原文与引擎版本),认识时什么都不做。由解析点(runner 的
+    /// `from_parts`)携 rc 调用一次;幂等,重复调用不覆盖。
+    pub fn apply_schema_guard(&mut self, rc: i32) {
+        if self.schema_guard.is_some() || self.schema_known() {
+            return;
+        }
+        self.schema_guard = Some(Evidence {
+            code: Some("SCHEMA_UNKNOWN".into()),
+            exit_code: Some(rc),
+            message: format!(
+                "需升级 nw:面板不认识 envelope schema \"{}\"(引擎 nw {})",
+                self.schema, self.nw
+            ),
+            hint: Some("升级 nw 与本面板,使两端 schema 对齐;收到的原文在 details".into()),
+            details: Some(serde_json::json!({
+                "schema": self.schema,
+                "nw": self.nw,
+            })),
+        });
+    }
+
+    /// 按 schema 拆出 data 的定型视图;schema 不在认识集合(契约守卫)
+    /// 或形状不匹配时返回 None——绝不按旧形状降级解析(UI 走证据展示)。
     pub fn data_as<T: for<'de> Deserialize<'de>>(&self) -> Option<T> {
+        if !self.schema_known() {
+            return None;
+        }
         serde_json::from_value(self.data.clone()).ok()
     }
 
@@ -331,5 +389,70 @@ mod tests {
             details: None,
         });
         assert_eq!(e.headline(), "漂了");
+    }
+
+    // ---- #28 契约守卫:不认识的 schema ----
+
+    fn envelope_with_schema(schema: &str, nw: &str, data: Value) -> Envelope {
+        serde_json::from_value(json!({
+            "schema": schema,
+            "nw": nw,
+            "ok": true,
+            "errors": [],
+            "warnings": [],
+            "data": data,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn 契约守卫_认识的_schema_照常拆型与无证据() {
+        let e = envelope_with_schema("nw/ls.v1", "0.1.0", json!({"domain": "all"}));
+        assert!(e.schema_known());
+        let d: LsData = e.data_as().unwrap();
+        assert_eq!(d.domain, "all");
+        let mut e = e;
+        e.apply_schema_guard(0);
+        assert!(e.schema_guard.is_none(), "认识的 schema 不产生守卫证据");
+    }
+
+    #[test]
+    fn 契约守卫_不认识的_schema_不按旧形状降级解析() {
+        // 即使 data 恰好兼容旧 LsData 形状,也不许拆出来(静默摆错数据)
+        let mut e = envelope_with_schema(
+            "nw/ls.v2",
+            "9.9.9",
+            json!({"domain": "all", "recipes": [{"name": "x"}]}),
+        );
+        assert!(!e.schema_known());
+        assert!(
+            e.data_as::<LsData>().is_none(),
+            "不认识的 schema 必须拒拆,不按旧形状解析"
+        );
+        e.apply_schema_guard(3);
+        let g = e.schema_guard.as_ref().expect("应合成需升级证据");
+        assert_eq!(g.code.as_deref(), Some("SCHEMA_UNKNOWN"));
+        assert_eq!(g.exit_code, Some(3));
+        assert!(
+            g.message.contains("需升级 nw")
+                && g.message.contains("nw/ls.v2")
+                && g.message.contains("9.9.9"),
+            "人话一句含需升级 + schema 原文 + 引擎版本:{}",
+            g.message
+        );
+        let d = g.details.as_ref().unwrap();
+        assert_eq!(d["schema"], "nw/ls.v2");
+        assert_eq!(d["nw"], "9.9.9");
+        // 五字段里的 hint 给升级指引,不回显任何密钥(只放 schema/版本)
+        assert!(g.hint.as_deref().unwrap().contains("升级"));
+    }
+
+    #[test]
+    fn 契约守卫_重复合成幂等_不覆盖已有证据() {
+        let mut e = envelope_with_schema("nw/doctor.v2", "1.0.0", json!({}));
+        e.apply_schema_guard(11);
+        let first = e.schema_guard.clone().unwrap();
+        e.apply_schema_guard(0);
+        assert_eq!(e.schema_guard.unwrap().exit_code, first.exit_code, "幂等");
     }
 }
