@@ -2,7 +2,9 @@
 
 面板新增第四类引擎动作：`nw source register`，且**代跑到落账**（含 `--yes`）。执行路径固定两段——**预审**（不带 `--yes`：扫描 + 验收 + 拟落账记录进 stdout，文件不落）→ **图形确认** → **落账**（带 `--yes`，写 `<数据仓根>/catalog.json`）。为此面板新增「数据仓根」这一状态（设置屏输入，与 NW_HOME 并列，持久化进 config）。`nw source recheck`（只读）一并纳入准许，落点是健康屏的漂移结论——这正是 ADR-0003 Consequences 里「`source recheck` 的漂移结论以只读方式并入健康屏」的兑现。
 
-Status: proposed
+Status: accepted
+
+> **决策记录**：操作者已拍板走两段式（预审 → 图形确认 → 落账），并批准 spec #25 / #33 / #34 / #35 全量；本文「Considered Options」里排除的三条（只给建议命令 / 一键到底 / 凭据收进面板配置）为其明确否决。落地票：#30 预审段、#31 落账段；汇总见 #41。
 
 ## Considered Options
 
