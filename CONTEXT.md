@@ -50,6 +50,10 @@ _Avoid_: 一致（太泛）
 安装根，默认 `$HOME/.nous-warehouse`，布局 `profiles/runtimes/state/pruned`，「一键搬走全部家当」。
 _Avoid_: 家目录（与 HOME 混淆）、安装目录
 
+**数据仓根（data repo root）**：
+配方 / 组件 / 编目的家，`--repo` 指向的目录；`catalog.json` 落在它的根部。面板原无此状态，`ls` 空 repo 时以启动目录兜底。
+_Avoid_: 项目根、workspace
+
 **作者侧 / 目标侧**：
 生成装配命令的一侧 / 执行装配命令的一侧；本面板双视角并存，但 V1 的交互打磨优先目标侧。
 _Avoid_: 客户端 / 服务端（我们没有服务端）
@@ -57,6 +61,14 @@ _Avoid_: 客户端 / 服务端（我们没有服务端）
 **外部源（external source）/ 编目（catalog）/ 条目（entry）**：
 源在作者自己的 GitHub 仓、本仓库只存一条编目记录；一条记录可含多个条目。
 _Avoid_: 市场、注册表
+
+**预审（dry preview）**：
+`nw source register` 不带 `--yes` 的那一段——扫描 + 跑验收 + 把拟落账记录送进 stdout，**文件不落、rc 0**；引擎设计内的只读态，不是错误态。
+_Avoid_: 试运行、空跑
+
+**确认闸（confirmation gate）**：
+引擎侧 `--yes` 的语义：无它 = 拟落账不落盘。面板的图形确认必须承载同等信息量（摊开验收结论与拟落账记录），否则等于把闸门交给手滑。
+_Avoid_: 二次确认、确认弹窗（那是交互形态，这是语义）
 
 **envelope**：
 `nw` stdout 的唯一输出面——`{schema, nw, ok, errors, warnings, data}`；铁律 `ok ≡ (退出码 == 0)`。
@@ -67,6 +79,18 @@ _Avoid_: 响应、输出
 **驾驶舱（cockpit）**：
 本面板的角色——呈现引擎状态、编排引擎动作；不做装配决策、不重造引擎逻辑。
 _Avoid_: 客户端（暗示另一套契约面）、GUI
+
+**代跑（run on behalf）**：
+面板自己把引擎命令跑完。准许清单：`ls` / `up` / `doctor` + `validate`（ADR-0003）、`source register` / `source recheck`（ADR-0006，后者只读）。
+_Avoid_: 自动执行、一键执行
+
+**建议命令（suggested command）**：
+面板给出可复制的命令文案、执行权留给用户——`bake` 等未获准代跑者的既定形态（ADR-0003）。
+_Avoid_: 命令提示、待办
+
+**跟随引擎（upstream-first）**：
+本面板不拥有任何领域决策：CLI 契约、领域词汇、「准许代跑哪些命令」的边界,一律以上游 Nous Warehouse 仓为唯一真相源;上游改,面板跟,不自创、不背离、不复刻引擎逻辑。
+_Avoid_: 兼容、适配（太被动;适配暗示以面板为主位）
 
 **屏幕（screen）**：
 用户停留的界面；V1 五屏：概览、装配、健康、配方、设置。
