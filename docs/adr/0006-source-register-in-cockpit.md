@@ -16,6 +16,8 @@ Status: accepted
 
 - ADR-0003 的「三类」扩为「四类」，新增仅 register / recheck 这一类；`bake` / `recipe new` / `category` / `vps` / 手改配置维持「只展示证据与建议命令，不代跑」。
 - `src/engine/commands.rs` 增 `source_register(repo, kind, name?, yes)`、`source_recheck(name?)`；一律走既有 `App::spawn_engine` 单缝与 `CommandRunner`（Real / Missing / Fake 可测）。
+
+> **实现勘误（以工单 #30/#31 实装为准）**：实装为 `commands::source_register_preaudit(repo, kind, root)` 与 `commands::source_register_commit(repo, kind, root)` 两函数——均带 `--root <数据仓根>`，均无 `--name`（类别不输入、落「未分类」），与上文草图 `source_register(repo, kind, name?, yes)` 不同。
 - envelope 增补 `nw/source-register.v1` / `nw/source-recheck.v1`；验收项 `data.acceptance[]` 的 **id 冻结、措辞不承诺**，面板按 id 渲染、复用结果四态（pass / warn / fail / skip；「无 `--yes`」= skip 是设计内正常态，不是错误）。
 - 登记流程状态机：输入 → 预审 → 确认 → 落账 → 结果；复用发射仪式已有的「浮层 + 布尔 + Enter/Esc 两段命中」，并与 ADR-0005 的命中区同源，鼠标随之可用。
 - 写动作互斥并入既有 `assembling`：登记与装配不同时进行。

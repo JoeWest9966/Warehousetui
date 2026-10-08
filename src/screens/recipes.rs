@@ -851,6 +851,12 @@ fn render_reg_done(frame: &mut Frame, area: Rect, app: &App) {
                 cat,
                 d.entries.len()
             )));
+            // repo 链接(#31 验收点名 名字/类别/链接/条目):链接是记录
+            // 五要素之一,不藏在可复制命令里才看得到。
+            lines.push(Line::from(format!(
+                "  链接    {}",
+                clip(&d.repo, inner_w.saturating_sub(8))
+            )));
             for e in d.entries.iter().take(3) {
                 lines.push(Line::from(Span::styled(
                     format!(
@@ -878,16 +884,27 @@ fn render_reg_done(frame: &mut Frame, area: Rect, app: &App) {
                 p.warn(),
             )));
             lines.push(Line::from(""));
-            // 可复制文案(用户故事 18):贴进 PR / CI 复核。
-            let copy = format!(
-                "nw source register --repo {} --kind {} --yes --root {}",
-                app.reg_repo_buf,
-                app.reg_kind.word(),
-                app.usable_data_root().unwrap_or_else(|| ".".into())
-            );
+            // 可复制文案(用户故事 18):贴进 PR / CI 复核。取不到可用
+            // 数据仓根时明说不可复制,绝不产出 `--root .` 的假命令。
             lines.push(Line::from(Span::styled("  可复制命令", p.accent())));
-            for ln in wrap(&copy, inner_w.saturating_sub(4)).into_iter().take(2) {
-                lines.push(Line::from(Span::styled(format!("    {ln}"), p.text())));
+            match app.usable_data_root() {
+                Some(root) => {
+                    let copy = format!(
+                        "nw source register --repo {} --kind {} --yes --root {}",
+                        app.reg_repo_buf,
+                        app.reg_kind.word(),
+                        root
+                    );
+                    for ln in wrap(&copy, inner_w.saturating_sub(4)).into_iter().take(2) {
+                        lines.push(Line::from(Span::styled(format!("    {ln}"), p.text())));
+                    }
+                }
+                None => {
+                    lines.push(Line::from(Span::styled(
+                        "    —(数据仓根不可用,命令不可复制)",
+                        p.dim(),
+                    )));
+                }
             }
         }
         _ => {

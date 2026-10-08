@@ -66,7 +66,7 @@ cargo build --release
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets     # 133 个单测:契约解析 / 发现策略 / 五屏快照 / 装配四路径 / 命中区与响应式两档 / 数据仓根三态指路 / 80×30 整帧 golden
+cargo test --all-targets     # 单测:契约解析 / 发现策略 / 五屏快照 / 装配四路径 / 命中区与响应式两档 / 数据仓根三态指路 / 登记两段式 / 80×30 整帧 golden
 cargo build --release
 ```
 
@@ -75,7 +75,7 @@ CI 三平台(ubuntu/macos/windows)跑齐上面四项。
 ## 文档
 
 - 领域词汇:[CONTEXT.md](./CONTEXT.md)
-- 架构决策:[docs/adr/](./docs/adr/)(0001 子进程契约 / 0002 技术栈 / 0003 动作边界)
+- 架构决策:[docs/adr/](./docs/adr/)(0001 子进程契约 / 0002 技术栈 / 0003 动作边界 / 0004 响应式双态 / 0005 鼠标命中区 / 0006 外部源登记两段式 / 0007 面板跟随引擎)
 - 调研底稿:[docs/research/](./docs/research/)(nw CLI 契约面 / 用户旅程 / 环境验证)
 - 发布矩阵:[docs/release.md](./docs/release.md)(安装 / 校验 / 打 tag 发布)
 - 工单:[GitHub Issues](https://github.com/JoeWest9966/Warehousetui/issues)(wayfinder 蓝图 #1)
