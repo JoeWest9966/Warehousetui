@@ -1,13 +1,10 @@
 //! typed 命令构造。面板只发三类动作(ADR-0003)+ 版本探测 + 只读 `ls`。
 
-/// 五域总览。空 `repo` 时不带 `--repo`。
-pub fn ls(repo: Option<&str>) -> Vec<String> {
-    let mut a = vec!["ls".to_string()];
-    if let Some(r) = repo {
-        a.push("--repo".into());
-        a.push(r.into());
-    }
-    a
+/// 五域总览。数据仓根**显式携带**——签名强制带 repo,
+/// 类型层面杜绝「不带 --repo 让引擎拿当前目录兜底」(spec #24,票 #27)。
+/// 缺根时调用方不应构造命令(下发前有门控,见 `App::spawn_engine`)。
+pub fn ls(repo: &str) -> Vec<String> {
+    vec!["ls".to_string(), "--repo".into(), repo.to_string()]
 }
 
 /// 装配。`lock` 可以是 `.nwlock` 或装配命令文件。
@@ -84,8 +81,10 @@ mod tests {
     }
 
     #[test]
-    fn ls_可选_repo() {
-        assert_eq!(ls(None), vec!["ls"]);
-        assert_eq!(ls(Some(".")), vec!["ls", "--repo", "."]);
+    fn ls_必带_repo_不给引擎当前目录兜底() {
+        assert_eq!(ls("/data/repo"), vec!["ls", "--repo", "/data/repo"]);
+        // 签名里没有 Option:想不带 --repo 都写不出来
+        let a = ls(".");
+        assert_eq!(a[1], "--repo");
     }
 }

@@ -8,7 +8,7 @@ use ratatui::Frame;
 use crate::app::App;
 use crate::engine::{EngineOutput, ExitCode};
 use crate::layout::{size_class, SizeClass};
-use crate::screens::body;
+use crate::screens::{body, data_root_signpost};
 
 const STEPS: [&str; 7] = [
     "0 前置",
@@ -42,6 +42,16 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     let cols =
         Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
+    // 锁定集属五域之一:根不对时入口给指路,不摆空清单(票 #27)。
+    if app.data_root_cause().is_some() {
+        frame.render_widget(
+            Paragraph::new(data_root_signpost(app))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .style(p.dim()),
+            area,
+        );
+        return;
+    }
     let Some(ls) = app.ls.as_ref() else {
         frame.render_widget(
             Paragraph::new("锁定集清单来自 ls;没有数据先回概览按 r 刷新。").style(p.dim()),

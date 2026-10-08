@@ -98,10 +98,10 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         ritual_hits(body, class, &mut hits);
         return hits;
     }
-    // 手填 NW_HOME 浮层对鼠标惰性:打字仍走键盘;浮层打开期间鼠标
-    // 不分派任何命中区——浮层打开时点击只作用于浮层,不误触底层
-    // (spec #15 故事 14/16)。
-    if app.home_input {
+    // 手填浮层(NW_HOME / 数据仓根)对鼠标惰性:打字仍走键盘;浮层打开
+    // 期间鼠标不分派任何命中区——点击只作用于浮层,不误触底层
+    // (spec #15 故事 14/16;数据仓根手填沿用同一条)。
+    if app.home_input || app.data_input {
         return hits;
     }
     match class {

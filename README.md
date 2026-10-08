@@ -43,7 +43,7 @@ cargo build --release
 | 装配 | 选锁定集 → 发射仪式 → 七步 + stderr 实时日志 | `↑/↓` 选锁,`Enter` 发射仪式,再 `Enter` 发射 |
 | 健康 | doctor 七面卡片 / validate 27 项清单 + 证据五字段 | `r` 复核,`m` 切模式,`↑/↓` 翻阅 |
 | 配方 | 五域两栏只读浏览(recipes/components/sources/profiles/locks) | `h/l` 切域,`↑/↓` 选行 |
-| 设置 | 引擎发现状态、NW_HOME、主题、配置入口 | `n` 轮换 NW_HOME,`e` 拉起 $EDITOR,`t` 主题 |
+| 设置 | 引擎发现状态、NW_HOME、数据仓根、主题、配置入口 | `n` 轮换 NW_HOME,`d` 手填数据仓根,`e` 拉起 $EDITOR,`t` 主题 |
 
 通用:`j/k` 切屏 · `Enter` 确认 · `Esc` 返回 · `?` 帮助 · `q` 退出(装配态禁用)。
 
@@ -66,7 +66,7 @@ cargo build --release
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets     # 118 个单测:契约解析 / 发现策略 / 五屏快照 / 装配四路径 / 命中区与响应式两档 / 80×30 整帧 golden
+cargo test --all-targets     # 133 个单测:契约解析 / 发现策略 / 五屏快照 / 装配四路径 / 命中区与响应式两档 / 数据仓根三态指路 / 80×30 整帧 golden
 cargo build --release
 ```
 

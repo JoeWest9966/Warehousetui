@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::app::App;
 use crate::engine::State;
-use crate::screens::body;
+use crate::screens::{body, data_root_signpost};
 
 pub fn render_overview(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
@@ -43,6 +43,18 @@ fn render_alert(frame: &mut Frame, area: Rect, app: &App) {
         let line = Line::from(vec![
             Span::styled(" ⚠ 找不到 nw 二进制 ", p.fail()),
             Span::styled("——按 F1? 不,按 ? 看帮助;到「设置」屏看指路", p.dim()),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    // 数据仓根门控优先于陈旧派态:根不对时,五域本就没在读(spec #24)。
+    if let Some(cause) = app.data_root_cause() {
+        let line = Line::from(vec![
+            Span::styled(format!(" ⚠ {} ", cause.title()), p.warn()),
+            Span::styled(
+                format!("——{}", cause.advice(app.data_root.as_deref())),
+                p.dim(),
+            ),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
@@ -91,6 +103,17 @@ fn render_profiles(frame: &mut Frame, area: Rect, app: &App) {
         .title(Span::styled(" 派 (profiles) ", p.accent()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // 根不对 → 五域入口给指路,不把「没在读」呈现成「没有数据」(票 #27)。
+    if app.data_root_cause().is_some() {
+        frame.render_widget(
+            Paragraph::new(data_root_signpost(app))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .style(p.dim()),
+            inner,
+        );
+        return;
+    }
 
     let Some(ls) = app.ls.as_ref() else {
         if app.ls_loading {
@@ -209,7 +232,8 @@ fn render_recent_log(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_counts(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let Some(ls) = app.ls.as_ref() else {
+    // 根不对时不摆计数:0 计数会把「没在读」冒充成「没有数据」。
+    let Some(ls) = app.ls.as_ref().filter(|_| app.data_root_cause().is_none()) else {
         frame.render_widget(Paragraph::new(""), area);
         return;
     };

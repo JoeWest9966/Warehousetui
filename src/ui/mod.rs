@@ -156,7 +156,7 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     if app.assembling {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("装配中:动作已锁定", p.dim()));
-    } else if app.home_input {
+    } else if app.home_input || app.data_input {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
     } else {
@@ -192,6 +192,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::from("    Esc        返回 / 关闭浮层"),
         Line::from("    t          切换主题"),
         Line::from("    i          手填 NW_HOME(设置屏)"),
+        Line::from("    d          手填数据仓根(设置屏)"),
         Line::from("    ?          本帮助"),
         Line::from("    q          退出(装配态 / 输入中禁用)"),
         Line::from(""),
@@ -402,6 +403,16 @@ mod tests {
         app.home_input = true;
         let s = render_to_string(&app, 100, 30);
         assert!(s.contains("输入中"));
+        assert!(s.contains("Enter 确认"));
+    }
+
+    /// 数据仓根手填与 NW_HOME 手填同一条 HUD 提示(票 #27)。
+    #[test]
+    fn 数据仓根输入态_hud_给键位提示() {
+        let mut app = ui_app();
+        app.data_input = true;
+        let s = render_to_string(&app, 100, 30);
+        assert!(s.contains("输入中"), "数据仓根手填共用输入态提示");
         assert!(s.contains("Enter 确认"));
     }
 

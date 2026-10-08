@@ -10,7 +10,7 @@ use crate::engine::config;
 use crate::screens::body;
 
 pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
-    let block = body(app, "NW_HOME · 引擎发现");
+    let block = body(app, "NW_HOME · 数据仓根 · 引擎发现");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -22,6 +22,9 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     // 浮层优先级最低的常屏之上:手填输入浮层盖在指路屏上也成立
     if app.home_input {
         render_home_input(frame, area, app);
+    }
+    if app.data_input {
+        render_data_input(frame, area, app);
     }
 }
 
@@ -39,6 +42,29 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled("环境", p.accent())),
         Line::from(format!("  NW_HOME  {}  (n 轮换 / i 手填)", app.nw_home)),
+        Line::from(format!(
+            "  数据仓根  {}  (d 手填)",
+            app.data_root.as_deref().unwrap_or("未设置")
+        )),
+        // 三态指路与五域入口同源(标题+说法,互不冒充);健康时给一行安心
+        match app.data_root_cause() {
+            Some(cause) => {
+                let style = if cause == crate::app::DataRootCause::Unset {
+                    p.dim()
+                } else {
+                    p.warn()
+                };
+                Line::from(Span::styled(
+                    format!(
+                        "  {}: {}",
+                        cause.title(),
+                        cause.advice(app.data_root.as_deref())
+                    ),
+                    style,
+                ))
+            }
+            None => Line::from(Span::styled("  数据仓根就绪:五域读的就是这个目录", p.dim())),
+        },
         Line::from(""),
         Line::from(Span::styled("外观", p.accent())),
         Line::from(format!("  主题     {} (t 切换)", app.theme.name())),
@@ -116,6 +142,42 @@ fn render_home_input(frame: &mut Frame, area: Rect, app: &App) {
                 Block::bordered()
                     .border_style(p.accent())
                     .title(Span::styled(" 手填 NW_HOME ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// 数据仓根手填浮层:与 NW_HOME 手填同构(缓冲区 + 块光标 + 键位提示)。
+fn render_data_input(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let w = 64u16.min(area.width.saturating_sub(4));
+    let h = 7u16.min(area.height.saturating_sub(2));
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(Clear, popup);
+    let cursor = format!("{}█", app.data_buf);
+    let lines = vec![
+        Line::from(Span::styled(cursor, p.text())),
+        Line::from(Span::styled(
+            "  Enter 确认 · Esc/q 放弃 · 退格删字符 · ~ 会展开",
+            p.dim(),
+        )),
+        Line::from(Span::styled(
+            "  生效后写配置并立即刷新五域;坏路径会得到指路",
+            p.dim(),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 手填数据仓根 ", p.accent().bold())),
             )
             .style(p.surface()),
         popup,
