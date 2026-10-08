@@ -323,6 +323,29 @@ impl FakeRunner {
         }
     }
 
+    /// 由 (args 子串, rc, fixture JSON, stderr 人话) 列表构造。
+    /// stderr 是能力探测的判定面(#29:引擎亲口「未知子命令」),
+    /// 三元构造给不出 stderr,故另开此路;既有三元构造不动。
+    pub fn with_stderr(rules: &[(&str, i32, &str, &str)]) -> Self {
+        Self {
+            rules: rules
+                .iter()
+                .map(|(needle, rc, json, stderr)| {
+                    let lines: Vec<String> = stderr.lines().map(String::from).collect();
+                    (
+                        needle.to_string(),
+                        EngineOutput::from_parts(
+                            &[needle.to_string()],
+                            *rc,
+                            json.to_string(),
+                            lines,
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+
     fn match_for(&self, args: &[String]) -> EngineOutput {
         let joined = args.join(" ");
         self.rules

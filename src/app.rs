@@ -7,7 +7,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::engine::{
-    commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, LsData, State,
+    capability::{self, Capability, Probe},
+    commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, Gate, LsData, State,
 };
 use crate::input::{self, InputAction};
 use crate::layout::{hitmap, size_class, ScrollDir, Target};
@@ -163,6 +164,8 @@ pub struct App {
     pub data_root: Option<String>,
     pub engine: EngineStatus,
     pub engine_version: String,
+    /// 能力探测门(#29):问引擎自己所得的三态结论,入口可用性唯一事实源。
+    pub capabilities: Gate,
     pub runner: Arc<dyn CommandRunner>,
 
     // ---- 概览 ----
@@ -276,6 +279,7 @@ impl App {
             data_root: crate::engine::config::load().0.data_root,
             engine,
             engine_version: "探测中".into(),
+            capabilities: Gate::default(),
             runner,
             ls: None,
             ls_loading: false,
@@ -312,10 +316,15 @@ impl App {
         }
     }
 
-    /// 开机自举:版本探测 + 首次 ls(引擎缺失时 MissingRunner 自然给出证据)。
-    /// 数据仓根缺 / 坏时不下发 ls——缺根不发命令(spec #24),指路在五域入口。
+    /// 开机自举:版本探测 + 能力探测(#29)+ 首次 ls(#27:引擎缺失时
+    /// MissingRunner 自然给出证据;数据仓根缺/坏时不下发 ls,指路在五域入口)。
     pub fn bootstrap(&mut self, tx: &mpsc::UnboundedSender<EngineEvent>) {
         self.spawn_engine(commands::version(), tx);
+        // 能力探测:每能力一次无害调用,经同一唯一入口下发;
+        // 结论在 on_engine_finished 按精确探针 argv 收账。
+        for cap in Capability::ALL {
+            self.spawn_engine(cap.probe_args(), tx);
+        }
         if let Some(root) = self.usable_data_root() {
             self.spawn_engine(commands::ls(&root), tx);
         } else if let Some(cause) = self.data_root_cause() {
@@ -537,8 +546,25 @@ impl App {
                 self.push_log(format!("{cmd} 复核完成"));
                 self.hl_result = Some(out);
             }
-            _ => {}
+            // 能力探测回音(#29):只认精确探针 argv——真实的
+            // `source register --repo …`(#30)不落此路,其结果留给 #30 路由。
+            _ => {
+                if let Some(cap) = Capability::from_probe(&out.args) {
+                    let verdict = capability::interpret(&out);
+                    if verdict != Probe::Available {
+                        // 日志只记一句人话;指路全文归设置屏能力清单。
+                        self.push_log(format!("能力探测:{} {}", cap.label(), verdict.label()));
+                    }
+                    self.capabilities.record(cap, verdict);
+                }
+            }
         }
+    }
+
+    /// 入口门(#29):引擎明确「有」才放行;未决与禁用一律不给。
+    /// #30 的外部源登记入口按此禁用并指路。
+    pub fn entry_enabled(&self, cap: Capability) -> bool {
+        self.capabilities.enabled(cap)
     }
 
     fn on_key(&mut self, k: KeyEvent) {
@@ -1347,7 +1373,7 @@ mod tests {
         );
         assert!(!app.ls_loading, "缺根不设加载态(命令未下发)");
         assert!(app.log[0].contains("未下发"), "日志留证据");
-        // bootstrap:只下版本探测
+        // bootstrap:版本探测 + 能力探针(#29),但不含 ls——缺根不下发命令
         let mut app2 = settings_app();
         app2.data_root = None;
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1358,7 +1384,14 @@ mod tests {
                 cmds.push(o.args.first().cloned().unwrap_or_default());
             }
         }
-        assert_eq!(cmds, vec!["--version".to_string()], "bootstrap 不发 ls");
+        assert!(
+            cmds.contains(&"--version".to_string()),
+            "bootstrap 仍下版本探测:{cmds:?}"
+        );
+        assert!(
+            !cmds.contains(&"ls".to_string()),
+            "bootstrap 缺根不发 ls(能力探针不受数据仓根门控):{cmds:?}"
+        );
         assert!(!app2.ls_loading);
         assert_eq!(app2.data_root_cause(), Some(DataRootCause::Unset));
     }
@@ -1954,5 +1987,180 @@ mod tests {
         assert_eq!(app.screen, Screen::Assemble, "契约守卫不冻结面板");
         app.update(Message::Key(key('?')));
         assert!(app.help, "帮助浮层照常");
+    }
+
+    // ---- #29 能力探测门(App 行为缝:探针下发 / 三路回音 / 入口门 / 指路) ----
+
+    /// 缺能力夹具:category/vps 按 0.1.0 实证形态回放(空 stdout + rc 3 +
+    /// stderr 人话「未知子命令」),source register/recheck 回 envelope(存在)。
+    fn missing_caps_runner() -> FakeRunner {
+        FakeRunner::with_stderr(&[
+            (
+                "category",
+                3,
+                "",
+                "nw: 未知子命令 \"category\"\n用法见 stderr",
+            ),
+            ("vps", 3, "", "nw: 未知子命令 \"vps\""),
+            (
+                "source register",
+                0,
+                r#"{"schema":"nw/source-register.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{}}"#,
+                "",
+            ),
+            (
+                "source recheck",
+                0,
+                r#"{"schema":"nw/source-recheck.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"catalog.json","checked":[],"drift":[]}}"#,
+                "",
+            ),
+            (
+                "ls",
+                0,
+                r#"{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}}"#,
+                "",
+            ),
+        ])
+    }
+
+    /// 齐备夹具:四条探针都回 envelope(等价于具备能力的引擎回放)。
+    fn capable_runner() -> FakeRunner {
+        FakeRunner::with_stderr(&[
+            (
+                "category",
+                0,
+                r#"{"schema":"nw/category.v1","nw":"0.2.0","ok":true,"errors":[],"warnings":[],"data":{"categories":[]}}"#,
+                "",
+            ),
+            (
+                "vps",
+                0,
+                r#"{"schema":"nw/vps.v1","nw":"0.2.0","ok":true,"errors":[],"warnings":[],"data":{}}"#,
+                "",
+            ),
+            (
+                "source register",
+                0,
+                r#"{"schema":"nw/source-register.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{}}"#,
+                "",
+            ),
+            (
+                "source recheck",
+                0,
+                r#"{"schema":"nw/source-recheck.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"catalog.json","checked":[],"drift":[]}}"#,
+                "",
+            ),
+            (
+                "ls",
+                0,
+                r#"{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}}"#,
+                "",
+            ),
+        ])
+    }
+
+    /// 把 bootstrap 下发的全部回音灌回状态树(生产同路:主循环收 tx)。
+    fn feed_bootstrap(
+        app: &mut App,
+        tx: &mpsc::UnboundedSender<EngineEvent>,
+        rx: &mut mpsc::UnboundedReceiver<EngineEvent>,
+    ) {
+        app.bootstrap(tx);
+        while let Ok(ev) = rx.try_recv() {
+            app.update(Message::Engine(ev));
+        }
+    }
+
+    #[tokio::test]
+    async fn 能力探针经唯一入口下发_无害无写旗标() {
+        let mut app = fake_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.bootstrap(&tx);
+        let mut argvs: Vec<Vec<String>> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Finished(o) = ev {
+                argvs.push(o.args);
+            }
+        }
+        for cap in Capability::ALL {
+            assert!(
+                argvs.contains(&cap.probe_args()),
+                "{:?} 探针必须经 spawn_engine 下发",
+                cap
+            );
+        }
+        // 无害性:探针不携带任何会动文件的旗标
+        for a in &argvs {
+            assert!(
+                !a.iter()
+                    .any(|f| f == "--yes" || f == "--root" || f == "--lock"),
+                "探针必须无害:{a:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 能力门_缺能力入口禁用并指路_齐备正常呈现() {
+        let mut app = App::with_runner(Arc::new(missing_caps_runner()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        feed_bootstrap(&mut app, &tx, &mut rx);
+        // 实证锚点:0.1.0 无 category/vps,这两个入口一律不呈现为可用
+        assert!(!app.entry_enabled(Capability::Category));
+        assert!(!app.entry_enabled(Capability::Vps));
+        // 能力齐备的两个:入口正常呈现
+        assert!(app.entry_enabled(Capability::SourceRegister));
+        assert!(app.entry_enabled(Capability::SourceRecheck));
+        // 操作者可见:禁用组 + 指路(说清缺的是引擎能力、不是面板坏了)
+        app.splash = false;
+        app.screen = Screen::Settings;
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("入口禁用:类别、vps"), "缺能力入口禁用可见:{s}");
+        assert!(
+            s.contains(crate::engine::GATE_HINT),
+            "指路文案可见(缺的是引擎能力,不是面板坏了)"
+        );
+        assert!(s.contains("✓外部源登记"), "齐备能力正常呈现:{s}");
+
+        // 等价回放另一侧:齐备引擎全部放行,不出现禁用组
+        let mut app2 = App::with_runner(Arc::new(capable_runner()));
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        feed_bootstrap(&mut app2, &tx2, &mut rx2);
+        for cap in Capability::ALL {
+            assert!(app2.entry_enabled(cap), "齐备引擎下 {:?} 应放行", cap);
+        }
+        app2.splash = false;
+        app2.screen = Screen::Settings;
+        let s2 = crate::testutil::frame_display(&app2, 110, 30);
+        assert!(!s2.contains("入口禁用"), "齐备时无禁用组:{s2}");
+        assert!(s2.contains("✓类别"), "齐备时类别入口呈现为可用");
+    }
+
+    #[tokio::test]
+    async fn 能力探测失败_走既有指路屏_面板不瘫痪() {
+        let mut app = App::with_runner(Arc::new(crate::engine::MissingRunner {
+            attempted: vec!["PATH".into()],
+        }));
+        app.engine.found = false;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        feed_bootstrap(&mut app, &tx, &mut rx);
+        // 探测全部未决:入口一律不放行(缺省不猜)
+        for cap in Capability::ALL {
+            assert!(!app.entry_enabled(cap), "未决不放行:{cap:?}");
+        }
+        // 引擎缺失:走既有指路屏,不新造失败面
+        app.splash = false;
+        app.screen = Screen::Settings;
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("找不到 nw"), "探测失败走既有指路屏:{s}");
+        // 不瘫痪:探测回音后其余部分照常可操作
+        app.update(Message::Key(key('?')));
+        assert!(app.help, "探测失败后帮助浮层仍可开(面板不瘫痪)");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.help, "帮助浮层可关");
+        app.update(Message::Key(key('j')));
+        assert_ne!(app.screen, Screen::Settings, "探测失败后仍可切屏");
     }
 }
