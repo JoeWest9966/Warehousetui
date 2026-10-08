@@ -9,6 +9,8 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::State;
+
 /// 契约守卫(#28):面板**认识**的 envelope schema 集合。
 ///
 /// 只收面板认识其 data 形状、或明确知道其存在的引擎 schema(调研底稿
@@ -36,6 +38,10 @@ fn is_known_schema(schema: &str) -> bool {
 pub struct Evidence {
     #[serde(default)]
     pub code: Option<String>,
+    /// 引擎的字段名是 `exitCode`(camelCase,契约冻结)。少了这一条 rename,
+    /// 证据五字段的第四列永远解析成 None——屏幕上的 `rc0` 是面板自己
+    /// 编的,不是引擎说的(#40 验收「显示引擎证据」钉的是原文)。
+    #[serde(default, rename = "exitCode")]
     pub exit_code: Option<i32>,
     pub message: String,
     #[serde(default)]
@@ -341,6 +347,65 @@ impl RegisterData {
     }
 }
 
+// ---- source recheck(`nw/source-recheck.v1`,工单 #40) ----
+
+/// 一条被复核的记录的事实(谁、扫到几个、快照是谁)。
+/// `commit` 只是快照身份:**上游 commit 变化不算漂移**(引擎口径,面板不自定规则)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct CheckedSource {
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub entries: u32,
+}
+
+/// 一条漂移差异。`kind` 是引擎冻结的四种之一:
+/// `added`(仓有编目无)/ `removed`(编目有仓无)/ `renamed`(路径在 name 变)/
+/// `path_changed`(name 在路径变)。面板按原文呈现,不自造第五种。
+#[derive(Clone, Debug, Deserialize)]
+pub struct Drift {
+    pub source: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub entry: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// recheck 的 data 形状(只读:只报告、永不写账)。
+/// 编目不存在 → 空报告 + rc 0(「还没注册过任何外部源」是合法状态)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RecheckData {
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub checked: Vec<CheckedSource>,
+    #[serde(default)]
+    pub drift: Vec<Drift>,
+}
+
+impl RecheckData {
+    /// 这条记录的漂移结论按结果四态落:无漂移 = 过,有漂移 = 败。
+    /// (漂移在引擎侧是「结论是红的」——rc 3;面板不把它降级成警告。)
+    pub fn state_of(&self, source: &str) -> State {
+        if self.drift.iter().any(|d| d.source == source) {
+            State::Fail
+        } else if self.checked.iter().any(|c| c.name == source) {
+            State::Pass
+        } else {
+            State::Skip
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +576,45 @@ mod tests {
         let first = e.schema_guard.clone().unwrap();
         e.apply_schema_guard(0);
         assert_eq!(e.schema_guard.unwrap().exit_code, first.exit_code, "幂等");
+    }
+
+    // ---- #40 recheck 定型:只读漂移结论,四态判定以引擎原文为据 ----
+
+    #[test]
+    fn 解析_recheck_data_漂移四种与快照身份() {
+        let e = envelope_with_schema(
+            "nw/source-recheck.v1",
+            "0.1.0",
+            json!({
+                "catalogPath": "/data/repo/catalog.json",
+                "checked": [
+                    {"name": "web-search", "kind": "skill", "repo": "o/r", "commit": "abc123", "entries": 2},
+                    {"name": "theme-pack", "kind": "extension", "repo": "o/t", "commit": "def456", "entries": 1}
+                ],
+                "drift": [
+                    {"source": "web-search", "kind": "added", "entry": "deep-research", "path": "skills/deep-research"}
+                ]
+            }),
+        );
+        let d: RecheckData = e.data_as().unwrap();
+        assert_eq!(d.checked.len(), 2);
+        assert_eq!(d.checked[0].entries, 2);
+        assert_eq!(d.drift[0].kind, "added");
+        // 四态:有漂移=败,查了没漂移=过,没查=略
+        assert_eq!(d.state_of("web-search"), State::Fail);
+        assert_eq!(d.state_of("theme-pack"), State::Pass);
+        assert_eq!(d.state_of("not-checked"), State::Skip);
+    }
+
+    #[test]
+    fn 解析_recheck_data_编目不存在是空报告不是错误() {
+        let e = envelope_with_schema(
+            "nw/source-recheck.v1",
+            "0.1.0",
+            json!({"catalogPath": "catalog.json", "checked": [], "drift": []}),
+        );
+        let d: RecheckData = e.data_as().unwrap();
+        assert!(d.checked.is_empty() && d.drift.is_empty());
+        assert_eq!(d.state_of("whatever"), State::Skip, "没查过的不冒充没问题");
     }
 }

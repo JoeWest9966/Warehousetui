@@ -84,6 +84,22 @@ pub fn source_register_commit(repo: &str, kind: &str, root: &str) -> Vec<String>
     a
 }
 
+/// 外部源漂移复核(spec #34 / 工单 #40):**只读**——只报告漂移、永不写账。
+/// `name` 非空 = 只查这一条记录;None = 全查已登记源。
+/// `--root` 指数据仓根(与 register 同槽位;别与 ls 的 `--repo` 混)。
+/// 铁律:本命令不产生、也不允许产生任何写旗标——两段式登记的写入口只有
+/// `source_register_commit` 一个,那里才有 `--yes`。
+pub fn source_recheck(name: Option<&str>, root: &str) -> Vec<String> {
+    let mut a = vec!["source".into(), "recheck".into()];
+    if let Some(n) = name {
+        a.push("--name".into());
+        a.push(n.to_string());
+    }
+    a.push("--root".into());
+    a.push(root.to_string());
+    a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +130,26 @@ mod tests {
         // 签名里没有 Option:想不带 --repo 都写不出来
         let a = ls(".");
         assert_eq!(a[1], "--repo");
+    }
+
+    #[test]
+    fn recheck_只读_按名限定与全查都不带任何写旗标() {
+        let all = source_recheck(None, "/data/root");
+        assert_eq!(
+            all,
+            vec!["source", "recheck", "--root", "/data/root"],
+            "全查:不带 --name"
+        );
+        let one = source_recheck(Some("web-search"), "/data/root");
+        assert_eq!(one[2], "--name");
+        assert_eq!(one[3], "web-search");
+        assert_eq!(one[4], "--root");
+        for a in [&all, &one] {
+            assert!(
+                !a.iter().any(|s| s == "--yes"),
+                "只读铁律:recheck 的 argv 里不许出现 --yes(写入口只有 register 一个)"
+            );
+        }
     }
 
     #[test]

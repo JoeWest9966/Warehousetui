@@ -771,3 +771,162 @@ fn 设置屏能力_无响应回未决不冒充禁用() {
         "未决不给「缺能力」指路(那是禁用组的):{s}"
     );
 }
+// ---- #40 外部源漂移:recheck 只读入健康屏,四态,口径以引擎为唯一真相 ----
+
+/// 两条已登记外部源 + 一次 recheck 回放(1 处 added 漂移,rc 3)。
+fn recheck_app() -> App {
+    use crate::engine::{Capability, Probe};
+    let ls = r#"{"domain":"all","recipes":[],"components":[],"sources":[{"name":"web-search","kind":"skill","entries":["a","b"]},{"name":"theme-pack","kind":"extension","entries":["t"]}],"profiles":[],"locks":[]}"#;
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Recheck;
+    app.ls = Some(serde_json::from_str(ls).unwrap());
+    app.capabilities
+        .record(Capability::SourceRecheck, Probe::Available);
+    app
+}
+
+const RECHECK_DRIFT: &str = r#"{"schema":"nw/source-recheck.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"漂移 1 处:上游与编目不一致","hint":"重跑 nw source register --yes 覆盖写","details":{"catalogPath":"/data/repo/catalog.json"}}],"warnings":[],"data":{"catalogPath":"/data/repo/catalog.json","checked":[{"name":"web-search","kind":"skill","repo":"o/r","commit":"abc123","entries":2},{"name":"theme-pack","kind":"extension","repo":"o/t","commit":"def456","entries":1}],"drift":[{"source":"web-search","kind":"added","entry":"deep-research","path":"skills/deep-research"}]}}"#;
+
+#[test]
+fn 外部源漂移_四态呈现_与doctor三档并列不合并() {
+    let mut app = recheck_app();
+    feed(
+        &mut app,
+        out(&["source", "recheck", "--root", "/tmp"], 3, RECHECK_DRIFT),
+    );
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("外部源漂移"), "模式标题:{s}");
+    // 四态:有漂移=败、查了没漂移=过
+    assert!(s.contains("web-search"), "记录名在清单:{s}");
+    assert!(s.contains("theme-pack"), "无漂移记录也在清单:{s}");
+    // 漂移条目按引擎原文的 kind 呈现,不改写
+    assert!(s.contains("added"), "漂移 kind 取引擎原文:{s}");
+    assert!(
+        s.contains("web-search/deep-research"),
+        "条目点名到 source/entry:{s}"
+    );
+    assert!(s.contains("skills/deep-research"), "路径取引擎原文:{s}");
+    // 结论与指路:批准的更新由操作者自己重跑 register
+    assert!(s.contains("1 处漂移"), "漂移计数:{s}");
+    assert!(
+        s.contains("重跑 register 覆盖写"),
+        "给可行动指路,执行权在操作者:{s}"
+    );
+    // 与 doctor 三档不合并:三种语义各说各话
+    assert!(
+        !s.contains("降级:没完全好"),
+        "不把 doctor 的降级档搬来冒充:{s}"
+    );
+    assert!(
+        !s.contains("破损:清单没了"),
+        "不把 doctor 的破损档搬来冒充:{s}"
+    );
+    // 证据五字段原样(含引擎真实的 rc)
+    assert!(s.contains("INPUT_INVALID rc3"), "证据带引擎 rc 原文:{s}");
+    assert!(s.contains("上游与编目不一致"), "证据 message 原样:{s}");
+    // 只读铁律与 commit 口径
+    assert!(s.contains("只读"), "明示只读:{s}");
+    assert!(s.contains("commit 变化不算漂移"), "口径以引擎为准:{s}");
+}
+
+#[test]
+fn 外部源漂移_无漂移与未查可区分_不拿未查冒充没问题() {
+    // 还没查:明说未查,不给四态结论
+    let app = recheck_app();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("还没查"), "未查说清:{s}");
+    assert!(!s.contains("无漂移"), "未查不冒充「没问题」:{s}");
+    // 查了且无漂移:给「过」
+    let ok = r#"{"schema":"nw/source-recheck.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/data/repo/catalog.json","checked":[{"name":"web-search","kind":"skill","repo":"o/r","commit":"abc123","entries":2},{"name":"theme-pack","kind":"extension","repo":"o/t","commit":"def456","entries":1}],"drift":[]}}"#;
+    let mut app = recheck_app();
+    feed(
+        &mut app,
+        out(&["source", "recheck", "--root", "/tmp"], 0, ok),
+    );
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("无漂移"), "查了没漂移给结论:{s}");
+    assert!(s.contains("漂移条目:无"), "条目区说清无:{s}");
+}
+
+#[test]
+fn 外部源漂移_三种缺前提各有可区分指路() {
+    // 未设数据仓根
+    let mut app = recheck_app();
+    app.data_root = None;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("数据仓根未设"), "未设根指路:{s}");
+    assert!(!s.contains("还没查"), "未设根不摆查询态:{s}");
+    // 引擎无 source 能力
+    use crate::engine::{Capability, Probe};
+    let mut app = recheck_app();
+    app.capabilities
+        .record(Capability::SourceRecheck, Probe::Unavailable);
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("引擎缺 source 能力"), "缺能力指路:{s}");
+    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    // 编目为空
+    let mut app = recheck_app();
+    app.ls = Some(
+        serde_json::from_str(
+            r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+        )
+        .unwrap(),
+    );
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("没有已登记外部源"), "空编目给人话:{s}");
+    assert!(s.contains("按 r 登记"), "空态可行动:{s}");
+}
+
+#[tokio::test]
+async fn 外部源漂移_不认识的schema走需升级_不按旧形状猜() {
+    // 走 FakeRunner(经 runner 的解析点),契约守卫才合证——直接拼
+    // EngineOutput 会绕过守卫,那不是引擎真实给面板的路径。
+    let unknown = r#"{"schema":"nw/source-recheck.v2","nw":"9.9.9","ok":false,"errors":[],"warnings":[],"data":{"checked":[{"name":"x"}],"drift":[]}}"#;
+    let runner = Arc::new(FakeRunner::new(&[("source recheck", 3, unknown)]));
+    let mut app = App::with_runner(runner.clone());
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Recheck;
+    app.capabilities.record(
+        crate::engine::Capability::SourceRecheck,
+        crate::engine::Probe::Available,
+    );
+    app.ls = Some(
+        serde_json::from_str(
+            r#"{"domain":"all","recipes":[],"components":[],"sources":[{"name":"web-search","kind":"skill","entries":["a"]}],"profiles":[],"locks":[]}"#,
+        )
+        .unwrap(),
+    );
+    let args = vec![
+        "source".to_string(),
+        "recheck".into(),
+        "--root".into(),
+        "/tmp".into(),
+    ];
+    let o = runner.run(&args).await;
+    feed(&mut app, o);
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("需升级 nw"), "契约守卫证据在屏:{s}");
+    assert!(s.contains("nw/source-recheck.v2"), "带 schema 原文:{s}");
+    assert!(!s.contains("无漂移"), "不认识的形状不按旧形状猜:{s}");
+}
+
+#[test]
+fn 外部源漂移_紧凑66x50_结论与证据可读不溢出() {
+    let mut app = recheck_app();
+    feed(
+        &mut app,
+        out(&["source", "recheck", "--root", "/tmp"], 3, RECHECK_DRIFT),
+    );
+    let s = crate::testutil::frame_display(&app, 66, 50);
+    for needle in ["外部源漂移", "已登记外部源", "漂移条目", "证据"] {
+        assert!(s.contains(needle), "66×50 缺「{needle}」:{s}");
+    }
+    for l in s.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(l) <= 66,
+            "66×50 行不溢出:{l}"
+        );
+    }
+}
