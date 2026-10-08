@@ -909,6 +909,99 @@ fn 紧凑_外部源详情_66x50_名字与路径都可见_不折行不溢出() {
     );
 }
 
+// ---- #39 配方域建议命令:选中即给出 bake,执行权留给操作者(ADR-0003) ----
+
+/// 一条带版本 + 一条不带版本的配方;能力探测门记「recipe bake 可用」。
+fn bake_app() -> App {
+    use crate::engine::{Capability, Probe};
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Recipes;
+    app.rc_domain = crate::app::Domain::Recipes;
+    app.ls = Some(
+        serde_json::from_str(
+            r#"{"domain":"all","recipes":[{"name":"research-desk","version":"1.0.0"},{"name":"desk"}],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+        )
+        .unwrap(),
+    );
+    app.capabilities
+        .record(Capability::RecipeBake, Probe::Available);
+    app
+}
+
+#[test]
+fn 配方域建议命令_选中即给出bake_旗标与数据仓根与at版本() {
+    let app = bake_app();
+    // 常畅态:命令整段在场
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("建议命令"), "标成建议命令:{s}");
+    assert!(s.contains("执行权在你"), "执行权归属说清:{s}");
+    assert!(
+        s.contains("nw recipe bake research-desk@1.0.0"),
+        "配方带版本时命令含 @版本 段:{s}"
+    );
+    assert!(s.contains("--out research-desk.sh"), "出参默认值:{s}");
+    assert!(
+        s.contains(&format!("--repo {}", app.data_root.clone().unwrap())),
+        "--repo 填数据仓根:{s}"
+    );
+    assert!(s.contains("c 取用(只读选中)"), "键位行可见:{s}");
+    assert!(s.contains("退出码 0 成功"), "退出码表在场:{s}");
+    assert!(s.contains("口径出自引擎自身"), "注明出处:{s}");
+    assert!(s.contains("面板不代跑"), "不冒充面板代跑:{s}");
+    // 紧凑态 66×50:命令按内层宽折行,旗标一段都不少
+    let c = draw(&app, 66, 50);
+    for needle in ["research-desk@1.0.0", "--out research-desk.sh", "--repo"] {
+        assert!(c.contains(needle), "66×50 命令片段「{needle}」在场:{c}");
+    }
+    assert!(c.contains("c 取用(只读选中)"), "66×50 键位行可见:{c}");
+    // 不带版本的配方:不猜,只给配方名
+    let mut app = bake_app();
+    app.rc_sel = 1;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("nw recipe bake desk "), "无版本不拼 @版本:{s}");
+    assert!(!s.contains("desk@"), "不猜版本:{s}");
+}
+
+#[test]
+fn 配方域建议命令_未设数据仓根给指路_不给半条命令() {
+    let mut app = bake_app();
+    app.data_root = None;
+    let s = draw(&app, 110, 30);
+    // 未设根时五域入口整体走 #27 的根指路(一处说,不说两遍):
+    // 标题与「不拿当前目录兜底」可区分,且绝不出现半条命令。
+    assert!(s.contains("数据仓根未设"), "指路标题:{s}");
+    assert!(s.contains("不拿当前目录兜底"), "带下一步与纪律:{s}");
+    assert!(!s.contains("nw recipe bake"), "缺前提绝不渲染半条命令:{s}");
+    assert!(!s.contains("--repo"), "连旗标都不给:{s}");
+    // 纯函数层三种缺前提两两不同(见 commands.rs 单测);这里只钉 UI 不放行
+    assert!(
+        app.bake_suggest_gate() == Err(crate::engine::commands::BakeGate::NoDataRoot),
+        "未设根时门不给行"
+    );
+}
+
+#[test]
+fn 配方域建议命令_引擎无bake能力给指路_不冒充面板故障() {
+    use crate::engine::{Capability, Probe};
+    let mut app = bake_app();
+    app.capabilities
+        .record(Capability::RecipeBake, Probe::Unavailable);
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("引擎缺 recipe bake 能力"), "缺能力指路:{s}");
+    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    assert!(!s.contains("nw recipe bake"), "缺能力不给半条命令:{s}");
+    // 未决(探测失败)同样不给命令,且说法与禁用可区分
+    app.capabilities
+        .record(Capability::RecipeBake, Probe::Unknown);
+    let s2 = draw(&app, 110, 30);
+    assert!(!s2.contains("nw recipe bake"), "未决不给命令:{s2}");
+    assert!(
+        s2.contains("引擎缺 recipe bake 能力"),
+        "未决与禁用同走缺能力指路:{s2}"
+    );
+}
+
 #[test]
 fn 组件详情_依赖列表来源与缺字段原样呈现() {
     let mut app = comp_locks_app();
@@ -1034,5 +1127,34 @@ fn 紧凑66x50_组件与锁定集详情_字段与出处都不被截() {
                 domain.label()
             );
         }
+    }
+}
+
+#[test]
+fn 配方域建议命令_配方域为空给人话指路_不摆空框() {
+    let mut app = bake_app();
+    app.ls = Some(serde_json::from_str(r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#).unwrap());
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("配方域为空"), "空域给人话:{s}");
+    assert!(!s.contains("nw recipe bake"), "空域不给半条命令:{s}");
+}
+
+#[test]
+fn 配方域建议命令_紧凑66x50_键位行钉在详情末行_不溢出() {
+    let app = bake_app();
+    let s = crate::testutil::frame_display(&app, 66, 50);
+    let key_rows: Vec<&str> = s.lines().filter(|l| l.contains("c 取用")).collect();
+    assert_eq!(key_rows.len(), 1, "键位行只出现一次:{s}");
+    // 键位行钉在详情块内层末行:它的下一行就是块边框
+    let at = s.lines().position(|l| l.contains("c 取用")).unwrap();
+    assert!(
+        s.lines().nth(at + 1).unwrap().contains('└'),
+        "键位行贴在详情块底边框之上:{s}"
+    );
+    for l in s.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(l) <= 66,
+            "66×50 详情行不溢出:{l}"
+        );
     }
 }

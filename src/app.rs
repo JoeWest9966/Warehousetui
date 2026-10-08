@@ -263,6 +263,9 @@ pub struct App {
     pub reg_kind_sel: usize,
     /// 预审回音(确认态呈现;为 None 时 Review 不成立)。
     pub reg_result: Option<EngineOutput>,
+    /// 配方域建议命令的只读选中态(#39,键 `c`):命令可见可取用,
+    /// 但面板**不执行**它(ADR-0003:执行权留给操作者)。选中行/切域即复位。
+    pub rc_bake_sel: bool,
 
     /// 最近动作流水,概览屏右下「最近日志」。
     pub log: Vec<String>,
@@ -372,6 +375,7 @@ impl App {
             reg_kind: RegKind::Skill,
             reg_kind_sel: 0,
             reg_result: None,
+            rc_bake_sel: false,
             log: vec!["驾驶舱已就绪".into()],
             queue: Vec::new(),
             pending_editor: false,
@@ -514,6 +518,18 @@ impl App {
             Target::DismissPopup => self.dismiss_popup(),
             // 左键点日志区不动作;翻看由上面的滚轮分支受理(#21)。
             Target::ScrollLog(_) => {}
+            // 配方域建议命令取用(#39):与键盘 `c` 完全同路——只读选中态,
+            // 面板不执行这条命令(ADR-0003:执行权留给操作者)。
+            Target::CopySuggest => {
+                if self.rc_domain == Domain::Recipes {
+                    self.rc_bake_sel = !self.rc_bake_sel;
+                    self.push_log(if self.rc_bake_sel {
+                        "建议命令已选中(只读):可复制,执行权在你"
+                    } else {
+                        "建议命令已取消选中"
+                    });
+                }
+            }
         }
     }
 
@@ -890,10 +906,22 @@ impl App {
             KeyCode::Char('h') | KeyCode::Left => {
                 self.rc_domain = prev_domain(self.rc_domain);
                 self.rc_sel = 0;
+                self.rc_bake_sel = false;
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 self.rc_domain = next_domain(self.rc_domain);
                 self.rc_sel = 0;
+                self.rc_bake_sel = false;
+            }
+            // 配方域建议命令取用(#39):只读选中态——命令可见、可复制,
+            // 面板不执行(ADR-0003)。与鼠标点「c 取用」段同路同果。
+            KeyCode::Char('c') if self.rc_domain == Domain::Recipes => {
+                self.rc_bake_sel = !self.rc_bake_sel;
+                self.push_log(if self.rc_bake_sel {
+                    "建议命令已选中(只读):可复制,执行权在你"
+                } else {
+                    "建议命令已取消选中"
+                });
             }
             // 外部源域登记入口(#30):两道门在 start_register 里把守,
             // 不可用时只留一句指路,不进流程。
@@ -902,16 +930,34 @@ impl App {
                 let n = self.domain_len();
                 if n > 0 {
                     self.rc_sel = (self.rc_sel + 1) % n;
+                    self.rc_bake_sel = false;
                 }
             }
             KeyCode::Up => {
                 let n = self.domain_len();
                 if n > 0 {
                     self.rc_sel = (self.rc_sel + n - 1) % n;
+                    self.rc_bake_sel = false;
                 }
             }
             _ => {}
         }
+    }
+
+    /// 配方域建议命令是否给得出(#39):三前提——选中行是配方、数据仓根
+    /// 已设、引擎有 `recipe bake` 能力(能力结论来自 #29 的探测门,不是常量表)。
+    pub fn bake_suggest_gate(&self) -> Result<(), crate::engine::commands::BakeGate> {
+        let recipe = self
+            .ls
+            .as_ref()
+            .and_then(|l| l.recipes.get(self.rc_sel))
+            .map(|r| (r.name.as_str(), r.version.as_deref()));
+        crate::engine::commands::recipe_bake_suggest(
+            recipe,
+            self.usable_data_root().as_deref(),
+            self.capabilities.enabled(Capability::RecipeBake),
+        )
+        .map(|_| ())
     }
 
     fn key_settings(&mut self, k: KeyEvent) {
@@ -1925,6 +1971,109 @@ mod tests {
         click(&mut app, nav);
         assert_eq!(app.screen, Screen::Settings, "输入浮层下鼠标不分派");
         assert_eq!(app.data_buf, "/x", "缓冲区不被鼠标扰动");
+    }
+
+    // ---- #39 配方域建议命令:选中即给出 bake,执行权留给操作者 ----
+
+    fn bake_app() -> App {
+        let mut app = fake_app();
+        app.screen = Screen::Recipes;
+        app.rc_domain = Domain::Recipes;
+        app.ls = Some(
+            serde_json::from_str::<LsData>(
+                r#"{"domain":"all","recipes":[{"name":"research-desk","version":"1.0.0"},{"name":"desk"}],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+            )
+            .unwrap(),
+        );
+        app.capabilities
+            .record(Capability::RecipeBake, capability::Probe::Available);
+        app
+    }
+
+    #[test]
+    fn 建议命令_三种缺前提各有可区分门_互不冒充() {
+        // 齐备:门放行
+        let app = bake_app();
+        assert!(app.bake_suggest_gate().is_ok(), "三前提齐备门放行");
+        // 选中行不是配方(配方域为空)
+        let mut app = bake_app();
+        app.ls = Some(serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#).unwrap());
+        assert_eq!(app.bake_suggest_gate(), Err(commands::BakeGate::NotARecipe));
+        // 未设数据仓根
+        let mut app = bake_app();
+        app.data_root = None;
+        assert_eq!(app.bake_suggest_gate(), Err(commands::BakeGate::NoDataRoot));
+        // 引擎没有 recipe bake 能力
+        let mut app = bake_app();
+        app.capabilities
+            .record(Capability::RecipeBake, capability::Probe::Unavailable);
+        assert_eq!(
+            app.bake_suggest_gate(),
+            Err(commands::BakeGate::NoCapability)
+        );
+    }
+
+    #[test]
+    fn 建议命令_c键取用只读选中_面板不执行不入队() {
+        let mut app = bake_app();
+        assert!(!app.rc_bake_sel, "初始未选中");
+        let queued = app.queue.len();
+        app.update(Message::Key(key('c')));
+        assert!(app.rc_bake_sel, "c 进入只读选中态");
+        assert_eq!(app.queue.len(), queued, "取用不入队:面板不执行 bake");
+        assert!(
+            app.log.iter().any(|l| l.contains("执行权在你")),
+            "日志说清执行权归属:{:?}",
+            app.log
+        );
+        app.update(Message::Key(key('c')));
+        assert!(!app.rc_bake_sel, "再按取消选中");
+        // 别的域按 c 不动作(建议命令只属于配方域)
+        let mut app = bake_app();
+        app.rc_domain = Domain::Locks;
+        app.update(Message::Key(key('c')));
+        assert!(!app.rc_bake_sel, "非配方域不给建议命令选中态");
+    }
+
+    #[test]
+    fn 建议命令_移选中与切域都复位只读选中态() {
+        let mut app = bake_app();
+        app.update(Message::Key(key('c')));
+        assert!(app.rc_bake_sel);
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.rc_bake_sel, "选中行变了,命令跟着变,选中态复位");
+        app.update(Message::Key(key('c')));
+        assert!(app.rc_bake_sel);
+        app.update(Message::Key(key('l')));
+        assert!(!app.rc_bake_sel, "切域复位");
+    }
+
+    #[test]
+    fn 建议命令_鼠标点键位行与c同路_命中区只在门放行时产出() {
+        let mut app = bake_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        for (w, h) in [(80, 30), (66, 50)] {
+            app.size = Rect::new(0, 0, w, h);
+            let row = hit_target(&app, |t| *t == Target::CopySuggest);
+            click(&mut app, row);
+            assert!(app.rc_bake_sel, "{w}×{h} 点键位行 = 键盘 c");
+            assert!(app.queue.is_empty(), "{w}×{h} 点取用不入队(不执行)");
+            click(&mut app, row);
+            assert!(!app.rc_bake_sel, "{w}×{h} 再点取消");
+        }
+        // 门不放行(引擎无能力):命中区不产出,鼠标点哪儿都不取用
+        let mut app = bake_app();
+        app.capabilities
+            .record(Capability::RecipeBake, capability::Probe::Unavailable);
+        app.size = Rect::new(0, 0, 80, 30);
+        let hits = hitmap(app.size, &app, size_class(app.size));
+        assert!(
+            hits.iter().all(|(_, t)| *t != Target::CopySuggest),
+            "闸不放行时无取用命中区(与登记落账闸同纪律)"
+        );
     }
 
     // ---- #19 鼠标接线:统一事件入口 + 逃逸两联 ----
