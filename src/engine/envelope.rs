@@ -284,6 +284,63 @@ pub struct LsData {
     pub locks: Vec<LockRow>,
 }
 
+// ---- source register(`nw/source-register.v1`,工单 #30/#31) ----
+
+/// 引擎扫到的一个条目(名字 + 路径)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RegisterEntry {
+    pub name: String,
+    #[serde(default)]
+    pub path: String,
+}
+
+/// 验收一条结论;`id` 是冻结面、`message` 措辞不承诺。
+/// `status` = pass | fail | skip(「未确认」= `register.confirmed` 的
+/// skip,设计内的待定态,不是错误)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RegisterAcceptance {
+    pub id: String,
+    pub status: String,
+    pub message: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// register 的 data 形状(引擎自测夹具口径):预审与落账共用,
+/// `written` 区分「文件不落」与真写入。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RegisterData {
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub category: Vec<String>,
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub entries: Vec<RegisterEntry>,
+    #[serde(default)]
+    pub acceptance: Vec<RegisterAcceptance>,
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub written: bool,
+    #[serde(default)]
+    pub updated: bool,
+    #[serde(default)]
+    pub action: String,
+}
+
+impl RegisterData {
+    /// 验收里有 fail(引擎铁律:有 fail 就不得进入落账段)。
+    pub fn has_fail(&self) -> bool {
+        self.acceptance.iter().any(|a| a.status == "fail")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

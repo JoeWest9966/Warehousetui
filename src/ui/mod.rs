@@ -159,6 +159,12 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.home_input || app.data_input {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
+    } else if app.reg_state == crate::app::RegState::RepoInput {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("登记填链:Enter 继续 · Esc/q 放弃", p.accent()));
+    } else if app.reg_state != crate::app::RegState::Idle {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("登记中:Esc 返航", p.accent()));
     } else {
         spans.push(Span::styled("  q", p.accent()));
         spans.push(Span::raw(" 退出"));
@@ -193,6 +199,7 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         Line::from("    t          切换主题"),
         Line::from("    i          手填 NW_HOME(设置屏)"),
         Line::from("    d          手填数据仓根(设置屏)"),
+        Line::from("    r          登记外部源(配方屏·外部源域)"),
         Line::from("    ?          本帮助"),
         Line::from("    q          退出(装配态 / 输入中禁用)"),
         Line::from(""),
