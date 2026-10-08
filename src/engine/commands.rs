@@ -73,6 +73,17 @@ pub fn source_register_preaudit(repo: &str, kind: &str, root: &str) -> Vec<Strin
     ]
 }
 
+/// 外部源登记·落账段(spec #25 ticket #31):与预审同参,多一枚 `--yes`
+/// 确认闸——引擎才把 `catalog.json` 写进数据仓根。**只能由图形确认后的
+/// `App::dispatch_register_commit` 调用**;预审段用的
+/// [`source_register_preaudit`] 连 `--yes` 的位置都没有,两段从构造函数
+/// 形状上分开,误下发靠类型杜绝。
+pub fn source_register_commit(repo: &str, kind: &str, root: &str) -> Vec<String> {
+    let mut a = source_register_preaudit(repo, kind, root);
+    a.push("--yes".into());
+    a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +136,37 @@ mod tests {
             !a.iter().any(|s| s == "--yes"),
             "预审段铁律:argv 里不许出现 --yes(文件不落)"
         );
+    }
+
+    #[test]
+    fn 登记落账_带_yes_带_root_不带_category() {
+        let a = source_register_commit("owner/repo", "skill", "/data/root");
+        assert_eq!(
+            a,
+            vec![
+                "source",
+                "register",
+                "--repo",
+                "owner/repo",
+                "--kind",
+                "skill",
+                "--root",
+                "/data/root",
+                "--yes"
+            ]
+        );
+        assert!(
+            a.iter().any(|s| s == "--yes"),
+            "落账段铁律:确认闸必须在 argv 里(否则文件不落)"
+        );
+        assert!(
+            !a.iter().any(|s| s == "--category"),
+            "类别输入不给(所配引擎无该能力,记录落未分类)"
+        );
+        // 预审与落账只差确认闸一枚棋:同根、同链、不同后果
+        let p = source_register_preaudit("owner/repo", "skill", "/data/root");
+        let mut pc = p.clone();
+        pc.push("--yes".into());
+        assert_eq!(a, pc, "落账 = 预审 + --yes,不另改槽位");
     }
 }

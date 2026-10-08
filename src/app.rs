@@ -138,9 +138,9 @@ impl DataRootCause {
     }
 }
 
-/// 外部源登记两段式(spec #25,ADR-0006)的第一段状态机(工单 #30):
-/// 输入 → 预审 → 确认;落账段(Enter → `--yes`)是 #31 的下一段。
-/// 任一态 Esc 返航(与既有返航同义),返航不留半条记录。
+/// 外部源登记两段式(spec #25,ADR-0006)的状态机(#30 输入/预审/确认 +
+/// #31 落账/结果)。任一态 Esc 返航(与既有返航同义),返航不留半条记录
+/// ——面板从不写文件,账由引擎写;在途返航时互斥由 assembling 收敛。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegState {
     /// 未登记;外部源域常态。
@@ -151,8 +151,13 @@ pub enum RegState {
     KindPick,
     /// 预审已下发(不带 `--yes`,文件不落),等回音。
     PreAudit,
-    /// 预审回音已呈现(条目 + 验收 + 拟落账),可审阅、可返航。
+    /// 预审回音已呈现(条目 + 验收 + 拟落账),可审阅、可落账、可返航。
     Review,
+    /// 落账已下发(图形确认后才带 `--yes`),等写盘回音;
+    /// 并入既有装配态(`assembling` 顶栏灯/HUD 同源)。
+    Commit,
+    /// 落账回音已呈现:写盘位置、记录内容、git 变更提示。
+    Done,
 }
 
 /// 登记类别二选一(引擎 `--kind` 槽位;所配 0.1.0 无 category,记录
@@ -496,14 +501,14 @@ impl App {
                 }
             }
             // 仪式「Enter 发射」段:与键盘 Enter 同一路(入队 up、关浮层);
-            // kind 选择屏的「Enter 预审」段同款(入队不带 --yes 的 register)。
-            Target::Activate => {
-                if self.reg_state == RegState::KindPick {
-                    self.dispatch_register();
-                } else {
-                    self.launch_selected_lock();
-                }
-            }
+            // kind 选择屏的「Enter 预审」段同款(入队不带 --yes 的 register);
+            // 确认屏「Enter 落账」段(#31,闸放行时才产此目标)同路入队
+            // 带 --yes 的落账——与键盘 Enter 一个后果,语义不许漂移。
+            Target::Activate => match self.reg_state {
+                RegState::KindPick => self.dispatch_register(),
+                RegState::Review if self.reg_can_commit() => self.dispatch_register_commit(),
+                _ => self.launch_selected_lock(),
+            },
             // 帮助「任意处关」与仪式「Esc 返航」:与键盘 Esc 同一路
             // (日志区左键无动作,翻看归上面的滚轮分支)。
             Target::DismissPopup => self.dismiss_popup(),
@@ -647,14 +652,41 @@ impl App {
                 self.push_log(format!("{cmd} 复核完成"));
                 self.hl_result = Some(out);
             }
-            // 登记预审回音(#30):只认真实登记 argv(带 --repo/--kind 等
-            // 旗标)——精确的无参探针仍归 `_` 的能力回音路;流程已返航的
-            // 回音按状态丢弃,不幽灵重开。
+            // 登记回音(#30 预审 / #31 落账):只认真实登记 argv(带
+            // --repo/--kind 等旗标)——精确的无参探针仍归 `_` 的能力
+            // 回音路;`--yes` 在不在 argv 里区分两段;流程已返航的回音
+            // 按状态丢弃(落账路的丢弃同时收敛写互斥),不幽灵重开。
             "source"
                 if out.args.get(1).map(String::as_str) == Some("register")
                     && Capability::from_probe(&out.args).is_none() =>
             {
-                if self.reg_state == RegState::PreAudit {
+                let is_commit = out.args.iter().any(|a| a == "--yes");
+                if is_commit {
+                    if self.reg_state == RegState::Commit {
+                        self.assembling = false;
+                        let ok = out.ok;
+                        let headline = out.headline().to_string();
+                        self.reg_result = Some(out);
+                        if ok {
+                            self.reg_state = RegState::Done;
+                            self.push_log(
+                                "登记落账完成:catalog.json 已写入数据仓根(一次 git 变更)"
+                                    .to_string(),
+                            );
+                            // 外部源域立即刷新,无需重启(#31);缺根时
+                            // refresh_ls 自然走缺根门控留证据。
+                            self.refresh_ls();
+                        } else {
+                            // 失败回确认态:闸随失败结论关闭(不可原地重发
+                            // 同一个写),证据在确认屏呈现,Esc 可返航。
+                            self.reg_state = RegState::Review;
+                            self.push_log(format!("登记落账失败:{headline}"));
+                        }
+                    } else {
+                        self.assembling = false;
+                        self.push_log("登记落账回音已丢弃(流程已返航)");
+                    }
+                } else if self.reg_state == RegState::PreAudit {
                     let headline = out.headline().to_string();
                     self.reg_result = Some(out);
                     self.reg_state = RegState::Review;
@@ -705,7 +737,8 @@ impl App {
             self.on_key_data_input(k);
             return;
         }
-        // 登记两段式(#30):输入 → 预审 → 确认,浮层优先级接在手填之后
+        // 登记两段式(#30 #31):输入 → 预审 → 确认 → 落账 → 结果,
+        // 浮层优先级接在手填之后
         match self.reg_state {
             RegState::RepoInput => {
                 self.on_key_reg_repo(k);
@@ -721,6 +754,14 @@ impl App {
             }
             RegState::Review => {
                 self.on_key_reg_review(k);
+                return;
+            }
+            RegState::Commit => {
+                self.on_key_reg_commit(k);
+                return;
+            }
+            RegState::Done => {
+                self.on_key_reg_done(k);
                 return;
             }
             RegState::Idle => {}
@@ -789,7 +830,9 @@ impl App {
                     self.as_sel = (self.as_sel + n - 1) % n;
                 }
             }
-            KeyCode::Enter if !self.assembling && n > 0 => self.as_confirm = true,
+            KeyCode::Enter if !self.assembling && self.reg_state == RegState::Idle && n > 0 => {
+                self.as_confirm = true
+            }
             _ => {}
         }
     }
@@ -983,6 +1026,11 @@ impl App {
 
     /// 配方屏外部源域发起登记(键 `r`):先过两道门,再进输入态。
     pub fn start_register(&mut self) {
+        if self.assembling {
+            // 写互斥(spec #25):装配进行中不接登记,反之亦然。
+            self.push_log("装配进行中:登记与装配互斥,稍后再试");
+            return;
+        }
         if !self.reg_entry_enabled() {
             self.push_log(format!("登记入口不可用:{}", self.reg_gate_hint()));
             return;
@@ -1061,10 +1109,28 @@ impl App {
         }
     }
 
-    /// 确认态键位:审阅;Esc 返航。Enter 落账是 #31 的下一段
-    /// (`--yes` 只可能由那时的图形确认触发),本票不下发任何写命令。
+    /// 确认态键位(#31):审阅;Enter = 图形确认 → 落账(——`--yes` 全流程
+    /// 只可能由这一次转换下发,闸不过时不下发任何写命令);
+    /// Esc 返航。与鼠标两段命中同路(`layout::register_hits` 同文案)。
     fn on_key_reg_review(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => self.dispatch_register_commit(),
+            KeyCode::Esc => self.cancel_register(),
+            _ => {}
+        }
+    }
+
+    /// 落账在途键位:只收 Esc(任一态可返航的 spec 约定)——视图返航、
+    /// 缓冲清空,但写盘互斥(`assembling`)留到回音收敛;其余键不动作。
+    fn on_key_reg_commit(&mut self, k: KeyEvent) {
         if matches!(k.code, KeyCode::Esc) {
+            self.cancel_register();
+        }
+    }
+
+    /// 结果屏键位:Esc(或 q)返航清状态;其余键不动作。
+    fn on_key_reg_done(&mut self, k: KeyEvent) {
+        if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.cancel_register();
         }
     }
@@ -1090,6 +1156,36 @@ impl App {
             .push(commands::source_register_preaudit(&repo, &kind, &root));
         self.push_log(format!(
             "登记预审已入队:source register --repo {repo} --kind {kind}(不带 --yes,文件不落)"
+        ));
+    }
+
+    /// 落账(#31):图形确认(键盘 Enter / 鼠标点「Enter 落账」段)后才可能
+    /// 到达这里——全流程唯一能产生 `--yes` 的转换。重过三道闸(入口能力 /
+    /// 数据仓根 / 预审结论),全过才下发并点亮写互斥(`assembling`,顶栏灯
+    /// 与 HUD 同源);任何一道不过都不下发写命令,留在确认态把结论说清。
+    pub fn dispatch_register_commit(&mut self) {
+        if self.reg_state != RegState::Review || !self.reg_can_commit() {
+            self.push_log("落账未下发:预审未通过(验收有 fail 或退出码非 0)");
+            return;
+        }
+        if !self.reg_entry_enabled() {
+            self.push_log(format!("落账未下发:{}", self.reg_gate_hint()));
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("落账未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        let repo = self.reg_repo_buf.clone();
+        let kind = self.reg_kind.word().to_string();
+        self.reg_state = RegState::Commit;
+        // 写互斥(spec #25 铁律):登记与装配不同时进行;回音到达时收敛
+        // (含在途返航后的丢弃路,见 on_engine_finished)。
+        self.assembling = true;
+        self.queue
+            .push(commands::source_register_commit(&repo, &kind, &root));
+        self.push_log(format!(
+            "登记落账已入队:source register --repo {repo} --kind {kind} --yes(--root {root})"
         ));
     }
 
@@ -2870,5 +2966,175 @@ mod tests {
         app.wheel_sel(ScrollDir::Up);
         assert_eq!(app.reg_kind, RegKind::Skill, "滚轮上移回 skill");
         assert_eq!(app.queue.len(), qlen, "滚轮不下发命令");
+    }
+
+    // ---- #31 落账段:图形确认后才 --yes;结果/互斥/返航 ----
+
+    /// 落账成功回音:written=true、rc 0、ok true(引擎把 catalog.json
+    /// 写进数据仓根后的形状)。
+    const REG_WRITTEN: &str = r#"{"schema":"nw/source-register.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"repo":"https://github.com/owner/tiny-skills","kind":"skill","name":"tiny-skills","category":[],"commit":"abc1234","entries":[{"name":"greeter","path":"skills/greeter/SKILL.md"},{"name":"scanner","path":"skills/scanner/SKILL.md"}],"acceptance":[{"id":"register.repo_structure","status":"pass","message":"扫到 2 个 skill 条目"},{"id":"register.confirmed","status":"pass","message":"已确认:编目落账"}],"catalogPath":"/data/root/catalog.json","written":true,"updated":false,"action":"registered"}}"#;
+
+    /// 一路走到确认态(预审成功回音已灌入)。
+    async fn reg_to_review(app: &mut App, link: &str) {
+        reg_to_kindpick(app, link);
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::PreAudit);
+        reg_feed(app, REG_OK, 0).await;
+        assert_eq!(app.reg_state, RegState::Review);
+        assert!(app.reg_can_commit());
+    }
+
+    #[tokio::test]
+    async fn 登记落账_仅图形确认后带_yes_成功路结果与即时刷新() {
+        let mut app = reg_app(&[("--yes", 0, REG_WRITTEN), ("source register", 0, REG_OK)]);
+        let root = app.usable_data_root().expect("注入的临时根可用");
+        reg_to_review(&mut app, "owner/tiny-skills").await;
+        let qlen = app.queue.len();
+        // 图形确认:Enter —— 全流程唯一能产生 --yes 的转换
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Commit, "确认后才进落账在途");
+        assert!(app.assembling, "写互斥点亮(登记中不接装配)");
+        let argv = app.queue.last().expect("落账入队").clone();
+        assert!(
+            argv.iter().any(|s| s == "--yes"),
+            "落账 argv 带 --yes:{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--root" && w[1] == root),
+            "--root 指数据仓根:{argv:?}"
+        );
+        // 落账回音(成功):结果态 + 互斥收敛 + 外部源域即时刷新
+        let runner = FakeRunner::new(&[("source register", 0, REG_WRITTEN)]);
+        let out = runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert_eq!(app.reg_state, RegState::Done, "成功进结果态");
+        assert!(!app.assembling, "回音收敛互斥");
+        assert!(
+            app.log.iter().any(|l| l.contains("git 变更")),
+            "日志说明这是一次 git 变更:{:?}",
+            app.log.iter().take(3).collect::<Vec<_>>()
+        );
+        assert!(
+            app.queue.len() > qlen
+                && app.queue.last().map(|a| a.first().map(String::as_str)) == Some(Some("ls")),
+            "落账后入队 ls:外部源域即时刷新,无需重启"
+        );
+        // 结果屏:写盘位置 + git 提示 + 可复制命令都在屏上
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("catalog.json"), "写到哪个文件:{s}");
+        assert!(s.contains("git 变更"), "git 变更提示:{s}");
+        assert!(s.contains("nw source register"), "可复制命令:{s}");
+        assert!(s.contains("--yes"), "命令带确认闸:{s}");
+    }
+
+    #[tokio::test]
+    async fn 登记落账_预审未通过_enter不下发_yes() {
+        let mut app = reg_app(&[("source register", 3, REG_FAIL)]);
+        reg_to_kindpick(&mut app, "owner/broken");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        reg_feed(&mut app, REG_FAIL, 3).await;
+        assert_eq!(app.reg_state, RegState::Review);
+        assert!(!app.reg_can_commit(), "验收有 fail:闸关");
+        let qlen = app.queue.len();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.queue.len(), qlen, "闸关时 Enter 不入队任何命令");
+        assert!(
+            !app.queue.iter().any(|a| a.iter().any(|s| s == "--yes")),
+            "预审未通过:任何路径都不出现 --yes"
+        );
+        assert!(
+            app.log[0].contains("落账未下发"),
+            "日志留证据:{}",
+            app.log[0]
+        );
+        assert_eq!(app.reg_state, RegState::Review, "留在确认态可审阅");
+    }
+
+    #[tokio::test]
+    async fn 登记落账_失败路_回确认态_闸关闭_互斥收敛() {
+        let mut app = reg_app(&[("--yes", 3, REG_RC3), ("source register", 0, REG_OK)]);
+        reg_to_review(&mut app, "owner/tiny-skills").await;
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.assembling);
+        let argv = app.queue.last().expect("落账入队").clone();
+        let runner = FakeRunner::new(&[("source register", 3, REG_RC3)]);
+        let out = runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert_eq!(app.reg_state, RegState::Review, "失败回确认态");
+        assert!(!app.assembling, "互斥收敛");
+        assert!(
+            !app.reg_can_commit(),
+            "失败结论关闭落账闸(不可原地重发同一个写)"
+        );
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("不可落账"), "闸结论在屏:{s}");
+    }
+
+    #[test]
+    fn 登记与装配互斥_双向都点不着火() {
+        let mut app = reg_app(&[]);
+        // 登记进行中:装配屏 Enter 不开发射仪式
+        app.update(Message::Key(key('r')));
+        assert_eq!(app.reg_state, RegState::RepoInput);
+        app.screen = Screen::Assemble;
+        app.ls = Some(
+            serde_json::from_str::<LsData>(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"9f8e"}]}"#,
+            )
+            .unwrap(),
+        );
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.as_confirm, "登记进行中不接装配(反之亦然)");
+        // 装配进行中:登记入口拒绝并留证据(先回配方屏,r 归它)
+        app.cancel_register();
+        app.assembling = true;
+        app.screen = Screen::Recipes;
+        app.update(Message::Key(key('r')));
+        assert_eq!(app.reg_state, RegState::Idle, "装配中不给开登记");
+        assert!(app.log[0].contains("互斥"), "日志留证据:{}", app.log[0]);
+    }
+
+    #[tokio::test]
+    async fn 登记落账_在途返航_回音丢弃_互斥仍收敛() {
+        let mut app = reg_app(&[("--yes", 0, REG_WRITTEN), ("source register", 0, REG_OK)]);
+        reg_to_review(&mut app, "owner/tiny-skills").await;
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let argv = app.queue.last().expect("落账入队").clone();
+        // 在途 Esc 返航:视图清空(引擎的写已在途中,面板不假装能收回)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Idle, "返航清状态");
+        assert!(app.reg_repo_buf.is_empty(), "不留半条记录");
+        // 回音到达:按状态丢弃,但写互斥必须收敛(否则面板假装还在写)
+        let runner = FakeRunner::new(&[("source register", 0, REG_WRITTEN)]);
+        let out = runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert_eq!(app.reg_state, RegState::Idle, "丢弃不回填状态");
+        assert!(app.reg_result.is_none(), "丢弃不幽灵重开");
+        assert!(!app.assembling, "丢弃路也收敛互斥");
+        assert!(app.log[0].contains("已丢弃"), "日志留证据:{}", app.log[0]);
     }
 }

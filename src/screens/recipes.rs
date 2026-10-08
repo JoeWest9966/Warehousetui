@@ -459,6 +459,8 @@ fn render_register_overlay(frame: &mut Frame, area: Rect, app: &App) {
         RegState::KindPick => render_reg_kind(frame, area, app),
         RegState::PreAudit => render_reg_preaudit(frame, area, app),
         RegState::Review => render_reg_review(frame, area, app),
+        RegState::Commit => render_reg_commit(frame, area, app),
+        RegState::Done => render_reg_done(frame, area, app),
     }
 }
 
@@ -738,13 +740,193 @@ fn render_reg_review(frame: &mut Frame, area: Rect, app: &App) {
     while lines.len() < budget {
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled("  Esc 返航 ", p.dim())));
+    lines.push(if app.reg_can_commit() {
+        // 落账闸放行(#31):键位行与 layout::register_hits 的
+        // two_key_segments(同文案同序)对齐——左「Enter 落账」
+        // 右「Esc 返航」,几何都在内层末行。
+        Line::from(vec![
+            Span::styled(crate::layout::REG_KEY_REVIEW_COMMIT, p.accent().bold()),
+            Span::raw(crate::layout::RITUAL_KEY_GAP),
+            Span::styled(crate::layout::RITUAL_KEY_RETURN, p.dim()),
+        ])
+    } else {
+        Line::from(Span::styled("  Esc 返航 ", p.dim()))
+    });
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::bordered()
                     .border_style(p.accent())
                     .title(Span::styled(" 登记外部源 · 预审确认 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ⑤ 落账在途(#31):带 `--yes` 的写命令已下发,等引擎回音;
+/// 鼠标惰性(命中侧同款,见 layout::register_hits 的 Commit 臂)。
+/// 尺寸与确认屏一致(同基准不跳变)。
+fn render_reg_commit(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = crate::layout::popup_rect(
+        area,
+        crate::layout::REG_REVIEW_W,
+        crate::layout::REG_REVIEW_H,
+    );
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let root = app.usable_data_root().unwrap_or_else(|| "—".to_string());
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled("  正在落账:引擎把编目写进数据仓根…", p.text())),
+        Line::from(Span::styled(
+            format!(
+                "  写入目标  {}",
+                clip(&format!("{root}/catalog.json"), inner_w.saturating_sub(13))
+            ),
+            p.dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  登记与装配互斥:写盘期间不接新装配。",
+            p.dim(),
+        )),
+        Line::from(Span::styled(
+            "  凭据只从进程环境继承:不回显、不落盘、不进日志。",
+            p.dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Esc 返航(回音将丢弃,互斥随回音收敛)",
+            p.dim(),
+        )),
+    ];
+    while lines.len() < popup.height.saturating_sub(3) as usize {
+        lines.push(Line::from(""));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记外部源 · 落账 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ⑥ 结果屏(#31):写盘位置 + 记录内容 + git 变更提示 + 可复制命令;
+/// 失败路给证据五字段。整屏点任意处 = 返航(命中侧同几何)。
+fn render_reg_done(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup =
+        crate::layout::popup_rect(area, crate::layout::REG_DONE_W, crate::layout::REG_DONE_H);
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    let out = app.reg_result.as_ref();
+    let typed = out
+        .and_then(|o| o.envelope.as_ref())
+        .and_then(|e| e.data_as::<crate::engine::RegisterData>());
+    match typed {
+        Some(d) if out.map(|o| o.ok).unwrap_or(false) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  已写入  {}",
+                    clip(&d.catalog_path, inner_w.saturating_sub(11))
+                ),
+                p.info().bold(),
+            )));
+            let cat = if d.category.is_empty() {
+                "未分类".to_string()
+            } else {
+                d.category.join("/")
+            };
+            lines.push(Line::from(format!(
+                "  记录    {} · kind {} · category {} · entries {}",
+                clip(&d.name, 16),
+                d.kind,
+                cat,
+                d.entries.len()
+            )));
+            for e in d.entries.iter().take(3) {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    {}  {}",
+                        clip(&e.name, 18),
+                        clip(&e.path, inner_w.saturating_sub(23))
+                    ),
+                    p.dim(),
+                )));
+            }
+            if d.entries.len() > 3 {
+                lines.push(Line::from(Span::styled(
+                    format!("    … 共 {} 条", d.entries.len()),
+                    p.dim(),
+                )));
+            }
+            lines.push(Line::from(""));
+            // git 变更提示(spec #25 用户故事 23):铁律位置,不折叠进小字。
+            lines.push(Line::from(Span::styled(
+                "  ⚠ catalog.json 是一次 git 变更:走 PR + 家长审,",
+                p.warn().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "    别把它当本地小改;外部源域已即时刷新。",
+                p.warn(),
+            )));
+            lines.push(Line::from(""));
+            // 可复制文案(用户故事 18):贴进 PR / CI 复核。
+            let copy = format!(
+                "nw source register --repo {} --kind {} --yes --root {}",
+                app.reg_repo_buf,
+                app.reg_kind.word(),
+                app.usable_data_root().unwrap_or_else(|| ".".into())
+            );
+            lines.push(Line::from(Span::styled("  可复制命令", p.accent())));
+            for ln in wrap(&copy, inner_w.saturating_sub(4)).into_iter().take(2) {
+                lines.push(Line::from(Span::styled(format!("    {ln}"), p.text())));
+            }
+        }
+        _ => {
+            // 失败路:引擎没写盘(或写盘失败)——证据五字段原样,
+            // 说法可区分(不是「装好了但没完全好」那种降级)。
+            let headline = out.map(|o| o.headline().to_string()).unwrap_or_default();
+            for ln in wrap(
+                &format!("  落账未完成:{headline}"),
+                inner_w.saturating_sub(2),
+            )
+            .into_iter()
+            .take(2)
+            {
+                lines.push(Line::from(Span::styled(ln, p.fail().bold())));
+            }
+            if let Some(env) = out.and_then(|o| o.envelope.as_ref()) {
+                for e in env.errors.iter().take(3) {
+                    push_evidence(&mut lines, "出错", p.fail(), e, inner_w);
+                }
+                for e in env.warnings.iter().take(2) {
+                    push_evidence(&mut lines, "警告", p.warn(), e, inner_w);
+                }
+            }
+            lines.push(Line::from(Span::styled(
+                "  未写入任何文件;Esc 返航后可从预审重来。",
+                p.dim(),
+            )));
+        }
+    }
+    while lines.len() < popup.height.saturating_sub(3) as usize {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled("  Esc/q 返航 ", p.dim())));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记外部源 · 落账结果 ", p.accent().bold())),
             )
             .style(p.surface()),
         popup,
