@@ -771,3 +771,126 @@ fn 设置屏能力_无响应回未决不冒充禁用() {
         "未决不给「缺能力」指路(那是禁用组的):{s}"
     );
 }
+// ---- #37 外部源详情:类别 / 仓库链接 / 扫出的条目(只读,以引擎输出为准) ----
+
+/// 两条外部源记录:第一条字段齐全(多级类别 + 两条条目),
+/// 第二条按引擎形状**缺 kind/repo 键**、类别空数组、条目空数组。
+/// 夹具逐字对齐 `nw ls` 实跑输出(见 /opt/spec-notes/browse-suggest-recheck.md §2.1)。
+const LS_SOURCES: &str = r#"{"domain":"all","recipes":[],"components":[],"sources":[{"name":"web-search","kind":"skill","category":["检索","网络"],"repo":"JoeWest9966/skills-web","entries":[{"name":"web-search","path":"skills/web-search"},{"name":"deep-research","path":"skills/deep-research"}]},{"name":"theme-pack","category":[],"entries":[]}],"profiles":[],"locks":[]}"#;
+
+fn sources_app(ls: &str) -> App {
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Recipes;
+    app.rc_domain = crate::app::Domain::Sources;
+    app.ls = Some(serde_json::from_str(ls).unwrap());
+    app
+}
+
+#[test]
+fn 外部源详情_类别链接条目原样呈现_不新增引擎调用() {
+    let app = sources_app(LS_SOURCES);
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("名称  web-search"), "记录名可见:{s}");
+    assert!(s.contains("kind  skill"), "kind 是引擎字段原样:{s}");
+    assert!(s.contains("类别  检索/网络"), "多级类别按数组层级拼出:{s}");
+    assert!(
+        s.contains("仓库  JoeWest9966/skills-web"),
+        "仓库链接可见:{s}"
+    );
+    assert!(s.contains("条目  2"), "条目条数可见:{s}");
+    assert!(s.contains("  web-search"), "条目名字可见:{s}");
+    assert!(s.contains("    skills/web-search"), "条目路径可见:{s}");
+    // 只读铁律:浏览(含详情联动)不入队、不下发任何引擎命令
+    assert!(app.queue.is_empty(), "浏览不入队:{:?}", app.queue);
+}
+
+#[test]
+fn 外部源详情_缺字段给占位_空类别兜底未分类() {
+    let mut app = sources_app(LS_SOURCES);
+    app.rc_sel = 1; // theme-pack:kind/repo 键缺、类别空、条目空
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("名称  theme-pack"), "第二条可见:{s}");
+    assert!(s.contains("kind  ——"), "kind 缺失给——,不猜:{s}");
+    assert!(s.contains("仓库  ——"), "链接缺失给——,不给空串:{s}");
+    assert!(
+        s.contains("类别  未分类"),
+        "空类别按编目约定兜底(引擎不落该字面量,展示方兜):{s}"
+    );
+    assert!(s.contains("条目  ——"), "条目空给——,不是空框:{s}");
+}
+
+#[test]
+fn 外部源详情_键盘切行即时联动() {
+    let mut app = sources_app(LS_SOURCES);
+    let first = draw(&app, 110, 30);
+    assert!(
+        first.contains("类别  检索/网络"),
+        "选中第 1 条的详情:{first}"
+    );
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    )));
+    assert_eq!(app.rc_sel, 1, "↓ 移选中");
+    let second = draw(&app, 110, 30);
+    assert!(
+        second.contains("类别  未分类"),
+        "详情跟着选中行即时重算:{second}"
+    );
+    assert!(
+        !second.contains("类别  检索/网络"),
+        "旧记录不再占位:{second}"
+    );
+}
+
+#[test]
+fn 外部源域为空_给指向登记的指路_不摆空框() {
+    use crate::engine::{Capability, Probe};
+    let mut app = sources_app(
+        r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+    );
+    // 探测未回 / 缺能力:给能力指路,不冒充「可以登记」
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("外部源域为空"), "空态有事实一句:{s}");
+    assert!(s.contains("登记禁用"), "缺能力时不给键位:{s}");
+    assert!(
+        s.contains("缺的是引擎能力,不是面板坏了"),
+        "指路说清缺的是引擎能力:{s}"
+    );
+    // 引擎确有 source register 能力:空态给登记键位
+    app.capabilities
+        .record(Capability::SourceRegister, Probe::Available);
+    let s2 = draw(&app, 110, 30);
+    assert!(s2.contains("按 r 登记新外部源"), "有能力时给键位指路:{s2}");
+    assert!(!s2.contains("登记禁用"), "两态互不冒充:{s2}");
+}
+
+/// 66×50(保证最小)紧凑态:条目名字与路径**都**完整可见——逐行画,不是折行;
+/// 详情块边框仍在自己的区内(内容不把边框挤出屏)。
+#[test]
+fn 紧凑_外部源详情_66x50_名字与路径都可见_不折行不溢出() {
+    let app = sources_app(LS_SOURCES);
+    let f = crate::testutil::frame_display(&app, 66, 50);
+    assert!(f.contains("名称  web-search"), "详情首行可见:{f}");
+    assert!(f.contains("类别  检索/网络"), "多级类别可见:{f}");
+    assert!(
+        f.contains("仓库  JoeWest9966/skills-web"),
+        "仓库链接完整可见:{f}"
+    );
+    assert!(f.contains("条目  2"), "条目条数可见:{f}");
+    assert!(f.contains("  deep-research"), "条目名字完整可见:{f}");
+    assert!(
+        f.contains("    skills/deep-research"),
+        "条目路径完整可见:{f}"
+    );
+    assert_eq!(
+        f.matches("skills/deep-research").count(),
+        1,
+        "不折行:路径只出现一次,没有被折成续行"
+    );
+    assert!(
+        f.lines().any(|l| l.contains("└")),
+        "详情块边框在场:内容没有溢出块区"
+    );
+}

@@ -120,6 +120,21 @@ fn domain_count(app: &App, d: Domain) -> usize {
     }
 }
 
+/// 登记入口提示(#30):可用给键位、缺能力给指路 —— 外部源域的**列表尾行**
+/// 与**详情空态指路**共用这一句,两种呈现里同一概念只有一个拼写。
+/// 根不可用时不进此路(整域已走上方 signpost)。
+fn register_entry_hint(app: &App) -> Line<'static> {
+    let p = &app.palette;
+    if app.reg_entry_enabled() {
+        Line::from(Span::styled("  按 r 登记新外部源…", p.info()))
+    } else {
+        Line::from(Span::styled(
+            format!("  ⚠ 登记禁用:{}", crate::engine::capability::GATE_HINT),
+            p.warn(),
+        ))
+    }
+}
+
 fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     // 根不对 → 当前域的入口给指路,不摆空列表(票 #27)。
@@ -178,20 +193,16 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
                         Line::from(vec![
                             Span::raw(s.name.clone()),
                             Span::raw(" "),
-                            Span::styled(s.repo.clone().unwrap_or_default(), p.dim()),
+                            // 链接缺失给「——」,不用空串冒充「没有这个字段」(#37)
+                            Span::styled(
+                                s.repo.as_deref().filter(|r| !r.is_empty()).unwrap_or("——"),
+                                p.dim(),
+                            ),
                         ])
                     })
                     .collect();
-                // 登记入口提示(#30):可用给键位,缺能力给指路;
-                // 根不可用时整个域已走上方 signpost,不进此分支。
-                if app.reg_entry_enabled() {
-                    v.push(Line::from(Span::styled("  按 r 登记新外部源…", p.info())));
-                } else {
-                    v.push(Line::from(Span::styled(
-                        format!("  ⚠ 登记禁用:{}", crate::engine::capability::GATE_HINT),
-                        p.warn(),
-                    )));
-                }
+                // 登记入口提示(#30):根不可用时整个域已走上方 signpost,不进此分支。
+                v.push(register_entry_hint(app));
                 v
             }
             Domain::Profiles => l
@@ -233,6 +244,52 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
         area,
         &mut st,
     );
+}
+
+/// 字段缺失(引擎没给 / 空串)时给「——」——不猜、不编默认值(#37 验收)。
+/// 回 owned 串:详情行整个是自持的,不把 `app.ls` 的借用拽进渲染签名。
+fn field_or_dash(v: Option<&str>) -> String {
+    v.filter(|x| !x.is_empty()).unwrap_or("——").to_string()
+}
+
+/// 外部源详情(#35/#37):类别(含多级)、仓库链接、一次扫描得出的条目清单。
+/// 纯函数——行数据进、展示行出,无 IO、不推导、不改写引擎措辞:
+/// 字段缺失显式「——」,空类别按编目约定兜底成「未分类」(引擎不落该字面量)。
+/// 不折行:长值由 Paragraph 在块边截断,不在细节栏里折行(66×50 紧凑态铁律)。
+fn source_detail(p: &crate::theme::Palette, s: &crate::engine::SourceRow) -> Vec<Line<'static>> {
+    // 类别是多级数组:按层级拼(单层内禁 "/",拼出来无歧义);
+    // 空数组 = 未分类 —— 消费方兜底,不是面板自造的值。
+    let category = if s.category.is_empty() {
+        "未分类".to_string()
+    } else {
+        s.category.join("/")
+    };
+    let mut lines = vec![
+        Line::from(format!("名称  {}", field_or_dash(Some(s.name.as_str())))),
+        Line::from(format!("kind  {}", field_or_dash(s.kind.as_deref()))),
+        Line::from(format!("类别  {category}")),
+        Line::from(format!("仓库  {}", field_or_dash(s.repo.as_deref()))),
+        Line::from(""),
+    ];
+    if s.entries.is_empty() {
+        lines.push(Line::from("条目  ——"));
+        return lines;
+    }
+    lines.push(Line::from(format!("条目  {}", s.entries.len())));
+    for e in s.entries.iter() {
+        // 名字与路径各占一行:66×50 的详情内层只有 29 列,`名字  路径`
+        // 单行排不下,截断等于把条目清单看不全;两行由渲染方逐行画,
+        // 不是折行——行数是写死的,不随宽度变(不折行、不溢出)。
+        lines.push(Line::from(Span::styled(
+            format!("  {}", field_or_dash(Some(e.name.as_str()))),
+            p.text(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", field_or_dash(Some(e.path.as_str()))),
+            p.dim(),
+        )));
+    }
+    lines
 }
 
 fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
@@ -309,6 +366,19 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                         ]
                     })
                     .unwrap_or_default(),
+                // 外部源域(#37):选中一条记录 = 它的类别/链接/条目清单;
+                // 编目为空时给指向登记的指路,不摆空框。
+                Domain::Sources => match l.sources.get(app.rc_sel) {
+                    Some(s) => source_detail(p, s),
+                    None => vec![
+                        Line::from(Span::styled(
+                            "外部源域为空:数据仓的编目里还没有登记记录。",
+                            p.dim(),
+                        )),
+                        Line::from(""),
+                        register_entry_hint(app),
+                    ],
+                },
                 _ => vec![Line::from(Span::styled("详情按域展开(只读)。", p.dim()))],
             },
         }

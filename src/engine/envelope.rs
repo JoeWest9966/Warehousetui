@@ -228,6 +228,14 @@ pub struct ComponentRow {
     pub depends: Vec<String>,
 }
 
+/// `nw ls` 外部源域的一行(#35/#37):**一条记录 = 一个仓库**。
+///
+/// - `kind` = `skill` | `extension`(记录落在编目哪条数组);
+/// - `category` 是**多级**类别(单层内禁 "/",空数组 = 未分类——引擎不落
+///   「未分类」字面量,由展示方兜底);
+/// - `entries` 是一次扫描得出的条目清单(名字 + 路径)。引擎侧 ls 用
+///   `SourceEntry`、register 用 `CatalogEntry`,两者形状同为「名字 + 路径」
+///   —— 面板这里共用 [`RegisterEntry`] 一个拼写,不造第二个同形类型。
 #[derive(Clone, Debug, Deserialize)]
 pub struct SourceRow {
     pub name: String,
@@ -236,7 +244,9 @@ pub struct SourceRow {
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
-    pub entries: Vec<String>,
+    pub category: Vec<String>,
+    #[serde(default)]
+    pub entries: Vec<RegisterEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
