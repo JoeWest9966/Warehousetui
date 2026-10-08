@@ -97,6 +97,46 @@ pub enum HealthMode {
     Validate,
 }
 
+/// 数据仓根门控的三种不可用原因(spec #24:「没设 / 目录不可用 / 引擎缺能力」
+/// 各有各的说法、互不冒充)。`Unset` / `Unavailable` 由 `App::data_root_cause`
+/// 产出;`EngineCapability` 是能力探测门(#29)的接入点,本票只留位。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DataRootCause {
+    /// 没设——不猜、不拿当前目录兑底。
+    Unset,
+    /// 设了,但目录不存在 / 不可读。
+    Unavailable,
+    /// 引擎缺能力(不是面板坏了)。
+    EngineCapability,
+}
+
+impl DataRootCause {
+    /// 指路标题:三态各说各话,互不冒充。
+    pub fn title(self) -> &'static str {
+        match self {
+            DataRootCause::Unset => "数据仓根未设",
+            DataRootCause::Unavailable => "数据仓根不可用",
+            DataRootCause::EngineCapability => "引擎缺能力",
+        }
+    }
+
+    /// 指路人话:每态一条,带各自的事实与下一步。
+    pub fn advice(self, root: Option<&str>) -> String {
+        match self {
+            DataRootCause::Unset => {
+                "五域读不到数据仓——不是数据丢了。去设置屏按 d 录入;面板不拿当前目录兑底。".into()
+            }
+            DataRootCause::Unavailable => format!(
+                "目录 {} 不存在或不可读——不是数据丢了。到设置屏按 d 重设。",
+                root.unwrap_or("—")
+            ),
+            DataRootCause::EngineCapability => {
+                "引擎缺少所需能力——不是面板坏了。升级 nw 后能力探测门自然开启。".into()
+            }
+        }
+    }
+}
+
 /// 全局消息。引擎事件与动画心跳都在这里。
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -118,6 +158,9 @@ pub struct App {
     /// 呼吸灯的相位(装配中每 500ms 翻转)。
     pub blink: bool,
     pub nw_home: String,
+    /// 数据仓根(spec #24,票 #27):与 NW_HOME 并列的一等设置,
+    /// 持久化进 config;None = 未设——五域入口走指路,不兑当前目录。
+    pub data_root: Option<String>,
     pub engine: EngineStatus,
     pub engine_version: String,
     pub runner: Arc<dyn CommandRunner>,
@@ -158,6 +201,10 @@ pub struct App {
     pub home_input: bool,
     /// 手填缓冲区(只收可打印字符;上限见 [`input::BUF_CAP`])。
     pub home_buf: String,
+    /// 数据仓根手填输入模式(设置屏 d 进入,形态与 NW_HOME 手填同构)。
+    pub data_input: bool,
+    /// 数据仓根手填缓冲区(同款上限与拒绝语义)。
+    pub data_buf: String,
     /// config.toml 解析失败的人话证据;None = 配置健康。
     pub config_error: Option<String>,
     /// 鼠标捕获是否开启(默认开;两联 = 配置 mouse_capture + --no-mouse,
@@ -191,7 +238,12 @@ impl App {
             source: "测试注入",
             attempted: Vec::new(),
         };
-        Self::assemble(runner, status, None)
+        let mut app = Self::assemble(runner, status, None);
+        // 测试注入给定一个可用的数据仓根(临时目录,三平台都在),
+        // 让既有行为测试聚焦各自语义;「未设 / 不可用」由 #27 专属
+        // 测试显式置 None / 坏路径验证,不靠环境带过。
+        app.data_root = Some(std::env::temp_dir().display().to_string());
+        app
     }
 
     fn assemble(
@@ -221,6 +273,7 @@ impl App {
             assembling: false,
             blink: false,
             nw_home,
+            data_root: crate::engine::config::load().0.data_root,
             engine,
             engine_version: "探测中".into(),
             runner,
@@ -244,6 +297,8 @@ impl App {
             splash: true,
             home_input: false,
             home_buf: String::new(),
+            data_input: false,
+            data_buf: String::new(),
             config_error,
             mouse_enabled: true,
             size: Rect::default(),
@@ -258,9 +313,14 @@ impl App {
     }
 
     /// 开机自举:版本探测 + 首次 ls(引擎缺失时 MissingRunner 自然给出证据)。
+    /// 数据仓根缺 / 坏时不下发 ls——缺根不发命令(spec #24),指路在五域入口。
     pub fn bootstrap(&mut self, tx: &mpsc::UnboundedSender<EngineEvent>) {
         self.spawn_engine(commands::version(), tx);
-        self.spawn_engine(commands::ls(None), tx);
+        if let Some(root) = self.usable_data_root() {
+            self.spawn_engine(commands::ls(&root), tx);
+        } else if let Some(cause) = self.data_root_cause() {
+            self.push_log(format!("ls 未下发:{}", cause.title()));
+        }
     }
 
     /// 唯一的引擎调用入口:登记进行态,再交给 runner。
@@ -275,6 +335,11 @@ impl App {
                 self.push_log(format!("装配启动:{}", args.join(" ")));
             }
             Some("ls") => {
+                // 缺根不下发命令的唯一水闸:任何路径想跑 ls 都过这里。
+                if self.data_root_cause().is_some() {
+                    self.push_log(format!("ls 未下发:{}", self.data_root_gate_msg()));
+                    return;
+                }
                 self.ls_loading = true;
             }
             Some("doctor") | Some("validate") => {
@@ -488,9 +553,13 @@ impl App {
             self.on_key_confirm(k);
             return;
         }
-        // 浮层优先级:帮助浮层 > 发射确认 > 手填输入 > 指路屏/常屏(见 spec #9)
+        // 浮层优先级:帮助浮层 > 发射确认 > 手填输入(NW_HOME / 数据仓根) > 指路屏/常屏(见 spec #9)
         if self.home_input {
             self.on_key_home_input(k);
+            return;
+        }
+        if self.data_input {
+            self.on_key_data_input(k);
             return;
         }
         match k.code {
@@ -618,6 +687,11 @@ impl App {
                 self.home_buf = self.nw_home.clone();
                 self.push_log("手填 NW_HOME:Enter 确认,Esc/q 放弃");
             }
+            KeyCode::Char('d') => {
+                self.data_input = true;
+                self.data_buf = self.data_root.clone().unwrap_or_default();
+                self.push_log("手填数据仓根:Enter 确认,Esc/q 放弃");
+            }
             KeyCode::Char('e') => self.pending_editor = true,
             KeyCode::Char('m') => self.toggle_mouse_capture(),
             _ => {}
@@ -676,6 +750,54 @@ impl App {
         self.apply_nw_home(expanded);
     }
 
+    /// 数据仓根手填键位:与 NW_HOME 手填同一条通用态机
+    /// ([`input::on_key`]),本函数只接数据仓根的后果链。
+    fn on_key_data_input(&mut self, k: KeyEvent) {
+        match input::on_key(&mut self.data_buf, k) {
+            InputAction::Submit => self.apply_data_input(),
+            InputAction::Cancel => {
+                self.data_input = false;
+                self.data_buf.clear();
+                self.push_log("取消手填数据仓根");
+            }
+            InputAction::Edited | InputAction::Ignored => {}
+        }
+    }
+
+    /// 数据仓根手填生效:去空白 + `~` 展开;空值拒绝并留驻可改。
+    /// 路径不存在/不可读**接受入状态**(由指路给可区分说法),不在输入层拦。
+    pub fn apply_data_input(&mut self) {
+        let Some(trimmed) = input::normalize(&self.data_buf) else {
+            self.push_log("数据仓根手填被拒:空值,原值保持不变");
+            return;
+        };
+        let expanded = crate::engine::discover::expand_tilde(&trimmed)
+            .display()
+            .to_string();
+        self.data_input = false;
+        self.data_buf.clear();
+        self.apply_data_root(expanded);
+    }
+
+    /// 数据仓根生效链(手填与将来其他入口共用):写状态 → 持久化 config →
+    /// 根可用则立即刷新五域(入队 ls,无需重启);根不可用则清掉陈旧五域、
+    /// 不下发命令,指路由 `data_root_cause` 的说法接管。
+    pub fn apply_data_root(&mut self, next: String) {
+        self.data_root = Some(next.clone());
+        let mut cfg = crate::engine::config::load().0;
+        cfg.data_root = Some(next.clone());
+        if let Err(e) = crate::engine::config::save(&cfg) {
+            self.push_log(format!("数据仓根持久化失败:{e}"));
+        }
+        self.push_log(format!("数据仓根切换到 {next}"));
+        if self.data_root_cause().is_none() {
+            self.refresh_ls();
+        } else {
+            self.ls = None; // 陈旧五域不冒充新根的内容
+            self.push_log(format!("ls 未下发:{}", self.data_root_gate_msg()));
+        }
+    }
+
     /// 轮换 NW_HOME:写进程环境(子进程继承)、持久化、顺手刷新 ls。
     pub fn cycle_nw_home(&mut self) {
         let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
@@ -716,6 +838,36 @@ impl App {
         self.refresh_ls();
     }
 
+    /// 数据仓根门控:已设且目录存在可读才放行;否则给可区分的原因。
+    /// 未设本身就是原因 `Unset`——「None = 没问题」在这里不成立(spec #24)。
+    /// (文件系统检查是面板侧呈现门控,不替代引擎自己的判断。)
+    pub fn data_root_cause(&self) -> Option<DataRootCause> {
+        let Some(root) = self.data_root.as_deref() else {
+            return Some(DataRootCause::Unset);
+        };
+        if path_usable(root) {
+            None
+        } else {
+            Some(DataRootCause::Unavailable)
+        }
+    }
+
+    /// 可用的数据仓根:缺 / 坏一律不给——调用方拿不到就不得下发 ls。
+    pub fn usable_data_root(&self) -> Option<String> {
+        self.data_root_cause()
+            .is_none()
+            .then(|| self.data_root.clone())
+            .flatten()
+    }
+
+    /// 下发拒绝的人话(带各自的下一步,与五域指路同源)。
+    pub fn data_root_gate_msg(&self) -> String {
+        match self.data_root_cause() {
+            Some(cause) => cause.advice(self.data_root.as_deref()),
+            None => "数据仓根就绪".into(),
+        }
+    }
+
     /// 外部编辑器逃逸口(设置屏 e)。返回拉起命令;EDITOR/VISUAL 都缺则 None。
     pub fn editor_command() -> Option<String> {
         std::env::var("EDITOR")
@@ -726,9 +878,15 @@ impl App {
 
     // ---- 需要 tx 的动作:由主循环调 ----
 
-    /// 刷新 ls(概览 'r' 与设置屏共用)。
+    /// 刷新 ls(概览 'r' 与设置屏共用)。缺根 / 坏根不入队(缺根不下发命令)。
     pub fn refresh_ls(&mut self) {
-        self.queue.push(commands::ls(None));
+        let Some(root) = self.usable_data_root() else {
+            if self.data_root_cause().is_some() {
+                self.push_log(format!("ls 未入队:{}", self.data_root_gate_msg()));
+            }
+            return;
+        };
+        self.queue.push(commands::ls(&root));
         self.push_log("ls 已入队");
     }
 
@@ -815,6 +973,14 @@ impl App {
 fn prev_domain(d: Domain) -> Domain {
     let i = Domain::ALL.iter().position(|x| *x == d).unwrap_or(0);
     Domain::ALL[(i + Domain::ALL.len() - 1) % Domain::ALL.len()]
+}
+
+/// 目录可用性:是目录且能枚举(不存在 / 不是目录 / 不可读都算不可用)。
+fn path_usable(p: &str) -> bool {
+    match std::fs::metadata(p) {
+        Ok(m) if m.is_dir() => std::fs::read_dir(p).is_ok(),
+        _ => false,
+    }
 }
 
 fn next_domain(d: Domain) -> Domain {
@@ -1100,6 +1266,179 @@ mod tests {
         app2.apply_nw_home("/data/shared".into());
         assert_eq!(a, app2.nw_home);
         assert_eq!(app.queue.len(), qa, "两个入口的入队行为一致");
+    }
+
+    // ---- #27 数据仓根:一等设置 / 缺根不下发 / 三态指路 ----
+
+    #[test]
+    fn 数据仓根_手填生效同链_持久化并入队带_repo的_ls() {
+        let (_g, _cfg) = env_locked();
+        let mut app = settings_app();
+        app.data_root = None; // 从未设开始
+        app.update(Message::Key(key('d')));
+        assert!(app.data_input, "d 进入数据仓根手填");
+        let target = std::env::temp_dir().display().to_string();
+        type_str(&mut app, &target);
+        assert_eq!(app.data_buf, target, "缓冲区回显");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.data_root.as_deref(),
+            Some(target.as_str()),
+            "新值落状态树"
+        );
+        assert!(!app.data_input && app.data_buf.is_empty(), "用完即退");
+        let (cfg, err) = crate::engine::config::load();
+        assert!(err.is_none());
+        assert_eq!(
+            cfg.data_root.as_deref(),
+            Some(target.as_str()),
+            "持久化进 config,重启(重读)仍生效"
+        );
+        assert!(
+            app.queue
+                .iter()
+                .any(|a| { a == &vec!["ls".to_string(), "--repo".into(), target.clone()] }),
+            "同链入队显式携带数据仓根的 ls"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("数据仓根切换")),
+            "日志留证据"
+        );
+    }
+
+    #[test]
+    fn 数据仓根_空值拒绝留驻_esc_放弃不改状态() {
+        let mut app = settings_app();
+        let before = app.data_root.clone();
+        app.update(Message::Key(key('d')));
+        app.data_buf = "   ".into();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.data_root, before, "拒绝不改状态");
+        assert!(app.data_input, "拒绝后留在输入态可改");
+        assert!(app.log[0].contains("被拒"), "日志留证据");
+        // Esc 放弃:状态不动、不退出
+        app.data_buf = "/x/y".into();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.data_input);
+        assert_eq!(app.data_root, before, "放弃不碰状态");
+        assert!(!app.quit, "输入态 Esc 不是退出");
+    }
+
+    #[test]
+    fn 未设数据仓根_入队与下发与自举三处都不发_ls() {
+        let mut app = settings_app();
+        app.data_root = None;
+        let queued = app.queue.len();
+        app.refresh_ls();
+        assert_eq!(app.queue.len(), queued, "缺根不入队");
+        // 水闸在 spawn_engine:argv 带不带 --repo 都拦
+        app.spawn_engine(
+            vec!["ls".into(), "--repo".into(), "/tmp".into()],
+            &mpsc::unbounded_channel().0,
+        );
+        assert!(!app.ls_loading, "缺根不设加载态(命令未下发)");
+        assert!(app.log[0].contains("未下发"), "日志留证据");
+        // bootstrap:只下版本探测
+        let mut app2 = settings_app();
+        app2.data_root = None;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app2.bootstrap(&tx);
+        let mut cmds: Vec<String> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Finished(o) = ev {
+                cmds.push(o.args.first().cloned().unwrap_or_default());
+            }
+        }
+        assert_eq!(cmds, vec!["--version".to_string()], "bootstrap 不发 ls");
+        assert!(!app2.ls_loading);
+        assert_eq!(app2.data_root_cause(), Some(DataRootCause::Unset));
+    }
+
+    #[test]
+    fn 换数据仓根_立即再入队_ls_带新根_无需重启() {
+        let (_g, _cfg) = env_locked();
+        let mut app = settings_app();
+        let first_root = std::env::temp_dir().display().to_string();
+        app.apply_data_root(first_root.clone());
+        let n1 = app.queue.len();
+        assert!(n1 > 0, "首个根入队一次");
+        let second_root = _cfg.dir().display().to_string(); // ConfigGuard 建的一次性目录
+        app.apply_data_root(second_root.clone());
+        assert_eq!(app.queue.len(), n1 + 1, "换根再入队一次");
+        assert_eq!(
+            app.queue.last().unwrap(),
+            &vec!["ls".to_string(), "--repo".into(), second_root.clone()],
+            "新根的 argv 立即生效"
+        );
+        assert_eq!(app.data_root.as_deref(), Some(second_root.as_str()));
+    }
+
+    #[test]
+    fn 数据仓根不可用_可区分指路_不崩不下发() {
+        let mut app = settings_app();
+        app.data_root = Some("/nonexistent-nwt-data-root-xyz".into());
+        assert_eq!(
+            app.data_root_cause(),
+            Some(DataRootCause::Unavailable),
+            "坏根与未设可区分"
+        );
+        assert!(app.usable_data_root().is_none());
+        let queued = app.queue.len();
+        app.refresh_ls();
+        assert_eq!(app.queue.len(), queued, "坏根不入队");
+        app.spawn_engine(vec!["ls".into()], &mpsc::unbounded_channel().0);
+        assert!(!app.ls_loading, "坏根不下发");
+        let msg = app.data_root_gate_msg();
+        assert!(msg.contains("/nonexistent-nwt-data-root-xyz"), "指路带路径");
+        assert!(msg.contains("不存在或不可读"), "事实原文");
+        assert!(msg.contains("按 d 重设"), "带下一步,不冒充未设或缺能力");
+    }
+
+    #[test]
+    fn 三种指路_标题与说法两两不同_互不冒充() {
+        let causes = [
+            DataRootCause::Unset,
+            DataRootCause::Unavailable,
+            DataRootCause::EngineCapability,
+        ];
+        for (i, a) in causes.iter().enumerate() {
+            for b in &causes[i + 1..] {
+                assert_ne!(a.title(), b.title(), "标题两两不同");
+                assert_ne!(a.advice(Some("/x")), b.advice(Some("/x")), "说法两两不同");
+            }
+        }
+        assert!(
+            DataRootCause::Unset.advice(None).contains("按 d 录入"),
+            "未设指路说清去哪设"
+        );
+        assert!(
+            DataRootCause::EngineCapability
+                .advice(None)
+                .contains("不是面板坏了"),
+            "缺能力指路不冒充面板故障"
+        );
+    }
+
+    #[test]
+    fn 数据仓根手填浮层下_鼠标惰性_缓冲不被扰动() {
+        let mut app = mouse_ls_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.screen = Screen::Settings;
+        let nav = hit_target(&app, |t| matches!(t, Target::NavTo(Screen::Health)));
+        app.data_input = true;
+        app.data_buf = "/x".into();
+        click(&mut app, nav);
+        assert_eq!(app.screen, Screen::Settings, "输入浮层下鼠标不分派");
+        assert_eq!(app.data_buf, "/x", "缓冲区不被鼠标扰动");
     }
 
     // ---- #19 鼠标接线:统一事件入口 + 逃逸两联 ----

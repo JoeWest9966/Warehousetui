@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Domain};
 use crate::layout::{size_class, SizeClass};
-use crate::screens::body;
+use crate::screens::{body, data_root_signpost};
 
 pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
     let block = body(app, "五域只读浏览");
@@ -48,12 +48,18 @@ fn render_recipes_compact(frame: &mut Frame, inner: Rect, app: &App) {
 /// 宽度:五域全名 + 计数 ≈ 48 列,66×50 下内宽 ≥ 48 不截断(窄则尾部截,Tab 不折行)。
 fn render_domain_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
+    let gated = app.data_root_cause().is_some();
     let mut spans: Vec<Span> = Vec::new();
     for (i, d) in Domain::ALL.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" │ ", p.dim()));
         }
-        let n = domain_count(app, *d);
+        // 根不对时计数显「—」:0 会把「没在读」冒充成「没有数据」。
+        let n = if gated {
+            "—".to_string()
+        } else {
+            domain_count(app, *d).to_string()
+        };
         let sel = *d == app.rc_domain;
         let label = format!("{}({n})", d.label());
         if sel {
@@ -67,10 +73,15 @@ fn render_domain_tabs(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_domain_rail(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
+    let gated = app.data_root_cause().is_some();
     let items: Vec<Line> = Domain::ALL
         .iter()
         .map(|d| {
-            let n = domain_count(app, *d);
+            let count = if gated {
+                "(—)".to_string()
+            } else {
+                format!("({})", domain_count(app, *d))
+            };
             let sel = *d == app.rc_domain;
             let style = if sel { p.sel().bold() } else { p.dim() };
             Line::from(vec![
@@ -78,7 +89,7 @@ fn render_domain_rail(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw(" "),
                 Span::styled(d.label(), style),
                 Span::raw(" "),
-                Span::styled(format!("({n})"), p.dim()),
+                Span::styled(count, p.dim()),
             ])
         })
         .collect();
@@ -107,6 +118,19 @@ fn domain_count(app: &App, d: Domain) -> usize {
 
 fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
+    // 根不对 → 当前域的入口给指路,不摆空列表(票 #27)。
+    if app.data_root_cause().is_some() {
+        frame.render_widget(
+            Paragraph::new(data_root_signpost(app))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(Block::bordered().border_style(p.dim()).title(Span::styled(
+                    format!(" {} ", app.rc_domain.label()),
+                    p.accent(),
+                ))),
+            area,
+        );
+        return;
+    }
     let items: Vec<Line> = match app.ls.as_ref() {
         None => vec![Line::from(Span::styled(
             "没有 ls 数据,回概览按 r。",
@@ -196,74 +220,81 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let lines: Vec<Line> = match app.ls.as_ref() {
-        None => vec![Line::from(Span::styled("—", p.dim()))],
-        Some(l) => match app.rc_domain {
-            Domain::Recipes => l
-                .recipes
-                .get(app.rc_sel)
-                .map(|r| {
-                    vec![
-                        Line::from(format!("名称   {}", r.name)),
-                        Line::from(format!(
-                            "版本   {}",
-                            r.version.clone().unwrap_or_else(|| "—".into())
-                        )),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "配方是仓库里的一等公民;改它要走 bake。",
-                            p.dim(),
-                        )),
-                    ]
-                })
-                .unwrap_or_default(),
-            Domain::Locks => l
-                .locks
-                .get(app.rc_sel)
-                .map(|k| {
-                    vec![
-                        Line::from(format!(
-                            "lockId  {}",
-                            k.lock_id.clone().unwrap_or_else(|| "—".into())
-                        )),
-                        Line::from(format!(
-                            "配方    {}",
-                            k.recipe.clone().unwrap_or_else(|| "—".into())
-                        )),
-                        Line::from(format!(
-                            "烤于    {}",
-                            k.baked_at.clone().unwrap_or_else(|| "—".into())
-                        )),
-                        Line::from(format!(
-                            "路径    {}",
-                            k.path.clone().unwrap_or_else(|| "—".into())
-                        )),
-                    ]
-                })
-                .unwrap_or_default(),
-            Domain::Profiles => l
-                .profiles
-                .get(app.rc_sel)
-                .map(|pr| {
-                    vec![
-                        Line::from(format!("派      {}", pr.name)),
-                        Line::from(format!(
-                            "状态    {}",
-                            pr.state.clone().unwrap_or_else(|| "—".into())
-                        )),
-                        Line::from(format!(
-                            "lockId  {}",
-                            pr.lock_id.clone().unwrap_or_else(|| "—".into())
-                        )),
-                        Line::from(format!(
-                            "装配于  {}",
-                            pr.installed_at.clone().unwrap_or_else(|| "—".into())
-                        )),
-                    ]
-                })
-                .unwrap_or_default(),
-            _ => vec![Line::from(Span::styled("详情按域展开(只读)。", p.dim()))],
-        },
+    let lines: Vec<Line> = if app.data_root_cause().is_some() {
+        vec![Line::from(Span::styled(
+            "根不对,详情未读取——先按指路设好数据仓根。",
+            p.dim(),
+        ))]
+    } else {
+        match app.ls.as_ref() {
+            None => vec![Line::from(Span::styled("—", p.dim()))],
+            Some(l) => match app.rc_domain {
+                Domain::Recipes => l
+                    .recipes
+                    .get(app.rc_sel)
+                    .map(|r| {
+                        vec![
+                            Line::from(format!("名称   {}", r.name)),
+                            Line::from(format!(
+                                "版本   {}",
+                                r.version.clone().unwrap_or_else(|| "—".into())
+                            )),
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                "配方是仓库里的一等公民;改它要走 bake。",
+                                p.dim(),
+                            )),
+                        ]
+                    })
+                    .unwrap_or_default(),
+                Domain::Locks => l
+                    .locks
+                    .get(app.rc_sel)
+                    .map(|k| {
+                        vec![
+                            Line::from(format!(
+                                "lockId  {}",
+                                k.lock_id.clone().unwrap_or_else(|| "—".into())
+                            )),
+                            Line::from(format!(
+                                "配方    {}",
+                                k.recipe.clone().unwrap_or_else(|| "—".into())
+                            )),
+                            Line::from(format!(
+                                "烤于    {}",
+                                k.baked_at.clone().unwrap_or_else(|| "—".into())
+                            )),
+                            Line::from(format!(
+                                "路径    {}",
+                                k.path.clone().unwrap_or_else(|| "—".into())
+                            )),
+                        ]
+                    })
+                    .unwrap_or_default(),
+                Domain::Profiles => l
+                    .profiles
+                    .get(app.rc_sel)
+                    .map(|pr| {
+                        vec![
+                            Line::from(format!("派      {}", pr.name)),
+                            Line::from(format!(
+                                "状态    {}",
+                                pr.state.clone().unwrap_or_else(|| "—".into())
+                            )),
+                            Line::from(format!(
+                                "lockId  {}",
+                                pr.lock_id.clone().unwrap_or_else(|| "—".into())
+                            )),
+                            Line::from(format!(
+                                "装配于  {}",
+                                pr.installed_at.clone().unwrap_or_else(|| "—".into())
+                            )),
+                        ]
+                    })
+                    .unwrap_or_default(),
+                _ => vec![Line::from(Span::styled("详情按域展开(只读)。", p.dim()))],
+            },
+        }
     };
     frame.render_widget(
         Paragraph::new(lines).block(

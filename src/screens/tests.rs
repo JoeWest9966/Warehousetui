@@ -406,6 +406,87 @@ fn 输入浮层_盖在指路屏之上() {
     assert!(s.contains("/srv/pi"));
 }
 
+// ---- #27 数据仓根:五域入口指路 / 设置屏录入 / 三态互不冒充 ----
+
+#[test]
+fn 概览_未设数据仓根_五域走指路不摆空表() {
+    let mut app = fake_app();
+    app.data_root = None;
+    app.screen = Screen::Overview;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("数据仓根未设"), "指路标题亮相");
+    assert!(s.contains("按 d"), "说清去哪设");
+    assert!(!s.contains("入坑三步"), "不把「没在读」摆成「没有数据」");
+    assert!(!s.contains("还没有 ls 数据"), "旧空态文案退场");
+}
+
+#[test]
+fn 概览_数据仓根不可用_指路带路径与事实() {
+    let mut app = fake_app();
+    app.data_root = Some("/nonexistent-nwt-xyz".into());
+    app.screen = Screen::Overview;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("数据仓根不可用"), "可区分标题");
+    assert!(s.contains("/nonexistent-nwt-xyz"), "带收到的路径");
+    assert!(s.contains("不存在或不可读"), "事实原文");
+}
+
+#[test]
+fn 配方屏_未设数据仓根_五域入口指路且计数不冒充0() {
+    let mut app = fake_app();
+    app.data_root = None;
+    app.screen = Screen::Recipes;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("数据仓根未设"), "当域入口给指路");
+    assert!(s.contains("(—)"), "域计数显未知而非 0");
+    assert!(!s.contains("(recipes 0)"), "0 计数退场");
+}
+
+#[test]
+fn 装配屏_未设数据仓根_锁定集入口走指路不摆空清单() {
+    let mut app = fake_app();
+    app.data_root = None;
+    app.screen = Screen::Assemble;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("数据仓根未设"), "锁定集属五域,入口给指路");
+    assert!(!s.contains("没有锁定集"), "不摆空清单");
+    assert!(!s.contains("没有数据先回概览"), "旧空态文案退场");
+}
+
+#[test]
+fn 设置屏_数据仓根行_未设给指路_已设给安心_坏根给指路() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    // fake_app 已注入可用临时根 → 健康行
+    let ok = draw(&app, 110, 30);
+    assert!(ok.contains("数据仓根"), "行在场");
+    assert!(ok.contains("(d 手填)"), "键位提示可见");
+    assert!(ok.contains("数据仓根就绪"), "健康给安心行");
+    // 未设
+    app.data_root = None;
+    let unset = draw(&app, 110, 30);
+    assert!(unset.contains("未设置"), "未设显式标出");
+    assert!(unset.contains("数据仓根未设"), "指路与五域同源");
+    // 坏根
+    app.data_root = Some("/nonexistent-nwt-xyz".into());
+    let bad = draw(&app, 110, 30);
+    assert!(bad.contains("/nonexistent-nwt-xyz"), "坏根指路带路径");
+    assert!(bad.contains("不存在或不可读"), "事实原文");
+}
+
+#[test]
+fn 设置屏_数据仓根手填浮层渲染() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.data_input = true;
+    app.data_buf = "/data/repo".into();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("手填数据仓根"), "浮层标题");
+    assert!(s.contains("/data/repo"), "缓冲区回显");
+    assert!(s.contains("█"), "块光标可见");
+    assert!(s.contains("Enter 确认"), "键位提示");
+}
+
 // ---- #22 纵向密度:50 行富余用满(常畅/紧凑两档共用同一 render_*) ----
 
 /// 整行剥掉边框字符后为空 ⇒ 空白行;返回最长连续空白行数。
