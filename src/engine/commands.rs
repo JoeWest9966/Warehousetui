@@ -121,7 +121,7 @@ impl BakeGate {
     pub fn advice(self) -> String {
         match self {
             BakeGate::NoDataRoot => {
-                "五域读不到数据仓,bake 命令指不到本地仓。去设置屏按 d 录入数据仓根;                 面板不拿当前目录兜底。"
+                "五域读不到数据仓,bake 命令指不到本地仓。去设置屏按 d 录入数据仓根;面板不拿当前目录兜底。"
                     .into()
             }
             BakeGate::NotARecipe => {
@@ -372,6 +372,24 @@ mod tests {
         }
         assert!(BakeGate::NoCapability.advice().contains("不是面板坏了"));
         assert!(BakeGate::NoDataRoot.advice().contains("不拿当前目录兜底"));
+    }
+
+    #[test]
+    fn 建议命令_指路人话不带连续空格_换行残留不入屏() {
+        // NoDataRoot 的说法曾是一行拼接残留,中段混进 17 个空格,
+        // 操作者在屏上会看到怪异空档——指路人话是一句正常句子。
+        for gate in [
+            BakeGate::NoDataRoot,
+            BakeGate::NotARecipe,
+            BakeGate::NoCapability,
+        ] {
+            let advice = gate.advice();
+            assert!(
+                !advice.contains("  "),
+                "{} 的说法中段不许有一长串空格:{advice:?}",
+                gate.title()
+            );
+        }
     }
 
     #[test]

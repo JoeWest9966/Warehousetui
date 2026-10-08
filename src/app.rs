@@ -141,6 +141,39 @@ impl DataRootCause {
     }
 }
 
+/// 复核门三(清单为空)的两种可区分原因(spec #34 / 工单 #40):
+/// **五域还没读到** 与 **编目真为空** 是两件事,话不许互相冒充——
+/// `ls` 还没回音时不能对操作者断言「没有记录」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecheckEmpty {
+    /// `ls` 还没回音:面板还没读到五域,谈不上有没有记录。
+    NotLoaded,
+    /// `ls` 回音了而外部源域确为空:编目里还没有登记记录(合法状态)。
+    NoRecords,
+}
+
+impl RecheckEmpty {
+    /// 指路标题:两态各说各话(与呈现层、日志同源)。
+    pub fn title(self) -> &'static str {
+        match self {
+            RecheckEmpty::NotLoaded => "五域还没读到",
+            RecheckEmpty::NoRecords => "没有已登记外部源",
+        }
+    }
+
+    /// 指路人话:各自的下一步,互不冒充。
+    pub fn advice(self) -> &'static str {
+        match self {
+            RecheckEmpty::NotLoaded => {
+                "等 ls 回音(回概览屏按 r 重读五域)再查——现在断言有没有记录为时过早。"
+            }
+            RecheckEmpty::NoRecords => {
+                "数据仓的编目里还没有记录;去配方屏外部源域按 r 登记(两段式:预审 → 图形确认后才落账)。"
+            }
+        }
+    }
+}
+
 /// 外部源登记两段式(spec #25,ADR-0006)的状态机(#30 输入/预审/确认 +
 /// #31 落账/结果)。任一态 Esc 返航(与既有返航同义),返航不留半条记录
 /// ——面板从不写文件,账由引擎写;在途返航时互斥由 assembling 收敛。
@@ -532,16 +565,7 @@ impl App {
             Target::ScrollLog(_) => {}
             // 配方域建议命令取用(#39):与键盘 `c` 完全同路——只读选中态,
             // 面板不执行这条命令(ADR-0003:执行权留给操作者)。
-            Target::CopySuggest => {
-                if self.rc_domain == Domain::Recipes {
-                    self.rc_bake_sel = !self.rc_bake_sel;
-                    self.push_log(if self.rc_bake_sel {
-                        "建议命令已选中(只读):可复制,执行权在你"
-                    } else {
-                        "建议命令已取消选中"
-                    });
-                }
-            }
+            Target::ToggleSuggest => self.toggle_bake_suggest(),
         }
     }
 
@@ -954,8 +978,30 @@ impl App {
         self.ls.as_ref().map(|l| l.sources.len()).unwrap_or(0)
     }
 
+    /// 门三(清单为空)的原因(#40):`None` = 清单非空,门放行。
+    /// 「五域还没读到」与「编目真为空」分开说,两者互不冒充。
+    pub fn recheck_empty_cause(&self) -> Option<RecheckEmpty> {
+        (self.recheck_source_len() == 0).then(|| {
+            if self.ls.is_none() {
+                RecheckEmpty::NotLoaded
+            } else {
+                RecheckEmpty::NoRecords
+            }
+        })
+    }
+
+    /// 本次 recheck 回音里可定型的 data(#40):`None` = 还没查,或回音不可
+    /// 定型(含契约守卫「需升级 nw」)。三处呈现共用这一条链,不再各写一遍
+    /// (`hl_recheck → envelope → data_as::<RecheckData>`)。
+    pub fn recheck_data(&self) -> Option<crate::engine::RecheckData> {
+        self.hl_recheck
+            .as_ref()
+            .and_then(|o| o.envelope.as_ref())
+            .and_then(|e| e.data_as::<crate::engine::RecheckData>())
+    }
+
     /// 下发 recheck(#40):**只读**。三道门——数据仓根已设、引擎有 `source`
-    /// 能力、编目非空——各有可区分指路;任一门不过都不下发命令。
+    /// 能力、清单非空——各有可区分指路;任一门不过都不下发命令。
     pub fn run_recheck(&mut self, name: Option<String>) {
         if let Some(cause) = self.data_root_cause() {
             self.push_log(format!("recheck 未下发:{}", cause.title()));
@@ -968,8 +1014,12 @@ impl App {
             ));
             return;
         }
-        if self.recheck_source_len() == 0 {
-            self.push_log("recheck 未下发:编目里还没有已登记外部源(去配方屏外部源域按 r 登记)");
+        if let Some(cause) = self.recheck_empty_cause() {
+            self.push_log(format!(
+                "recheck 未下发:{}:{}",
+                cause.title(),
+                cause.advice()
+            ));
             return;
         }
         let Some(root) = self.usable_data_root() else {
@@ -998,16 +1048,9 @@ impl App {
                 self.rc_sel = 0;
                 self.rc_bake_sel = false;
             }
-            // 配方域建议命令取用(#39):只读选中态——命令可见、可复制,
-            // 面板不执行(ADR-0003)。与鼠标点「c 取用」段同路同果。
-            KeyCode::Char('c') if self.rc_domain == Domain::Recipes => {
-                self.rc_bake_sel = !self.rc_bake_sel;
-                self.push_log(if self.rc_bake_sel {
-                    "建议命令已选中(只读):可复制,执行权在你"
-                } else {
-                    "建议命令已取消选中"
-                });
-            }
+            // 配方域建议命令取用(#39):与鼠标点键位行完全同一条路——
+            // 只读选中态,面板不执行(ADR-0003)。三前提不齐时只留指路。
+            KeyCode::Char('c') => self.toggle_bake_suggest(),
             // 外部源域登记入口(#30):两道门在 start_register 里把守,
             // 不可用时只留一句指路,不进流程。
             KeyCode::Char('r') if self.rc_domain == Domain::Sources => self.start_register(),
@@ -1043,6 +1086,28 @@ impl App {
             self.capabilities.enabled(Capability::RecipeBake),
         )
         .map(|_| ())
+    }
+
+    /// 配方域建议命令切换只读选中态(#39):键盘 `c` 与鼠标点键位行「取用」段
+    /// 走同一条路。三前提不齐时**不翻状态、不入队**,只留一句与呈现层
+    /// 同源的指路(门不放行时命中区同样不产出,键盘/鼠标同源)。
+    fn toggle_bake_suggest(&mut self) {
+        if self.rc_domain != Domain::Recipes {
+            return;
+        }
+        match self.bake_suggest_gate() {
+            Ok(()) => {
+                self.rc_bake_sel = !self.rc_bake_sel;
+                self.push_log(if self.rc_bake_sel {
+                    "建议命令已选中(只读):可复制,执行权在你".to_string()
+                } else {
+                    "建议命令已取消选中".to_string()
+                });
+            }
+            Err(gate) => {
+                self.push_log(format!("建议命令取用:{}:{}", gate.title(), gate.advice()));
+            }
+        }
     }
 
     fn key_settings(&mut self, k: KeyEvent) {
@@ -2127,6 +2192,53 @@ mod tests {
     }
 
     #[test]
+    fn 建议命令_闸不过时c只给指路_不翻状态不入队() {
+        // 键盘与鼠标同源:命中侧在闸不放行时不产出目标,键盘同样不得
+        // 翻转只读选中态——只留一句与呈现层同源的指路。
+        let mut app = bake_app();
+        app.capabilities
+            .record(Capability::RecipeBake, capability::Probe::Unavailable);
+        let n = app.queue.len();
+        app.update(Message::Key(key('c')));
+        assert!(!app.rc_bake_sel, "引擎无能力时 c 不翻只读选中态");
+        assert_eq!(app.queue.len(), n, "闸不过不入队(面板不执行)");
+        assert!(
+            app.log[0].contains("引擎缺 recipe bake 能力"),
+            "缺能力的指路在日志:{:?}",
+            app.log[0]
+        );
+        assert!(
+            app.log[0].contains("升级所配 nw"),
+            "指路带下一步:{:?}",
+            app.log[0]
+        );
+        // 未设数据仓根:另一种指路,与「缺能力」互不冒充
+        let mut app = bake_app();
+        app.data_root = None;
+        app.update(Message::Key(key('c')));
+        assert!(!app.rc_bake_sel, "未设根时 c 不翻只读选中态");
+        assert!(
+            app.log[0].contains("数据仓根未设"),
+            "未设根的指路在日志:{:?}",
+            app.log[0]
+        );
+        assert!(
+            !app.log[0].contains("recipe bake 能力"),
+            "两种缺前提各说各话:{:?}",
+            app.log[0]
+        );
+        // 三前提齐备:照旧翻转,键盘与鼠标同一后果
+        let mut app = bake_app();
+        app.update(Message::Key(key('c')));
+        assert!(app.rc_bake_sel, "门放行时 c 取用只读选中态");
+        assert!(
+            app.log[0].contains("执行权在你"),
+            "取用说清执行权归属:{:?}",
+            app.log[0]
+        );
+    }
+
+    #[test]
     fn 建议命令_移选中与切域都复位只读选中态() {
         let mut app = bake_app();
         app.update(Message::Key(key('c')));
@@ -2148,7 +2260,7 @@ mod tests {
         app.size = Rect::new(0, 0, 80, 30);
         for (w, h) in [(80, 30), (66, 50)] {
             app.size = Rect::new(0, 0, w, h);
-            let row = hit_target(&app, |t| *t == Target::CopySuggest);
+            let row = hit_target(&app, |t| *t == Target::ToggleSuggest);
             click(&mut app, row);
             assert!(app.rc_bake_sel, "{w}×{h} 点键位行 = 键盘 c");
             assert!(app.queue.is_empty(), "{w}×{h} 点取用不入队(不执行)");
@@ -2162,7 +2274,7 @@ mod tests {
         app.size = Rect::new(0, 0, 80, 30);
         let hits = hitmap(app.size, &app, size_class(app.size));
         assert!(
-            hits.iter().all(|(_, t)| *t != Target::CopySuggest),
+            hits.iter().all(|(_, t)| *t != Target::ToggleSuggest),
             "闸不放行时无取用命中区(与登记落账闸同纪律)"
         );
     }
@@ -3590,6 +3702,73 @@ mod tests {
         app.run_recheck(None);
         assert_eq!(app.queue.len(), n, "空编目不下发");
         assert!(app.log[0].contains("没有已登记外部源"), "{:?}", app.log);
+    }
+
+    #[test]
+    fn recheck_清单空的两种原因各说各话_互不冒充() {
+        // 四种缺前提里的第四种边缘态:ls 还没回音 ≠ 编目真为空。
+        let mut app = recheck_app();
+        app.ls = None;
+        assert_eq!(app.recheck_empty_cause(), Some(RecheckEmpty::NotLoaded));
+        let n = app.queue.len();
+        app.run_recheck(None);
+        assert_eq!(app.queue.len(), n, "还没读到不下发");
+        assert!(
+            app.log[0].contains("五域还没读到"),
+            "没读到说没读到:{:?}",
+            app.log[0]
+        );
+        assert!(
+            !app.log[0].contains("没有已登记外部源"),
+            "没读到不冒充空编目:{:?}",
+            app.log[0]
+        );
+        // ls 回音了而外部源域确为空:另一个说法,可行动指路不变
+        let mut app = recheck_app();
+        app.ls = Some(
+            serde_json::from_str::<LsData>(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(app.recheck_empty_cause(), Some(RecheckEmpty::NoRecords));
+        app.run_recheck(None);
+        assert!(
+            app.log[0].contains("没有已登记外部源"),
+            "空编目说空编目:{:?}",
+            app.log[0]
+        );
+        assert!(
+            app.log[0].contains("按 r 登记"),
+            "空编目给可行动指路:{:?}",
+            app.log[0]
+        );
+        assert!(
+            !app.log[0].contains("五域还没读到"),
+            "空编目不冒充没读到:{:?}",
+            app.log[0]
+        );
+        // 清单非空:门放行,不产原因
+        let app = recheck_app();
+        assert_eq!(app.recheck_empty_cause(), None, "有记录时门放行");
+    }
+
+    #[tokio::test]
+    async fn recheck_定型链只有一处_查过给数据没查给空() {
+        // recheck_state_of / recheck_banner / drift_lines 三处共用
+        // App::recheck_data 这一条链, 行为不变:没查 / 不可定型
+        // (含契约守卫「需升级 nw」)一律 None,不冒充上次结论。
+        let mut app = recheck_app();
+        assert!(app.recheck_data().is_none(), "还没查 = None");
+        app.run_recheck(None);
+        let json = r#"{"schema":"nw/source-recheck.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/data/repo/catalog.json","checked":[{"name":"web-search","kind":"skill","repo":"o/r","commit":"abc","entries":1}],"drift":[]}}"#;
+        recheck_feed(&mut app, json, 0).await;
+        let d = app.recheck_data().expect("回音可定型 = Some");
+        assert_eq!(d.checked.len(), 1, "三处呈现看到的是同一份数据");
+        // 换数据仓根作废陈旧结论：链随之归 None,不拿旧根的结论冒充
+        let (_g, _cfg) = env_locked();
+        app.apply_data_root(_cfg.dir().display().to_string());
+        assert!(app.recheck_data().is_none(), "换根后链归 None");
     }
 
     /// 经 FakeRunner 喂一次 recheck 回音(与既有 reg_feed 同款:走解析点,

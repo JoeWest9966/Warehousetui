@@ -34,8 +34,9 @@ pub enum Target {
     ScrollLog(ScrollDir),
     /// 点帮助浮层任意处关闭。
     DismissPopup,
-    /// 点配方域建议命令键位行 = 取用(只读选中;#39,与键盘 `c` 同路)。
-    CopySuggest,
+    /// 点配方域建议命令键位行 = 切换只读选中态(#39,与键盘 `c` 同路;
+    /// 面板不执行该命令,也不碰剪贴板——名字里没有 "copy" 就是因为没有复制)。
+    ToggleSuggest,
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -274,9 +275,41 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
     row_hits(lst, 0, ls.locks.len(), hits, Target::SelectRow);
 }
 
+/// recheck 屏四块几何(#40):渲染侧 `health::render_recheck` 与命中侧
+/// [`health_hits`] 共用同一组常量,几何零分歧(不靠人工对齐)。
+///
+/// `recheck_panels` 返回 `[结论横幅, 已登记外部源清单, 漂移条目, 证据]`:
+/// 前两块在 55% 左栏(横幅 3 行文案 + 2 行块边框 = `Length(5)`),后两块在
+/// 45% 右栏(漂移条目 `Length(12)`),同栏的下一块都取 `Min(4)` 的余量。
+pub(crate) fn recheck_panels(area: Rect) -> [Rect; 4] {
+    let (left, right) = h_split2(area, 55, 45);
+    let l = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(5),
+        ratatui::layout::Constraint::Min(4),
+    ])
+    .split(left);
+    let r = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(12),
+        ratatui::layout::Constraint::Min(4),
+    ])
+    .split(right);
+    [l[0], l[1], r[0], r[1]]
+}
+
+/// recheck 屏左右两栏(三道门的指路铺满整栏):由 [`recheck_panels`] 的同一组
+/// 常量合回来,不再另写一份 55/45 + 纵向分栏。
+pub(crate) fn recheck_cols(area: Rect) -> (Rect, Rect) {
+    let p = recheck_panels(area);
+    (
+        Rect::new(p[0].x, p[0].y, p[0].width, p[0].height + p[1].height),
+        Rect::new(p[2].x, p[2].y, p[2].width, p[2].height + p[3].height),
+    )
+}
+
 /// 健康屏:validate 模式下「27 项」列表在 55% 左栏、带边框、首行即数据
 /// (doctor 模式是只读七面卡,无选中目标);外部源漂移模式(#40)的左栏是
-/// 「结论横幅 4 行 + 已登记外部源清单」,清单行在横幅之下。
+/// 「结论横幅 + 已登记外部源清单」,清单行在横幅之下,几何见
+/// [`recheck_panels`]。
 fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     if matches!(app.hl_mode, crate::app::HealthMode::Recheck) {
         // 三道门任一不过:整栏是指路,没有可选中行
@@ -284,19 +317,18 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
             || !app
                 .capabilities
                 .enabled(crate::engine::Capability::SourceRecheck)
-            || app.recheck_source_len() == 0
+            || app.recheck_empty_cause().is_some()
         {
             return;
         }
-        let (cols, _) = h_split2(area, 55, 45);
-        // 与 render_recheck 同款:左栏纵向 [Length(4) 横幅, Min(清单)]
-        let rows = ratatui::layout::Layout::vertical([
-            ratatui::layout::Constraint::Length(5),
-            ratatui::layout::Constraint::Min(4),
-        ])
-        .split(cols);
-        let lst = shrink_border(rows[1]);
-        row_hits(lst, 0, app.recheck_source_len(), hits, Target::SelectRow);
+        // 与 render_recheck 同一个 recheck_panels,不抄第二份分栏常量
+        row_hits(
+            shrink_border(recheck_panels(area)[1]),
+            0,
+            app.recheck_source_len(),
+            hits,
+            Target::SelectRow,
+        );
         return;
     }
     if !matches!(app.hl_mode, crate::app::HealthMode::Validate) {
@@ -373,7 +405,7 @@ fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, T
         if d.height > 0 && d.width > 0 {
             hits.push((
                 Rect::new(d.x, d.y + d.height - 1, d.width, 1),
-                Target::CopySuggest,
+                Target::ToggleSuggest,
             ));
         }
     }
@@ -938,6 +970,44 @@ mod tests {
         app.screen = Screen::Assemble;
         app.as_confirm = true;
         assert_ritual_column_aligned(&app, 66, 31);
+    }
+
+    /// recheck 屏(#40)四块几何:横幅确实占 5 行(3 行文案 + 2 行块边框,
+    /// 与 [`recheck_panels`] 注释同源),且命中侧的清单首行就是渲染侧的
+    /// 清单首行——几何收在一处后,渲染与命中不可能再各写一套。
+    #[test]
+    fn hitmap_recheck_横幅占五行_清单行与渲染同一行() {
+        use crate::engine::{Capability, Probe};
+        let mut app = test_app();
+        app.screen = Screen::Health;
+        app.hl_mode = crate::app::HealthMode::Recheck;
+        app.capabilities
+            .record(Capability::SourceRecheck, Probe::Available);
+        app.ls = Some(
+            serde_json::from_str::<crate::engine::LsData>(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[{"name":"web-search","kind":"skill","entries":[]},{"name":"theme-pack","kind":"extension","entries":[]}],"profiles":[],"locks":[]}"#,
+            )
+            .unwrap(),
+        );
+        let a = area(80, 30);
+        assert_eq!(recheck_panels(a)[0].height, 5, "横幅 = 3 行文案 + 2 行边框");
+        let hits = hitmap(a, &app, size_class(a));
+        let row0 = first(&hits, |t| *t == Target::SelectRow(0)).expect("清单首行可点");
+        let frame = crate::testutil::frame_display(&app, a.width, a.height);
+        let rendered = frame
+            .split('\n')
+            .nth(row0.y as usize)
+            .expect("命中行在渲染中在场");
+        assert!(
+            rendered.contains("web-search"),
+            "命中行 = 渲染清单首行:{}",
+            rendered
+        );
+        assert!(
+            hits.iter()
+                .all(|(_, t)| !matches!(t, Target::ToggleSuggest)),
+            "配方域建议命令的键位行不归健康屏"
+        );
     }
 
     #[test]
