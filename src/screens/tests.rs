@@ -609,3 +609,48 @@ fn 日志偏移取窗_跳过偏移行_七步判定不受影响() {
         "七步判定读全量日志:行被移出窗仍打勾"
     );
 }
+
+// ---- #29 能力探测门(设置屏能力清单渲染) ----
+
+#[test]
+fn 设置屏能力清单_缺能力禁用并指路_紧凑态不截断() {
+    use crate::engine::{Capability, FakeRunner, Probe};
+    let runner = FakeRunner::with_stderr(&[("category", 3, "", "nw: 未知子命令 \"category\"")]);
+    let mut app = App::with_runner(std::sync::Arc::new(runner));
+    app.capabilities
+        .record(Capability::Category, Probe::Unavailable);
+    app.capabilities.record(Capability::Vps, Probe::Unavailable);
+    app.capabilities
+        .record(Capability::SourceRegister, Probe::Available);
+    app.capabilities
+        .record(Capability::SourceRecheck, Probe::Available);
+    app.screen = Screen::Settings;
+    // 常畅态:禁用组 + 指路句都在
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("入口禁用:类别、vps"), "禁用组可见:{s}");
+    assert!(s.contains("缺的是引擎能力,不是面板坏了"), "指路句可见:{s}");
+    assert!(s.contains("✓外部源登记"), "齐备能力可见:{s}");
+    // 紧凑态 66×50(保证最小):能力行渲染不炸、禁用组可见
+    let c = draw(&app, 66, 50);
+    assert!(c.contains("入口禁用"), "紧凑态禁用组可见:{c}");
+    assert!(c.contains("能力"), "紧凑态能力行在场:{c}");
+}
+
+#[test]
+fn 设置屏能力_无响应回未决不冒充禁用() {
+    use crate::engine::{Capability, FakeRunner, Probe};
+    // found=true 但探针无回答:空 stdout、无「未知子命令」——归未决
+    let runner = FakeRunner::with_stderr(&[("category", -1, "", "")]);
+    let mut app = App::with_runner(std::sync::Arc::new(runner));
+    for cap in Capability::ALL {
+        app.capabilities.record(cap, Probe::Unknown);
+    }
+    app.screen = Screen::Settings;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("未决"), "无响应回未决:{s}");
+    assert!(!s.contains("入口禁用"), "未决不冒充禁用(三态互不冒充):{s}");
+    assert!(
+        !s.contains("缺的是引擎能力"),
+        "未决不给「缺能力」指路(那是禁用组的):{s}"
+    );
+}

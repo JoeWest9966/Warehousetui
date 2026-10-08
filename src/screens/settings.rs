@@ -7,6 +7,7 @@ use ratatui::Frame;
 
 use crate::app::App;
 use crate::engine::config;
+use crate::engine::{Capability, Probe, GATE_HINT};
 use crate::screens::body;
 
 pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
@@ -36,6 +37,59 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
         )),
         Line::from(format!("  来源     {}", app.engine.source)),
         Line::from(format!("  版本     nw {}", app.engine_version)),
+    ];
+    // 能力节(#29):竖向预算钉死——面板在 110×30 内层 24 行,既有 21 行
+    // 之外只许 +3(config 告警必须留在屏内,既有测试钉着);横向按紧凑态
+    // 62 列排:总行只放标记+名,状态归组行,指路单独一行。
+    let verdicts: Vec<(Capability, Probe)> = Capability::ALL
+        .into_iter()
+        .map(|c| (c, app.capabilities.get(c)))
+        .collect();
+    let mut row1 = vec![Span::raw("  "), Span::styled("能力 ", p.accent())];
+    for (cap, v) in &verdicts {
+        let (mark, style) = match v {
+            Probe::Available => ("✓", p.ok()),
+            Probe::Unavailable => ("✗", p.fail()),
+            Probe::Unknown => ("?", p.warn()),
+        };
+        row1.push(Span::styled(mark, style));
+        row1.push(Span::raw(cap.label()));
+        row1.push(Span::raw(" "));
+    }
+    lines.push(Line::from(row1));
+    let disabled: Vec<&str> = verdicts
+        .iter()
+        .filter(|(_, v)| *v == Probe::Unavailable)
+        .map(|(c, _)| c.label())
+        .collect();
+    let pending: Vec<&str> = verdicts
+        .iter()
+        .filter(|(_, v)| *v == Probe::Unknown)
+        .map(|(c, _)| c.label())
+        .collect();
+    // 状态归组行:只在有非「可用」时出现(全部可用不占行);
+    // 入口禁用与未决各成一组,互不冒充。
+    if !disabled.is_empty() || !pending.is_empty() {
+        let mut seg: Vec<String> = Vec::new();
+        if !disabled.is_empty() {
+            seg.push(format!("入口禁用:{}", disabled.join("、")));
+        }
+        if !pending.is_empty() {
+            seg.push(format!("未决:{}", pending.join("、")));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("      {}", seg.join("; ")),
+            p.warn(),
+        )));
+    }
+    // 指路:只在真有「引擎没这能力」时给(未决不冒充禁用,指路屏另管)。
+    if !disabled.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", GATE_HINT),
+            p.dim(),
+        )));
+    }
+    lines.extend(vec![
         Line::from(""),
         Line::from(Span::styled("环境", p.accent())),
         Line::from(format!("  NW_HOME  {}  (n 轮换 / i 手填)", app.nw_home)),
@@ -63,7 +117,7 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
             "  铁律:配置永不存密钥;env 只显示 present 布尔",
             p.dim(),
         )),
-    ];
+    ]);
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  发现优先级:--nw-bin > 配置 > PATH > $NW_HOME/nw",
