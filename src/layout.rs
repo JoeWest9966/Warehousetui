@@ -332,7 +332,11 @@ pub const RITUAL_KEY_RETURN: &str = "Esc 返航 ";
 /// 共用):右段直接复用 [`RITUAL_KEY_RETURN`],段间仍用 [`RITUAL_KEY_GAP`]。
 pub const REG_KEY_KIND_LAUNCH: &str = "  Enter 预审 ";
 
-/// 登记三个浮层的尺寸(spec #25 / 工单 #30):渲染与命中同一组常量,
+/// 登记确认屏键位行的左段(#31 落账段,与 [`REG_KEY_KIND_LAUNCH`] 同法):
+/// 只在落账闸放行时铺——不可落账时整屏仍归返航(命中侧同条件分叉)。
+pub const REG_KEY_REVIEW_COMMIT: &str = "  Enter 落账 ";
+
+/// 登记四个浮层的尺寸(spec #25 / 工单 #30 #31):渲染与命中同一组常量,
 /// 几何零分歧;`popup_rect` 的收窄规则两边同用。
 pub const REG_INPUT_W: u16 = 64;
 pub const REG_INPUT_H: u16 = 7;
@@ -340,6 +344,8 @@ pub const REG_KIND_W: u16 = 56;
 pub const REG_KIND_H: u16 = 9;
 pub const REG_REVIEW_W: u16 = 76;
 pub const REG_REVIEW_H: u16 = 24;
+pub const REG_DONE_W: u16 = 76;
+pub const REG_DONE_H: u16 = 20;
 
 /// 发射仪式浮层:与 `render_launch_ritual` 同尺寸、在**正文区**内居中;
 /// 底部键位行按渲染同一文案对半分——「Enter 发射」段给
@@ -399,11 +405,13 @@ fn two_key_segments(popup: Rect, y: u16, left: &str, right: &str, hits: &mut Vec
     }
 }
 
-/// 登记浮层(#30):几何与 `recipes::render_register_overlay` 同一组
+/// 登记浮层(#30 #31):几何与 `recipes::render_register_overlay` 同一组
 /// 常量、同一 `popup_rect` 居中基准。输入/等回音态鼠标惰性(同手填
 /// 浮层先例);kind 选项两行产 [`Target::SelectRow`] 选中 + 键位行两段
-/// (Activate 预审 / Dismiss 返航);确认态整屏点任意处 = 返航
-/// (同帮助浮层先例)。浮层外不产出任何命中区(弹层优先级)。
+/// (Activate 预审 / Dismiss 返航);确认态按落账闸分叉——放行时
+/// 键位行两段(Activate 落账 / Dismiss 返航),不放行时整屏点任意处
+/// = 返航(不可落账不可达);结果屏整屏点任意处 = 返航。浮层外不产出
+/// 任何命中区(弹层优先级)。
 fn register_hits(
     body: Rect,
     class: SizeClass,
@@ -438,8 +446,28 @@ fn register_hits(
         }
         crate::app::RegState::Review => {
             let popup = popup_rect(content, REG_REVIEW_W, REG_REVIEW_H);
+            if popup.width == 0 || popup.height == 0 {
+                return;
+            }
+            if app.reg_can_commit() {
+                // 落账闸放行(#31):键位行两段——「Enter 落账」→ Activate
+                // (与键盘 Enter 同路,仍过闸),「Esc 返航」→ Dismiss;
+                // 几何与渲染同文案同序(key_y = 内层末行)。
+                let key_y = popup.y + popup.height - 2;
+                two_key_segments(popup, key_y, REG_KEY_REVIEW_COMMIT, RITUAL_KEY_RETURN, hits);
+            } else {
+                // 闸不放行:没绑 Enter(不可落账不可达),整屏点任意处 = 返航
+                hits.push((popup, Target::DismissPopup));
+            }
+        }
+        crate::app::RegState::Commit => {}
+        // 落账在途:同预审等回音态鼠标惰性(Esc 返航归键盘);
+        // 写盘互斥由 assembling 顶栏灯/HUD 同源呈现。
+        crate::app::RegState::Done => {
+            // 结果屏:点任意处 = 返航(同确认态不可落账分支的先例)
+            let popup = popup_rect(content, REG_DONE_W, REG_DONE_H);
             if popup.width > 0 && popup.height > 0 {
-                hits.push((popup, Target::DismissPopup)); // 点任意处 = 返航
+                hits.push((popup, Target::DismissPopup));
             }
         }
     }
