@@ -166,75 +166,55 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
     );
 }
 
-/// 手填输入浮层:缓冲区 + 块光标 + 键位提示。
-fn render_home_input(frame: &mut Frame, area: Rect, app: &App) {
+/// 手填输入浮层(NW_HOME / 数据仓根共用):缓冲区 + 块光标 + 键位提示。
+/// 居中矩形走 [`crate::layout::popup_rect`](与登记浮层同源),两个入口只差
+/// 缓冲区、标题与末行提示——形状零分歧(Duplicated Code 收口)。
+fn render_text_input(frame: &mut Frame, area: Rect, app: &App, buf: &str, title: &str, hint: &str) {
     let p = &app.palette;
-    let w = 64u16.min(area.width.saturating_sub(4));
-    let h = 7u16.min(area.height.saturating_sub(2));
-    let popup = Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
-    );
+    let popup = crate::layout::popup_rect(area, 64, 7);
     frame.render_widget(Clear, popup);
-    let cursor = format!("{}█", app.home_buf);
+    let cursor = format!("{buf}█");
     let lines = vec![
         Line::from(Span::styled(cursor, p.text())),
         Line::from(Span::styled(
             "  Enter 确认 · Esc/q 放弃 · 退格删字符 · ~ 会展开",
             p.dim(),
         )),
-        Line::from(Span::styled(
-            "  生效后与轮换同链:写环境、持久化、刷新 ls",
-            p.dim(),
-        )),
+        Line::from(Span::styled(format!("  {hint}"), p.dim())),
     ];
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::bordered()
                     .border_style(p.accent())
-                    .title(Span::styled(" 手填 NW_HOME ", p.accent().bold())),
+                    .title(Span::styled(title, p.accent().bold())),
             )
             .style(p.surface()),
         popup,
     );
 }
 
-/// 数据仓根手填浮层:与 NW_HOME 手填同构(缓冲区 + 块光标 + 键位提示)。
-fn render_data_input(frame: &mut Frame, area: Rect, app: &App) {
-    let p = &app.palette;
-    let w = 64u16.min(area.width.saturating_sub(4));
-    let h = 7u16.min(area.height.saturating_sub(2));
-    let popup = Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
+/// NW_HOME 手填浮层。
+fn render_home_input(frame: &mut Frame, area: Rect, app: &App) {
+    render_text_input(
+        frame,
+        area,
+        app,
+        &app.home_buf,
+        " 手填 NW_HOME ",
+        "  生效后与轮换同链:写环境、持久化、刷新 ls",
     );
-    frame.render_widget(Clear, popup);
-    let cursor = format!("{}█", app.data_buf);
-    let lines = vec![
-        Line::from(Span::styled(cursor, p.text())),
-        Line::from(Span::styled(
-            "  Enter 确认 · Esc/q 放弃 · 退格删字符 · ~ 会展开",
-            p.dim(),
-        )),
-        Line::from(Span::styled(
-            "  生效后写配置并立即刷新五域;坏路径会得到指路",
-            p.dim(),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::bordered()
-                    .border_style(p.accent())
-                    .title(Span::styled(" 手填数据仓根 ", p.accent().bold())),
-            )
-            .style(p.surface()),
-        popup,
+}
+
+/// 数据仓根手填浮层:与 NW_HOME 手填同构(同一渲染件)。
+fn render_data_input(frame: &mut Frame, area: Rect, app: &App) {
+    render_text_input(
+        frame,
+        area,
+        app,
+        &app.data_buf,
+        " 手填数据仓根 ",
+        "  生效后写配置并立即刷新五域;坏路径会得到指路",
     );
 }
 

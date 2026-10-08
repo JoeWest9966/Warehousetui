@@ -103,7 +103,7 @@ pub enum HealthMode {
 /// 产出;`EngineCapability` 是能力探测门(#29)的接入点,本票只留位。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DataRootCause {
-    /// 没设——不猜、不拿当前目录兑底。
+    /// 没设——不猜、不拿当前目录兜底。
     Unset,
     /// 设了,但目录不存在 / 不可读。
     Unavailable,
@@ -125,7 +125,7 @@ impl DataRootCause {
     pub fn advice(self, root: Option<&str>) -> String {
         match self {
             DataRootCause::Unset => {
-                "五域读不到数据仓——不是数据丢了。去设置屏按 d 录入;面板不拿当前目录兑底。".into()
+                "五域读不到数据仓——不是数据丢了。去设置屏按 d 录入;面板不拿当前目录兜底。".into()
             }
             DataRootCause::Unavailable => format!(
                 "目录 {} 不存在或不可读——不是数据丢了。到设置屏按 d 重设。",
@@ -624,6 +624,23 @@ impl App {
             }
             "ls" => {
                 self.ls_loading = false;
+                // 换根竞态(#30 评审 P2):回音携带下发时的 --repo,与当前
+                // 数据仓根不一致 = 旧根的迟到结果,不入账(自愈刷新已带
+                // 新根在途);不带 --repo 的裸回放维持旧行为照收。
+                let echo_repo = out
+                    .args
+                    .windows(2)
+                    .find(|w| w[0] == "--repo")
+                    .map(|w| w[1].as_str());
+                if let Some(repo) = echo_repo {
+                    let current = self.usable_data_root();
+                    if current.as_deref() != Some(repo) {
+                        self.push_log(format!(
+                            "ls 回音已丢弃:数据仓根已换(旧根 {repo} 结果不入账)"
+                        ));
+                        return;
+                    }
+                }
                 match out.envelope.as_ref().and_then(|e| e.data_as::<LsData>()) {
                     Some(d) => {
                         self.ls = Some(d);
@@ -684,7 +701,18 @@ impl App {
                         }
                     } else {
                         self.assembling = false;
-                        self.push_log("登记落账回音已丢弃(流程已返航)");
+                        if out.ok {
+                            // 在途返航收不回引擎的写(进程边界):回音报成功则
+                            // 五域必须刷新,并明示「写可能已落盘」——catalog.json
+                            // 的最终对错交给 PR + 家长审复核(#31 评审 P1)。
+                            self.refresh_ls();
+                            self.push_log(
+                                "登记写盘可能已完成:五域已刷新,catalog.json 走 PR + 家长审复核"
+                                    .to_string(),
+                            );
+                        } else {
+                            self.push_log("登记落账回音已丢弃(流程已返航,写未成功)");
+                        }
                     }
                 } else if self.reg_state == RegState::PreAudit {
                     let headline = out.headline().to_string();
@@ -1073,10 +1101,11 @@ impl App {
         self.reg_state = RegState::KindPick;
         self.reg_kind = RegKind::Skill;
         self.reg_kind_sel = 0;
-        self.push_log("选 kind:↑/↓ 或 s/e 选择,Enter 预审,Esc 返航");
+        self.push_log("选 kind:↑/↓ 或 s/e 选择,Enter 预审,Esc/q 返航");
     }
 
-    /// kind 选择态键位:↑/↓ 移选中、s/e 直选、Enter 预审、Esc 返航。
+    /// kind 选择态键位:↑/↓ 移选中、s/e 直选、Enter 预审、Esc/q 返航
+    /// (q 与 Esc 同义,与输入态机一致)。
     fn on_key_reg_kind(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1096,7 +1125,7 @@ impl App {
                 self.reg_kind = RegKind::Extension;
             }
             KeyCode::Enter => self.dispatch_register(),
-            KeyCode::Esc => self.cancel_register(),
+            KeyCode::Esc | KeyCode::Char('q') => self.cancel_register(),
             _ => {}
         }
     }
@@ -3129,12 +3158,113 @@ mod tests {
         assert_eq!(app.reg_state, RegState::Idle, "返航清状态");
         assert!(app.reg_repo_buf.is_empty(), "不留半条记录");
         // 回音到达:按状态丢弃,但写互斥必须收敛(否则面板假装还在写)
+        let qlen = app.queue.len();
         let runner = FakeRunner::new(&[("source register", 0, REG_WRITTEN)]);
         let out = runner.run(&argv).await;
         app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
         assert_eq!(app.reg_state, RegState::Idle, "丢弃不回填状态");
         assert!(app.reg_result.is_none(), "丢弃不幽灵重开");
         assert!(!app.assembling, "丢弃路也收敛互斥");
-        assert!(app.log[0].contains("已丢弃"), "日志留证据:{}", app.log[0]);
+        // #31 评审 P1:回音报写盘成功 → 五域刷新必须入队(不因返航而丢),
+        // 且日志明示「写可能已落盘」并指路 PR + 家长审复核。
+        assert!(
+            app.queue.len() > qlen
+                && app.queue.last().map(|a| a.first().map(String::as_str)) == Some(Some("ls")),
+            "成功回音触发五域刷新入队"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("登记写盘可能已完成")
+                && l.contains("catalog.json 走 PR + 家长审复核")),
+            "日志明示写可能已落盘并指路复核:{:?}",
+            app.log.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- PR #32 评审修复:q 返航 / 旧根回音 / 最小终端登记浮层 ----
+
+    #[test]
+    fn 登记kind态_q与小写esc同义返航() {
+        let mut app = reg_app(&[]);
+        reg_to_kindpick(&mut app, "owner/x");
+        app.update(Message::Key(key('q')));
+        assert_eq!(app.reg_state, RegState::Idle, "q 返航与 Esc 同义");
+        assert!(app.reg_repo_buf.is_empty(), "不留半条记录");
+        // 再进一次,Esc 仍同义(两个键一个后果)
+        reg_to_kindpick(&mut app, "owner/x");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Idle, "Esc 返航不漂移");
+    }
+
+    #[test]
+    fn 换根后旧根ls回音_不入账_新根回音照常() {
+        let mut app = fake_app();
+        let cur = app.usable_data_root().expect("注入的临时根可用");
+        const LS_JSON: &str = r#"{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"domain":"all","recipes":[{"name":"r1"}],"components":[],"sources":[],"profiles":[],"locks":[]}}"#;
+        let echo = |repo: &str| EngineOutput {
+            args: vec!["ls".into(), "--repo".into(), repo.into()],
+            exit_code: crate::engine::ExitCode::Ok,
+            ok: true,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(LS_JSON).ok(),
+            raw_stdout: LS_JSON.into(),
+            parse_error: None,
+        };
+        // 旧根的迟到回音:--repo 与当前数据仓根不一致 → 丢弃并留证据
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(echo(
+            "/old-root-abc",
+        )))));
+        assert!(app.ls.is_none(), "旧根结果不入状态树");
+        assert!(
+            app.log[0].contains("数据仓根已换") && app.log[0].contains("/old-root-abc"),
+            "日志留证据:{}",
+            app.log[0]
+        );
+        // 当前根的回音照常入账(自愈刷新不受影响)
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(echo(&cur)))));
+        assert!(app.ls.is_some(), "当前根的回音入账");
+        assert!(
+            app.log[0].contains("五域已刷新"),
+            "日志留证据:{}",
+            app.log[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn 登记浮层_紧凑66x50_键位行可见_两段命中与落账同路() {
+        let mut app = reg_app(&[("--yes", 0, REG_WRITTEN), ("source register", 0, REG_OK)]);
+        app.size = Rect::new(0, 0, 66, 50);
+        reg_to_review(&mut app, "owner/tiny-skills").await;
+        // 确认屏在最小支持终端(66×50)下键位行两段可见
+        let s = crate::testutil::frame_display(&app, 66, 50);
+        assert!(s.contains("Enter 落账"), "左段键位行可见:{s}");
+        assert!(s.contains("Esc 返航"), "右段键位行可见:{s}");
+        // 右段返航:点与键盘 Esc 同路(紧凑态两段命中不炸)
+        let back = hit_target(&app, |t| *t == Target::DismissPopup);
+        click(&mut app, back);
+        assert_eq!(app.reg_state, RegState::Idle, "点返航段同路");
+        // 重进确认态:左段落账 = 图形确认(唯一 --yes 出口,紧凑态同路)
+        reg_to_review(&mut app, "owner/tiny-skills").await;
+        let act = hit_target(&app, |t| *t == Target::Activate);
+        click(&mut app, act);
+        assert_eq!(app.reg_state, RegState::Commit, "点落账段进在途");
+        let argv = app.queue.last().expect("落账入队").clone();
+        assert!(
+            argv.iter().any(|a| a == "--yes"),
+            "段命中与键盘同路也带 --yes:{argv:?}"
+        );
+        // 结果屏在 66×50 下渲染不炸:写盘位置与记录链接可见
+        let runner = FakeRunner::new(&[("source register", 0, REG_WRITTEN)]);
+        let out = runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert_eq!(app.reg_state, RegState::Done, "回音进结果态");
+        let s2 = crate::testutil::frame_display(&app, 66, 50);
+        assert!(s2.contains("catalog.json"), "写盘位置可见:{s2}");
+        assert!(
+            s2.contains("https://github.com/owner/tiny-skills"),
+            "记录链接行可见:{s2}"
+        );
     }
 }
