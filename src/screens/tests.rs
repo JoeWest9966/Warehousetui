@@ -771,3 +771,145 @@ fn 设置屏能力_无响应回未决不冒充禁用() {
         "未决不给「缺能力」指路(那是禁用组的):{s}"
     );
 }
+
+// ---- #38 组件与锁定集详情补全(spec #35):只读、以引擎 ls 输出为唯一来源 ----
+
+/// 引擎实跑 `nw ls` 的真实形状(0.1.0 契约):components 带 path / depends
+/// **对象数组** / vendored / usedBy;locks 的 recipe 是 **{name,version} 对象**、
+/// assets 是**数字**。夹具照引擎原文写,不是面板自造。
+const LS_COMPLOCKS: &str = r#"{"domain":"all","recipes":[],"components":[{"name":"scout","version":"1.0.0","path":"components/scout","depends":[{"name":"retention","version":"0.4.1"}],"vendored":true,"usedBy":["research-desk"]},{"name":"retention","version":"0.4.1","path":"components/retention","depends":[],"vendored":false,"usedBy":[]}],"sources":[],"profiles":[],"locks":[{"lockId":"9f8e","recipe":{"name":"research-desk","version":"1.0.0"},"bakedAt":"2026-10-01","assets":12}]}"#;
+
+fn comp_locks_app() -> App {
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_COMPLOCKS).unwrap());
+    app.screen = Screen::Recipes;
+    app
+}
+
+#[test]
+fn 组件详情_依赖列表来源与缺字段原样呈现() {
+    let mut app = comp_locks_app();
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_sel = 0; // scout:带依赖、被配方引用、vendored
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("scout"), "组件名在详情栏:{s}");
+    assert!(s.contains("components/scout"), "路径取引擎原文:{s}");
+    // 依赖 = 对象数组拼成 name@version(引擎原文的名与版本,不改写)
+    assert!(s.contains("retention@0.4.1"), "依赖带上版本:{s}");
+    assert!(s.contains("research-desk"), "被谁用取引擎 usedBy 原文:{s}");
+    assert!(s.contains("vendored"), "引擎自己的字段名原样留着:{s}");
+    assert!(s.contains("true"), "布尔值取引擎原文,不另译:{s}");
+    // 来源(本地/外部):nw ls 不输出 → 显式「——」+ 出处,不是面板猜
+    assert!(s.contains("(本地/外部)"), "来源栏点名是哪个二分:{s}");
+    assert!(s.contains("——"), "缺字段显式「——」:{s}");
+    assert!(s.contains("nw ls 不输出,面板不猜。"), "出处与纪律都在:{s}");
+}
+
+#[test]
+fn 组件详情_空依赖给无依赖_空引用给无_不是白屏() {
+    let mut app = comp_locks_app();
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_sel = 1; // retention:depends 空、usedBy 空
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("retention"), "第二个组件也可见:{s}");
+    assert!(s.contains("无依赖"), "空依赖给「无依赖」而不是空行:{s}");
+    assert!(
+        s.contains("依赖     无依赖"),
+        "选中行(retention)详情给「无依赖」:{s}"
+    );
+    assert!(
+        !s.contains("依赖     retention@0.4.1"),
+        "选中行没有依赖就不冒充有(列表里 scout 的依赖不算详情):{s}"
+    );
+    assert!(s.contains("——"), "来源仍给「——」:{s}");
+    // 详情栏不是白屏:字段行常在
+    assert!(s.contains("版本"), "字段名常在:{s}");
+}
+
+#[test]
+fn 锁定集详情_烤于资产数与ls不输出字段给占位与出处() {
+    let mut app = comp_locks_app();
+    app.rc_domain = crate::app::Domain::Locks;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("9f8e"), "lockId 可见:{s}");
+    // recipe 是 {name,version} 对象 → 展示名@版本
+    assert!(s.contains("research-desk@1.0.0"), "配方名@版本:{s}");
+    assert!(s.contains("2026-10-01"), "烤于时间取引擎原文:{s}");
+    assert!(s.contains("12"), "资产数取引擎整数:{s}");
+    // 路径 / 外部条目来源:引擎 ls 不输出 → 显式「——」+ 一句出处
+    assert!(s.contains("外部来源"), "外部条目来源栏在场:{s}");
+    assert!(s.contains("(repo/commit/落地位置)"), "三个子字段点名:{s}");
+    assert!(s.contains("——"), "缺字段显式「——」:{s}");
+    assert!(
+        s.contains("nw ls 不输出路径/外部来源;"),
+        "说明是引擎没给,不是面板漏了:{s}"
+    );
+    assert!(
+        s.contains("面板不猜,也不另开引擎调用。"),
+        "纪律原话在场(不新增引擎调用):{s}"
+    );
+}
+
+#[test]
+fn 锁定集配方_夹具字符串与引擎对象两形状都呈现() {
+    // 同一个渲染面吃两种 recipe 形状:对象形(引擎真输出)与裸字符串形
+    // (仓内既有夹具)。形状差异只许体现在标签上,不许让整份 ls 解析失败。
+    let mut app = comp_locks_app();
+    app.rc_domain = crate::app::Domain::Locks;
+    let object_shape = draw(&app, 110, 30);
+    assert!(
+        object_shape.contains("research-desk@1.0.0"),
+        "对象形 → 名@版本:{object_shape}"
+    );
+
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    app.screen = Screen::Recipes;
+    app.rc_domain = crate::app::Domain::Locks;
+    let string_shape = draw(&app, 110, 30);
+    assert!(
+        string_shape.contains("research-desk"),
+        "字符串形照原样给,不因形状解析失败:{string_shape}"
+    );
+    assert!(
+        !string_shape.contains("——") || string_shape.contains("lockId"),
+        "两条路都渲染出字段行,不是白屏:{string_shape}"
+    );
+}
+
+#[test]
+fn 紧凑66x50_组件与锁定集详情_字段与出处都不被截() {
+    // 紧凑态保证最小:详情栏不折行(Paragraph 无 wrap),字段名与出处整句可见。
+    for (domain, needles) in [
+        (
+            crate::app::Domain::Components,
+            vec![
+                "scout",
+                "retention@0.4.1",
+                "vendored",
+                "nw ls 不输出,面板不猜。",
+            ],
+        ),
+        (
+            crate::app::Domain::Locks,
+            vec![
+                "9f8e",
+                "research-desk@1.0.0",
+                "外部来源",
+                "nw ls 不输出路径/外部来源;",
+                "面板不猜,也不另开引擎调用。",
+            ],
+        ),
+    ] {
+        let mut app = comp_locks_app();
+        app.rc_domain = domain;
+        let s = draw(&app, 66, 50);
+        for needle in needles {
+            assert!(
+                s.contains(needle),
+                "66×50 {} 详情截断了「{needle}」:{s}",
+                domain.label()
+            );
+        }
+    }
+}

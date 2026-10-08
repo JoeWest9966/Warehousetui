@@ -219,13 +219,42 @@ pub struct RecipeRow {
     pub version: Option<String>,
 }
 
+/// 组件依赖的一项(引擎 `nw ls` 的 `components[].depends[]` 原文:
+/// 对象 `{name, version}`,不是裸字符串)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct ComponentDep {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+impl ComponentDep {
+    /// 展示串:`name@version`;引擎没给版本就只给名字。
+    pub fn label(&self) -> String {
+        match self.version.as_deref() {
+            Some(v) => format!("{}@{}", self.name, v),
+            None => self.name.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ComponentRow {
     pub name: String,
     #[serde(default)]
     pub version: Option<String>,
+    /// 组件目录相对数据仓根的路径(`nw ls` 原文)。
     #[serde(default)]
-    pub depends: Vec<String>,
+    pub path: Option<String>,
+    #[serde(default)]
+    pub depends: Vec<ComponentDep>,
+    /// 声明了第三方依赖随仓走(validate 检查 `component.vendored_declared`);
+    /// 这是引擎自己的字段名,面板不另译一个词,取原文呈现。
+    #[serde(default)]
+    pub vendored: bool,
+    /// 用到这个组件的配方名单(`nw ls` 原文)。
+    #[serde(default, rename = "usedBy")]
+    pub used_by: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -251,22 +280,66 @@ pub struct ProfileRow {
     pub installed_at: Option<String>,
 }
 
+/// 配方身份的对象形态(引擎 `nw ls` 的 `locks[].recipe` 契约)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RecipeBrief {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+impl RecipeBrief {
+    /// 展示串:`name@version`;缺名给「——」(不推导、不补全)。
+    pub fn label(&self) -> String {
+        match (self.name.as_deref(), self.version.as_deref()) {
+            (Some(n), Some(v)) => format!("{n}@{v}"),
+            (Some(n), None) => n.to_string(),
+            (None, _) => "——".to_string(),
+        }
+    }
+}
+
+/// 锁定集里的配方身份。
+///
+/// 引擎真输出是对象 `{name, version}`;仓内部分夹具与旧口径写成裸字符串
+/// (`"recipe": "research-desk"`)。两种形状都容忍(untagged)——展示只取
+/// [`RecipeRef::label`],缺字段由渲染层给「——」,不因形状差异整份 ls 解析失败。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RecipeRef {
+    Brief(RecipeBrief),
+    Name(String),
+}
+
+impl RecipeRef {
+    /// 展示串:对象形走 [`RecipeBrief::label`],裸字符串形原样给。
+    pub fn label(&self) -> String {
+        match self {
+            RecipeRef::Brief(b) => b.label(),
+            RecipeRef::Name(n) => n.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct LockRow {
     #[serde(default, rename = "lockId")]
     pub lock_id: Option<String>,
     #[serde(default)]
-    pub recipe: Option<String>,
+    pub recipe: Option<RecipeRef>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default, rename = "bakedAt")]
     pub baked_at: Option<String>,
+    /// 引擎 `ls` 不输出锁定集路径(它只读锁目录,不读锁正文)。
     #[serde(default)]
     pub path: Option<String>,
+    /// 资产数(`nw ls` 给整数)。
     #[serde(default)]
-    pub assets: Option<Value>,
+    pub assets: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
