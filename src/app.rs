@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use crate::engine::{
     commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, LsData, State,
 };
+use crate::input::{self, InputAction};
 use crate::layout::{hitmap, size_class, ScrollDir, Target};
 use crate::term::{self, ColorCap};
 use crate::theme::{cached_degrade, Palette, ThemeKind};
@@ -155,7 +156,7 @@ pub struct App {
     pub splash: bool,
     /// NW_HOME 手填输入模式(设置屏 i 进入;浮层优先级见 on_key)。
     pub home_input: bool,
-    /// 手填缓冲区(只收可打印字符;上限 HOME_BUF_CAP)。
+    /// 手填缓冲区(只收可打印字符;上限见 [`input::BUF_CAP`])。
     pub home_buf: String,
     /// config.toml 解析失败的人话证据;None = 配置健康。
     pub config_error: Option<String>,
@@ -646,40 +647,27 @@ impl App {
         }
     }
 
-    /// 手填输入模式的键位:Enter 生效、Esc/q 放弃、Backspace 删、
-    /// 可打印字符入栈(控制字符与带 CONTROL 修饰的键一律忽略)。
+    /// 手填输入模式的键位:键入分发归通用态机 [`input::on_key`],
+    /// 本函数只接 NW_HOME 的后果链(拒绝留驻、取消留日志)。
     fn on_key_home_input(&mut self, k: KeyEvent) {
-        const CAP: usize = 512;
-        match k.code {
-            KeyCode::Enter => self.apply_home_input(),
-            KeyCode::Esc | KeyCode::Char('q') => {
+        match input::on_key(&mut self.home_buf, k) {
+            InputAction::Submit => self.apply_home_input(),
+            InputAction::Cancel => {
                 self.home_input = false;
                 self.home_buf.clear();
                 self.push_log("取消手填 NW_HOME");
             }
-            KeyCode::Backspace => {
-                self.home_buf.pop();
-            }
-            KeyCode::Char(c) => {
-                let ctrl = k
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL);
-                if !ctrl && !c.is_control() && self.home_buf.chars().count() < CAP {
-                    self.home_buf.push(c);
-                }
-            }
-            _ => {}
+            InputAction::Edited | InputAction::Ignored => {}
         }
     }
 
     /// 手填生效:规范化(去空白 + `~` 展开)→ 与轮换同一条后果链。
     /// 空值/纯空格拒绝并留证据,不写任何状态、不退输入模式。
     pub fn apply_home_input(&mut self) {
-        let trimmed = self.home_buf.trim().to_string();
-        if trimmed.is_empty() {
+        let Some(trimmed) = input::normalize(&self.home_buf) else {
             self.push_log("NW_HOME 手填被拒:空值,原值保持不变");
             return;
-        }
+        };
         let expanded = crate::engine::discover::expand_tilde(&trimmed)
             .display()
             .to_string();

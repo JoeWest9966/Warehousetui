@@ -6,6 +6,7 @@
 
 mod app;
 mod engine;
+mod input;
 pub mod layout;
 mod screens;
 mod term;
