@@ -91,11 +91,14 @@ impl Domain {
     }
 }
 
-/// 健康屏两种复核模式。
+/// 健康屏三种复核模式:doctor 七面 / validate 27 项 / 外部源漂移(recheck,
+/// spec #34 工单 #40)。三者并列,语义互不冒充。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HealthMode {
     Doctor,
     Validate,
+    /// 外部源漂移复核:只读,结论按结果四态呈现,与 doctor 三档并列不合并。
+    Recheck,
 }
 
 /// 数据仓根门控的三种不可用原因(spec #24:「没设 / 目录不可用 / 引擎缺能力」
@@ -249,6 +252,9 @@ pub struct App {
     pub hl_sel: usize,
     pub hl_result: Option<EngineOutput>,
     pub hl_loading: bool,
+    /// 外部源漂移复核的**本次**结论(#40):只由刚下发的那一次 recheck 的回音
+    /// 写入,面板不缓存、不轮询、不冒充「上次结果」。换数据仓根即清空。
+    pub hl_recheck: Option<EngineOutput>,
 
     // ---- 配方 ----
     pub rc_domain: Domain,
@@ -368,6 +374,7 @@ impl App {
             hl_sel: 0,
             hl_result: None,
             hl_loading: false,
+            hl_recheck: None,
             rc_domain: Domain::Recipes,
             rc_sel: 0,
             reg_state: RegState::Idle,
@@ -435,6 +442,11 @@ impl App {
             Some("doctor") | Some("validate") => {
                 self.hl_loading = true;
                 self.hl_result = None;
+            }
+            // recheck(#40)在途:清掉上一轮结论,不拿旧结论冒充本次
+            Some("source") if args.get(1).map(String::as_str) == Some("recheck") => {
+                self.hl_loading = true;
+                self.hl_recheck = None;
             }
             _ => {}
         }
@@ -739,6 +751,17 @@ impl App {
                     self.push_log("登记预审回音已丢弃(流程已返航)");
                 }
             }
+            // 外部源漂移复核回音(#40):只读,只认真实 argv(带 --root 或
+            // --name);精确的无参探针仍归下面的能力回音路。
+            "source"
+                if out.args.get(1).map(String::as_str) == Some("recheck")
+                    && Capability::from_probe(&out.args).is_none() =>
+            {
+                self.hl_loading = false;
+                let headline = out.headline();
+                self.push_log(format!("外部源漂移复核完成(只读,未写任何文件):{headline}"));
+                self.hl_recheck = Some(out);
+            }
             // 能力探测回音(#29):只认精确探针 argv——真实的
             // `source register --repo …`(#30)不落此路,其结果留给 #30 路由。
             _ => {
@@ -882,23 +905,85 @@ impl App {
     }
 
     fn key_health(&mut self, k: KeyEvent) {
-        let n = self
-            .hl_result
-            .as_ref()
-            .map(|r| r.evidence().len())
-            .unwrap_or(0);
-        match k.code {
-            KeyCode::Char('m') => {
-                self.hl_mode = match self.hl_mode {
-                    HealthMode::Doctor => HealthMode::Validate,
-                    HealthMode::Validate => HealthMode::Doctor,
-                };
-            }
-            KeyCode::Char('r') => self.run_health(),
-            KeyCode::Down if n > 0 => self.hl_sel = (self.hl_sel + 1) % n,
-            KeyCode::Up if n > 0 => self.hl_sel = (self.hl_sel + n - 1) % n,
-            _ => {}
+        // m 在三模式间轮转:doctor → validate → 外部源漂移 → doctor。
+        if let KeyCode::Char('m') = k.code {
+            self.hl_mode = match self.hl_mode {
+                HealthMode::Doctor => HealthMode::Validate,
+                HealthMode::Validate => HealthMode::Recheck,
+                HealthMode::Recheck => HealthMode::Doctor,
+            };
+            return;
         }
+        match self.hl_mode {
+            HealthMode::Recheck => {
+                let n = self.recheck_source_len();
+                match k.code {
+                    // r = 全查已登记外部源;Enter = 只查选中这一条。
+                    KeyCode::Char('r') => self.run_recheck(None),
+                    KeyCode::Enter if n > 0 => {
+                        let name = self
+                            .ls
+                            .as_ref()
+                            .and_then(|l| l.sources.get(self.hl_sel.min(n - 1)))
+                            .map(|s| s.name.clone());
+                        self.run_recheck(name);
+                    }
+                    KeyCode::Down if n > 0 => self.hl_sel = (self.hl_sel + 1) % n,
+                    KeyCode::Up if n > 0 => self.hl_sel = (self.hl_sel + n - 1) % n,
+                    _ => {}
+                }
+            }
+            _ => {
+                let n = self
+                    .hl_result
+                    .as_ref()
+                    .map(|r| r.evidence().len())
+                    .unwrap_or(0);
+                match k.code {
+                    KeyCode::Char('r') => self.run_health(),
+                    KeyCode::Down if n > 0 => self.hl_sel = (self.hl_sel + 1) % n,
+                    KeyCode::Up if n > 0 => self.hl_sel = (self.hl_sel + n - 1) % n,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// 外部源漂移复核的可选行数(#40):已登记的外部源记录数。
+    pub fn recheck_source_len(&self) -> usize {
+        self.ls.as_ref().map(|l| l.sources.len()).unwrap_or(0)
+    }
+
+    /// 下发 recheck(#40):**只读**。三道门——数据仓根已设、引擎有 `source`
+    /// 能力、编目非空——各有可区分指路;任一门不过都不下发命令。
+    pub fn run_recheck(&mut self, name: Option<String>) {
+        if let Some(cause) = self.data_root_cause() {
+            self.push_log(format!("recheck 未下发:{}", cause.title()));
+            return;
+        }
+        if !self.capabilities.enabled(Capability::SourceRecheck) {
+            self.push_log(format!(
+                "recheck 未下发:{}",
+                crate::engine::capability::GATE_HINT
+            ));
+            return;
+        }
+        if self.recheck_source_len() == 0 {
+            self.push_log("recheck 未下发:编目里还没有已登记外部源(去配方屏外部源域按 r 登记)");
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log("recheck 未下发:数据仓根不可用");
+            return;
+        };
+        let scope = match name.as_deref() {
+            Some(n) => format!("只查 {n}"),
+            None => "全查已登记外部源".to_string(),
+        };
+        self.hl_recheck = None; // 在途:不拿上一轮结论冒充本次
+        self.queue
+            .push(commands::source_recheck(name.as_deref(), &root));
+        self.push_log(format!("recheck 已入队({scope},只读不写账)"));
     }
 
     fn key_recipes(&mut self, k: KeyEvent) {
@@ -1078,6 +1163,10 @@ impl App {
         } else {
             self.ls = None; // 陈旧五域不冒充新根的内容
             self.push_log(format!("ls 未下发:{}", self.data_root_gate_msg()));
+        }
+        // 换根即作废上一轮的漂移结论(#40 无缓存语义):旧根的结论不冒充新根的。
+        if self.hl_recheck.take().is_some() {
+            self.push_log("漂移结论已作废:数据仓根已换(旧根结论不入账)");
         }
     }
 
@@ -1399,6 +1488,8 @@ impl App {
         match self.hl_mode {
             HealthMode::Doctor => self.queue.push(commands::doctor_profile(&profile, None)),
             HealthMode::Validate => self.queue.push(commands::validate_recipe(&profile)),
+            // 漂移复核走 run_recheck(三道门 + 按名/全查),不在这条派体检路上。
+            HealthMode::Recheck => self.run_recheck(None),
         }
     }
 
@@ -3414,6 +3505,172 @@ mod tests {
         assert!(
             s2.contains("https://github.com/owner/tiny-skills"),
             "记录链接行可见:{s2}"
+        );
+    }
+
+    // ---- #40 外部源漂移:recheck 只读入健康屏 ----
+
+    fn recheck_app() -> App {
+        let mut app = fake_app();
+        app.screen = Screen::Health;
+        app.hl_mode = HealthMode::Recheck;
+        app.ls = Some(
+            serde_json::from_str::<LsData>(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[{"name":"web-search","kind":"skill","entries":[{"name":"a","path":"skills/a"}]},{"name":"theme-pack","kind":"extension","entries":[{"name":"t","path":"."}]}],"profiles":[],"locks":[]}"#,
+            )
+            .unwrap(),
+        );
+        app.capabilities
+            .record(Capability::SourceRecheck, capability::Probe::Available);
+        app
+    }
+
+    #[test]
+    fn m_在三模式间轮转_漂移与doctor不互冒充() {
+        let mut app = recheck_app();
+        assert_eq!(app.hl_mode, HealthMode::Recheck);
+        app.update(Message::Key(key('m')));
+        assert_eq!(app.hl_mode, HealthMode::Doctor);
+        app.update(Message::Key(key('m')));
+        assert_eq!(app.hl_mode, HealthMode::Validate);
+        app.update(Message::Key(key('m')));
+        assert_eq!(app.hl_mode, HealthMode::Recheck, "轮转回漂移模式");
+    }
+
+    #[test]
+    fn recheck_全查与按名限定_argv都不带任何写旗标() {
+        let mut app = recheck_app();
+        app.run_recheck(None);
+        assert_eq!(
+            app.queue.last().unwrap(),
+            &vec![
+                "source".to_string(),
+                "recheck".into(),
+                "--root".into(),
+                std::env::temp_dir().display().to_string()
+            ],
+            "全查:不带 --name"
+        );
+        app.run_recheck(Some("web-search".into()));
+        let a = app.queue.last().unwrap();
+        assert_eq!(a[2], "--name");
+        assert_eq!(a[3], "web-search");
+        assert!(
+            !a.iter().any(|x| x == "--yes"),
+            "只读铁律:recheck 永不带 --yes(写入口只有 register 一个)"
+        );
+    }
+
+    #[test]
+    fn recheck_三种缺前提都不下发命令_各有可区分指路() {
+        // 未设数据仓根
+        let mut app = recheck_app();
+        app.data_root = None;
+        let n = app.queue.len();
+        app.run_recheck(None);
+        assert_eq!(app.queue.len(), n, "未设根不下发");
+        assert!(app.log[0].contains("数据仓根未设"), "{:?}", app.log);
+        // 引擎无 source 能力
+        let mut app = recheck_app();
+        app.capabilities
+            .record(Capability::SourceRecheck, capability::Probe::Unavailable);
+        let n = app.queue.len();
+        app.run_recheck(None);
+        assert_eq!(app.queue.len(), n, "缺能力不下发");
+        assert!(app.log[0].contains("不是面板坏了"), "{:?}", app.log);
+        // 编目为空
+        let mut app = recheck_app();
+        app.ls = Some(
+            serde_json::from_str::<LsData>(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+            )
+            .unwrap(),
+        );
+        let n = app.queue.len();
+        app.run_recheck(None);
+        assert_eq!(app.queue.len(), n, "空编目不下发");
+        assert!(app.log[0].contains("没有已登记外部源"), "{:?}", app.log);
+    }
+
+    /// 经 FakeRunner 喂一次 recheck 回音(与既有 reg_feed 同款:走解析点,
+    /// 契约守卫才会合证;直接拼 EngineOutput 会绕过它)。
+    async fn recheck_feed(app: &mut App, json: &str, rc: i32) {
+        let argv = app.queue.last().expect("队尾有 recheck argv").clone();
+        let runner = FakeRunner::new(&[("source recheck", rc, json)]);
+        let o = runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(o))));
+    }
+
+    #[tokio::test]
+    async fn recheck_回音入状态树_只读不占装配互斥() {
+        let mut app = recheck_app();
+        app.run_recheck(None);
+        let json = r#"{"schema":"nw/source-recheck.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"漂移 1 处","hint":"重跑 register","details":{}}],"warnings":[],"data":{"catalogPath":"/data/repo/catalog.json","checked":[{"name":"web-search","kind":"skill","repo":"o/r","commit":"abc","entries":1},{"name":"theme-pack","kind":"extension","repo":"o/t","commit":"def","entries":1}],"drift":[{"source":"web-search","kind":"added","entry":"x","path":"p/x"}]}}"#;
+        recheck_feed(&mut app, json, 3).await;
+        assert!(app.hl_recheck.is_some(), "本次结论入状态树");
+        assert!(!app.assembling, "只读不点装配互斥灯");
+        assert!(
+            app.log.iter().any(|l| l.contains("只读,未写任何文件")),
+            "日志明示只读:{:?}",
+            app.log
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_换数据仓根即作废陈旧结论_不冒充新根的() {
+        let mut app = recheck_app();
+        app.run_recheck(None);
+        let json = r#"{"schema":"nw/source-recheck.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/data/repo/catalog.json","checked":[{"name":"web-search","kind":"skill","repo":"o/r","commit":"abc","entries":1}],"drift":[]}}"#;
+        recheck_feed(&mut app, json, 0).await;
+        assert!(app.hl_recheck.is_some());
+        let (_g, _cfg) = env_locked();
+        app.apply_data_root(_cfg.dir().display().to_string());
+        assert!(app.hl_recheck.is_none(), "换根作废旧结论(无缓存语义)");
+        assert!(
+            app.log.iter().any(|l| l.contains("漂移结论已作废")),
+            "作废留证据:{:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn recheck_键位_r全查_enter只查选中_record条目不误发() {
+        let mut app = recheck_app();
+        // Enter 只查选中这一条
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.hl_sel, 1, "↓ 移到第二条记录");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let a = app.queue.last().unwrap();
+        assert_eq!(a[3], "theme-pack", "Enter 只查选中记录:{a:?}");
+        // r 全查
+        app.update(Message::Key(key('r')));
+        let a = app.queue.last().unwrap();
+        assert!(!a.iter().any(|x| x == "--name"), "r 全查:{a:?}");
+    }
+
+    #[test]
+    fn recheck_鼠标点清单行选中_与上下键同路_点空白不误发() {
+        let mut app = recheck_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        let qlen = app.queue.len();
+        click(&mut app, row);
+        assert_eq!(app.hl_sel, 1, "点清单行选中");
+        assert_eq!(app.queue.len(), qlen, "点行只选中,不下发命令");
+        // 三道门任一不过:清单不产命中区(整栏是指路)
+        let mut gated = recheck_app();
+        gated.size = Rect::new(0, 0, 80, 30);
+        gated.data_root = None;
+        let hits = hitmap(gated.size, &gated, size_class(gated.size));
+        assert!(
+            hits.iter().all(|(_, t)| *t != Target::SelectRow(1)),
+            "未设根时没有可选中行(指路屏)"
         );
     }
 }

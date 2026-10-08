@@ -275,8 +275,30 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
 }
 
 /// 健康屏:validate 模式下「27 项」列表在 55% 左栏、带边框、首行即数据
-/// (doctor 模式是只读七面卡,无选中目标)。
+/// (doctor 模式是只读七面卡,无选中目标);外部源漂移模式(#40)的左栏是
+/// 「结论横幅 4 行 + 已登记外部源清单」,清单行在横幅之下。
 fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
+    if matches!(app.hl_mode, crate::app::HealthMode::Recheck) {
+        // 三道门任一不过:整栏是指路,没有可选中行
+        if app.data_root_cause().is_some()
+            || !app
+                .capabilities
+                .enabled(crate::engine::Capability::SourceRecheck)
+            || app.recheck_source_len() == 0
+        {
+            return;
+        }
+        let (cols, _) = h_split2(area, 55, 45);
+        // 与 render_recheck 同款:左栏纵向 [Length(4) 横幅, Min(清单)]
+        let rows = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Length(5),
+            ratatui::layout::Constraint::Min(4),
+        ])
+        .split(cols);
+        let lst = shrink_border(rows[1]);
+        row_hits(lst, 0, app.recheck_source_len(), hits, Target::SelectRow);
+        return;
+    }
     if !matches!(app.hl_mode, crate::app::HealthMode::Validate) {
         return;
     }

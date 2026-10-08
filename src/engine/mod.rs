@@ -17,9 +17,9 @@ use serde::Deserialize;
 pub use capability::{Capability, Gate, Probe, GATE_HINT};
 #[allow(unused_imports)]
 pub use envelope::{
-    CheckResult, ComponentRow, DoctorData, DoctorResult, Envelope, Evidence, LockRow, LsData,
-    ManifestBrief, ProfileRow, RecipeRow, RegisterAcceptance, RegisterData, RegisterEntry,
-    SourceRow, UpData, ValidateData, ValidateSummary,
+    CheckResult, CheckedSource, ComponentRow, DoctorData, DoctorResult, Drift, Envelope, Evidence,
+    LockRow, LsData, ManifestBrief, ProfileRow, RecheckData, RecipeRow, RegisterAcceptance,
+    RegisterData, RegisterEntry, SourceRow, UpData, ValidateData, ValidateSummary,
 };
 #[allow(unused_imports)]
 pub use runner::{CommandRunner, EngineEvent, EngineOutput, FakeRunner, MissingRunner, RealRunner};
