@@ -178,7 +178,14 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
                             if c.depends.is_empty() {
                                 "无依赖".into()
                             } else {
-                                format!("依赖:{}", c.depends.join(","))
+                                format!(
+                                    "依赖:{}",
+                                    c.depends
+                                        .iter()
+                                        .map(|d| d.label())
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                )
                             },
                             p.dim(),
                         ),
@@ -223,7 +230,7 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
                     Line::from(format!(
                         "{}  {}",
                         k.lock_id.clone().unwrap_or_default(),
-                        k.recipe.clone().unwrap_or_default()
+                        k.recipe.as_ref().map(|r| r.label()).unwrap_or_default()
                     ))
                 })
                 .collect(),
@@ -321,27 +328,86 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                         ]
                     })
                     .unwrap_or_default(),
+                Domain::Components => l
+                    .components
+                    .get(app.rc_sel)
+                    .map(|c| {
+                        vec![
+                            Line::from(format!("名称     {}", c.name)),
+                            Line::from(format!(
+                                "版本     {}",
+                                c.version.clone().unwrap_or_else(|| "——".into())
+                            )),
+                            Line::from(format!(
+                                "路径     {}",
+                                c.path.clone().unwrap_or_else(|| "——".into())
+                            )),
+                            Line::from(format!(
+                                "依赖     {}",
+                                if c.depends.is_empty() {
+                                    "无依赖".to_string()
+                                } else {
+                                    c.depends
+                                        .iter()
+                                        .map(|d| d.label())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                }
+                            )),
+                            Line::from(format!(
+                                "被谁用   {}",
+                                if c.used_by.is_empty() {
+                                    "无".to_string()
+                                } else {
+                                    c.used_by.join(", ")
+                                }
+                            )),
+                            // 引擎自己的字段名 + 原文布尔值:不另译一个词
+                            Line::from(format!("vendored {}", c.vendored)),
+                            Line::from(""),
+                            Line::from("来源     ——  (本地/外部)"),
+                            Line::from(Span::styled("nw ls 不输出,面板不猜。", p.dim())),
+                        ]
+                    })
+                    .unwrap_or_default(),
                 Domain::Locks => l
                     .locks
                     .get(app.rc_sel)
                     .map(|k| {
                         vec![
                             Line::from(format!(
-                                "lockId  {}",
-                                k.lock_id.clone().unwrap_or_else(|| "—".into())
+                                "lockId   {}",
+                                k.lock_id.clone().unwrap_or_else(|| "——".into())
                             )),
                             Line::from(format!(
-                                "配方    {}",
-                                k.recipe.clone().unwrap_or_else(|| "—".into())
+                                "配方     {}",
+                                k.recipe
+                                    .as_ref()
+                                    .map(|r| r.label())
+                                    .unwrap_or_else(|| "——".into())
                             )),
                             Line::from(format!(
-                                "烤于    {}",
-                                k.baked_at.clone().unwrap_or_else(|| "—".into())
+                                "烤于     {}",
+                                k.baked_at.clone().unwrap_or_else(|| "——".into())
                             )),
                             Line::from(format!(
-                                "路径    {}",
-                                k.path.clone().unwrap_or_else(|| "—".into())
+                                "资产数   {}",
+                                k.assets
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|| "——".into())
                             )),
+                            // 路径与外部条目来源(repo/commit/落地位置)在锁定集
+                            // 正文里,nw ls 只读锁目录、不读锁正文 —— 显式「——」
+                            // + 一句出处:面板不猜,也不为它们另开引擎调用。
+                            Line::from(format!(
+                                "路径     {}",
+                                k.path.clone().unwrap_or_else(|| "——".into())
+                            )),
+                            Line::from("外部来源 ——"),
+                            Line::from(Span::styled("  (repo/commit/落地位置)", p.dim())),
+                            Line::from(""),
+                            Line::from(Span::styled("nw ls 不输出路径/外部来源;", p.dim())),
+                            Line::from(Span::styled("面板不猜,也不另开引擎调用。", p.dim())),
                         ]
                     })
                     .unwrap_or_default(),
@@ -379,7 +445,8 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                         register_entry_hint(app),
                     ],
                 },
-                _ => vec![Line::from(Span::styled("详情按域展开(只读)。", p.dim()))],
+                // 五域(#37 #38)已全部有详情臂;将来上游加新域时这里会变成
+                // 编译错误,提醒面板跟上引擎——不留 catch-all 把新域静默成一句占位。
             },
         }
     };
