@@ -1267,6 +1267,30 @@ fn 外部源漂移_三种缺前提各有可区分指路() {
     assert!(s.contains("按 r 登记"), "空态可行动:{s}");
 }
 
+#[test]
+fn 外部源漂移_五域还没读到与编目为空两种指路_互不冒充() {
+    // 第四种边缘态:ls 还没回音时清单也是 0 行,但不能对操作者断言
+    // 「没有记录」——两种说法各有各的下一步,互不冒充。
+    let mut app = recheck_app();
+    app.ls = None;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("五域还没读到"), "没读到说没读到:{s}");
+    assert!(s.contains("等 ls 回音"), "指路带下一步:{s}");
+    assert!(!s.contains("没有已登记外部源"), "没读到不冒充空编目:{s}");
+    // ls 回音了而外部源域确为空:另一个说法
+    let mut app = recheck_app();
+    app.ls = Some(
+        serde_json::from_str(
+            r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+        )
+        .unwrap(),
+    );
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("没有已登记外部源"), "空编目说空编目:{s}");
+    assert!(s.contains("按 r 登记"), "空编目给可行动指路:{s}");
+    assert!(!s.contains("五域还没读到"), "空编目不冒充没读到:{s}");
+}
+
 #[tokio::test]
 async fn 外部源漂移_不认识的schema走需升级_不按旧形状猜() {
     // 走 FakeRunner(经 runner 的解析点),契约守卫才合证——直接拼
