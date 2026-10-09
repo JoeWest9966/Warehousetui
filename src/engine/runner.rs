@@ -212,19 +212,30 @@ impl CommandRunner for RealRunner {
                     return;
                 }
             };
-            // stderr 实时逐行推 UI(装配日志窗格的数据源)
+            // stderr 实时逐行推 UI(装配日志窗格的数据源),同时收拢成
+            // Finished 的尾巴 —— 版本探测等从 stderr 读真相的调用要用它
+            // (nw --version 的裸版本号在 stderr;尾巴空 = 顶栏永远「未知」)。
+            let (collect_tx, mut collect_rx) = mpsc::unbounded_channel::<String>();
             let tx_lines = tx.clone();
-            let streamer = child_stderr_lines(cmd.stderr.take(), tx_lines);
+            let streamer = child_stderr_lines(cmd.stderr.take(), tx_lines, collect_tx);
             let output = cmd.wait_with_output().await;
             if let Some(h) = streamer {
                 let _ = h.await;
+            }
+            let mut tail: Vec<String> = Vec::new();
+            while let Ok(l) = collect_rx.try_recv() {
+                tail.push(l);
+            }
+            const CAP: usize = 200;
+            if tail.len() > CAP {
+                tail.drain(0..tail.len() - CAP);
             }
             let out = match output {
                 Ok(o) => EngineOutput::from_parts(
                     &args,
                     o.status.code().unwrap_or(-1),
                     String::from_utf8_lossy(&o.stdout).into_owned(),
-                    vec![],
+                    tail,
                 ),
                 Err(e) => {
                     let out = EngineOutput::from_parts(
@@ -244,14 +255,16 @@ impl CommandRunner for RealRunner {
 fn child_stderr_lines(
     stderr: Option<tokio::process::ChildStderr>,
     tx: mpsc::UnboundedSender<EngineEvent>,
+    collect: mpsc::UnboundedSender<String>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     stderr.map(|se| {
         tokio::spawn(async move {
             let mut lines = BufReader::new(se).lines();
             while let Ok(Some(l)) = lines.next_line().await {
-                if tx.send(EngineEvent::Stderr(l)).is_err() {
+                if tx.send(EngineEvent::Stderr(l.clone())).is_err() {
                     break;
                 }
+                let _ = collect.send(l);
             }
         })
     })
@@ -433,6 +446,42 @@ mod tests {
             EngineEvent::Finished(o) => assert!(o.ok),
             _ => panic!("应立即 Finished"),
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_真实进程_stderr收进尾巴() {
+        // 回归:spawn 路径曾把 Finished 的 stderr_tail 落成空 Vec ——
+        // 版本探测(nw --version 的裸版本号在 stderr)永远解析出「未知」,
+        // 顶栏从此报错引擎版本。真进程:拿测试二进制自己认不动的旗标,
+        // libtest 会把 "Unrecognized option" 写到 stderr 并非零退出。
+        let exe = std::env::current_exe().expect("当前测试二进制路径");
+        let r = RealRunner::new(exe);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        r.spawn(vec!["--nonexistent-flag-xyz".into()], tx);
+        let mut lines = 0usize;
+        let mut finished = None;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                EngineEvent::Stderr(_) => lines += 1,
+                EngineEvent::Finished(o) => {
+                    finished = Some(o);
+                    break;
+                }
+            }
+        }
+        let out = finished.expect("必须收到 Finished");
+        assert!(lines > 0, "stderr 应实时逐行推 UI");
+        assert!(
+            !out.stderr_tail.is_empty(),
+            "尾巴必须收拢 stderr(不再空 Vec)"
+        );
+        assert!(
+            out.stderr_tail
+                .iter()
+                .any(|l| l.contains("Unrecognized option")),
+            "尾巴带 stderr 原文:{:?}",
+            out.stderr_tail
+        );
     }
 
     // ---- #28 契约守卫:解析点合证 + 输出面只采信守卫 ----
