@@ -42,21 +42,31 @@ impl EngineOutput {
         format!("nw {}", self.args.join(" "))
     }
 
-    /// 「人话一句」:parse_error > 错误 message > rc 人话。
+    /// 「人话一句」:parse_error > 契约守卫「需升级」> 错误 message > rc 人话。
     pub fn headline(&self) -> String {
         if let Some(pe) = &self.parse_error {
             return format!("stdout 不是合法 envelope:{pe}");
         }
         if let Some(env) = &self.envelope {
+            // 契约守卫(#28):schema 不认识时,面板自己的结论顶到最前,
+            // 不引用引擎原话(原话的形状已经不可信)。
+            if let Some(g) = &env.schema_guard {
+                return g.message.clone();
+            }
             return env.headline().to_string();
         }
         self.exit_code.human().to_string()
     }
 
     /// 证据条目:错误优先、警告兜底;用于结果屏折叠展示。
+    /// schema 不认识时只给契约守卫的「需升级」证据——引擎对不认识的
+    /// envelope 说的任何话都不采信(不降级解析)。
     pub fn evidence(&self) -> Vec<&Evidence> {
         match &self.envelope {
             Some(e) => {
+                if let Some(g) = &e.schema_guard {
+                    return vec![g];
+                }
                 let mut v: Vec<&Evidence> = e.errors.iter().collect();
                 v.extend(e.warnings.iter());
                 v
@@ -71,8 +81,11 @@ impl EngineOutput {
             (None, Some("stdout 为空".into()), code == 0)
         } else {
             match serde_json::from_str::<Envelope>(trimmed) {
-                Ok(e) => {
+                Ok(mut e) => {
                     let ok = e.ok && code == 0;
+                    // 契约守卫(#28):解析点认识性检查,不认识就带上
+                    // 「需升级」证据(携引擎真实 rc),并禁止 data 拆型。
+                    e.apply_schema_guard(code);
                     (Some(e), None, ok)
                 }
                 Err(e) => (None, Some(e.to_string()), code == 0),
@@ -310,6 +323,29 @@ impl FakeRunner {
         }
     }
 
+    /// 由 (args 子串, rc, fixture JSON, stderr 人话) 列表构造。
+    /// stderr 是能力探测的判定面(#29:引擎亲口「未知子命令」),
+    /// 三元构造给不出 stderr,故另开此路;既有三元构造不动。
+    pub fn with_stderr(rules: &[(&str, i32, &str, &str)]) -> Self {
+        Self {
+            rules: rules
+                .iter()
+                .map(|(needle, rc, json, stderr)| {
+                    let lines: Vec<String> = stderr.lines().map(String::from).collect();
+                    (
+                        needle.to_string(),
+                        EngineOutput::from_parts(
+                            &[needle.to_string()],
+                            *rc,
+                            json.to_string(),
+                            lines,
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+
     fn match_for(&self, args: &[String]) -> EngineOutput {
         let joined = args.join(" ");
         self.rules
@@ -397,5 +433,60 @@ mod tests {
             EngineEvent::Finished(o) => assert!(o.ok),
             _ => panic!("应立即 Finished"),
         }
+    }
+
+    // ---- #28 契约守卫:解析点合证 + 输出面只采信守卫 ----
+
+    const UNKNOWN_SCHEMA_LS: &str = r#"{"schema":"nw/ls.v2","nw":"9.9.9","ok":true,"errors":[{"code":"X","exitCode":0,"message":"引擎自己的话","hint":null,"details":null}],"warnings":[],"data":{"domain":"all","recipes":[{"name":"x"}]}}"#;
+
+    #[tokio::test]
+    async fn 未知_schema_headline_与_evidence_只给需升级证据() {
+        let r = FakeRunner::new(&[("ls", 0, UNKNOWN_SCHEMA_LS)]);
+        let out = r.run(&["ls".into()]).await;
+        assert!(out.ok, "守卫不改写引擎的 ok≡rc 判定");
+        let h = out.headline();
+        assert!(
+            h.contains("需升级 nw") && h.contains("nw/ls.v2") && h.contains("9.9.9"),
+            "一句话含需升级 + schema 原文 + 引擎版本:{h}"
+        );
+        let evs = out.evidence();
+        assert_eq!(evs.len(), 1, "不认识的 envelope 话不采信,只给守卫证据");
+        assert_eq!(evs[0].code.as_deref(), Some("SCHEMA_UNKNOWN"));
+        let d = evs[0].details.as_ref().unwrap();
+        assert_eq!(d["schema"], "nw/ls.v2");
+        assert_eq!(d["nw"], "9.9.9");
+        // 降级解析被禁止:形状再像也不拆
+        assert!(out
+            .envelope
+            .as_ref()
+            .unwrap()
+            .data_as::<super::super::LsData>()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn 未知_schema_rc11_守卫证据带引擎真实rc() {
+        let r = FakeRunner::new(&[(
+            "doctor",
+            11,
+            r#"{"schema":"nw/doctor.v2","nw":"2.0.0","ok":false,"errors":[],"warnings":[],"data":{"exit":11}}"#,
+        )]);
+        let out = r
+            .run(&["doctor".into(), "--profile".into(), "desk".into()])
+            .await;
+        assert_eq!(out.exit_code, ExitCode::Drift);
+        let evs = out.evidence();
+        assert_eq!(evs[0].exit_code, Some(11), "守卫证据携引擎真实 rc");
+        assert!(evs[0].message.contains("需升级 nw"));
+    }
+
+    #[tokio::test]
+    async fn 认识的_schema_不产生守卫_旧样照常() {
+        let r = FakeRunner::new(&[("ls", 0, LS_FIXTURE)]);
+        let out = r.run(&["ls".into()]).await;
+        assert!(out.envelope.as_ref().unwrap().schema_guard.is_none());
+        let d: super::super::LsData = out.envelope.as_ref().unwrap().data_as().unwrap();
+        assert_eq!(d.profiles[0].name, "desk");
+        assert_eq!(out.headline(), "完成");
     }
 }

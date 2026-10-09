@@ -34,6 +34,9 @@ pub enum Target {
     ScrollLog(ScrollDir),
     /// 点帮助浮层任意处关闭。
     DismissPopup,
+    /// 点配方域建议命令键位行 = 切换只读选中态(#39,与键盘 `c` 同路;
+    /// 面板不执行该命令,也不碰剪贴板——名字里没有 "copy" 就是因为没有复制)。
+    ToggleSuggest,
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -98,10 +101,16 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         ritual_hits(body, class, &mut hits);
         return hits;
     }
-    // 手填 NW_HOME 浮层对鼠标惰性:打字仍走键盘;浮层打开期间鼠标
-    // 不分派任何命中区——浮层打开时点击只作用于浮层,不误触底层
-    // (spec #15 故事 14/16)。
-    if app.home_input {
+    // 手填浮层(NW_HOME / 数据仓根)对鼠标惰性:打字仍走键盘;浮层打开
+    // 期间鼠标不分派任何命中区——点击只作用于浮层,不误触底层
+    // (spec #15 故事 14/16;数据仓根手填沿用同一条)。
+    if app.home_input || app.data_input {
+        return hits;
+    }
+    // 登记两段式(#30):输入/等回音态同手填浮层惰性;kind 选择与
+    // 确认态只产浮层命中区(弹层优先级,底层不产出)。
+    if app.reg_state != crate::app::RegState::Idle {
+        register_hits(body, class, app, &mut hits);
         return hits;
     }
     match class {
@@ -266,9 +275,62 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
     row_hits(lst, 0, ls.locks.len(), hits, Target::SelectRow);
 }
 
+/// recheck 屏四块几何(#40):渲染侧 `health::render_recheck` 与命中侧
+/// [`health_hits`] 共用同一组常量,几何零分歧(不靠人工对齐)。
+///
+/// `recheck_panels` 返回 `[结论横幅, 已登记外部源清单, 漂移条目, 证据]`:
+/// 前两块在 55% 左栏(横幅 3 行文案 + 2 行块边框 = `Length(5)`),后两块在
+/// 45% 右栏(漂移条目 `Length(12)`),同栏的下一块都取 `Min(4)` 的余量。
+pub(crate) fn recheck_panels(area: Rect) -> [Rect; 4] {
+    let (left, right) = h_split2(area, 55, 45);
+    let l = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(5),
+        ratatui::layout::Constraint::Min(4),
+    ])
+    .split(left);
+    let r = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(12),
+        ratatui::layout::Constraint::Min(4),
+    ])
+    .split(right);
+    [l[0], l[1], r[0], r[1]]
+}
+
+/// recheck 屏左右两栏(三道门的指路铺满整栏):由 [`recheck_panels`] 的同一组
+/// 常量合回来,不再另写一份 55/45 + 纵向分栏。
+pub(crate) fn recheck_cols(area: Rect) -> (Rect, Rect) {
+    let p = recheck_panels(area);
+    (
+        Rect::new(p[0].x, p[0].y, p[0].width, p[0].height + p[1].height),
+        Rect::new(p[2].x, p[2].y, p[2].width, p[2].height + p[3].height),
+    )
+}
+
 /// 健康屏:validate 模式下「27 项」列表在 55% 左栏、带边框、首行即数据
-/// (doctor 模式是只读七面卡,无选中目标)。
+/// (doctor 模式是只读七面卡,无选中目标);外部源漂移模式(#40)的左栏是
+/// 「结论横幅 + 已登记外部源清单」,清单行在横幅之下,几何见
+/// [`recheck_panels`]。
 fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
+    if matches!(app.hl_mode, crate::app::HealthMode::Recheck) {
+        // 三道门任一不过:整栏是指路,没有可选中行
+        if app.data_root_cause().is_some()
+            || !app
+                .capabilities
+                .enabled(crate::engine::Capability::SourceRecheck)
+            || app.recheck_empty_cause().is_some()
+        {
+            return;
+        }
+        // 与 render_recheck 同一个 recheck_panels,不抄第二份分栏常量
+        row_hits(
+            shrink_border(recheck_panels(area)[1]),
+            0,
+            app.recheck_source_len(),
+            hits,
+            Target::SelectRow,
+        );
+        return;
+    }
     if !matches!(app.hl_mode, crate::app::HealthMode::Validate) {
         return;
     }
@@ -313,6 +375,40 @@ fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, T
         hits,
         Target::SelectRow,
     );
+    // 配方域建议命令键位行(#39):与渲染同一套分栏常量算出详情栏,取其内层
+    // 末行;三前提不齐时命中侧不放行(与登记落账闸同一种纪律)。
+    if app.rc_domain == crate::app::Domain::Recipes
+        && app.data_root_cause().is_none()
+        && app.bake_suggest_gate().is_ok()
+    {
+        let detail = match class {
+            SizeClass::Comfy => ratatui::layout::Layout::horizontal([
+                ratatui::layout::Constraint::Length(14),
+                ratatui::layout::Constraint::Percentage(45),
+                ratatui::layout::Constraint::Percentage(41),
+            ])
+            .split(area)[2],
+            SizeClass::Compact => {
+                let rows = ratatui::layout::Layout::vertical([
+                    ratatui::layout::Constraint::Length(1),
+                    ratatui::layout::Constraint::Min(4),
+                ])
+                .split(area);
+                ratatui::layout::Layout::horizontal([
+                    ratatui::layout::Constraint::Percentage(52),
+                    ratatui::layout::Constraint::Percentage(48),
+                ])
+                .split(rows[1])[1]
+            }
+        };
+        let d = shrink_border(detail);
+        if d.height > 0 && d.width > 0 {
+            hits.push((
+                Rect::new(d.x, d.y + d.height - 1, d.width, 1),
+                Target::ToggleSuggest,
+            ));
+        }
+    }
 }
 
 /// 发射仪式键位行的三段文案:渲染与命中共用(与 [`tab_cell`] 同法,
@@ -321,6 +417,25 @@ fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, T
 pub const RITUAL_KEY_LAUNCH: &str = "  Enter 发射 ";
 pub const RITUAL_KEY_GAP: &str = "   ";
 pub const RITUAL_KEY_RETURN: &str = "Esc 返航 ";
+
+/// 登记 kind 选择屏键位行的左段(与 RITUAL_KEY_* 同法,渲染与命中
+/// 共用):右段直接复用 [`RITUAL_KEY_RETURN`],段间仍用 [`RITUAL_KEY_GAP`]。
+pub const REG_KEY_KIND_LAUNCH: &str = "  Enter 预审 ";
+
+/// 登记确认屏键位行的左段(#31 落账段,与 [`REG_KEY_KIND_LAUNCH`] 同法):
+/// 只在落账闸放行时铺——不可落账时整屏仍归返航(命中侧同条件分叉)。
+pub const REG_KEY_REVIEW_COMMIT: &str = "  Enter 落账 ";
+
+/// 登记四个浮层的尺寸(spec #25 / 工单 #30 #31):渲染与命中同一组常量,
+/// 几何零分歧;`popup_rect` 的收窄规则两边同用。
+pub const REG_INPUT_W: u16 = 64;
+pub const REG_INPUT_H: u16 = 7;
+pub const REG_KIND_W: u16 = 56;
+pub const REG_KIND_H: u16 = 9;
+pub const REG_REVIEW_W: u16 = 76;
+pub const REG_REVIEW_H: u16 = 24;
+pub const REG_DONE_W: u16 = 76;
+pub const REG_DONE_H: u16 = 20;
 
 /// 发射仪式浮层:与 `render_launch_ritual` 同尺寸、在**正文区**内居中;
 /// 底部键位行按渲染同一文案对半分——「Enter 发射」段给
@@ -333,17 +448,9 @@ pub const RITUAL_KEY_RETURN: &str = "Esc 返航 ";
 /// body 居中,常畅态恒差一个导航列宽(80 宽差 6 列——点渲染出来的「射」
 /// 会落进返航段),紧凑态奇数高度还会差一行;两处偏差由列级测试钉住。
 fn ritual_hits(body: Rect, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
-    use unicode_width::UnicodeWidthStr;
     // 与 `render_body` 同款分出正文区,再在其内居中(布局模型只读 size_class)。
-    let content = match class {
-        SizeClass::Comfy => match body_cols(body) {
-            Some((_, inner)) => inner,
-            None => return,
-        },
-        SizeClass::Compact => match body_below_tabs(body) {
-            Some(inner) => inner,
-            None => return,
-        },
+    let Some(content) = popup_content(body, class) else {
+        return;
     };
     let popup = popup_rect(content, 60, 14);
     // 与渲染同一套行序:block 内 10 行(空/四字段/空/两行说明/空/键位行),
@@ -352,23 +459,107 @@ fn ritual_hits(body: Rect, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
         return;
     }
     let y = popup.y + 10;
-    // 发射段自内层首列起(popup.x+1),含文案宽;返航段接在段间空隙之后。
-    let inner_x = popup.x.saturating_add(1);
-    let launch_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_LAUNCH)).unwrap_or(0);
-    let gap_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_GAP)).unwrap_or(0);
-    let return_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_RETURN)).unwrap_or(0);
-    let launch_end = (inner_x.saturating_add(launch_w)).min(popup.x + popup.width);
-    let launch_w = launch_end.saturating_sub(inner_x);
-    if launch_w > 0 {
-        hits.push((Rect::new(inner_x, y, launch_w, 1), Target::Activate));
+    two_key_segments(popup, y, RITUAL_KEY_LAUNCH, RITUAL_KEY_RETURN, hits);
+}
+
+/// 正文区(常畅去左导航轨 / 紧凑去 Tab 条):浮层命中的居中基准,
+/// 与 `render_body` 分给各屏的区域几何零分歧。
+fn popup_content(body: Rect, class: SizeClass) -> Option<Rect> {
+    match class {
+        SizeClass::Comfy => body_cols(body).map(|(_, inner)| inner),
+        SizeClass::Compact => body_below_tabs(body),
     }
-    let return_x = launch_end.saturating_add(gap_w);
-    let right_end = (return_x.saturating_add(return_w)).min(popup.x + popup.width);
-    if return_x < right_end {
+}
+
+/// 键位行两段命中:左段(确认动作)→ [`RITUAL_KEY_GAP`] → 右段(返航);
+/// 渲染按同一组文案同一顺序铺行,段间不重叠、不留歧义区。
+/// 发射仪式与登记 kind 选择屏共用此分法(点哪打哪)。
+fn two_key_segments(popup: Rect, y: u16, left: &str, right: &str, hits: &mut Vec<(Rect, Target)>) {
+    use unicode_width::UnicodeWidthStr;
+    let inner_x = popup.x.saturating_add(1);
+    let left_w = u16::try_from(UnicodeWidthStr::width(left)).unwrap_or(0);
+    let gap_w = u16::try_from(UnicodeWidthStr::width(RITUAL_KEY_GAP)).unwrap_or(0);
+    let right_w = u16::try_from(UnicodeWidthStr::width(right)).unwrap_or(0);
+    let left_end = (inner_x.saturating_add(left_w)).min(popup.x + popup.width);
+    let left_w = left_end.saturating_sub(inner_x);
+    if left_w > 0 {
+        hits.push((Rect::new(inner_x, y, left_w, 1), Target::Activate));
+    }
+    let right_x = left_end.saturating_add(gap_w);
+    let right_end = (right_x.saturating_add(right_w)).min(popup.x + popup.width);
+    if right_x < right_end {
         hits.push((
-            Rect::new(return_x, y, right_end - return_x, 1),
+            Rect::new(right_x, y, right_end - right_x, 1),
             Target::DismissPopup,
         ));
+    }
+}
+
+/// 登记浮层(#30 #31):几何与 `recipes::render_register_overlay` 同一组
+/// 常量、同一 `popup_rect` 居中基准。输入/等回音态鼠标惰性(同手填
+/// 浮层先例);kind 选项两行产 [`Target::SelectRow`] 选中 + 键位行两段
+/// (Activate 预审 / Dismiss 返航);确认态按落账闸分叉——放行时
+/// 键位行两段(Activate 落账 / Dismiss 返航),不放行时整屏点任意处
+/// = 返航(不可落账不可达);结果屏整屏点任意处 = 返航。浮层外不产出
+/// 任何命中区(弹层优先级)。
+fn register_hits(
+    body: Rect,
+    class: SizeClass,
+    app: &crate::app::App,
+    hits: &mut Vec<(Rect, Target)>,
+) {
+    let Some(content) = popup_content(body, class) else {
+        return;
+    };
+    match app.reg_state {
+        crate::app::RegState::Idle | crate::app::RegState::RepoInput => {}
+        crate::app::RegState::PreAudit => {} // 等回音:无处可点,同惰性
+        crate::app::RegState::KindPick => {
+            let popup = popup_rect(content, REG_KIND_W, REG_KIND_H);
+            if popup.height < REG_KIND_H {
+                return; // 收窄后行序不再可信,不产命中
+            }
+            let inner = shrink_border(popup);
+            // 与渲染同序:内层首行是标题行,其后是 kind 选项两行,
+            // 末行是键位行(渲染把键位行钉在内层最后一行)。
+            for i in 0..crate::app::RegKind::ALL.len() as u16 {
+                let y = inner.y.saturating_add(1 + i);
+                if y < inner.y + inner.height {
+                    hits.push((
+                        Rect::new(inner.x, y, inner.width, 1),
+                        Target::SelectRow(i as usize),
+                    ));
+                }
+            }
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(popup, key_y, REG_KEY_KIND_LAUNCH, RITUAL_KEY_RETURN, hits);
+        }
+        crate::app::RegState::Review => {
+            let popup = popup_rect(content, REG_REVIEW_W, REG_REVIEW_H);
+            if popup.width == 0 || popup.height == 0 {
+                return;
+            }
+            if app.reg_can_commit() {
+                // 落账闸放行(#31):键位行两段——「Enter 落账」→ Activate
+                // (与键盘 Enter 同路,仍过闸),「Esc 返航」→ Dismiss;
+                // 几何与渲染同文案同序(key_y = 内层末行)。
+                let key_y = popup.y + popup.height - 2;
+                two_key_segments(popup, key_y, REG_KEY_REVIEW_COMMIT, RITUAL_KEY_RETURN, hits);
+            } else {
+                // 闸不放行:没绑 Enter(不可落账不可达),整屏点任意处 = 返航
+                hits.push((popup, Target::DismissPopup));
+            }
+        }
+        crate::app::RegState::Commit => {}
+        // 落账在途:同预审等回音态鼠标惰性(Esc 返航归键盘);
+        // 写盘互斥由 assembling 顶栏灯/HUD 同源呈现。
+        crate::app::RegState::Done => {
+            // 结果屏:点任意处 = 返航(同确认态不可落账分支的先例)
+            let popup = popup_rect(content, REG_DONE_W, REG_DONE_H);
+            if popup.width > 0 && popup.height > 0 {
+                hits.push((popup, Target::DismissPopup));
+            }
+        }
     }
 }
 
@@ -377,8 +568,9 @@ fn help_hits(area: Rect, hits: &mut Vec<(Rect, Target)>) {
     hits.push((popup_rect(area, 44, 18), Target::DismissPopup));
 }
 
-/// 与壳/浮层渲染同款的居中弹层矩形。
-fn popup_rect(area: Rect, w: u16, h: u16) -> Rect {
+/// 与壳/浮层渲染同款的居中弹层矩形(`recipes` 登记浮层渲染直接调用,
+/// 与命中侧同一个函数——居中与收窄规则永不分歧)。
+pub(crate) fn popup_rect(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width.saturating_sub(4));
     let h = h.min(area.height.saturating_sub(2));
     Rect::new(
@@ -778,6 +970,44 @@ mod tests {
         app.screen = Screen::Assemble;
         app.as_confirm = true;
         assert_ritual_column_aligned(&app, 66, 31);
+    }
+
+    /// recheck 屏(#40)四块几何:横幅确实占 5 行(3 行文案 + 2 行块边框,
+    /// 与 [`recheck_panels`] 注释同源),且命中侧的清单首行就是渲染侧的
+    /// 清单首行——几何收在一处后,渲染与命中不可能再各写一套。
+    #[test]
+    fn hitmap_recheck_横幅占五行_清单行与渲染同一行() {
+        use crate::engine::{Capability, Probe};
+        let mut app = test_app();
+        app.screen = Screen::Health;
+        app.hl_mode = crate::app::HealthMode::Recheck;
+        app.capabilities
+            .record(Capability::SourceRecheck, Probe::Available);
+        app.ls = Some(
+            serde_json::from_str::<crate::engine::LsData>(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[{"name":"web-search","kind":"skill","entries":[]},{"name":"theme-pack","kind":"extension","entries":[]}],"profiles":[],"locks":[]}"#,
+            )
+            .unwrap(),
+        );
+        let a = area(80, 30);
+        assert_eq!(recheck_panels(a)[0].height, 5, "横幅 = 3 行文案 + 2 行边框");
+        let hits = hitmap(a, &app, size_class(a));
+        let row0 = first(&hits, |t| *t == Target::SelectRow(0)).expect("清单首行可点");
+        let frame = crate::testutil::frame_display(&app, a.width, a.height);
+        let rendered = frame
+            .split('\n')
+            .nth(row0.y as usize)
+            .expect("命中行在渲染中在场");
+        assert!(
+            rendered.contains("web-search"),
+            "命中行 = 渲染清单首行:{}",
+            rendered
+        );
+        assert!(
+            hits.iter()
+                .all(|(_, t)| !matches!(t, Target::ToggleSuggest)),
+            "配方域建议命令的键位行不归健康屏"
+        );
     }
 
     #[test]

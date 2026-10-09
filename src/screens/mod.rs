@@ -35,3 +35,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 pub(crate) fn body<'a>(app: &App, note: &'a str) -> ratatui::widgets::Block<'a> {
     screen_block(&app.palette, app.screen.title(), Some(note.to_string()))
 }
+
+/// 数据仓根三态指路的共用渲染(五域入口同源,措辞取自
+/// [`crate::app::DataRootCause`],三种情形互不冒充)。
+pub(crate) fn data_root_signpost(app: &App) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line, Span};
+    let Some(cause) = app.data_root_cause() else {
+        return Vec::new();
+    };
+    let p = &app.palette;
+    vec![
+        Line::from(Span::styled(
+            format!(" ⚠ {} ", cause.title()),
+            p.warn().bold(),
+        )),
+        Line::from(Span::styled(
+            cause.advice(app.data_root.as_deref()),
+            p.dim(),
+        )),
+    ]
+}

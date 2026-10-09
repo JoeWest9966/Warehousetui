@@ -3,6 +3,7 @@
 //! 本模块是面板与引擎之间的**唯一**缝:Ui 永远经由 [`runner`] 的
 //! 输出与 [`envelope`] 的类型看世界,凭据与环境细节不下渗到 UI。
 
+pub mod capability;
 pub mod commands;
 pub mod config;
 pub mod discover;
@@ -13,10 +14,12 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+pub use capability::{Capability, Gate, Probe, GATE_HINT};
 #[allow(unused_imports)]
 pub use envelope::{
-    CheckResult, ComponentRow, DoctorData, DoctorResult, Envelope, Evidence, LockRow, LsData,
-    ManifestBrief, ProfileRow, RecipeRow, SourceRow, UpData, ValidateData, ValidateSummary,
+    CheckResult, CheckedSource, ComponentRow, DoctorData, DoctorResult, Drift, Envelope, Evidence,
+    LockRow, LsData, ManifestBrief, ProfileRow, RecheckData, RecipeRow, RegisterAcceptance,
+    RegisterData, RegisterEntry, SourceRow, UpData, ValidateData, ValidateSummary,
 };
 #[allow(unused_imports)]
 pub use runner::{CommandRunner, EngineEvent, EngineOutput, FakeRunner, MissingRunner, RealRunner};

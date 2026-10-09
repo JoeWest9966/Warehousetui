@@ -19,6 +19,10 @@ pub struct Config {
     /// 默认 NW_HOME。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nw_home: Option<String>,
+    /// 数据仓根(数据仓目录,`nw ls --repo` 的显式指向;spec #24)。
+    /// None = 未设——面板不猜、不拿当前目录兜底,五域走指路(#27)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_root: Option<String>,
     /// 主题 warehouse | high_contrast。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
@@ -101,6 +105,23 @@ mod tests {
         assert!(err.unwrap().contains("解析失败"));
         let (_c2, err2) = parse("nw_home = \"/data\"");
         assert!(err2.is_none(), "好 TOML 不制造噪音");
+    }
+
+    #[test]
+    fn data_root_缺省未设_写回再读不丢() {
+        let (cfg, err) = parse("");
+        assert!(err.is_none());
+        assert_eq!(cfg.data_root, None, "缺省即未设,不当当前目录兜底");
+        let (mut off, _) = parse("");
+        off.data_root = Some("/data/repo".into());
+        let text = toml::to_string_pretty(&off).unwrap();
+        let (back, err2) = parse(&text);
+        assert!(err2.is_none());
+        assert_eq!(
+            back.data_root.as_deref(),
+            Some("/data/repo"),
+            "重启仍生效的落盘语义"
+        );
     }
 
     #[test]

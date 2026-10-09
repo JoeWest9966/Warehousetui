@@ -9,11 +9,39 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::State;
+
+/// 契约守卫(#28):面板**认识**的 envelope schema 集合。
+///
+/// 只收面板认识其 data 形状、或明确知道其存在的引擎 schema(调研底稿
+/// §3 的 `nw/<cmd>.v1` 全集)。不在集合里的一律走「需升级 nw」证据:
+/// 不 panic、不按旧形状降级解析(`data_as` 直接返回 None)。
+/// 这是面板自己的契约知识,不是引擎能力表(那是 #29 的探测门)。
+const KNOWN_SCHEMAS: [&str; 8] = [
+    "nw/validate.v1",
+    "nw/up.v1",
+    "nw/doctor.v1",
+    "nw/bake.v1",
+    "nw/recipe-new.v1",
+    "nw/ls.v1",
+    "nw/source-register.v1",
+    "nw/source-recheck.v1",
+];
+
+/// schema 是否在面板认识的集合内(契约守卫的判据)。
+fn is_known_schema(schema: &str) -> bool {
+    KNOWN_SCHEMAS.contains(&schema)
+}
+
 /// 错误/警告条目五字段。warnings 的 code 可缺。
 #[derive(Clone, Debug, Deserialize)]
 pub struct Evidence {
     #[serde(default)]
     pub code: Option<String>,
+    /// 引擎的字段名是 `exitCode`(camelCase,契约冻结)。少了这一条 rename,
+    /// 证据五字段的第四列永远解析成 None——屏幕上的 `rc0` 是面板自己
+    /// 编的,不是引擎说的(#40 验收「显示引擎证据」钉的是原文)。
+    #[serde(default, rename = "exitCode")]
     pub exit_code: Option<i32>,
     pub message: String,
     #[serde(default)]
@@ -33,11 +61,47 @@ pub struct Envelope {
     #[serde(default)]
     pub warnings: Vec<Evidence>,
     pub data: Value,
+    /// 契约守卫证据(#28):schema 不在认识集合时由 [`Envelope::apply_schema_guard`]
+    /// 在解析点合成,非空即「按旧形状解析」被禁止。serde 跳过——它是面板的
+    /// 结论,不是引擎的原话,不参与反序列化。
+    #[serde(skip)]
+    pub schema_guard: Option<Evidence>,
 }
 
 impl Envelope {
-    /// 按 schema 拆出 data 的定型视图;形状不匹配时返回 None(UI 走证据展示)。
+    /// 契约守卫:这次给的 schema 面板认不认识。
+    pub fn schema_known(&self) -> bool {
+        is_known_schema(&self.schema)
+    }
+
+    /// 契约守卫:schema 不认识时合成「需升级 nw」五字段证据(带收到的
+    /// schema 原文与引擎版本),认识时什么都不做。由解析点(runner 的
+    /// `from_parts`)携 rc 调用一次;幂等,重复调用不覆盖。
+    pub fn apply_schema_guard(&mut self, rc: i32) {
+        if self.schema_guard.is_some() || self.schema_known() {
+            return;
+        }
+        self.schema_guard = Some(Evidence {
+            code: Some("SCHEMA_UNKNOWN".into()),
+            exit_code: Some(rc),
+            message: format!(
+                "需升级 nw:面板不认识 envelope schema \"{}\"(引擎 nw {})",
+                self.schema, self.nw
+            ),
+            hint: Some("升级 nw 与本面板,使两端 schema 对齐;收到的原文在 details".into()),
+            details: Some(serde_json::json!({
+                "schema": self.schema,
+                "nw": self.nw,
+            })),
+        });
+    }
+
+    /// 按 schema 拆出 data 的定型视图;schema 不在认识集合(契约守卫)
+    /// 或形状不匹配时返回 None——绝不按旧形状降级解析(UI 走证据展示)。
     pub fn data_as<T: for<'de> Deserialize<'de>>(&self) -> Option<T> {
+        if !self.schema_known() {
+            return None;
+        }
         serde_json::from_value(self.data.clone()).ok()
     }
 
@@ -161,15 +225,52 @@ pub struct RecipeRow {
     pub version: Option<String>,
 }
 
+/// 组件依赖的一项(引擎 `nw ls` 的 `components[].depends[]` 原文:
+/// 对象 `{name, version}`,不是裸字符串)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct ComponentDep {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+impl ComponentDep {
+    /// 展示串:`name@version`;引擎没给版本就只给名字。
+    pub fn label(&self) -> String {
+        match self.version.as_deref() {
+            Some(v) => format!("{}@{}", self.name, v),
+            None => self.name.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ComponentRow {
     pub name: String,
     #[serde(default)]
     pub version: Option<String>,
+    /// 组件目录相对数据仓根的路径(`nw ls` 原文)。
     #[serde(default)]
-    pub depends: Vec<String>,
+    pub path: Option<String>,
+    #[serde(default)]
+    pub depends: Vec<ComponentDep>,
+    /// 声明了第三方依赖随仓走(validate 检查 `component.vendored_declared`);
+    /// 这是引擎自己的字段名,面板不另译一个词,取原文呈现。
+    #[serde(default)]
+    pub vendored: bool,
+    /// 用到这个组件的配方名单(`nw ls` 原文)。
+    #[serde(default, rename = "usedBy")]
+    pub used_by: Vec<String>,
 }
 
+/// `nw ls` 外部源域的一行(#35/#37):**一条记录 = 一个仓库**。
+///
+/// - `kind` = `skill` | `extension`(记录落在编目哪条数组);
+/// - `category` 是**多级**类别(单层内禁 "/",空数组 = 未分类——引擎不落
+///   「未分类」字面量,由展示方兜底);
+/// - `entries` 是一次扫描得出的条目清单(名字 + 路径)。引擎侧 ls 用
+///   `SourceEntry`、register 用 `CatalogEntry`,两者形状同为「名字 + 路径」
+///   —— 面板这里共用 [`RegisterEntry`] 一个拼写,不造第二个同形类型。
 #[derive(Clone, Debug, Deserialize)]
 pub struct SourceRow {
     pub name: String,
@@ -178,7 +279,9 @@ pub struct SourceRow {
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
-    pub entries: Vec<String>,
+    pub category: Vec<String>,
+    #[serde(default)]
+    pub entries: Vec<RegisterEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -193,22 +296,66 @@ pub struct ProfileRow {
     pub installed_at: Option<String>,
 }
 
+/// 配方身份的对象形态(引擎 `nw ls` 的 `locks[].recipe` 契约)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RecipeBrief {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+impl RecipeBrief {
+    /// 展示串:`name@version`;缺名给「——」(不推导、不补全)。
+    pub fn label(&self) -> String {
+        match (self.name.as_deref(), self.version.as_deref()) {
+            (Some(n), Some(v)) => format!("{n}@{v}"),
+            (Some(n), None) => n.to_string(),
+            (None, _) => "——".to_string(),
+        }
+    }
+}
+
+/// 锁定集里的配方身份。
+///
+/// 引擎真输出是对象 `{name, version}`;仓内部分夹具与旧口径写成裸字符串
+/// (`"recipe": "research-desk"`)。两种形状都容忍(untagged)——展示只取
+/// [`RecipeRef::label`],缺字段由渲染层给「——」,不因形状差异整份 ls 解析失败。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RecipeRef {
+    Brief(RecipeBrief),
+    Name(String),
+}
+
+impl RecipeRef {
+    /// 展示串:对象形走 [`RecipeBrief::label`],裸字符串形原样给。
+    pub fn label(&self) -> String {
+        match self {
+            RecipeRef::Brief(b) => b.label(),
+            RecipeRef::Name(n) => n.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct LockRow {
     #[serde(default, rename = "lockId")]
     pub lock_id: Option<String>,
     #[serde(default)]
-    pub recipe: Option<String>,
+    pub recipe: Option<RecipeRef>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default, rename = "bakedAt")]
     pub baked_at: Option<String>,
+    /// 引擎 `ls` 不输出锁定集路径(它只读锁目录,不读锁正文)。
     #[serde(default)]
     pub path: Option<String>,
+    /// 资产数(`nw ls` 给整数)。
     #[serde(default)]
-    pub assets: Option<Value>,
+    pub assets: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -224,6 +371,122 @@ pub struct LsData {
     pub profiles: Vec<ProfileRow>,
     #[serde(default)]
     pub locks: Vec<LockRow>,
+}
+
+// ---- source register(`nw/source-register.v1`,工单 #30/#31) ----
+
+/// 引擎扫到的一个条目(名字 + 路径)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RegisterEntry {
+    pub name: String,
+    #[serde(default)]
+    pub path: String,
+}
+
+/// 验收一条结论;`id` 是冻结面、`message` 措辞不承诺。
+/// `status` = pass | fail | skip(「未确认」= `register.confirmed` 的
+/// skip,设计内的待定态,不是错误)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RegisterAcceptance {
+    pub id: String,
+    pub status: String,
+    pub message: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// register 的 data 形状(引擎自测夹具口径):预审与落账共用,
+/// `written` 区分「文件不落」与真写入。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RegisterData {
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub category: Vec<String>,
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub entries: Vec<RegisterEntry>,
+    #[serde(default)]
+    pub acceptance: Vec<RegisterAcceptance>,
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub written: bool,
+    #[serde(default)]
+    pub updated: bool,
+    #[serde(default)]
+    pub action: String,
+}
+
+impl RegisterData {
+    /// 验收里有 fail(引擎铁律:有 fail 就不得进入落账段)。
+    pub fn has_fail(&self) -> bool {
+        self.acceptance.iter().any(|a| a.status == "fail")
+    }
+}
+
+// ---- source recheck(`nw/source-recheck.v1`,工单 #40) ----
+
+/// 一条被复核的记录的事实(谁、扫到几个、快照是谁)。
+/// `commit` 只是快照身份:**上游 commit 变化不算漂移**(引擎口径,面板不自定规则)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct CheckedSource {
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub entries: u32,
+}
+
+/// 一条漂移差异。`kind` 是引擎冻结的四种之一:
+/// `added`(仓有编目无)/ `removed`(编目有仓无)/ `renamed`(路径在 name 变)/
+/// `path_changed`(name 在路径变)。面板按原文呈现,不自造第五种。
+#[derive(Clone, Debug, Deserialize)]
+pub struct Drift {
+    pub source: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub entry: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// recheck 的 data 形状(只读:只报告、永不写账)。
+/// 编目不存在 → 空报告 + rc 0(「还没注册过任何外部源」是合法状态)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RecheckData {
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub checked: Vec<CheckedSource>,
+    #[serde(default)]
+    pub drift: Vec<Drift>,
+}
+
+impl RecheckData {
+    /// 这条记录的漂移结论按结果四态落:无漂移 = 过,有漂移 = 败。
+    /// (漂移在引擎侧是「结论是红的」——rc 3;面板不把它降级成警告。)
+    pub fn state_of(&self, source: &str) -> State {
+        if self.drift.iter().any(|d| d.source == source) {
+            State::Fail
+        } else if self.checked.iter().any(|c| c.name == source) {
+            State::Pass
+        } else {
+            State::Skip
+        }
+    }
 }
 
 #[cfg(test)]
@@ -331,5 +594,110 @@ mod tests {
             details: None,
         });
         assert_eq!(e.headline(), "漂了");
+    }
+
+    // ---- #28 契约守卫:不认识的 schema ----
+
+    fn envelope_with_schema(schema: &str, nw: &str, data: Value) -> Envelope {
+        serde_json::from_value(json!({
+            "schema": schema,
+            "nw": nw,
+            "ok": true,
+            "errors": [],
+            "warnings": [],
+            "data": data,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn 契约守卫_认识的_schema_照常拆型与无证据() {
+        let e = envelope_with_schema("nw/ls.v1", "0.1.0", json!({"domain": "all"}));
+        assert!(e.schema_known());
+        let d: LsData = e.data_as().unwrap();
+        assert_eq!(d.domain, "all");
+        let mut e = e;
+        e.apply_schema_guard(0);
+        assert!(e.schema_guard.is_none(), "认识的 schema 不产生守卫证据");
+    }
+
+    #[test]
+    fn 契约守卫_不认识的_schema_不按旧形状降级解析() {
+        // 即使 data 恰好兼容旧 LsData 形状,也不许拆出来(静默摆错数据)
+        let mut e = envelope_with_schema(
+            "nw/ls.v2",
+            "9.9.9",
+            json!({"domain": "all", "recipes": [{"name": "x"}]}),
+        );
+        assert!(!e.schema_known());
+        assert!(
+            e.data_as::<LsData>().is_none(),
+            "不认识的 schema 必须拒拆,不按旧形状解析"
+        );
+        e.apply_schema_guard(3);
+        let g = e.schema_guard.as_ref().expect("应合成需升级证据");
+        assert_eq!(g.code.as_deref(), Some("SCHEMA_UNKNOWN"));
+        assert_eq!(g.exit_code, Some(3));
+        assert!(
+            g.message.contains("需升级 nw")
+                && g.message.contains("nw/ls.v2")
+                && g.message.contains("9.9.9"),
+            "人话一句含需升级 + schema 原文 + 引擎版本:{}",
+            g.message
+        );
+        let d = g.details.as_ref().unwrap();
+        assert_eq!(d["schema"], "nw/ls.v2");
+        assert_eq!(d["nw"], "9.9.9");
+        // 五字段里的 hint 给升级指引,不回显任何密钥(只放 schema/版本)
+        assert!(g.hint.as_deref().unwrap().contains("升级"));
+    }
+
+    #[test]
+    fn 契约守卫_重复合成幂等_不覆盖已有证据() {
+        let mut e = envelope_with_schema("nw/doctor.v2", "1.0.0", json!({}));
+        e.apply_schema_guard(11);
+        let first = e.schema_guard.clone().unwrap();
+        e.apply_schema_guard(0);
+        assert_eq!(e.schema_guard.unwrap().exit_code, first.exit_code, "幂等");
+    }
+
+    // ---- #40 recheck 定型:只读漂移结论,四态判定以引擎原文为据 ----
+
+    #[test]
+    fn 解析_recheck_data_漂移四种与快照身份() {
+        let e = envelope_with_schema(
+            "nw/source-recheck.v1",
+            "0.1.0",
+            json!({
+                "catalogPath": "/data/repo/catalog.json",
+                "checked": [
+                    {"name": "web-search", "kind": "skill", "repo": "o/r", "commit": "abc123", "entries": 2},
+                    {"name": "theme-pack", "kind": "extension", "repo": "o/t", "commit": "def456", "entries": 1}
+                ],
+                "drift": [
+                    {"source": "web-search", "kind": "added", "entry": "deep-research", "path": "skills/deep-research"}
+                ]
+            }),
+        );
+        let d: RecheckData = e.data_as().unwrap();
+        assert_eq!(d.checked.len(), 2);
+        assert_eq!(d.checked[0].entries, 2);
+        assert_eq!(d.drift[0].kind, "added");
+        // 四态:有漂移=败,查了没漂移=过,没查=略
+        assert_eq!(d.state_of("web-search"), State::Fail);
+        assert_eq!(d.state_of("theme-pack"), State::Pass);
+        assert_eq!(d.state_of("not-checked"), State::Skip);
+    }
+
+    #[test]
+    fn 解析_recheck_data_编目不存在是空报告不是错误() {
+        let e = envelope_with_schema(
+            "nw/source-recheck.v1",
+            "0.1.0",
+            json!({"catalogPath": "catalog.json", "checked": [], "drift": []}),
+        );
+        let d: RecheckData = e.data_as().unwrap();
+        assert!(d.checked.is_empty() && d.drift.is_empty());
+        assert_eq!(d.state_of("whatever"), State::Skip, "没查过的不冒充没问题");
     }
 }
