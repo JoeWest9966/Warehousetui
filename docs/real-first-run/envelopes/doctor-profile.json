@@ -1,0 +1,141 @@
+{
+  "schema": "nw/doctor.v1",
+  "nw": "0.1.0",
+  "ok": false,
+  "errors": [
+    {
+      "code": "DEGRADED",
+      "exitCode": 10,
+      "message": "env: required env 缺失:派能会降级跑(不阻断)",
+      "details": {
+        "missing": [
+          "TAVILY_API_KEY"
+        ]
+      }
+    },
+    {
+      "code": "DEGRADED",
+      "exitCode": 10,
+      "message": "provider: provider stepfun-sb 未就绪:credentials_not_configured",
+      "details": {
+        "provider": "stepfun-sb",
+        "reason": "credentials_not_configured",
+        "status": "not_ready"
+      }
+    }
+  ],
+  "warnings": [],
+  "data": {
+    "results": [
+      {
+        "surface": "manifest",
+        "status": "pass",
+        "message": "清单在位(schema nw/manifest.v1)",
+        "details": {
+          "installedAt": "2026-10-09T03:00:07Z",
+          "lockId": "research-desk-1.0.0-360ae68"
+        }
+      },
+      {
+        "surface": "consist",
+        "status": "skip",
+        "message": "未给 --lock:只核对清单自述,不比对锁定集"
+      },
+      {
+        "surface": "consist",
+        "status": "pass",
+        "message": "runtime node 版本相符",
+        "details": {
+          "binary": "/opt/nwt-realrun/nw-home/runtimes/node-22.19.0+pi-1.0.2/bin/node",
+          "version": "22.19.0"
+        }
+      },
+      {
+        "surface": "consist",
+        "status": "pass",
+        "message": "runtime chezmoi 版本相符",
+        "details": {
+          "binary": "/opt/nwt-realrun/nw-home/runtimes/node-22.19.0+pi-1.0.2/bin/chezmoi",
+          "version": "2.73.0"
+        }
+      },
+      {
+        "surface": "converge",
+        "status": "pass",
+        "message": "收敛:重算指纹与清单一致",
+        "details": {
+          "convergeHash": "3cf6a584a523b35ec42630766a9eb6a84d3dcf11d2347d5aa3f3ae879b420502"
+        }
+      },
+      {
+        "surface": "config",
+        "status": "pass",
+        "message": "声明键全部在位(9 个)",
+        "details": {
+          "configKeys": [
+            "/models/providers/anthropic",
+            "/models/providers/stepfun-sb",
+            "/settings/collapseChangelog",
+            "/settings/defaultModel",
+            "/settings/defaultProvider",
+            "/settings/defaultThinkingLevel",
+            "/settings/defaultTools",
+            "/settings/packages",
+            "/settings/theme"
+          ]
+        }
+      },
+      {
+        "surface": "env",
+        "status": "fail",
+        "message": "required env 缺失:派能会降级跑(不阻断)",
+        "details": {
+          "missing": [
+            "TAVILY_API_KEY"
+          ]
+        }
+      },
+      {
+        "surface": "runtime",
+        "status": "pass",
+        "message": "运行期产物部分在位(1 个在 / 5 个不在)",
+        "details": {
+          "missing": [
+            "bin",
+            "git",
+            "missions",
+            "models-store.json",
+            "sessions"
+          ],
+          "present": [
+            "auth.json"
+          ],
+          "profileDir": "/opt/nwt-realrun/nw-home/profiles/research-desk"
+        }
+      },
+      {
+        "surface": "provider",
+        "status": "fail",
+        "message": "provider stepfun-sb 未就绪:credentials_not_configured",
+        "details": {
+          "provider": "stepfun-sb",
+          "reason": "credentials_not_configured",
+          "status": "not_ready"
+        }
+      }
+    ],
+    "exit": 10,
+    "converged": true,
+    "manifest": {
+      "schema": "nw/manifest.v1",
+      "lockId": "research-desk-1.0.0-360ae68",
+      "profile": "research-desk",
+      "recipe": "research-desk",
+      "version": "1.0.0",
+      "runtimeKey": "node-22.19.0+pi-1.0.2",
+      "installedAt": "2026-10-09T03:00:07Z",
+      "convergeHash": "3cf6a584a523b35ec42630766a9eb6a84d3dcf11d2347d5aa3f3ae879b420502",
+      "engine": "0.1.0"
+    }
+  }
+}

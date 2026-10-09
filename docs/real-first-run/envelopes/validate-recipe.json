@@ -1,0 +1,154 @@
+{
+  "schema": "nw/validate.v1",
+  "nw": "0.1.0",
+  "ok": true,
+  "errors": [],
+  "warnings": [],
+  "data": {
+    "target": "recipe",
+    "results": [
+      {
+        "id": "lock.literal",
+        "status": "skip",
+        "message": "本次 target 未提供锁定集(lock.literal 属跨文件检查)"
+      },
+      {
+        "id": "recipe.schema",
+        "status": "pass",
+        "message": "配方是 nw/v1 配方"
+      },
+      {
+        "id": "recipe.profile_default",
+        "status": "pass",
+        "message": "profile 缺省等于配方名"
+      },
+      {
+        "id": "recipe.runtime_pins",
+        "status": "pass",
+        "message": "node/pi/chezmoi 三个 pin 齐全"
+      },
+      {
+        "id": "recipe.components_exist",
+        "status": "pass",
+        "message": "配方引用的组件都有清单"
+      },
+      {
+        "id": "recipe.external_refs_form",
+        "status": "skip",
+        "message": "配方没有外部 ref(引用形态只审 source: external)"
+      },
+      {
+        "id": "recipe.version_match",
+        "status": "pass",
+        "message": "配方版本与清单版本一致"
+      },
+      {
+        "id": "recipe.external_reserved_fields",
+        "status": "skip",
+        "message": "配方没有外部 ref(保留字段检查只审 source: external)"
+      },
+      {
+        "id": "component.deps_resolve",
+        "status": "pass",
+        "message": "组件依赖存在且版本精确咬合"
+      },
+      {
+        "id": "recipe.params_match",
+        "status": "pass",
+        "message": "params 名字与组件声明对得上"
+      },
+      {
+        "id": "recipe.env_registered",
+        "status": "pass",
+        "message": "providers 的 $ENV 都在 env: 登记过"
+      },
+      {
+        "id": "secrets.no_literals",
+        "status": "pass",
+        "message": "3 个文件无密钥字面量"
+      },
+      {
+        "id": "component.packages_pinned",
+        "status": "pass",
+        "message": "第三方 pi 包都带 pin"
+      },
+      {
+        "id": "env.usedby_consistent",
+        "status": "skip",
+        "message": "本次 target 未提供锁定集(env.usedby_consistent 属跨文件检查)"
+      },
+      {
+        "id": "component.landing",
+        "status": "skip",
+        "message": "本次 target 未提供锁定集(component.landing 属跨文件检查)"
+      },
+      {
+        "id": "lock.matches_recipe",
+        "status": "skip",
+        "message": "本次 target 未提供锁定集(lock.matches_recipe 属跨文件检查)"
+      },
+      {
+        "id": "lock.external_fields",
+        "status": "skip",
+        "message": "本次 target 未提供锁定集(lock.external_fields 属跨文件检查)"
+      },
+      {
+        "id": "lock.external_matches",
+        "status": "skip",
+        "message": "本次 target 未提供锁定集(lock.external_matches 属跨文件检查)"
+      },
+      {
+        "id": "skeleton.tmpl_suffix",
+        "status": "skip",
+        "message": "仓库里没有 skeleton 目录(骨架在 bake 时从 bundle 展开),本项对当前 target 不适用"
+      },
+      {
+        "id": "skeleton.no_config_state",
+        "status": "skip",
+        "message": "仓库里没有 skeleton 目录,本项对当前 target 不适用"
+      },
+      {
+        "id": "component.vendored_declared",
+        "status": "pass",
+        "message": "有依赖的组件都声明了 vendored"
+      },
+      {
+        "id": "component.no_symlinks",
+        "status": "pass",
+        "message": "组件资产树内无符号链接"
+      },
+      {
+        "id": "catalog.schema",
+        "status": "skip",
+        "message": "仓库根没有 catalog.json(编目检查只审已登记的仓库)"
+      },
+      {
+        "id": "catalog.records",
+        "status": "skip",
+        "message": "仓库根没有 catalog.json(编目检查只审已登记的仓库)"
+      },
+      {
+        "id": "catalog.refs_resolve",
+        "status": "skip",
+        "message": "配方没有外部 ref(编目对账只审 source: external)"
+      },
+      {
+        "id": "catalog.extension_entries",
+        "status": "skip",
+        "message": "仓库根没有 catalog.json(编目检查只审已登记的仓库)"
+      },
+      {
+        "id": "command.no_bashism",
+        "status": "skip",
+        "message": "本次 target 未提供锁定集(command.no_bashism 属跨文件检查)"
+      }
+    ],
+    "summary": {
+      "total": 27,
+      "pass": 12,
+      "warn": 0,
+      "fail": 0,
+      "skip": 15
+    }
+  }
+}

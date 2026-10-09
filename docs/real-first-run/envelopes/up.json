@@ -1,0 +1,36 @@
+{
+  "schema": "nw/up.v1",
+  "nw": "0.1.0",
+  "ok": true,
+  "errors": [],
+  "warnings": [],
+  "data": {
+    "profile": "research-desk",
+    "profileDir": "/opt/nwt-realrun/nw-home/profiles/research-desk",
+    "runtimeKey": "node-22.19.0+pi-1.0.2",
+    "components": [
+      "retention@0.4.1",
+      "scout@1.0.0"
+    ],
+    "skeletonFiles": [],
+    "configKeys": [
+      "/models/providers/anthropic",
+      "/models/providers/stepfun-sb",
+      "/settings/collapseChangelog",
+      "/settings/defaultModel",
+      "/settings/defaultProvider",
+      "/settings/defaultThinkingLevel",
+      "/settings/defaultTools",
+      "/settings/packages",
+      "/settings/theme"
+    ],
+    "envPresent": 2,
+    "envMissing": [
+      "TAVILY_API_KEY"
+    ],
+    "convergeHash": "3cf6a584a523b35ec42630766a9eb6a84d3dcf11d2347d5aa3f3ae879b420502",
+    "lockId": "research-desk-1.0.0-360ae68",
+    "upgraded": false,
+    "installedAt": "2026-10-09T03:00:07Z"
+  }
+}

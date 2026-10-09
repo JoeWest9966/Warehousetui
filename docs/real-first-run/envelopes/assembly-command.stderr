@@ -1,0 +1,8 @@
+nw up: profile research-desk 已装配(research-desk-1.0.0-360ae68),降级:required env 缺失 TAVILY_API_KEY
+nw doctor: rc=10  research-desk @ research-desk-1.0.0-360ae68
+  FAIL  env       required env 缺失:派能会降级跑(不阻断)
+  FAIL  provider  provider stepfun-sb 未就绪:credentials_not_configured
+
+real	1m4.173s
+user	0m29.067s
+sys	0m10.907s
