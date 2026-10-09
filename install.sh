@@ -4,9 +4,9 @@
 # 一行安装:
 #   curl -fsSL https://raw.githubusercontent.com/JoeWest9966/Warehousetui/main/install.sh | sh
 #
-# 行为契约(与 .github/workflows/release.yml 的命名严格同源,改一处必须同步另一处):
+# 行为契约(与 docs/release.md「资产命名」表严格同源,改一处必须同步另一处):
 #   资产名   nwt_<版本>_<os>_<arch>.tar.gz
-#   os       linux | macos
+#   os       linux(macos 自 v0.2.0 起暂缺预编译,见 detect_os)
 #   arch     x86_64 | aarch64
 #   校验文件 checksums.txt(sha256sum 双列格式)
 #   <版本>   = release tag 去掉 v 前缀(如 v0.1.0 -> 0.1.0)
@@ -25,6 +25,24 @@ BIN_NAME="nwt"
 # 默认指向 GitHub 正式源;沙盒实测/内部镜像可用同名环境变量覆盖
 DOWNLOAD_BASE="${NWT_DOWNLOAD_BASE:-https://github.com/$REPO/releases/download}"
 API_BASE="${NWT_API_BASE:-https://api.github.com}"
+
+# ---------- 凭证(私有仓必读)----------
+# 本仓是私有仓:release 资产的 **web 下载面对 token 也返回 404**,匿名更不必说。
+# 唯一可用的下载面是带 token 的 API 资产面,所以有 token 时全部下载走 API。
+# GH_TOKEN / GITHUB_TOKEN 任选其一;都没有 = 匿名(公开仓够用,私有仓会明说)。
+GH_TOK="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+
+# gh_curl:统一的 curl 出口。有 token 就带 Authorization 头,没有就裸跑。
+# 注意:GitHub 的 API **要求头里冒号后有空格**(「Authorization: token X」),
+# 无空格会被当成未认证(私有仓 404);而带空格的值没法用「变量 + 词分裂」
+# 拼进 curl 参数(会裂成三段),所以用这个函数分叉,不引 eval / 数组。
+gh_curl() {
+  if [ -n "$GH_TOK" ]; then
+    curl -H "Authorization: token $GH_TOK" "$@"
+  else
+    curl "$@"
+  fi
+}
 
 # ---------- 输出帮手:统一人话化 ----------
 info() { printf 'nwt-install: %s\n' "$1"; }
@@ -96,8 +114,10 @@ detect_os() {
   SYS_KERNEL=$(uname -s 2>/dev/null) || die "uname -s 失败"
   case "$SYS_KERNEL" in
     Linux) SYS_OS=linux ;;
-    Darwin) SYS_OS=macos ;;
-    *) die "不支持的系统: $SYS_KERNEL(本脚本只支持 linux/macos;Windows 请手动下载 zip)" ;;
+    # v0.2.0 起 macOS 预编译暂缺(无 Apple 设备,产不出两个 mac 包):
+    # 明说,别让用户撞 404。见 docs/release.md「支持级与已知取舍」。
+    Darwin) die "macOS 预编译包暂缺(v0.2.0 起):本机无 Apple 设备,无法产出。请源码构建:cargo build --release(只需 Rust 工具链)。Windows 同理请手动下载 zip。" ;;
+    *) die "不支持的系统: $SYS_KERNEL(本脚本只支持 linux;Windows 请手动下载 zip)" ;;
   esac
 }
 
@@ -118,7 +138,7 @@ detect_arch() {
 #      从里面抠 tag —— 走 HTML 重定向,不吃 API 配额。
 # 全程不引 jq;curl -I 不跟随重定向,只读响应头。
 resolve_latest() {
-  LATEST_TAG=$(curl -fsSL --retry 2 "$API_BASE/repos/$REPO/releases/latest" 2>/dev/null \
+  LATEST_TAG=$(gh_curl -fsSL --retry 2 "$API_BASE/repos/$REPO/releases/latest" 2>/dev/null \
     | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 \
     | sed 's/.*"\([^"]*\)"$/\1/')
 
@@ -130,15 +150,40 @@ resolve_latest() {
       | sed 's#.*/releases/##; s#^tag/##; s#^download/##; s#/.*##')
   fi
 
-  [ -n "$LATEST_TAG" ] || die "取不到 latest 版本号(GitHub API 与 releases/latest 重定向两条路都失败了:网络不通,或仓库还没有 release?)"
+  [ -n "$LATEST_TAG" ] || die "取不到 latest 版本号(API 与重定向两条路都失败了:网络不通、仓库没有 release,或私有仓没有凭证 —— 私有仓请先 export GH_TOKEN=… 或 gh auth login)"
 }
 
 # ---------- 下载与校验 ----------
-# fetch <url> <落盘路径>:失败即中止(调用方 trap 负责清理)
+# asset_id <资产名>:从 releases/tags 的 JSON 里抠该资产对象的 id。
+# GitHub REST 的 JSON 是美化格式(每字段一行),asset 对象里 id 在 name 之前;
+# tr ',' '\n' 把紧凑格式也归一成每字段一行,awk 跨行记住最后一个 id、
+# 命中name 时输出 —— 不引 jq,awk 本就是依赖预检项。
+asset_id() {
+  [ -n "$1" ] || die "内部错误:asset_id 缺参数"
+  gh_curl -fsSL --retry 2 "$API_BASE/repos/$REPO/releases/tags/v$VER" 2>/dev/null \
+    | tr ',' '\n' \
+    | awk -v want="$1" '
+        /"id"[[:space:]]*:/ { if (match($0, /[0-9]+/)) id = substr($0, RSTART, RLENGTH) }
+        /"name"[[:space:]]*:/ && index($0, "\"" want "\"") { print id; exit }
+      ' \
+    | grep -o '[0-9]*$' | head -n 1
+}
+
+# fetch <url> <落盘路径>:失败即中止(调用方 trap 负责清理)。
+# 有 token(私有仓)时走 API 资产面;匿名(公开仓)走 web 下载面。
 fetch() {
   [ -n "$1" ] && [ -n "$2" ] || die "内部错误:fetch 参数不全"
+  name=${1##*/}
+  if [ -n "$GH_TOK" ]; then
+    aid=$(asset_id "$name")
+    [ -n "$aid" ] || die "release v$VER 里找不到资产 $name(版本对不上,或资产还没上传完)"
+    gh_curl -H "Accept: application/octet-stream" -fsSL --retry 2 \
+      -o "$2" "$API_BASE/repos/$REPO/releases/assets/$aid" \
+      || die "下载失败(API 资产面): $name(网络问题或被限流?)"
+    return 0
+  fi
   curl -fsSL --retry 2 -o "$2" "$1" \
-    || die "下载失败: $1(网络问题、版本不存在,或被限流?)"
+    || die "下载失败: $1(网络问题、版本不存在,或被限流?私有仓请设 GH_TOKEN/GITHUB_TOKEN)"
 }
 
 # sha256_of <文件>:两种常见实现择一,输出纯哈希
@@ -194,6 +239,11 @@ if [ "$DRY_RUN" = "1" ]; then
   info "  资产     $ASSET_URL"
   info "  校验     $CK_URL"
   info "  装到     $PREFIX/$BIN_NAME"
+  if [ -n "$GH_TOK" ]; then
+    info "  凭证     用 GH_TOKEN/GITHUB_TOKEN 走 API 资产面(私有仓唯一可用面)"
+  else
+    info "  凭证     匿名(私有仓会失败;export GH_TOKEN=… 后重试)"
+  fi
   exit 0
 fi
 

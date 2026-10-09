@@ -10,6 +10,10 @@
 curl -fsSL https://raw.githubusercontent.com/JoeWest9966/Warehousetui/main/install.sh | sh
 ```
 
+> 本仓是**私有仓**:匿名请求这条 raw URL 会 404。带凭证装:
+> `curl -H "Authorization: token $GH_TOKEN" -fsSL https://raw.githubusercontent.com/JoeWest9966/Warehousetui/main/install.sh | sh`
+> (install.sh 随后也要带同一个 token 才能读到 release 资产;`export GH_TOKEN=…` 即可,install.sh 透传环境。)
+
 默认装到 `~/.local/bin/nwt`。装完敲 `nwt` 没反应,就是它不在 `PATH`:
 
 ```bash
@@ -23,7 +27,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # 或 ~/.zshrc
 
 Windows:去 [releases](https://github.com/JoeWest9966/Warehousetui/releases) 手动下载 `nwt_<版本>_windows_x86_64.zip`。支持级是「编译可运行」([spec #10](https://github.com/JoeWest9966/Warehousetui/issues/10) 钉死的 R3 决定;ADR-0002 只定 Rust/ratatui 技术栈,不涉支持级),不提供 installer;资产与校验细节见 [docs/release.md](./docs/release.md)。
 
-> 预编译二进制随 tag 发布(当前最新 v0.2.0);安装脚本默认取 latest,也可 `--version` 钉版本。
+> 预编译二进制随 tag 发布(当前最新 v0.2.0:**linux x86_64 / aarch64 + windows x86_64** 三个包;macOS 暂缺,请源码构建);安装脚本默认取 latest,也可 `--version` 钉版本。命名契约与已知取舍见 [docs/release.md](./docs/release.md)。
 
 ## 从源码构建
 
@@ -70,7 +74,7 @@ cargo test --all-targets     # 单测:契约解析 / 发现策略 / 五屏快照
 cargo build --release
 ```
 
-CI 三平台(ubuntu/macos/windows)跑齐上面四项。
+本仓不跑 CI(无 GitHub Actions;跨平台测试在本地进行)。改动合入前,上面四项在开发机上跑齐即闸门——注意两条只在特定平台暴露的回归历史:建议命令测试的 OS 临时目录长度依赖(macOS/Windows 红)、discover 测试在装有真 `nw` 的机器上会红(环境测试,非缺陷)。
 
 ## 文档
 
