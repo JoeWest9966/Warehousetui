@@ -6,7 +6,7 @@
   XDG_CONFIG_HOME=/opt/nwt-realrun/config  隔离配置(初始无数据仓根)
   CWD=/opt/nwt-realrun/run              干净目录(无 catalog.json)
 """
-import os, pty, sys, time, select, fcntl, termios, struct
+import os, pty, sys, time, select, fcntl, termios, struct, tempfile
 
 COLS, ROWS = 110, 30
 NWT = "/opt/Warehousetui/target/release/nwt"
@@ -96,7 +96,9 @@ class Screen:
 
 def main():
     os.makedirs(LOGDIR, exist_ok=True)
-    raw = open(f"{LOGDIR}/pty-raw.bin", "wb")
+    # 原始 ANSI 流落系统临时目录(证据本体,但不进版本库 —— 帧文件是可读形态)
+    raw = tempfile.NamedTemporaryFile(prefix="nwt-pty-raw-", delete=False)
+
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["TERM"] = "xterm-256color"

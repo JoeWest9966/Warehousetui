@@ -1,4 +1,4 @@
- Warehousetui · Nous Warehouse 驾 驶 舱    nwt v0.1 · nw 0.1.0 · PATH  │  NW_HOME: /opt/nwt-realrun/nw-home  ○ 空
+ Warehousetui · Nous Warehouse 驾 驶 舱    nwt v0.2 · nw 0.1.0 · PATH  │  NW_HOME: /opt/nwt-realrun/nw-home  ○ 空
 ┌ 导 航  ────┐
 │  ▸ 概 览   │    7 项   ─
 │▸ ⚙ 装 配   │

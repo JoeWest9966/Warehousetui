@@ -1,4 +1,4 @@
- Warehousetui · Nous Warehouse 驾 驶 舱    nwt v0.1 · nw 0.1.0 · PATH  │  NW_HOME: /opt/nwt-realrun/nw-home  ○ 空
+ Warehousetui · Nous Warehouse 驾 驶 舱    nwt v0.2 · nw 0.1.0 · PATH  │  NW_HOME: /opt/nwt-realrun/nw-home  ○ 空
 ┌ 导 航  ────┐┌ 健 康  ────────────────────────────────────────────────────────────doctor · validate · 外 部 源 漂 移 ┐
 │  ▸ 概 览   ││┌ 27 项行 ─────────────── 共  27:过  12 警  0 败  0 略  15 ┐┌ 证 据  ───────────────────────────────────┐│
 │  ⚙ 装 配   │││○ lock.literal本 次  target 未 提 供 锁 定 集 (lock.literal││证 据 (五 字 段 ,原 样 呈 现 )                    ││
