@@ -931,7 +931,18 @@ fn bake_app() -> App {
 
 #[test]
 fn 配方域建议命令_选中即给出bake_旗标与数据仓根与at版本() {
-    let app = bake_app();
+    let mut app = bake_app();
+    // 数据仓根钉「定长短路径」:本断言钉的是「--repo 与根相邻整段在场」。
+    // 命令按内层宽折行是真设计(紧凑态那条同款),但根一长(如 with_runner
+    // 给的 OS 临时目录,macOS /var/folders/… 51+ 字符),折点就落进
+    // 「--repo」与根之间,断言随之平台相关(实测 macOS/Windows 红、Linux 绿)。
+    // 三平台各取一个必然存在且短的根:unix /tmp,windows 盘根。
+    let short_root = if cfg!(windows) {
+        "C:\\".to_string()
+    } else {
+        "/tmp".to_string()
+    };
+    app.data_root = Some(short_root.clone());
     // 常畅态:命令整段在场
     let s = draw(&app, 110, 30);
     assert!(s.contains("建议命令"), "标成建议命令:{s}");
@@ -942,7 +953,7 @@ fn 配方域建议命令_选中即给出bake_旗标与数据仓根与at版本() 
     );
     assert!(s.contains("--out research-desk.sh"), "出参默认值:{s}");
     assert!(
-        s.contains(&format!("--repo {}", app.data_root.clone().unwrap())),
+        s.contains(&format!("--repo {short_root}")),
         "--repo 填数据仓根:{s}"
     );
     assert!(s.contains("c 取用(只读选中)"), "键位行可见:{s}");
