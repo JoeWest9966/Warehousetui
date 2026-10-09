@@ -1,0 +1,171 @@
+{
+  "schema": "nw/bake.v1",
+  "nw": "0.1.0",
+  "ok": true,
+  "errors": [],
+  "warnings": [],
+  "data": {
+    "lockId": "research-desk-1.0.0-360ae68",
+    "recipe": {
+      "name": "research-desk",
+      "version": "1.0.0"
+    },
+    "profile": "research-desk",
+    "command": {
+      "file": "assembly-command.sh",
+      "sha256": "a9511c478f94c7c62a8e603f7310afe9012e4edd3a38e4dbbe65f9d12258c9e9",
+      "bytes": 9203,
+      "shell": "sh"
+    },
+    "invoke": {
+      "unix": {
+        "run": "sh ./assembly-command.sh"
+      },
+      "windows": {
+        "run": "sh ./assembly-command.sh",
+        "shell": "Git Bash"
+      }
+    },
+    "lock": {
+      "schema": "nw/lock.v1",
+      "lockId": "research-desk-1.0.0-360ae68",
+      "bakedAt": "2026-10-09T02:52:51Z",
+      "recipe": {
+        "name": "research-desk",
+        "version": "1.0.0"
+      },
+      "profile": "research-desk",
+      "runtime": {
+        "node": "22.19.0",
+        "pi": "1.0.2",
+        "chezmoi": "2.73.0"
+      },
+      "components": [
+        {
+          "name": "scout",
+          "version": "1.0.0",
+          "landing": {
+            "path": "\u003cagent-dir\u003e/nw/components/scout",
+            "kind": "pi-local-package"
+          },
+          "packages": [],
+          "sha256": "d34ca6bd82db9bd0e31fa2b9eb8f5d50444468cd4d71e2a274d815d56b517a54"
+        },
+        {
+          "name": "retention",
+          "version": "0.4.1",
+          "landing": {
+            "path": "\u003cagent-dir\u003e/nw/components/retention",
+            "kind": "pi-local-package"
+          },
+          "packages": [],
+          "sha256": "b01b1e6753488c79dcec27df93e2cc0ef156126efaee2d3e5e70101f2adc0a72"
+        }
+      ],
+      "env": [
+        {
+          "name": "STEPFUN_API_KEY",
+          "required": false,
+          "usedBy": [
+            "models.providers.stepfun-sb"
+          ],
+          "purpose": ""
+        },
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "required": false,
+          "usedBy": [
+            "models.providers.anthropic"
+          ],
+          "purpose": ""
+        },
+        {
+          "name": "TAVILY_API_KEY",
+          "required": true,
+          "usedBy": [
+            "components/scout"
+          ],
+          "purpose": ""
+        }
+      ],
+      "assets": [
+        {
+          "tag": "nw/v0.1.0",
+          "file": "chezmoi",
+          "sha256": "4b42a0fb0dec69f37964c6701f89daa6bf6393aaeb92bbcbc8f3ee9f08a49bcd"
+        },
+        {
+          "tag": "nw/v0.1.0",
+          "file": "node",
+          "sha256": "596b5144ff242737f1c1be6a5f0ccb3907dbba2482344143cb1a6898633402a9"
+        },
+        {
+          "tag": "nw/v0.1.0",
+          "file": "nw-linux-amd64",
+          "sha256": "d3dfe7bc2a15519a99dd3759fe60d923c4036110de73730fcf88e2d4373599fa"
+        },
+        {
+          "tag": "nw/v0.1.0",
+          "file": "pi",
+          "sha256": "39ef3c685b983a8a0454f88bee7a6bb36ae7b3cd46b6caae17243074017ad646"
+        }
+      ]
+    },
+    "assets": [
+      {
+        "platform": "",
+        "tag": "nw/v0.1.0",
+        "file": "chezmoi",
+        "sha256": "4b42a0fb0dec69f37964c6701f89daa6bf6393aaeb92bbcbc8f3ee9f08a49bcd",
+        "bytes": 0
+      },
+      {
+        "platform": "",
+        "tag": "nw/v0.1.0",
+        "file": "node",
+        "sha256": "596b5144ff242737f1c1be6a5f0ccb3907dbba2482344143cb1a6898633402a9",
+        "bytes": 0
+      },
+      {
+        "platform": "linux-amd64",
+        "tag": "nw/v0.1.0",
+        "file": "nw-linux-amd64",
+        "sha256": "d3dfe7bc2a15519a99dd3759fe60d923c4036110de73730fcf88e2d4373599fa",
+        "bytes": 0
+      },
+      {
+        "platform": "",
+        "tag": "nw/v0.1.0",
+        "file": "pi",
+        "sha256": "39ef3c685b983a8a0454f88bee7a6bb36ae7b3cd46b6caae17243074017ad646",
+        "bytes": 0
+      }
+    ],
+    "bundle": {
+      "file": "research-desk-1.0.0.nwbundle",
+      "sha256": "2a8b9a86e7de4ebcf1671fe6237838215146d25e358944e668531f889f12293f",
+      "bytes": 89419787,
+      "dir": "/opt/Data-001/recipes/research-desk/baked/research-desk-1.0.0",
+      "files": [
+        "bin/chezmoi",
+        "bin/node",
+        "bin/nw-linux-amd64",
+        "bin/pi",
+        "components/retention/component.yaml",
+        "components/scout/README.md",
+        "components/scout/component.yaml",
+        "components/scout/extensions/session-marker.ts",
+        "components/scout/package.json",
+        "components/scout/scripts/search.sh",
+        "components/scout/skills/web-scout/SKILL.md",
+        "recipe.yaml"
+      ]
+    },
+    "validate": {
+      "pass": 12,
+      "warn": 0,
+      "skip": 15,
+      "total": 27
+    }
+  }
+}

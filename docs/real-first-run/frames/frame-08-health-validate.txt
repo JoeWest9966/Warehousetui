@@ -1,0 +1,30 @@
+ Warehousetui · Nous Warehouse 驾 驶 舱    nwt v0.1 · nw 0.1.0 · PATH  │  NW_HOME: /opt/nwt-realrun/nw-home  ○ 空
+┌ 导 航  ────┐┌ 健 康  ────────────────────────────────────────────────────────────doctor · validate · 外 部 源 漂 移 ┐
+│  ▸ 概 览   ││┌ 27 项行 ─────────────── 共  27:过  12 警  0 败  0 略  15 ┐┌ 证 据  ───────────────────────────────────┐│
+│  ⚙ 装 配   │││○ lock.literal本 次  target 未 提 供 锁 定 集 (lock.literal││证 据 (五 字 段 ,原 样 呈 现 )                    ││
+│▸ ✚ 健 康   │││● recipe.schema配 方 是  nw/v1 配 方                    ││没 有  errors/warnings。                    ││
+│  ▤ 配 方   │││● recipe.profile_defaultprofile 缺 省 等 于 配 方 名      ││    nw validate: 12/27 pass, 15 skip     ││
+│  ✦ 设 置   │││● recipe.runtime_pinsnode/pi/chezmoi 三 个  pin 齐 全  ││                                         ││
+│          │││● recipe.components_exist配 方 引 用 的 组 件 都 有 清 单     ││                                         ││
+│          │││○ recipe.external_refs_form配 方 没 有 外 部  ref(引 用 形  ││                                         ││
+│          │││● recipe.version_match配 方 版 本 与 清 单 版 本 一 致        ││                                         ││
+│          │││○ recipe.external_reserved_fields配 方 没 有 外 部  ref( ││                                         ││
+│          │││● component.deps_resolve组 件 依 赖 存 在 且 版 本 精 确 咬 合  ││                                         ││
+│          │││● recipe.params_matchparams 名 字 与 组 件 声 明 对 得 上    ││                                         ││
+│          │││● recipe.env_registeredproviders 的  $ENV 都 在  env: ││                                         ││
+│          │││● secrets.no_literals3 个 文 件 无 密 钥 字 面 量           ││                                         ││
+│          │││● component.packages_pinned第 三 方  pi 包 都 带  pin    ││                                         ││
+│          │││○ env.usedby_consistent本 次  target 未 提 供 锁 定 集 (env││                                         ││
+│          │││○ component.landing本 次  target 未 提 供 锁 定 集 (compone││                                         ││
+│          │││○ lock.matches_recipe本 次  target 未 提 供 锁 定 集 (lock.││                                         ││
+│          │││○ lock.external_fields本 次  target 未 提 供 锁 定 集 (lock││                                         ��
+│          │││○ lock.external_matches本 次  target 未 提 供 锁 定 集 (loc││                                         ││
+│          │││○ skeleton.tmpl_suffix仓 库 里 没 有  skeleton 目 录 (骨 架 ││                                         ││
+│          │││○ skeleton.no_config_state仓 库 里 没 有  skeleton 目 录 ,││                                         ││
+│          │││● component.vendored_declared有 依 赖 的 组 件 都 声 明 了  v││                                         ││
+│          │││● component.no_symlinks组 件 资 产 树 内 无 符 号 链 接       ││                                         ││
+│          │││○ catalog.schema仓 库 根 没 有  catalog.json(编 目 检 查 只  ││                                         ││
+│          │││○ catalog.records仓 库 根 没 有  catalog.json(编 目 检 查 只 ││                                         ││
+│          ││└───────────────────────────────────────────────────┘└─────────────────────────────────────────┘┘
+└──────────┘└────────────────────────────────────────────────────────────────────────────────────────────────┘
+ j/k 切 屏  Enter 确 认  t 主 题  ? 帮 助    q 退中出:                                     主色题仓:暗 色 仓 库

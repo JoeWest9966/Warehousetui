@@ -1,0 +1,77 @@
+{
+  "schema": "nw/ls.v1",
+  "nw": "0.1.0",
+  "ok": true,
+  "errors": [],
+  "warnings": [],
+  "data": {
+    "domain": "all",
+    "recipes": [
+      {
+        "name": "research-desk",
+        "version": "1.0.0",
+        "profile": "research-desk",
+        "path": "recipes/research-desk/recipe.yaml"
+      }
+    ],
+    "components": [
+      {
+        "name": "retention",
+        "version": "0.4.1",
+        "path": "components/retention",
+        "depends": [],
+        "vendored": true,
+        "usedBy": [
+          "research-desk"
+        ]
+      },
+      {
+        "name": "scout",
+        "version": "1.0.0",
+        "path": "components/scout",
+        "depends": [
+          {
+            "name": "retention",
+            "version": "0.4.1"
+          }
+        ],
+        "vendored": true,
+        "usedBy": [
+          "research-desk"
+        ]
+      }
+    ],
+    "sources": [],
+    "profiles": [
+      {
+        "name": "research-desk",
+        "lockId": "research-desk-1.0.0-360ae68",
+        "convergeHash": "3cf6a584a523b35ec42630766a9eb6a84d3dcf11d2347d5aa3f3ae879b420502",
+        "installedAt": "2026-10-09T03:00:07Z",
+        "recipe": {
+          "name": "research-desk",
+          "version": "1.0.0"
+        },
+        "runtimeKey": "node-22.19.0+pi-1.0.2",
+        "state": "degraded",
+        "degraded": [
+          {
+            "name": "TAVILY_API_KEY",
+            "reason": "required_env_missing"
+          }
+        ]
+      }
+    ],
+    "locks": [
+      {
+        "lockId": "research-desk-1.0.0-360ae68",
+        "recipe": {
+          "name": "research-desk",
+          "version": "1.0.0"
+        },
+        "bakedAt": "2026-10-05T05:56:14Z",
+        "assets": 4
+      }
+    ]
+  }
+}

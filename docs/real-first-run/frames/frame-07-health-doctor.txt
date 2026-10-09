@@ -1,0 +1,30 @@
+ Warehousetui · Nous Warehouse 驾 驶 舱    nwt v0.1 · nw 0.1.0 · PATH  │  NW_HOME: /opt/nwt-realrun/nw-home  ○ 空
+┌ 导 航  ────┐┌ 健 康  ────────────────────────────────────────────────────────────doctor · validate · 外 部 源 漂 移 ┐
+│  ▸ 概 览   ││┌ 七─面─ ─────────────────────────────────────────────┐┌ 证 据  ───────────────────────────────────┐│
+│  ⚙ 装 配   │││  降 级 :没 完 全 好 ,但 不 算 坏  (rc 10)                   ││证 据 (五 字 段 ,原 样 呈 现 )                    ││
+│▸ ✚ 健 康   │││                                                   ││[DEGRADED rc10] env: required env 缺 失 :派 ││
+│  ▤ 配 方   │││● manifest   清 单 在 位 (schema nw/manifest.v1)       ││    {                                    ││
+│  ✦ 设 置   │││○ consist    未 给  --lock:只 核 对 清 单 自 述 ,不 比 对 锁 定  ││      "missing": [                       ││
+│          │││● consist    runtime node 版 本 相 符                  ││        "TAVILY_API_KEY"                 ││
+│          │││● consist    runtime chezmoi 版 本 相 符               ││      ]                                  ││
+│          │││● converge   收 敛 :重 算 指 纹 与 清 单 一 致                ││    }                                    ││
+│          │││● config     声 明 键 全 部 在 位 (9 个 )                  ││[DEGRADED rc10] provider: provider stepfu││
+│          │││✗ env        required env 缺 失 :派 能 会 降 级 跑 (不 阻 断 )││    {                                    ││
+│          │││● runtime    运 行 期 产 物 部 分 在 位 (1 个 在  / 5 个 不 在 ) ││      "provider": "stepfun-sb",          ││
+│          │││✗ provider   provider stepfun-sb 未 就 绪 :credentials││      "reason": "credentials_not_configur││
+│          │││                                                   ││      "status": "not_ready"              ││
+│          │││                                                   ││    }                                    ││
+│          │││                                                   ││      FAIL  provider  provider stepfun-sb││
+│          │││                                                   ││      FAIL  env       required env 缺 失 : ││
+│          │││                                                   ││    nw doctor: rc=10  research-desk @ res││
+│          │││                                                   ││                                         ││
+│          │││                                                   ││                                         ││
+│          │││                                                   ││                                         ││
+│          │││                                                   ││                                         ││
+│          │││                                                   ││                                         ││
+│          │││                                                   ││                                         ││
+│          │││                                                   ││                                         ││
+│          │││                                                   ││                                         ││
+│          ││└───────────────────────────────────────────────────┘└─────────────────────────────────────────┘┘
+└──────────┘└────────────────────────────────────────────────────────────────────────────────────────────────┘
+ j/k 切 屏  Enter 确 认  t 主 题  ? 帮 助    q 退中出:                                     主色题仓:暗 色 仓 库

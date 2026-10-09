@@ -1,0 +1,12 @@
+{
+  "schema": "nw/source-recheck.v1",
+  "nw": "0.1.0",
+  "ok": true,
+  "errors": [],
+  "warnings": [],
+  "data": {
+    "catalogPath": "catalog.json",
+    "checked": [],
+    "drift": []
+  }
+}
