@@ -1559,6 +1559,14 @@ impl App {
     }
 
     /// 发射当前选中的锁定集。
+    ///
+    /// 引擎 `up --lock` 只收**载体文件**(装配命令或独立 `.nwlock`),`ls` 的
+    /// 锁行又不带路径 —— 但落点不另立真相:引擎 `ls` 的 locks 域读
+    /// `$NW_HOME/locks/*.nwlock`,装配命令的「交锁段」写的也是
+    /// `$NW_HOME/locks/<lockId>.nwlock`。面板按同一落点把 lockId 还原成
+    /// 引擎认的文件。裸 lockId 下发实测 rc 3 `INPUT_INVALID:读锁定集 …`
+    /// (FakeRunner 回放发现不了,真机首跑暴露,见 docs/real-first-run.md)。
+    /// NW_HOME 与子进程环境同源:apply / cycle 都写进程环境供引擎继承。
     pub fn launch_selected_lock(&mut self) {
         let lock = self
             .ls
@@ -1566,11 +1574,22 @@ impl App {
             .and_then(|l| l.locks.get(self.as_sel))
             .and_then(|l| l.lock_id.clone());
         if let Some(lock) = lock {
-            self.queue.push(commands::up(&lock, None));
+            self.queue
+                .push(commands::up(&self.lock_carrier(&lock), None));
             self.as_confirm = false;
         } else {
             self.push_log("没有选中的锁定集");
         }
+    }
+
+    /// 选中锁定集的载体文件路径:`$NW_HOME/locks/<lockId>.nwlock`
+    /// (引擎 ls 的 locks 域与装配命令交锁段的同一落点;tilde 展开同输入链)。
+    fn lock_carrier(&self, lock_id: &str) -> String {
+        let home = crate::engine::discover::expand_tilde(&self.nw_home);
+        format!(
+            "{}/locks/{lock_id}.nwlock",
+            home.display().to_string().trim_end_matches('/')
+        )
     }
 
     // ---- 通用 ----
@@ -1766,6 +1785,7 @@ mod tests {
     #[test]
     fn 发射锁定集入队() {
         let mut app = fake_app();
+        app.nw_home = "/nw-home".into(); // 钉定:落点拼装不随进程环境漂
         app.ls = Some(
             serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"9f8e"}]}"#)
                 .unwrap(),
@@ -1773,7 +1793,31 @@ mod tests {
         app.launch_selected_lock();
         assert_eq!(
             app.queue.last().unwrap(),
-            &vec!["up".to_string(), "--lock".into(), "9f8e".into()]
+            &vec![
+                "up".to_string(),
+                "--lock".into(),
+                // 引擎 up --lock 只收载体文件(裸 lockId 实测 rc 3 INPUT_INVALID);
+                // 落点 = ls 的 locks 域读处、装配命令交锁段写处
+                "/nw-home/locks/9f8e.nwlock".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn 发射锁定集_载体落点跟随当前安装根() {
+        let mut app = fake_app();
+        app.ls = Some(
+            serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"9f8e"}]}"#)
+                .unwrap(),
+        );
+        app.nw_home = "/first-home".into();
+        app.launch_selected_lock();
+        app.nw_home = "/second-home".into();
+        app.launch_selected_lock();
+        assert_eq!(
+            app.queue.last().unwrap()[2],
+            "/second-home/locks/9f8e.nwlock",
+            "换 NW_HOME 后再发射,锁落点跟新家走(与子进程继承的 NW_HOME 同源)"
         );
     }
 
@@ -2523,7 +2567,12 @@ mod tests {
         click(&mut app, act);
         assert_eq!(
             app.queue.last().unwrap(),
-            &vec!["up".to_string(), "--lock".into(), "9f8e".into()],
+            &vec![
+                "up".to_string(),
+                "--lock".into(),
+                // 载体文件路径(落点同 launch_selected_lock:NW_HOME/locks/<id>.nwlock)
+                format!("{}/locks/9f8e.nwlock", app.nw_home)
+            ],
             "点发射与 Enter 同路入队 up"
         );
         assert!(!app.as_confirm, "发射后仪式关闭");
