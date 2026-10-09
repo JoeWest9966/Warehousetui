@@ -23,7 +23,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # 或 ~/.zshrc
 
 Windows:去 [releases](https://github.com/JoeWest9966/Warehousetui/releases) 手动下载 `nwt_<版本>_windows_x86_64.zip`。支持级是「编译可运行」([spec #10](https://github.com/JoeWest9966/Warehousetui/issues/10) 钉死的 R3 决定;ADR-0002 只定 Rust/ratatui 技术栈,不涉支持级),不提供 installer;资产与校验细节见 [docs/release.md](./docs/release.md)。
 
-> 预编译二进制随首个 tag(v0.1.0)发布后才可用;在那之前请用下面的源码构建。
+> 预编译二进制随 tag 发布(当前最新 v0.2.0);安装脚本默认取 latest,也可 `--version` 钉版本。
 
 ## 从源码构建
 
