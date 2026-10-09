@@ -1552,9 +1552,38 @@ impl App {
         }
         match self.hl_mode {
             HealthMode::Doctor => self.queue.push(commands::doctor_profile(&profile, None)),
-            HealthMode::Validate => self.queue.push(commands::validate_recipe(&profile)),
+            HealthMode::Validate => self.queue_validate(&profile),
             // 漂移复核走 run_recheck(三道门 + 按名/全查),不在这条派体检路上。
             HealthMode::Recheck => self.run_recheck(None),
+        }
+    }
+
+    /// 健康屏 validate 档:27 项冻结检查按**配方文件**跑。引擎没有
+    /// 「按派名 validate」这个形状(`--recipe` 收配方路径),而派名 = 配方名
+    /// 是 #5 命名决策(引擎 up 的缺省同款)—— 据此在 ls 的配方域找行,
+    /// 用行自带的 path 拼数据仓根下的配方文件。引擎从配方路径自己推导
+    /// 仓根(`<root>/recipes/<名>/recipe.yaml` → root),不必另带 --repo。
+    /// 缺前提(根没设 / 配方不在仓里 / 引擎没给 path)→ 日志说清、不下发
+    /// 一条必败的命令(与 bake 建议同纪律:不给半条命令)。
+    fn queue_validate(&mut self, profile: &str) {
+        let Some(root) = self.usable_data_root() else {
+            self.push_log("validate 要读配方文件:数据仓根未设,去设置屏按 d 录入");
+            return;
+        };
+        let rel = self.ls.as_ref().and_then(|l| {
+            l.recipes
+                .iter()
+                .find(|r| r.name == profile)
+                .and_then(|r| r.path.clone())
+        });
+        match rel {
+            Some(rel) => {
+                let abs = format!("{}/{rel}", root.trim_end_matches('/'));
+                self.queue.push(commands::validate_recipe(&abs));
+            }
+            None => self.push_log(format!(
+                "派 {profile} 的配方不在当前数据仓(或引擎 ls 没给配方路径):validate 无从拼装,先 ls 刷新或换数据仓根"
+            )),
         }
     }
 
@@ -1780,6 +1809,54 @@ mod tests {
             app.queue.last().unwrap(),
             &vec!["doctor".to_string(), "--profile".into(), "lab".into()]
         );
+    }
+
+    #[test]
+    fn 健康validate档_按派名拼配方文件入队() {
+        let mut app = fake_app();
+        // 根须真存在(下发前的可用性门控);期望与实现同构拼路径,不钉平台形状
+        let root = std::env::temp_dir().join("nwt-validate-ok");
+        let _ = std::fs::create_dir_all(&root);
+        app.data_root = Some(root.display().to_string());
+        app.ls = Some(
+            serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[{"name":"research-desk","version":"1.0.0","path":"recipes/research-desk/recipe.yaml"}],"components":[],"sources":[],"profiles":[{"name":"research-desk","state":"ok","lockId":"9f8e"}],"locks":[]}"#)
+                .unwrap(),
+        );
+        app.hl_mode = HealthMode::Validate;
+        app.run_health();
+        assert_eq!(
+            app.queue.last().unwrap(),
+            &vec![
+                "validate".to_string(),
+                "--recipe".into(),
+                // 引擎 --recipe 收配方路径(裸派名实测 rc 3 INPUT_INVALID);
+                // 派名 = 配方名(#5),path 取自 ls 行,仓根由引擎从路径自推导
+                format!("{}/recipes/research-desk/recipe.yaml", root.display())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 健康validate档_配方不在仓_不入队只留话() {
+        let mut app = fake_app();
+        let root = std::env::temp_dir().join("nwt-validate-miss");
+        let _ = std::fs::create_dir_all(&root);
+        app.data_root = Some(root.display().to_string());
+        app.ls = Some(
+            serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[{"name":"desk","state":"ok"}],"locks":[]}"#)
+                .unwrap(),
+        );
+        app.hl_mode = HealthMode::Validate;
+        let before = app.queue.len();
+        app.run_health();
+        assert_eq!(app.queue.len(), before, "找不到配方:不下发一条必败的命令");
+        assert!(
+            app.log.iter().any(|l| l.contains("配方不在当前数据仓")),
+            "日志说清为什么没跑:{:?}",
+            app.log
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

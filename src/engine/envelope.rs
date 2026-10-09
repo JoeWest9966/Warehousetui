@@ -223,6 +223,10 @@ pub struct RecipeRow {
     pub name: String,
     #[serde(default)]
     pub version: Option<String>,
+    /// 引擎 `ls` 给的仓内相对路径(如 `recipes/research-desk/recipe.yaml`;
+    /// 老引擎可能不给 → None)。validate 档按派名拼配方文件要用它。
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// 组件依赖的一项(引擎 `nw ls` 的 `components[].depends[]` 原文:
