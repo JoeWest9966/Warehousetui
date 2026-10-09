@@ -87,3 +87,4 @@ Get-FileHash -Algorithm SHA256 nwt_0.1.0_windows_x86_64.zip
 |---|---|---|---|
 | 2026-10-06 | v0.1.0 | [37443153354](https://github.com/JoeWest9966/Warehousetui/actions/runs/37443153354) | 首次彩排:5 组合全绿;修复两条彩排问题(macOS x86_64 改交叉编译、runs-on 重复定义)后正式成发布 |
 | 待填 | v0.1.0 | — | 首个正式发布 |
+| 2026-10-09 | v0.2.0 | [37880214287](https://github.com/JoeWest9966/Warehousetui/actions/runs/37880214287) | 真机首跑实证( docs/real-first-run.md)后打 tag;发布构建因账号级计费一度无法启动(jobs 无 runner),计费恢复后 `gh run rerun 37880214287`(全部 job,含被依赖跳过的 release job)即成发布,回填本行 |
