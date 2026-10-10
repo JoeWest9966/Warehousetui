@@ -361,6 +361,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('r'),
     },
     HelpRow {
+        key: "/",
+        desc: "配方:过滤五域(本地筛选,键入即筛)",
+        screen: Some(Screen::Recipes),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('/'),
+    },
+    HelpRow {
         key: "r",
         desc: "编目:登记一台机器(两段式,预审不落文件)",
         screen: Some(Screen::Vps),
@@ -684,18 +695,6 @@ mod tests {
     /// 必须与该回归同一次提交并说明——不许为过测试回填。
     /// 场景全部钉死:with_runner(引擎状态固定「测试注入」)+ splash 关 +
     /// NW_HOME 置 /nw + ls 固定夹具——CI 三平台 HOME/配置不同也不漂。
-    #[test]
-    fn zz_dump_help_tmp() {
-        let mut app = crate::app::App::new();
-        app.splash = false;
-        app.help = true;
-        std::fs::write(
-            "/tmp/help.txt",
-            crate::testutil::frame_display(&app, 80, 44),
-        )
-        .unwrap();
-    }
-
     #[test]
     fn golden_常畅态_80x30_整帧逐字节() {
         use crate::engine::FakeRunner;

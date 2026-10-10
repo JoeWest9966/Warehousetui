@@ -27,9 +27,10 @@ pub enum Screen {
     Health,
     Recipes,
     /// 编目册屏(#53):vps 登记册端到端(登记两段式 + ls 投影 + rm 确认)。
-    /// 第一本编目册;#54 起屏内可换册(机器 / 标签,`m` 键)——后两本
-    /// (key / subscription)只换数据源与登记规格,不换屏与骨架
-    /// (`screens::catalog`)。
+    /// 第一本编目册;#54 起屏内可换册(机器 / 标签 / 订阅 / 钥匙,`m` 键)
+    /// ——四本册只换数据源与登记规格,不换屏与骨架(`screens::catalog`)。
+    /// 名字留在 `Vps` 是公开 API 形状(#53 已合入,改名收益不抵风险),
+    /// 册内维度一律走 `catalog_kind`。
     Vps,
     Settings,
 }
@@ -667,7 +668,8 @@ impl App {
                 _ => {}
             },
             // 标签册(#54):ls 反查只读在途;add 没有 `--yes`,那一条 argv
-            // 本身就是写命令,点亮写互斥;rm 同 vps rm(面板确认后才到这儿)。
+            // 本身就是写命令,点亮写互斥;rm 同 vps rm(面板确认后在下发处
+            // 点灯,回音到达时灭,ADR-0009 §4)。
             Some("tag") => match args.get(1).map(String::as_str) {
                 Some("ls") => {
                     self.tag_ls_loading = true;
@@ -771,14 +773,12 @@ impl App {
                     Screen::Assemble => self.as_sel = i,
                     Screen::Health => self.hl_sel = i,
                     Screen::Recipes => self.rc_sel = i,
-                    // 编目册:点行选中按当前是哪一本走(#54)
-                    Screen::Vps if self.catalog_kind == catalog::CatalogKind::Tag => {
-                        self.tag_sel = i.min(self.tag_len().saturating_sub(1));
+                    // 编目册:点行选中按当前是哪一本走(#54 起四本册各有
+                    // 自己的选中态,catalog_sel_mut 单一查表,换册不串味)
+                    Screen::Vps => {
+                        let (sel, n) = self.catalog_sel_mut();
+                        *sel = i.min(n.saturating_sub(1));
                     }
-                    Screen::Vps if self.catalog_kind == catalog::CatalogKind::Key => {
-                        self.key_sel = i.min(self.key_len().saturating_sub(1));
-                    }
-                    Screen::Vps => self.vps_sel = i.min(self.vps_len().saturating_sub(1)),
                     Screen::Settings => {}
                 }
             }
@@ -807,7 +807,8 @@ impl App {
     /// 落在 [0, n) (既有键盘代码走 % n 会绕回,那是键盘行为,
     /// 键盘零回归不动它)。
     fn wheel_sel(&mut self, dir: ScrollDir) {
-        let (sel, n) = match self.screen {
+        let screen = self.screen;
+        let (sel, n) = match screen {
             Screen::Overview => {
                 let n = self.ls.as_ref().map(|l| l.profiles.len()).unwrap_or(0);
                 (&mut self.ov_sel, n)
@@ -839,20 +840,9 @@ impl App {
                 let n = self.domain_len();
                 (&mut self.rc_sel, n)
             }
-            Screen::Vps => {
-                // 编目册选中行按当前是哪一本走(#54:两本各有自己的投影
-                // 与选中态,换册不串味)。
-                if self.catalog_kind == catalog::CatalogKind::Tag {
-                    let n = self.tag_len();
-                    (&mut self.tag_sel, n)
-                } else if self.catalog_kind == catalog::CatalogKind::Key {
-                    let n = self.key_len();
-                    (&mut self.key_sel, n)
-                } else {
-                    let n = self.vps_len();
-                    (&mut self.vps_sel, n)
-                }
-            }
+            // 编目册选中行按当前是哪一本走(#54 起四本册各有自己的投影
+            // 与选中态,catalog_sel_mut 单一查表,换册不串味)。
+            Screen::Vps => self.catalog_sel_mut(),
             Screen::Settings => return, // 设置屏无可滚列表
         };
         if n == 0 {
@@ -1932,9 +1922,9 @@ impl App {
         }
     }
 
-    /// 编目册屏键位:`m` 换册(机器 / 标签);机器册 r 登记 / ↑/↓ 选 /
-    /// d 删除 / l 重读;标签册 r 挂标签 / d 摘引用删标签 / Enter 反查这一条 /
-    /// l 反查全部(#54)。
+    /// 编目册屏键位:`m` 换册(机器 / 标签 / 订阅 / 钥匙);各册 r 登记 /
+    /// ↑/↓ 选 / d 删除 / l 重读;订阅与钥匙册 `g` 只给取回建议命令、
+    /// 标签册 `Enter` 反查选中的这一条(#54 / #56 / #57)。
     fn key_catalog(&mut self, k: KeyEvent) {
         if let KeyCode::Char('m') = k.code {
             self.cycle_catalog_kind();
@@ -1946,18 +1936,8 @@ impl App {
                 // 取回链接本体:只给建议命令,面板不代跑 get(ADR-0009 §1)
                 KeyCode::Char('g') => self.log_sub_get_suggest(),
                 KeyCode::Char('d') => self.start_sub_rm(),
-                KeyCode::Down => {
-                    let n = self.sub_len();
-                    if n > 0 {
-                        self.sub_sel = (self.sub_sel + 1) % n;
-                    }
-                }
-                KeyCode::Up => {
-                    let n = self.sub_len();
-                    if n > 0 {
-                        self.sub_sel = (self.sub_sel + n - 1) % n;
-                    }
-                }
+                KeyCode::Down => self.catalog_move(true),
+                KeyCode::Up => self.catalog_move(false),
                 KeyCode::Char('l') => self.run_sub_ls(),
                 _ => {}
             }
@@ -1969,18 +1949,8 @@ impl App {
                 // 取回钥匙本体:只给建议命令,面板不代跑 get(ADR-0009 §1)
                 KeyCode::Char('g') => self.log_key_get_suggest(),
                 KeyCode::Char('d') => self.start_key_rm(),
-                KeyCode::Down => {
-                    let n = self.key_len();
-                    if n > 0 {
-                        self.key_sel = (self.key_sel + 1) % n;
-                    }
-                }
-                KeyCode::Up => {
-                    let n = self.key_len();
-                    if n > 0 {
-                        self.key_sel = (self.key_sel + n - 1) % n;
-                    }
-                }
+                KeyCode::Down => self.catalog_move(true),
+                KeyCode::Up => self.catalog_move(false),
                 KeyCode::Char('l') => self.run_key_ls(),
                 _ => {}
             }
@@ -1998,18 +1968,8 @@ impl App {
                     };
                     self.run_tag_ls(Some(&name));
                 }
-                KeyCode::Down => {
-                    let n = self.tag_len();
-                    if n > 0 {
-                        self.tag_sel = (self.tag_sel + 1) % n;
-                    }
-                }
-                KeyCode::Up => {
-                    let n = self.tag_len();
-                    if n > 0 {
-                        self.tag_sel = (self.tag_sel + n - 1) % n;
-                    }
-                }
+                KeyCode::Down => self.catalog_move(true),
+                KeyCode::Up => self.catalog_move(false),
                 KeyCode::Char('l') => self.run_tag_ls(None),
                 _ => {}
             }
@@ -2017,18 +1977,8 @@ impl App {
         }
         match k.code {
             KeyCode::Char('r') if !self.assembling => self.start_vps_register(),
-            KeyCode::Down => {
-                let n = self.vps_len();
-                if n > 0 {
-                    self.vps_sel = (self.vps_sel + 1) % n;
-                }
-            }
-            KeyCode::Up => {
-                let n = self.vps_len();
-                if n > 0 {
-                    self.vps_sel = (self.vps_sel + n - 1) % n;
-                }
-            }
+            KeyCode::Down => self.catalog_move(true),
+            KeyCode::Up => self.catalog_move(false),
             KeyCode::Char('d') => self.start_vps_rm(),
             KeyCode::Char('l') => self.run_vps_ls(),
             _ => {}
@@ -2190,6 +2140,9 @@ impl App {
         };
         self.vps_rm_confirm = false;
         self.vps_rm_result = None;
+        // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
+        // 与 register 落账段同一处点灯,回音到达时灭,见 on_vps_echo)。
+        self.assembling = true;
         self.queue.push(commands::vps_rm(&name, &root));
         self.push_log(format!("删除已入队:vps rm {name} --root {root}"));
     }
@@ -2218,7 +2171,7 @@ impl App {
                     Some(d) => {
                         let n = d.machines.len();
                         self.vps_ls = Some(d);
-                        self.clamp_vps_sel();
+                        self.catalog_clamp();
                         self.push_log(format!("vps 编目册已刷新:{n} 台机器(只读)"));
                     }
                     None => self.push_log(format!("vps ls 结果不可用:{}", out.headline())),
@@ -2272,6 +2225,9 @@ impl App {
                 }
             }
             Some("rm") => {
+                // 写互斥随 rm 回音收敛(ADR-0009 §4;删不存在的名 rc 3 同样
+                // 到达这里——互斥释放,文件一个字节都没动)。
+                self.assembling = false;
                 let typed = out
                     .envelope
                     .as_ref()
@@ -2304,20 +2260,10 @@ impl App {
         }
     }
 
-    /// 选中行钳回可见范围内(刷新后旧下标可能越界)。
-    fn clamp_vps_sel(&mut self) {
-        let n = self.vps_len();
-        if n == 0 {
-            self.vps_sel = 0;
-        } else {
-            self.vps_sel = self.vps_sel.min(n - 1);
-        }
-    }
-
     // ---- 编目册屏·标签册(spec #50 工单 #54,ADR-0009) ----
 
     /// 当前是哪一本(`m` 换册)。换册只改维度、不清另一本的投影——
-    /// 两本各有自己的账,回来还在(不重跑、不轮询)。
+    /// 四本各有自己的账,回来还在(不重跑、不轮询)。
     pub fn cycle_catalog_kind(&mut self) {
         self.catalog_kind = self.catalog_kind.next();
         let k = self.catalog_kind;
@@ -2334,7 +2280,7 @@ impl App {
         ));
     }
 
-    /// 编目册屏当前这一本的投影(两本各自的数据源汇到同一个
+    /// 编目册屏当前这一本的投影(四本各自的数据源汇到同一个
     /// `CatalogSheet`——列表件只有一份,见 `screens::catalog`)。
     pub fn catalog_sheet(&self) -> Option<crate::engine::CatalogSheet> {
         match self.catalog_kind {
@@ -2390,6 +2336,49 @@ impl App {
         }
     }
 
+    /// 册级选中态的**单一查表**:当前是哪一本,就借出它自己的选中槽与行数
+    /// (键位 ↑/↓、鼠标点行、滚轮移选中都走这一口,换册不串味)。
+    /// 只读侧的同源口径是 [`App::catalog_sel`] / [`App::catalog_len`]。
+    fn catalog_sel_mut(&mut self) -> (&mut usize, usize) {
+        let n = self.catalog_len();
+        match self.catalog_kind {
+            catalog::CatalogKind::Vps => (&mut self.vps_sel, n),
+            catalog::CatalogKind::Tag => (&mut self.tag_sel, n),
+            catalog::CatalogKind::Subscription => (&mut self.sub_sel, n),
+            catalog::CatalogKind::Key => (&mut self.key_sel, n),
+        }
+    }
+
+    /// 当前这一本的行数(只读侧;与 `catalog_sel_mut` 同一张表)。
+    pub fn catalog_len(&self) -> usize {
+        match self.catalog_kind {
+            catalog::CatalogKind::Vps => self.vps_len(),
+            catalog::CatalogKind::Tag => self.tag_len(),
+            catalog::CatalogKind::Subscription => self.sub_len(),
+            catalog::CatalogKind::Key => self.key_len(),
+        }
+    }
+
+    /// 册级选中行钳回可见范围内(刷新后旧下标可能越界;四本册同一口径)。
+    fn catalog_clamp(&mut self) {
+        let (sel, n) = self.catalog_sel_mut();
+        *sel = if n == 0 { 0 } else { (*sel).min(n - 1) };
+    }
+
+    /// 册级键盘 ↑/↓ 移选中:四本册同一口径。与鼠标/滚轮的唯一差别是
+    /// **到边界绕回**(既有键盘行为,零回归);鼠标/滚轮到界停界
+    /// (`on_mouse` / `wheel_sel` 走 `catalog_sel_mut` 的钳位口径)。
+    fn catalog_move(&mut self, down: bool) {
+        let (sel, n) = self.catalog_sel_mut();
+        if n > 0 {
+            *sel = if down {
+                (*sel + 1) % n
+            } else {
+                (*sel + n - 1) % n
+            };
+        }
+    }
+
     /// 标签册的行数(反查投影条数;没查到 = 0)。
     pub fn tag_len(&self) -> usize {
         self.catalog_sheet().map(|s| s.entries.len()).unwrap_or(0)
@@ -2414,16 +2403,6 @@ impl App {
         match self.data_root_cause() {
             Some(_) => self.data_root_gate_msg(),
             None => capability::GATE_HINT.to_string(),
-        }
-    }
-
-    /// 标签册选中行钳回可见范围内(反查刷新后旧下标可能越界)。
-    fn clamp_tag_sel(&mut self) {
-        let n = self.tag_len();
-        if n == 0 {
-            self.tag_sel = 0;
-        } else {
-            self.tag_sel = self.tag_sel.min(n - 1);
         }
     }
 
@@ -2585,6 +2564,9 @@ impl App {
         };
         self.tag_rm_confirm = false;
         self.tag_rm_result = None;
+        // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
+        // 与 tag add 同一处点灯,回音到达时灭,见 on_tag_echo)。
+        self.assembling = true;
         let refs = spec.refs.len();
         self.queue
             .push(commands::tag_rm(&spec.name, &spec.refs, &root));
@@ -2633,7 +2615,7 @@ impl App {
                             self.tag_lookup = asked.clone();
                         }
                         self.tag_ls_echo = Some(out);
-                        self.clamp_tag_sel();
+                        self.catalog_clamp();
                         let scope = match asked.as_deref() {
                             Some(name) => format!("标签 {name}:{n} 条"),
                             None => format!("全部标签:{n} 条"),
@@ -2697,6 +2679,9 @@ impl App {
                 }
             }
             Some("rm") => {
+                // 写互斥随 rm 回音收敛(ADR-0009 §4;删不存在的标签 rc 3 同样
+                // 到达这里——互斥释放,文件一个字节都没动)。
+                self.assembling = false;
                 let typed = out
                     .envelope
                     .as_ref()
@@ -2974,18 +2959,11 @@ impl App {
         };
         self.sub_rm_confirm = false;
         self.sub_rm_result = None;
+        // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
+        // 与 register 落账段同一处点灯,回音到达时灭,见 on_sub_echo)。
+        self.assembling = true;
         self.queue.push(commands::subscription_rm(&name, &root));
         self.push_log(format!("删除已入队:subscription rm {name} --root {root}"));
-    }
-
-    /// 订阅册选中行钳回可见范围内(刷新后旧下标可能越界)。
-    fn clamp_sub_sel(&mut self) {
-        let n = self.sub_len();
-        if n == 0 {
-            self.sub_sel = 0;
-        } else {
-            self.sub_sel = self.sub_sel.min(n - 1);
-        }
     }
 
     /// 订阅册回音路由(#56):ls 只读 / register 两段式(本体经 stdin)/ rm。
@@ -3002,7 +2980,7 @@ impl App {
                         let n = d.subscriptions.len();
                         let counts = d.status_counts();
                         self.sub_ls = Some(d);
-                        self.clamp_sub_sel();
+                        self.catalog_clamp();
                         self.sub_get_logged = false;
                         self.push_log(format!(
                             "订阅册已刷新:{n} 条(active {} · expiring {} · expired {},只读)",
@@ -3062,6 +3040,9 @@ impl App {
                 }
             }
             Some("rm") => {
+                // 写互斥随 rm 回音收敛(ADR-0009 §4;删不存在的订阅 rc 3 同样
+                // 到达这里——互斥释放,文件一个字节都没动)。
+                self.assembling = false;
                 let typed = out
                     .envelope
                     .as_ref()
@@ -3327,18 +3308,11 @@ impl App {
         };
         self.key_rm_confirm = false;
         self.key_rm_result = None;
+        // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
+        // 与 register 落账段同一处点灯,回音到达时灭,见 on_key_echo)。
+        self.assembling = true;
         self.queue.push(commands::key_rm(&name, &root));
         self.push_log(format!("删除已入队:key rm {name} --root {root}"));
-    }
-
-    /// 钥匙册选中行钳回可见范围内(刷新后旧下标可能越界)。
-    fn clamp_key_sel(&mut self) {
-        let n = self.key_len();
-        if n == 0 {
-            self.key_sel = 0;
-        } else {
-            self.key_sel = self.key_sel.min(n - 1);
-        }
     }
 
     /// 钥匙册回音路由(#57):ls 只读 / register 两段式(本体经 stdin)/ rm。
@@ -3354,7 +3328,7 @@ impl App {
                     Some(d) => {
                         let n = d.keys.len();
                         self.key_ls = Some(d);
-                        self.clamp_key_sel();
+                        self.catalog_clamp();
                         self.key_get_logged = false;
                         self.push_log(format!("钥匙册已刷新:{n} 条(只读,无本体槽、不印指纹)"));
                     }
@@ -3410,6 +3384,9 @@ impl App {
                 }
             }
             Some("rm") => {
+                // 写互斥随 rm 回音收敛(ADR-0009 §4;删不存在的钥匙 rc 3 同样
+                // 到达这里——互斥释放,文件一个字节都没动)。
+                self.assembling = false;
                 let typed = out
                     .envelope
                     .as_ref()
@@ -4985,6 +4962,85 @@ mod tests {
         assert!(!app.as_confirm, "点行不触发破坏性动作");
     }
 
+    // ---- 编目册屏四本册:鼠标点行 / 滚轮移选中走册级查表(#54 起) ----
+
+    /// 四本册的 ls 投影(数据面形状,与 `screens/catalog.rs` 测试同源):
+    /// 每本 3 条,才好断言「点第 3 行 = 该册 sel 2」。
+    const CAT_VPS_LS: &str = r#"{"catalogPath":"/r/vps.json","machines":[{"name":"gate","ips":[],"port":22,"logins":[]},{"name":"bare","ips":[],"port":0,"logins":[]},{"name":"zen","ips":[],"port":0,"logins":[]}]}"#;
+    const CAT_TAG_LS: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[{"name":"pi","refs":[{"kind":"skill","id":"o/r/deep-research"}]},{"name":"bare","refs":[]},{"name":"ops","refs":[]}]}}"#;
+    const CAT_SUB_LS: &str = r#"{"catalogPath":"/r/subscriptions.json","subscriptions":[{"name":"airport","kind":"subscription-url","client":"Mihomo","expires":"2099-03-01","status":"active","daysLeft":26000},{"name":"soon","kind":"subscription-url","client":"Clash","expires":"2099-03-04","status":"expiring","daysLeft":3},{"name":"forever","kind":"subscription-url","client":"Surge","expires":"","status":"active","daysLeft":null}]}"#;
+    const CAT_KEY_LS: &str = r#"{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"ghe.internal","scopes":[],"rotatedAt":"2025-11-02"},{"name":"deploy","kind":"github-key","host":"github.com","scopes":["repo"],"rotatedAt":"2026-01-15"},{"name":"ops","kind":"github-key","host":"gitlab.com","scopes":[],"rotatedAt":"2026-02-01"}]}"#;
+
+    /// 编目册屏四本册各灌 3 条投影(点行/滚轮才有命中区可点)。
+    fn catalog_four_books_app() -> App {
+        let mut app = fake_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.screen = Screen::Vps;
+        app.vps_ls = Some(serde_json::from_str(CAT_VPS_LS).unwrap());
+        app.tag_ls_echo = Some(EngineOutput {
+            args: vec!["tag".into(), "ls".into()],
+            exit_code: crate::engine::ExitCode::Ok,
+            ok: true,
+            stderr_tail: vec![],
+            envelope: Some(serde_json::from_str(CAT_TAG_LS).unwrap()),
+            raw_stdout: CAT_TAG_LS.into(),
+            parse_error: None,
+        });
+        app.sub_ls = Some(serde_json::from_str(CAT_SUB_LS).unwrap());
+        app.key_ls = Some(serde_json::from_str(CAT_KEY_LS).unwrap());
+        app
+    }
+
+    /// 册体文案承诺「↑/↓ 或鼠标点行」(ADR-0005 V1 交互范围):鼠标点行与
+    /// 滚轮移选中对**四本册**都落在各自的 `*_sel` 上——订阅册曾落进
+    /// `Screen::Vps` 兜底写 `vps_sel`,册体选中永不随鼠标动(双轴评审
+    /// 发现 1),这条守四本册各自不串味。
+    #[test]
+    fn 编目册四本册_鼠标点行与滚轮移选中_各动各的选中槽() {
+        let mut app = catalog_four_books_app();
+        for kind in [
+            catalog::CatalogKind::Vps,
+            catalog::CatalogKind::Tag,
+            catalog::CatalogKind::Subscription,
+            catalog::CatalogKind::Key,
+        ] {
+            app.catalog_kind = kind;
+            // 每本册都从全零选中态起步(上一本册的滚轮余量不许带进来)
+            app.vps_sel = 0;
+            app.tag_sel = 0;
+            app.sub_sel = 0;
+            app.key_sel = 0;
+            assert_eq!(app.catalog_len(), 3, "{kind:?} 册应有 3 条投影");
+            // 鼠标点第 3 行 = 该册 sel 2
+            let row = hit_target(&app, |t| matches!(t, Target::SelectRow(2)));
+            click(&mut app, row);
+            assert_eq!(app.catalog_sel(), 2, "{kind:?} 册点行选中");
+            assert_eq!(
+                (app.vps_sel, app.tag_sel, app.sub_sel, app.key_sel),
+                match kind {
+                    catalog::CatalogKind::Vps => (2, 0, 0, 0),
+                    catalog::CatalogKind::Tag => (0, 2, 0, 0),
+                    catalog::CatalogKind::Subscription => (0, 0, 2, 0),
+                    catalog::CatalogKind::Key => (0, 0, 0, 2),
+                },
+                "{kind:?} 册点行只动自己的选中槽,四本册不串味"
+            );
+            // 滚轮在册体行上移一档(与 ↑/↓ 同语义、钳位不绕回)
+            let row = hit_target(&app, |t| matches!(t, Target::SelectRow(_)));
+            wheel(&mut app, row, MouseEventKind::ScrollUp);
+            assert_eq!(app.catalog_sel(), 1, "{kind:?} 册滚轮上移一档");
+        }
+        // 订阅册专项:点行/滚轮都不再误写 vps_sel(发现 1 的回归形状)
+        app.catalog_kind = catalog::CatalogKind::Subscription;
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        click(&mut app, row);
+        assert_eq!(app.sub_sel, 1, "订阅册点行动 sub_sel");
+        assert_eq!(app.vps_sel, 0, "订阅册点行不误写 vps_sel");
+        wheel(&mut app, row, MouseEventKind::ScrollDown);
+        assert_eq!(app.sub_sel, 2, "订阅册滚轮动 sub_sel");
+        assert_eq!(app.vps_sel, 0, "订阅册滚轮不误写 vps_sel");
+    }
+
     #[test]
     fn 点空白不改状态_顶栏与hud行() {
         let mut app = mouse_ls_app();
@@ -6372,7 +6428,7 @@ mod tests {
 
     /// 可观测状态快照:帮助对照测试据此判断「这个键按下去到底动没动」。
     /// 覆盖任何键位可能改到的字段(屏 / 各屏选中 / 模式 / 域 / 浮层 / 退出 /
-    /// 手填 / 编辑器 / 鼠标 / NW_HOME / 日志长度 / 队列长度)。
+    /// 手填 / 配方过滤输入态 / 编辑器 / 鼠标 / NW_HOME / 日志长度 / 队列长度)。
     #[derive(PartialEq, Debug)]
     struct KeySnap {
         screen: Screen,
@@ -6390,6 +6446,8 @@ mod tests {
         quit: bool,
         home_input: bool,
         data_input: bool,
+        rc_filter_on: bool,
+        rc_filter: String,
         pending_editor: bool,
         mouse_enabled: bool,
         nw_home: String,
@@ -6414,6 +6472,8 @@ mod tests {
             quit: a.quit,
             home_input: a.home_input,
             data_input: a.data_input,
+            rc_filter_on: a.rc_filter_on,
+            rc_filter: a.rc_filter.clone(),
             pending_editor: a.pending_editor,
             mouse_enabled: a.mouse_enabled,
             nw_home: a.nw_home.clone(),
@@ -6517,6 +6577,93 @@ mod tests {
         }
         for m in MOUSE_LINES {
             assert!(seen.contains(m), "鼠标章节应含 `{m}`");
+        }
+    }
+
+    /// README 六屏表的中文屏名 ↔ `Screen`(键位对齐测试的地砖)。
+    fn readme_screen_cn(s: Screen) -> &'static str {
+        match s {
+            Screen::Overview => "概览",
+            Screen::Assemble => "装配",
+            Screen::Health => "健康",
+            Screen::Recipes => "配方",
+            Screen::Vps => "编目",
+            Screen::Settings => "设置",
+        }
+    }
+
+    /// 键位字面量切碎:「a / h / l」「↑/↓」→ 单个键;`/` 保持原样。
+    fn key_tokens(key: &str) -> Vec<String> {
+        key.split('/')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    /// 取 README 六屏表里某一屏的那一行(行首是屏名)。
+    fn readme_row_for(readme: &str, cn: &str) -> String {
+        readme
+            .lines()
+            .find(|l| l.trim_start().starts_with('|') && l.contains(cn))
+            .unwrap_or_else(|| panic!("README 六屏表应有「{cn}」行"))
+            .to_string()
+    }
+
+    /// 守「README 键位表与帮助浮层自此一致,不再互相漏」(#62 验收钉,
+    /// 双轴评审发现 3):方向一,`HELP_ROWS` 每一行的键都写进 README 对应屏
+    /// 那一行(帮助不写 README 没有的键);方向二,README 六屏表每一行的键列
+    /// 列出的键都在 `HELP_ROWS` 里(README 不写帮助里没有的键)。
+    ///
+    /// 有意不追的边界(注释钉住,别静默扩大):方向一只对**带屏**的行按屏
+    /// 比对,全局行(j/k、↑/↓、Esc、t、?)在「通用行 + 六屏键列」里找;
+    /// 方向二只扫六屏表的键列——README「通用」行里的 `q`(退出)与鼠标章节
+    /// 不在帮助对照表里,那是既有取舍(浮层不教退出),不进豁免清单。
+    #[test]
+    fn readme_键位表与帮助浮层互不漏() {
+        use crate::ui::HELP_ROWS;
+        let readme = include_str!("../README.md");
+        let help_keys: Vec<String> = HELP_ROWS.iter().flat_map(|r| key_tokens(r.key)).collect();
+        // 方向一:帮助列出的每个键,README 键位表都找得到
+        for row in HELP_ROWS {
+            let hay = match row.screen {
+                Some(s) => readme_row_for(readme, readme_screen_cn(s)).replace('`', ""),
+                // 全局键:通用行 + 六屏键列(不放大到整篇,免得单字母被
+                // 英文正文里的同名字母「凑中」)
+                None => {
+                    let mut h = readme
+                        .lines()
+                        .find(|l| l.starts_with("通用:"))
+                        .expect("README 应有通用键位行")
+                        .replace('`', "");
+                    for s in Screen::ALL {
+                        h.push_str(&readme_row_for(readme, readme_screen_cn(s)).replace('`', ""));
+                    }
+                    h
+                }
+            };
+            for t in key_tokens(row.key) {
+                assert!(
+                    hay.contains(&t),
+                    "帮助列的键 `{}`({})应写进 README 键位表",
+                    row.key,
+                    row.desc
+                );
+            }
+        }
+        // 方向二:README 六屏表每行键列列出的键,帮助对照表里都有
+        for s in Screen::ALL {
+            let line = readme_row_for(readme, readme_screen_cn(s));
+            let cells: Vec<&str> = line.split('|').collect();
+            let key_cell = cells.get(3).expect("六屏表第三列是键列");
+            // 反引号包裹的才是键位字面量(`` `r` `` / `` `↑/↓` ``)
+            for tok in key_cell.split('`').skip(1).step_by(2) {
+                for t in key_tokens(tok) {
+                    assert!(
+                        help_keys.iter().any(|k| k == &t),
+                        "README {s:?} 屏键列的 `{tok}` 应在 HELP_ROWS 里"
+                    );
+                }
+            }
         }
     }
 

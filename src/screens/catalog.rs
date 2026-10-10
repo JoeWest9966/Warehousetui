@@ -22,8 +22,8 @@
 //! # 册子与屏的关系(#54)
 //!
 //! 屏只有一块(`Screen::Vps`,标题「编目」),**册子是屏内的一个维度**
-//! ([`CatalogKind`]):五本编目共用同一套骨架,拆五块屏等于把同一件东西
-//! 复制五份;而「当前是哪一本」必须显式在场(五本都是数据仓根下机器写的
+//! ([`CatalogKind`]):四本编目共用同一套骨架,拆四块屏等于把同一件东西
+//! 复制四份;而「当前是哪一本」必须显式在场(四本都是数据仓根下机器写的
 //! JSON)。键 `m` 换册。
 //!
 //! 机密纪律(ADR-0009 §3):`logins[].ref` 是**指针不是密钥**,原样呈现安全;
@@ -163,8 +163,8 @@ impl Audit {
 /// 两段式登记的命令组契约:预审段与落账段的 argv 构造**在类型层面分开**
 /// (两个方法,预审那个连 `--yes` 的位置都没有),误下发靠形状杜绝。
 ///
-/// vps 是第一个实现(`VpsSpec`);key / subscription 两本只换这一个实现
-/// (本体经 stdin 喂入,#55 铺的管子)。**tag 是例外**(#54):上游
+/// vps 是第一个实现(`VpsSpec`);key / subscription 两本(与 vps 同形状)
+/// 只换这一个实现(本体经 stdin 喂入,#55 铺的管子)。**tag 是例外**(#54):上游
 /// `tag add` 没有 `--yes`(追加合并、幂等,没有「覆盖」可确认),所以
 /// 它的 `preaudit` 与 `commit` 是**同一份 argv**,且那一份本身就是写命令
 /// ——tag 没有「拟落账不落盘」的那一段。别为了套这个 trait 伪造一枚
@@ -190,6 +190,9 @@ pub trait RegisterSpec {
     /// 为什么做成 trait 上的方法而不是面板侧的一个 `if`:「有没有 `--yes`」
     /// 是**命令组自己的属性**,面板不替引擎回答(同 #29 探测铁律)。默认
     /// `true` 让 vps 与外部源登记两个既有实现逐字节不变。
+    ///
+    /// 谁在消费它:`render_tag_review` 的键位行按它决定画不画「Enter 落账」
+    /// 段(tag add 无闸 → 只画返航段),测试钉两种实现的取值。不是死代码。
     fn confirm_gate() -> bool {
         true
     }
@@ -206,11 +209,11 @@ pub fn preaudit_passed(out: &EngineOutput, audit: Option<&Audit>) -> bool {
 
 /// 编目册屏当前翻开的那一本。
 ///
-/// **为什么是屏内的一个枚举而不是第二块屏**:五本编目共用同一套骨架
-/// (投影三件 / 列表件 / 登记流),拆成五块屏等于把同一件东西复制五份;
-/// 而「当前是哪一本」又必须显式在场——五本都是数据仓根下机器写的 JSON,
+/// **为什么是屏内的一个枚举而不是第二块屏**:四本编目共用同一套骨架
+/// (投影三件 / 列表件 / 登记流),拆成四块屏等于把同一件东西复制四份;
+/// 而「当前是哪一本」又必须显式在场——四本都是数据仓根下机器写的 JSON,
 /// 操作者得知道自己正在改哪一本(ADR-0009:机器写、永不手改)。键 `m`
-/// 换册(与健康屏 `m` 轮转模式同语义)。后两本(key / subscription)
+/// 换册(与健康屏 `m` 轮转模式同语义)。后三本(tag / subscription / key)
 /// 随票追加,只在这里多一个变体。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CatalogKind {
@@ -227,13 +230,6 @@ pub enum CatalogKind {
 }
 
 impl CatalogKind {
-    pub const ALL: [CatalogKind; 4] = [
-        CatalogKind::Vps,
-        CatalogKind::Tag,
-        CatalogKind::Subscription,
-        CatalogKind::Key,
-    ];
-
     /// 册名(操作者视角;词有出处:vps / 标签 / 订阅 / 钥匙都是上游命令组名,不自造)。
     pub fn label(self) -> &'static str {
         match self {
@@ -286,6 +282,8 @@ impl CatalogKind {
     }
 
     /// 换一册(`m` 键)。
+    /// 换册:四本册按 Vps → Tag → Subscription → Key → Vps 轮转(屏内维度,
+    /// 不换屏;`m` 键)。
     pub fn next(self) -> Self {
         match self {
             CatalogKind::Vps => CatalogKind::Tag,
@@ -300,7 +298,7 @@ impl CatalogKind {
 /// 没有)+ 名字行之下的明细行(机器册给 地址/登录/备注,标签册给 引用)。
 ///
 /// 列表件 [`catalog_sheet_lines`] 只按这一组画;选中标记 / 名字 / 折行
-/// 截断 / 确定性排序都在它自己那一处。后两本册子只换这一个函数指针,
+/// 截断 / 确定性排序都在它自己那一处。后三本册子只换这一个函数指针,
 /// **不换列表件**(工单 #54 验收第 5 条:不复制第二份列表逻辑)。
 pub type EntryDetail =
     fn(&CatalogEntryView, usize, &Palette) -> (Option<String>, Vec<Line<'static>>);
@@ -1199,11 +1197,12 @@ impl VpsForm {
 
 // ---- 编目册屏渲染 ----
 
-/// 编目册屏(机器册 / 标签册两本,`m` 换册)。常畅态 / 紧凑态同一份正文
+/// 编目册屏(机器册 / 标签册 / 订阅册 / 钥匙册四本,`m` 换册)。常畅态 /
+/// 紧凑态同一份正文
 /// (只随宽度折行,不引新断点、不缩放字号):当前是哪一本 + 编目路径 +
 /// 清单 + 键位行;登记与删除各是一个浮层。
 ///
-/// **册体行序是命中区的几何基准**(`layout::vps_hits` 按 `row_lines()`
+/// **册体行序是命中区的几何基准**(`layout::catalog_hits` 按 `row_lines()`
 /// 逐条铺),所以「当前是哪一本」与编目路径合并在首行,不另起一行——
 /// 多一行就整体错位,点哪打哪就断了。
 pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
@@ -1411,46 +1410,44 @@ fn cause_line(app: &App) -> String {
 }
 
 /// 编目册键位行(与鼠标命中区同文案同序)。
+/// 册级键位行**按 kind 查表**(四本册各一组;在途浮层与空册各换一句,
+/// 三态形状相同)。新增第五本册只加一行——册级状态不再复制四份 if-else
+/// (双轴评审发现 9:Mysterious Name,catalog_keys 曾用四条 if)。
 fn catalog_keys(app: &App) -> &'static str {
-    if app.catalog_kind == CatalogKind::Subscription {
-        if app.sub_flow.phase != RegPhase::Idle || app.sub_rm_confirm {
-            return "  Enter 确认 · Esc/q 返航 ";
-        }
-        if app.sub_len() == 0 {
-            return "  r 登记订阅 · l 重读 · m 换册 · Esc/q 返航 ";
-        }
-        return "  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ";
+    const IN_FLOW: &str = "  Enter 确认 · Esc/q 返航 ";
+    let (in_flow, empty, empty_line, line) = match app.catalog_kind {
+        CatalogKind::Vps => (
+            app.vps_flow.phase != RegPhase::Idle || app.vps_rm_confirm,
+            app.vps_len() == 0,
+            "  r 登记机器 · Esc/q 返航 ",
+            "  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 ",
+        ),
+        CatalogKind::Tag => (
+            app.tag_flow.phase != RegPhase::Idle || app.tag_rm_confirm,
+            app.tag_len() == 0,
+            "  l 反查全部 · r 挂标签 · m 换册 · Esc/q 返航 ",
+            "  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册 ",
+        ),
+        CatalogKind::Subscription => (
+            app.sub_flow.phase != RegPhase::Idle || app.sub_rm_confirm,
+            app.sub_len() == 0,
+            "  r 登记订阅 · l 重读 · m 换册 · Esc/q 返航 ",
+            "  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
+        ),
+        CatalogKind::Key => (
+            app.key_flow.phase != RegPhase::Idle || app.key_rm_confirm,
+            app.key_len() == 0,
+            "  r 登记钥匙 · l 重读 · m 换册 · Esc/q 返航 ",
+            "  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
+        ),
+    };
+    if in_flow {
+        IN_FLOW
+    } else if empty {
+        empty_line
+    } else {
+        line
     }
-    if app.catalog_kind == CatalogKind::Key {
-        if app.key_flow.phase != RegPhase::Idle || app.key_rm_confirm {
-            return "  Enter 确认 · Esc/q 返航 ";
-        }
-        if app.key_len() == 0 {
-            return "  r 登记钥匙 · l 重读 · m 换册 · Esc/q 返航 ";
-        }
-        return "  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ";
-    }
-    if app.catalog_kind == CatalogKind::Tag {
-        if app.tag_flow.phase != RegPhase::Idle || app.tag_rm_confirm {
-            return "  Enter 确认 · Esc/q 返航 ";
-        }
-        if app.tag_len() == 0 {
-            return "  l 反查全部 · r 挂标签 · m 换册 · Esc/q 返航 ";
-        }
-        return "  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册 ";
-    }
-    if app.vps_flow.phase != RegPhase::Idle || app.vps_rm_confirm {
-        return "  Enter 确认 · Esc/q 返航 ";
-    }
-    if app
-        .vps_ls
-        .as_ref()
-        .map(|d| d.machines.is_empty())
-        .unwrap_or(true)
-    {
-        return "  r 登记机器 · Esc/q 返航 ";
-    }
-    "  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 "
 }
 
 /// **编目册列表件**(#53 骨架第二件):按投影字段渲染,遵循确定性排序。
@@ -3754,6 +3751,18 @@ mod tests {
     /// 删不存在的标签回音:rc 3 + 文件一个字节都不动。
     const TAG_RM_MISS: &str = r#"{"schema":"nw/tag-rm.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"标签 \"ghost\" 不在 tags.json 里","hint":"tags.json 是机器写的产物,永不手改","details":{"catalogPath":"/r/tags.json"}}],"warnings":[],"data":{"name":"ghost","catalogPath":"/r/tags.json","removed":false,"written":false,"action":"not_found","remaining":2}}"#;
 
+    /// 删整个标签成功回音(引用留空 = 删标签本身)。
+    const TAG_RM_LAST: &str = r#"{"schema":"nw/tag-rm.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"name":"pi","catalogPath":"/r/tags.json","removed":true,"written":true,"action":"removed","remaining":1}}"#;
+
+    /// 机器册 3 条投影(点行 / 滚轮 / rm 互斥测试共用)。
+    const CAT_VPS_LS: &str = r#"{"catalogPath":"/r/vps.json","machines":[{"name":"gate","ips":[],"port":22,"logins":[]},{"name":"bare","ips":[],"port":0,"logins":[]},{"name":"zen","ips":[],"port":0,"logins":[]}]}"#;
+
+    /// 机器册删一台成功回音(剩 2 台)。
+    const VPS_RM_LAST: &str = r#"{"schema":"nw/vps-rm.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"name":"gate","catalogPath":"/r/vps.json","removed":true,"written":true,"action":"removed","remaining":2}}"#;
+
+    /// 删后即时重读的机器册投影(合法空态也成立,这里留 1 台)。
+    const VPS_LS_GATE_ONLY: &str = r#"{"catalogPath":"/r/vps.json","machines":[{"name":"gate","ips":[],"port":22,"logins":[]}]}"#;
+
     /// 一台能力齐备的标签册夹具:引擎有 tag 组、数据仓根可用。
     fn tag_app(rules: &[(&str, i32, &str)]) -> crate::app::App {
         let mut app = crate::app::App::with_runner(std::sync::Arc::new(
@@ -4491,6 +4500,120 @@ mod tests {
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(s.contains("合法空态"), "{s}");
         assert!(s.contains("subscriptions.json"), "说清是哪一本:{s}");
+    }
+
+    /// rm 是写动作:下发即点亮写互斥(ADR-0009 §4,与 register 落账段同一处
+    /// 点灯)。在途窗口里两个写不并发(装配仪式打不开)、`q` 不禁用前不退;
+    /// 回音到达(删成 / 删不存在的名 rc 3 都算到达)互斥即释放。
+    #[test]
+    fn 删订阅_下发即点亮写互斥_在途不接装配q禁用_回音后释放() {
+        let (mut app, _r) = sub_app(&[
+            ("subscription ls", 0, SUB_LS_ALL),
+            ("subscription rm", 0, SUB_RM_LAST),
+        ]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        assert_eq!(app.sub_len(), 4);
+        app.sub_sel = 0;
+        tap(&mut app, KeyCode::Char('d'));
+        assert!(app.sub_rm_confirm, "面板加一道图形确认(ADR-0009 §2)");
+        assert!(!app.assembling, "确认前不点灯:命令还没递出去");
+        tap(&mut app, KeyCode::Enter);
+        assert!(app.assembling, "rm 下发即点亮写互斥(ADR-0009 §4)");
+        assert!(
+            app.queue
+                .iter()
+                .any(|a| a.get(1).map(String::as_str) == Some("rm")),
+            "rm 已入队"
+        );
+        // 在途互斥:装配屏 Enter 打不开发射仪式(rm 在途时 up 不并发)
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"9f8e","recipe":"research-desk","bakedAt":"2026-10-01"}]}"#,
+            )
+            .unwrap(),
+        );
+        app.screen = crate::app::Screen::Assemble;
+        tap(&mut app, KeyCode::Enter);
+        assert!(!app.as_confirm, "rm 在途:发射仪式打不开(写互斥)");
+        assert!(
+            app.queue
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("up")),
+            "rm 在途:up 不入队(两个写不并发)"
+        );
+        // 写互斥期间 q 禁用
+        app.screen = crate::app::Screen::Vps;
+        tap(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit, "写互斥期间 q 不禁用");
+        // 回音到达:互斥释放,q 恢复受理
+        feed(&mut app);
+        assert!(!app.assembling, "rm 回音到达后互斥释放");
+        feed(&mut app); // 删后即时重读(只读)
+        tap(&mut app, KeyCode::Char('q'));
+        assert!(app.quit, "互斥释放后 q 恢复受理");
+    }
+
+    /// 四本册的 rm 下发都点亮写互斥、回音都灭(ADR-0009 §4 对四本册一视
+    /// 同仁:册级状态复制了四份,互斥语义不许漏掉任何一本——评审发现 2
+    /// 正是四本册的 dispatch 全都没点灯)。
+    #[test]
+    fn 四本册rm下发都点亮写互斥_回音到达都释放() {
+        // 机器册
+        let mut app =
+            crate::app::App::with_runner(std::sync::Arc::new(crate::engine::FakeRunner::new(&[
+                ("vps rm", 0, VPS_RM_LAST),
+                ("vps ls", 0, VPS_LS_GATE_ONLY),
+            ])));
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        app.vps_ls = Some(serde_json::from_str(CAT_VPS_LS).unwrap());
+        tap(&mut app, KeyCode::Char('d'));
+        tap(&mut app, KeyCode::Enter);
+        assert!(app.assembling, "机器册 rm 下发点灯");
+        feed(&mut app);
+        assert!(!app.assembling, "机器册 rm 回音灭灯");
+        // 标签册(删标签要走一遍表单:Enter 提交 → 确认框 → Enter 下发)
+        let mut app = tag_app(&[("tag rm", 0, TAG_RM_LAST), ("tag ls", 0, TAG_LS_ALL)]);
+        app.tag_ls_echo = Some(crate::engine::EngineOutput {
+            args: vec!["tag".into(), "ls".into()],
+            exit_code: crate::engine::ExitCode::Ok,
+            ok: true,
+            stderr_tail: vec![],
+            envelope: Some(serde_json::from_str(TAG_LS_ALL).unwrap()),
+            raw_stdout: TAG_LS_ALL.into(),
+            parse_error: None,
+        });
+        tap(&mut app, KeyCode::Char('d'));
+        tap(&mut app, KeyCode::Enter); // 表单提交(引用留空 = 删整个标签)
+        assert!(app.tag_rm_confirm, "面板加一道图形确认");
+        tap(&mut app, KeyCode::Enter); // 确认下发
+        assert!(app.assembling, "标签册 rm 下发点灯");
+        feed(&mut app);
+        assert!(!app.assembling, "标签册 rm 回音灭灯");
+        // 订阅册
+        let (mut app, _r) = sub_app(&[
+            ("subscription rm", 0, SUB_RM_LAST),
+            ("subscription ls", 0, SUB_LS_EMPTY_ENV),
+        ]);
+        app.sub_ls = Some(serde_json::from_str(SUB_LS_ONE).unwrap());
+        tap(&mut app, KeyCode::Char('d'));
+        tap(&mut app, KeyCode::Enter);
+        assert!(app.assembling, "订阅册 rm 下发点灯");
+        feed(&mut app);
+        assert!(!app.assembling, "订阅册 rm 回音灭灯");
+        // 钥匙册
+        let (mut app, _r) = key_app(&[("key rm", 0, KEY_RM_LAST), ("key ls", 0, KEY_LS_ONE)]);
+        app.key_ls = Some(serde_json::from_str(KEY_LS_ONE).unwrap());
+        tap(&mut app, KeyCode::Char('d'));
+        tap(&mut app, KeyCode::Enter);
+        assert!(app.assembling, "钥匙册 rm 下发点灯");
+        feed(&mut app);
+        assert!(!app.assembling, "钥匙册 rm 回音灭灯");
     }
 
     /// 取回链接本体:**只给建议命令**。面板不代跑 `subscription get`——队列里

@@ -90,7 +90,10 @@ pub enum ExitCode {
     InputInvalid,
     /// 3 校验失败(sha256 / 锁 schema 不认,与上面有意共用 3)。
     VerifyFailed,
-    /// 4 装配失败。
+    /// 4 装配失败。**同一数字码服务两类写动作**:`up` 的某步失败,以及
+    /// 编目册(vps / tag / subscription / key)写 `xxx.json` 失败——后者是
+    /// 磁盘/权限问题,不是用户输入问题(ADR-0009 Consequences),所以人话
+    /// 见 [`ExitCode::human`] 不许说成「输入无效」。
     ApplyFailed,
     /// 5 锁冲突(同 profile 已有 up 在跑)。
     LockConflict,
@@ -145,13 +148,19 @@ impl ExitCode {
         }
     }
 
+    /// 人话(顶栏 / HUD / 回音结论同源)。
+    ///
+    /// `ApplyFailed` 这句同时服务 `up` 与四本编目册的写失败(rc 4 = 装配
+    /// 某步失败,或写 `xxx.json` 失败;ADR-0009 Consequences 钉死后者不是
+    /// 用户输入问题),所以用覆盖两种来源的中性句,不把磁盘/权限问题误导
+    /// 成「你填错了」。
     pub fn human(self) -> &'static str {
         match self {
             ExitCode::Ok => "成功",
             ExitCode::EnvMissing => "环境缺失:NW_HOME/HOME 不可解析",
             ExitCode::InputInvalid => "输入无效:参数或输入不合法",
             ExitCode::VerifyFailed => "校验失败:资产 sha256 不符或锁定集 schema 不认",
-            ExitCode::ApplyFailed => "装配失败",
+            ExitCode::ApplyFailed => "执行失败:装配某步失败,或写编目文件失败",
             ExitCode::LockConflict => "锁冲突:同一派已有装配在跑",
             ExitCode::Degraded => "降级:required env 缺失或 provider 未就绪",
             ExitCode::Drift => "漂移:声明物被改动或与锁定集不符",

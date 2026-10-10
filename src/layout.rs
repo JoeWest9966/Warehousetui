@@ -205,17 +205,18 @@ fn screen_hits(content: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect,
         Screen::Assemble => assemble_hits(inner, app, class, hits),
         Screen::Health => health_hits(inner, app, hits),
         Screen::Recipes => recipes_hits(inner, app, class, hits),
-        Screen::Vps => vps_hits(inner, app, hits),
+        Screen::Vps => catalog_hits(inner, app, hits),
         Screen::Settings => {}
     }
 }
 
-/// 编目册屏命中区(#53 / #54):清单整块产行命中(点行 = 选中,同 ↑/↓);
-/// 登记浮层与删除确认弹层只产键位行两段(渲染 `catalog::render_catalog`
-/// 同一个 `popup_rect` 基准,弹层优先级高于册体)。
-fn vps_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
+/// 编目册屏命中区(#53 / #54 / #56 / #57):清单整块产行命中(点行 = 选中,
+/// 同 ↑/↓);登记浮层与删除确认弹层只产键位行两段(渲染 `catalog::render_catalog`
+/// 同一个 `popup_rect` 基准,弹层优先级高于册体)。屏虽叫 `Vps`,命中区
+/// 服务屏内四本册(机器 / 标签 / 订阅 / 钥匙),按 `app.catalog_kind` 分叉。
+fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     let kind = app.catalog_kind;
-    // 标签册浮层:rm 确认弹层的键位行两段可点(其余态同手填浮层惰性)
+    // 订阅册浮层:rm 确认弹层的键位行两段可点(其余态同手填浮层惰性)
     if kind == crate::screens::catalog::CatalogKind::Subscription {
         // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
         if app.sub_flow.phase != crate::screens::catalog::RegPhase::Idle {
@@ -572,7 +573,7 @@ pub const REG_KEY_KIND_LAUNCH: &str = "  Enter 预审 ";
 pub const REG_KEY_REVIEW_COMMIT: &str = "  Enter 落账 ";
 
 /// 编目册删除确认的键位行左段(#53,ADR-0009 §2 的图形确认):
-/// 渲染(`catalog::render_rm_confirm`)与命中(`vps_hits`)同一份文案。
+/// 渲染(`catalog::render_rm_confirm`)与命中(`catalog_hits`)同一份文案。
 pub const REG_KEY_RM_CONFIRM: &str = "  Enter 确认删除 ";
 
 /// 登记四个浮层的尺寸(spec #25 / 工单 #30 #31):渲染与命中同一组常量,
