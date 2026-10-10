@@ -1386,3 +1386,297 @@ fn 外部源漂移_紧凑66x50_结论与证据可读不溢出() {
         );
     }
 }
+
+// ---- #61 五域搜索过滤:纯本地筛选,空结果两态可区分指路 ----
+
+/// 五域各两条的夹具(#61):每域第二条都带独特可检索词,过滤后应只剩它一条。
+/// 形状照引擎 `nw ls` 原文(components 带 path/depends 对象数组/usedBy;
+/// locks 的 recipe 是裸字符串形),不是面板自造。
+const LS_FIVE: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0","path":"recipes/research-desk/recipe.yaml"},{"name":"night-shift","version":"1.1.0","path":"recipes/night-shift/recipe.yaml"}],"components":[{"name":"retention","version":"0.4.1","path":"components/retention","depends":[],"usedBy":["research-desk"]},{"name":"sentry","version":"0.9.0","path":"components/sentry","depends":[{"name":"retention","version":"0.4.1"}],"usedBy":[]}],"sources":[{"name":"web-search","repo":"JoeWest9966/skills-web","kind":"skill","category":["检索","网络"],"entries":[{"name":"deep-research","path":"skills/deep-research"}]},{"name":"theme-pack","kind":"extension","category":[],"entries":[]}],"profiles":[{"name":"desk","state":"drift","lockId":"9f8e"},{"name":"lab","state":"ok","lockId":"a1b2"}],"locks":[{"lockId":"9f8e","recipe":"research-desk","bakedAt":"2026-10-01"},{"lockId":"c3d4","recipe":"night-shift","bakedAt":"2026-10-02"}]}"#;
+
+fn five_app() -> App {
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Recipes;
+    app.ls = Some(serde_json::from_str(LS_FIVE).unwrap());
+    app
+}
+
+/// 派一个键(与既有测试同一条入口:`Message::Key` → `App::update`)。
+fn key(app: &mut App, code: crossterm::event::KeyCode) {
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        code,
+        crossterm::event::KeyModifiers::NONE,
+    )));
+}
+
+/// 敲一串字符(过滤词键入)。
+fn type_str(app: &mut App, s: &str) {
+    for c in s.chars() {
+        key(app, crossterm::event::KeyCode::Char(c));
+    }
+}
+
+/// 进过滤输入态并敲入 `q`(不做收词,保留输入态可断言)。
+fn filter_with(app: &mut App, q: &str) {
+    key(app, crossterm::event::KeyCode::Char('/'));
+    type_str(app, q);
+}
+
+/// 走**回音路**的 ls 夹具(#61):与直接塞 `app.ls` 不同,这条经过 envelope
+/// 解析(schema 认识才拆 data)——用来验证「刷新五域」的真路径,不是旁路设状态。
+const LS_ONE_RECIPE: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0"}],"components":[],"sources":[],"profiles":[],"locks":[]}"#;
+const LS_EMPTY: &str =
+    r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#;
+
+fn ls_out(data: &str) -> EngineOutput {
+    out(
+        &["ls"],
+        0,
+        &format!(
+            r#"{{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{data}}}"#
+        ),
+    )
+}
+
+/// 每域一个只命中第二条的独特词(#61:五域都要能过滤)。
+fn five_query(d: crate::app::Domain) -> &'static str {
+    match d {
+        crate::app::Domain::Recipes => "night",
+        crate::app::Domain::Components => "sentry",
+        crate::app::Domain::Sources => "theme",
+        crate::app::Domain::Profiles => "lab",
+        crate::app::Domain::Locks => "c3d4",
+    }
+}
+
+#[test]
+fn 五域搜索过滤_键入即筛_纯本地不新增引擎调用() {
+    for d in crate::app::Domain::ALL {
+        let mut app = five_app();
+        app.rc_domain = d;
+        let before = format!("{:?}", app.ls);
+        filter_with(&mut app, five_query(d));
+        assert_eq!(app.domain_len(), 1, "{d:?} 过滤后只剩命中那条");
+        assert_eq!(app.rc_sel, 0, "{d:?} 选中回顶");
+        let s = draw(&app, 110, 30);
+        assert!(s.contains(five_query(d)), "{d:?} 命中行在场:{s}");
+        assert!(!s.contains("research-desk"), "{d:?} 未命中行被筛掉:{s}");
+        // 纯本地铁律:不入队、不下发任何引擎命令,ls 回音逐字节不动
+        assert!(app.queue.is_empty(), "{d:?} 过滤不入队:{:?}", app.queue);
+        assert_eq!(format!("{:?}", app.ls), before, "{d:?} 数据来源不动");
+        assert!(!app.ls_loading, "{d:?} 不假装在加载");
+    }
+}
+
+#[test]
+fn 五域搜索过滤_大小写不敏感_可退格改词() {
+    let mut app = five_app();
+    filter_with(&mut app, "NIGHT");
+    assert_eq!(app.domain_len(), 1, "大写同样命中");
+    let mut app2 = five_app();
+    filter_with(&mut app2, "Shift");
+    assert_eq!(app2.domain_len(), 1, "小写片段同样命中");
+    // 退格到空 = 不过滤,回到全量(与过滤前逐字节相同)
+    for _ in 0..5 {
+        key(&mut app, crossterm::event::KeyCode::Backspace);
+    }
+    assert!(app.rc_filter.is_empty(), "退格清空缓冲");
+    assert_eq!(app.domain_len(), 2, "空词回到全量");
+}
+
+#[test]
+fn 空结果两态指路_域真空与被过滤空_标题与说法两两不同() {
+    // 域真空:组件域就是没有条目,且没有过滤词
+    let mut vacant = five_app();
+    vacant.rc_domain = crate::app::Domain::Components;
+    vacant.ls = Some(
+        serde_json::from_str(
+            r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+        )
+        .unwrap(),
+    );
+    let s = draw(&vacant, 110, 30);
+    assert!(s.contains("组件域为空"), "域真空有指路:{s}");
+    assert!(s.contains("还没有条目"), "域真空说清是域里没有:{s}");
+    assert!(!s.contains("无命中"), "域真空不被说成过滤空:{s}");
+
+    // 被过滤空:同一域两条,关键词把两条都筛掉
+    let mut filtered = five_app();
+    filtered.rc_domain = crate::app::Domain::Components;
+    filter_with(&mut filtered, "zzz");
+    assert_eq!(filtered.domain_len(), 0, "全被筛掉");
+    let s2 = draw(&filtered, 110, 30);
+    assert!(s2.contains("组件无命中"), "被过滤空有指路:{s2}");
+    assert!(
+        s2.contains("「zzz」在 2 条里没有命中"),
+        "被过滤空带词与总数:{s2}"
+    );
+    assert!(s2.contains("按 / 改词"), "给改词的路:{s2}");
+    assert!(s2.contains("Esc 清空过滤"), "给清空的路:{s2}");
+    assert!(!s2.contains("组件域为空"), "被过滤空不冒充域真空:{s2}");
+    assert!(!s2.contains("还没有条目"), "两态说法不混用:{s2}");
+    // 详情栏同样不给旧行残影,也不换一套说法
+    assert!(s2.contains("组件无命中"), "详情同因由:{s2}");
+    assert!(!s2.contains("retention"), "旧行不残影:{s2}");
+}
+
+#[test]
+fn 切域清空过滤词_选中回顶_旧词不跨域滞留() {
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Components;
+    filter_with(&mut app, "sentry");
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    app.rc_sel = 0;
+    key(&mut app, crossterm::event::KeyCode::Char('l'));
+    assert_eq!(app.rc_domain, crate::app::Domain::Sources, "l 切到外部源");
+    assert!(app.rc_filter.is_empty(), "切域清空过滤词");
+    assert!(!app.rc_filter_on, "输入态不跨域停留");
+    assert_eq!(app.rc_sel, 0, "选中回顶");
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("web-search"), "切域后回到全量:{s}");
+    assert!(s.contains("theme-pack"), "全量两条都在:{s}");
+}
+
+#[test]
+fn 切屏保留过滤词但退输入态_输入态不吞新屏的键() {
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Recipes;
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    assert!(app.rc_filter_on, "/ 进过滤输入态");
+    type_str(&mut app, "night");
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(!app.rc_filter_on, "Enter 收词退输入态");
+    assert_eq!(app.rc_filter, "night", "收词后过滤词留着");
+    // 切屏(j):过滤词保留,输入态已退,新屏的键位照常
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    assert_eq!(app.screen, Screen::Settings, "j 切到下一屏");
+    assert!(!app.rc_filter_on, "切屏后输入态不驻留");
+    assert_eq!(app.rc_filter, "night", "过滤词跨屏保留");
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    assert_eq!(app.screen, Screen::Overview, "新屏的键位照常");
+    // 回配方屏:列表仍是过滤态(标题显命中/总数,状态可见)
+    key(&mut app, crossterm::event::KeyCode::Char('k'));
+    key(&mut app, crossterm::event::KeyCode::Char('k'));
+    assert_eq!(app.screen, Screen::Recipes, "k 回配方屏");
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("night-shift"), "过滤态跨屏仍在:{s}");
+    assert!(!s.contains("research-desk"), "未命中行仍被筛掉:{s}");
+    assert!(s.contains("配方 1/2"), "标题显命中/总数:{s}");
+    // 输入态里 j 是缓冲字符,不是切屏(输入态优先于屏键位,同两份手填)
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    assert_eq!(app.screen, Screen::Recipes, "输入态里 j 不切屏");
+    assert_eq!(app.rc_filter, "nightj", "输入态里 j 进缓冲");
+}
+
+#[test]
+fn 刷新五域_过滤词仍生效_选中钳到新的可见行数() {
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Recipes;
+    filter_with(&mut app, "desk");
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(app.domain_len(), 1, "desk 只命中 research-desk");
+    // 刷新:新回音仍过同一道筛(纯本地),选中不越界
+    feed(&mut app, ls_out(LS_ONE_RECIPE));
+    assert_eq!(app.domain_len(), 1, "刷新后过滤词仍生效");
+    assert_eq!(app.rc_sel, 0, "选中钳在可见行数内");
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("research-desk"), "新回音过筛后在场:{s}");
+    // 再刷新成空域:可见行数 0,选中钳回 0(不越界、不指向另一条)
+    feed(&mut app, ls_out(LS_EMPTY));
+    assert_eq!(app.domain_len(), 0, "空域可见 0 条");
+    assert_eq!(app.rc_sel, 0, "选中钳回 0");
+    let s2 = draw(&app, 110, 30);
+    assert!(s2.contains("配方无命中"), "过滤词把新回音也筛空了:{s2}");
+    assert!(
+        app.queue.is_empty(),
+        "过滤与回音处理都不入队:{:?}",
+        app.queue
+    );
+}
+
+#[test]
+fn 过滤后选中行不错位_c取用建议命令作用于看得见的那一行() {
+    use crate::engine::{Capability, Probe};
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Recipes;
+    app.capabilities
+        .record(Capability::RecipeBake, Probe::Available);
+    app.data_root = Some("/tmp".into());
+    // 不过滤时第 0 条是 research-desk:先钉住过滤前的口径
+    let plain = draw(&app, 110, 30);
+    assert!(
+        plain.contains("nw recipe bake research-desk@0.2.0"),
+        "{plain}"
+    );
+    filter_with(&mut app, "night");
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(app.domain_len(), 1, "只剩 night-shift");
+    key(&mut app, crossterm::event::KeyCode::Char('c'));
+    assert!(app.rc_bake_sel, "过滤后仍可取用(只读)");
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("nw recipe bake night-shift@1.1.0"),
+        "取用的是看得见的那一行:{s}"
+    );
+    assert!(
+        !s.contains("research-desk@0.2.0"),
+        "不错位到原始数组第 0 条:{s}"
+    );
+    // 选中态复位:过滤词一动,建议命令的只读选中态跟着清(不冒充旧行的)
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    type_str(&mut app, "x");
+    assert!(!app.rc_bake_sel, "改词即复位只读选中态");
+    assert!(app.queue.is_empty(), "全程不入队、不执行:{:?}", app.queue);
+}
+
+#[test]
+fn 常畅与紧凑两档_过滤态布局不溢出不删内容() {
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Components;
+    filter_with(&mut app, "sentry");
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        for l in f.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= usize::from(w),
+                "{w}×{h} 行不溢出:{l}"
+            );
+        }
+        assert!(f.lines().any(|l| l.contains("└")), "{w}×{h} 块边框在场");
+        assert!(f.contains("sentry"), "{w}×{h} 命中行可见:{f}");
+    }
+    // 紧凑态:五域 Tab 行照旧一排,当前域计数显命中/总数
+    let c = crate::testutil::frame_display(&app, 66, 50);
+    for label in ["配方", "组件", "外部源", "派", "锁定集"] {
+        assert!(c.contains(label), "66×50 五域 Tab 齐:{label}");
+    }
+    assert!(
+        c.contains("▸ 组件(2)"),
+        "过滤态 Tab 计数仍是原总数(不改导航布局):{c}"
+    );
+    assert!(c.contains("组件 1/2"), "命中/总数由列表块标题说:{c}");
+    // 常畅态:五域竖轨照旧
+    let m = crate::testutil::frame_display(&app, 80, 30);
+    assert!(m.contains("┌ 五域 "), "常畅态五域竖轨原样在场:{m}");
+}
+
+#[test]
+fn 不过滤时渲染与过滤前逐字节相同() {
+    let mut app = five_app();
+    let plain = draw(&app, 110, 30);
+    // 无过滤词:标题只有域名、计数是原总数,没有任何过滤痕迹
+    assert!(plain.contains(" 配方 "), "标题只有域名:{plain}");
+    assert!(!plain.contains('/'), "无过滤痕迹:{plain}");
+    assert!(!plain.contains("无命中"), "无空态指路:{plain}");
+    assert!(!plain.contains("域为空"), "无空态指路:{plain}");
+    // Esc 在无过滤词时什么都不做(不新增键位语义)
+    let before = format!("{:?}", app.rc_filter);
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert_eq!(
+        format!("{:?}", app.rc_filter),
+        before,
+        "无过滤词时 Esc 空动作"
+    );
+}

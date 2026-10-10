@@ -305,6 +305,13 @@ pub struct App {
     /// 配方域建议命令的只读选中态(#39,键 `c`):命令可见可取用,
     /// 但面板**不执行**它(ADR-0003:执行权留给操作者)。选中行/切域即复位。
     pub rc_bake_sel: bool,
+    /// 配方屏五域搜索过滤词(#61):**纯本地筛选**——只作用于面板已拿到的
+    /// `ls` 回音,不新增引擎调用、不改数据来源、不把关键词带进任何命令。
+    /// 空串 = 不过滤(与过滤前的渲染逐字节相同)。
+    pub rc_filter: String,
+    /// 过滤词输入态(#61,键 `/`):与 NW_HOME / 数据仓根手填同一级输入态,
+    /// 键入即筛。只在配方屏在场时吞键(切屏即退输入态,过滤词保留)。
+    pub rc_filter_on: bool,
 
     /// 最近动作流水,概览屏右下「最近日志」。
     pub log: Vec<String>,
@@ -416,6 +423,8 @@ impl App {
             reg_kind_sel: 0,
             reg_result: None,
             rc_bake_sel: false,
+            rc_filter: String::new(),
+            rc_filter_on: false,
             log: vec!["驾驶舱已就绪".into()],
             queue: Vec::new(),
             pending_editor: false,
@@ -531,7 +540,10 @@ impl App {
         }
         match target {
             // 点导航(常畅)/屏 Tab(紧凑)切屏,与 j/k 同语义。
-            Target::NavTo(s) => self.screen = s,
+            Target::NavTo(s) => {
+                self.screen = s;
+                self.rc_filter_on = false; // 点导航切屏同样退过滤输入态(#61)
+            }
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
             // 登记 kind 选项行在场时优先于配方列表(弹层优先级)。
@@ -696,6 +708,9 @@ impl App {
                 match out.envelope.as_ref().and_then(|e| e.data_as::<LsData>()) {
                     Some(d) => {
                         self.ls = Some(d);
+                        // 过滤词在刷新后仍然生效(#61):新回音照样过一遍筛,
+                        // 选中钳回新的可见行数内,不越界、不指向另一条。
+                        self.clamp_rc_sel();
                         self.push_log("ls 五域已刷新".to_string());
                     }
                     None => {
@@ -826,6 +841,12 @@ impl App {
         }
         if self.data_input {
             self.on_key_data_input(k);
+            return;
+        }
+        // 配方屏搜索过滤输入态(#61):与两份手填同一级(输入态优先于屏键位),
+        // 但只在本屏在场时吞键——切屏即退输入态,过滤词保留可预期。
+        if self.rc_filter_on && self.screen == Screen::Recipes {
+            self.on_key_rc_filter(k);
             return;
         }
         // 登记两段式(#30 #31):输入 → 预审 → 确认 → 落账 → 结果,
@@ -1042,11 +1063,26 @@ impl App {
                 self.rc_domain = prev_domain(self.rc_domain);
                 self.rc_sel = 0;
                 self.rc_bake_sel = false;
+                self.clear_rc_filter();
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 self.rc_domain = next_domain(self.rc_domain);
                 self.rc_sel = 0;
                 self.rc_bake_sel = false;
+                self.clear_rc_filter();
+            }
+            // 五域搜索过滤(#61):`/` 进过滤输入态,缓冲以当前过滤词起手
+            // (可改可退格),键入即筛。键位取配方屏未占用的 `/`——
+            // h/l/←/→ 切域、c 取用建议命令、r 登记、↑/↓ 选行都已占用,
+            // 不为搜索新开一个会撞车的键。
+            KeyCode::Char('/') => {
+                self.rc_filter_on = true;
+            }
+            // Esc 一键回到全量(#61):过滤词与选中都复位,输入态不退
+            // (本来就不在)。无过滤词时 Esc 仍是什么都不做。
+            KeyCode::Esc if !self.rc_filter.is_empty() => {
+                self.clear_rc_filter();
+                self.push_log("已清空过滤词:回到五域全量".to_string());
             }
             // 配方域建议命令取用(#39):与鼠标点键位行完全同一条路——
             // 只读选中态,面板不执行(ADR-0003)。三前提不齐时只留指路。
@@ -1076,9 +1112,7 @@ impl App {
     /// 已设、引擎有 `recipe bake` 能力(能力结论来自 #29 的探测门,不是常量表)。
     pub fn bake_suggest_gate(&self) -> Result<(), crate::engine::commands::BakeGate> {
         let recipe = self
-            .ls
-            .as_ref()
-            .and_then(|l| l.recipes.get(self.rc_sel))
+            .selected_recipe()
             .map(|r| (r.name.as_str(), r.version.as_deref()));
         crate::engine::commands::recipe_bake_suggest(
             recipe,
@@ -1183,6 +1217,41 @@ impl App {
         self.apply_nw_home(expanded);
     }
 
+    /// 配方屏搜索过滤输入态(#61):键入分发归通用态机 [`input::on_key`]
+    /// (与两份手填同一条路,缓冲同样 [`input::BUF_CAP`] 封顶),本函数只接
+    /// 过滤这一条的后果链。**纯本地**:改的只有 `rc_filter` 一个字符串,
+    /// 不入队、不下发任何引擎命令,也不把关键词写进别处。
+    /// Enter 收词退输入态;Esc/q 取消并清空过滤词(两种退出都可预期)。
+    fn on_key_rc_filter(&mut self, k: KeyEvent) {
+        match input::on_key(&mut self.rc_filter, k) {
+            InputAction::Submit => {
+                self.rc_filter_on = false;
+                self.rc_sel = 0;
+                self.rc_bake_sel = false;
+                let n = self.domain_len();
+                self.push_log(format!(
+                    "过滤词「{}」:{} 域 {} 条命中(本地筛选,未入队)",
+                    self.rc_filter.trim(),
+                    self.rc_domain.label(),
+                    n
+                ));
+            }
+            InputAction::Cancel => {
+                self.rc_filter_on = false;
+                self.rc_filter.clear();
+                self.rc_sel = 0;
+                self.rc_bake_sel = false;
+                self.push_log("已清空过滤词:回到五域全量".to_string());
+            }
+            // 每改一个词,选中回顶:行数变了,旧下标可能指向另一条
+            InputAction::Edited => {
+                self.rc_sel = 0;
+                self.rc_bake_sel = false;
+            }
+            InputAction::Ignored => {}
+        }
+    }
+
     /// 数据仓根手填键位:与 NW_HOME 手填同一条通用态机
     /// ([`input::on_key`]),本函数只接数据仓根的后果链。
     fn on_key_data_input(&mut self, k: KeyEvent) {
@@ -1227,6 +1296,7 @@ impl App {
             self.refresh_ls();
         } else {
             self.ls = None; // 陈旧五域不冒充新根的内容
+            self.clamp_rc_sel();
             self.push_log(format!("ls 未下发:{}", self.data_root_gate_msg()));
         }
         // 换根即作废上一轮的漂移结论(#40 无缓存语义):旧根的结论不冒充新根的。
@@ -1626,11 +1696,13 @@ impl App {
     pub fn next_screen(&mut self) {
         let i = (self.screen.index() + 1) % Screen::ALL.len();
         self.screen = Screen::ALL[i];
+        self.rc_filter_on = false; // 切屏退过滤输入态(#61),过滤词留着回屏还在
     }
 
     pub fn prev_screen(&mut self) {
         let i = (self.screen.index() + Screen::ALL.len() - 1) % Screen::ALL.len();
         self.screen = Screen::ALL[i];
+        self.rc_filter_on = false;
     }
 
     pub fn cycle_theme(&mut self) {
@@ -1651,18 +1723,114 @@ impl App {
         p.state.as_deref().map(State::from)
     }
 
+    /// 过滤后选中行对应的配方行(#61):↑/↓、鼠标点行与 `c` 取用建议命令
+    /// 都走这一口——口径是「**看得见**的那一行」,下标经过滤后的可见列表
+    /// 映射回原始数组。不过滤时与过去的 `l.recipes.get(rc_sel)` 逐个等价。
+    pub fn selected_recipe(&self) -> Option<&crate::engine::RecipeRow> {
+        if self.rc_domain != Domain::Recipes {
+            return None;
+        }
+        let l = self.ls.as_ref()?;
+        let i = *self.rc_visible().get(self.rc_sel)?;
+        l.recipes.get(i)
+    }
+
+    /// 清空过滤词并让选中回顶(#61):切域 / Esc / 取消输入共用一条后果链。
+    fn clear_rc_filter(&mut self) {
+        self.rc_filter.clear();
+        self.rc_filter_on = false;
+        self.rc_sel = 0;
+        self.rc_bake_sel = false;
+    }
+
+    /// 选中钳回当前域可见行数内(#61):过滤/刷新后行数变了,`rc_sel` 不越界——
+    /// ↑/↓ 的 `% n`、鼠标命中区与详情取值都建立在 `rc_sel ∈ [0, domain_len())` 上。
+    pub fn clamp_rc_sel(&mut self) {
+        let n = self.domain_len();
+        self.rc_sel = if n == 0 { 0 } else { self.rc_sel.min(n - 1) };
+    }
+
+    /// 五域当前域**可见行**在原始数组里的下标(#61 纯本地过滤):
+    /// 无关键词时就是 `0..n` 全量顺序(与过滤前逐字节同序);有关键词时按域
+    /// 在该行字段上做大小写不敏感包含匹配。只筛面板已拿到的 `ls` 回音——
+    /// 不新增引擎调用、不改数据来源、不把关键词带进任何命令。
+    pub fn rc_visible(&self) -> Vec<usize> {
+        let Some(l) = self.ls.as_ref() else {
+            return Vec::new();
+        };
+        let q = self.rc_filter.trim().to_lowercase();
+        (0..domain_total(l, self.rc_domain))
+            .filter(|&i| {
+                q.is_empty()
+                    || domain_row_fields(self.rc_domain, l, i)
+                        .iter()
+                        .any(|f| f.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
     pub fn domain_len(&self) -> usize {
-        match self.ls.as_ref() {
-            None => 0,
-            Some(l) => match self.rc_domain {
-                Domain::Recipes => l.recipes.len(),
-                Domain::Components => l.components.len(),
-                Domain::Sources => l.sources.len(),
-                Domain::Profiles => l.profiles.len(),
-                Domain::Locks => l.locks.len(),
-            },
+        self.rc_visible().len()
+    }
+}
+
+/// 一域的原始条数(#61:不过滤的总数,域轨/Tab 计数与「命中/总数」的分母)。
+fn domain_total(l: &LsData, d: Domain) -> usize {
+    match d {
+        Domain::Recipes => l.recipes.len(),
+        Domain::Components => l.components.len(),
+        Domain::Sources => l.sources.len(),
+        Domain::Profiles => l.profiles.len(),
+        Domain::Locks => l.locks.len(),
+    }
+}
+
+/// 一行里参与过滤的字段(#61):按域取该 Row 的文本(列表与详情里出现的那些)。
+/// 引擎没给的字段不参与匹配——不猜、不拿占位符「——」冒充可检索内容。
+/// `profile`(引擎 `ls` 确有该键)不在面板的 RecipeRow 契约里,故不入匹配面。
+fn domain_row_fields(d: Domain, l: &LsData, i: usize) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    match d {
+        Domain::Recipes => {
+            if let Some(r) = l.recipes.get(i) {
+                v.push(r.name.clone());
+                v.extend(r.version.clone());
+                v.extend(r.path.clone());
+            }
+        }
+        Domain::Components => {
+            if let Some(c) = l.components.get(i) {
+                v.push(c.name.clone());
+                v.extend(c.version.clone());
+                v.extend(c.path.clone());
+                v.extend(c.depends.iter().map(|d| d.label()));
+                v.extend(c.used_by.iter().cloned());
+            }
+        }
+        Domain::Sources => {
+            if let Some(s) = l.sources.get(i) {
+                v.push(s.name.clone());
+                v.extend(s.repo.clone());
+                v.extend(s.kind.clone());
+                v.extend(s.category.iter().cloned());
+                v.extend(s.entries.iter().map(|e| e.name.clone()));
+                v.extend(s.entries.iter().map(|e| e.path.clone()));
+            }
+        }
+        Domain::Profiles => {
+            if let Some(p) = l.profiles.get(i) {
+                v.push(p.name.clone());
+                v.extend(p.lock_id.clone());
+            }
+        }
+        Domain::Locks => {
+            if let Some(k) = l.locks.get(i) {
+                v.extend(k.lock_id.clone());
+                v.extend(k.recipe.as_ref().map(|r| r.label()));
+            }
         }
     }
+    v
 }
 
 /// repo 链接形状检查(spec #25:owner/repo · https://github.com/… ·
@@ -2373,6 +2541,93 @@ mod tests {
         assert!(app.rc_bake_sel);
         app.update(Message::Key(key('l')));
         assert!(!app.rc_bake_sel, "切域复位");
+    }
+
+    // ---- #61 五域搜索过滤:纯本地筛选,选中语义不因过滤漂移 ----
+
+    /// 配方域两条(bake_app 的夹具即两条配方)+ 数据仓根,便于验 `c` 取用。
+    fn filter_app() -> App {
+        let mut app = bake_app();
+        app.data_root = Some("/tmp".into());
+        app
+    }
+
+    /// 进过滤输入态、敲词、收词(走真实键路,与 tests.rs 的 type_str 同一条)。
+    fn filter_type(app: &mut App, q: &str) {
+        app.update(Message::Key(key('/')));
+        for c in q.chars() {
+            app.update(Message::Key(key(c)));
+        }
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn 过滤后_上下键与鼠标点行仍同义_命中区随过滤后条数收缩() {
+        let mut app = filter_app();
+        filter_type(&mut app, "research");
+        assert_eq!(app.domain_len(), 1, "过滤后只剩命中那条");
+        // 命中区只产过滤后的条数:点第 0 行 = ↑/↓ 落在同一行
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            app.size = Rect::new(0, 0, w, h);
+            let hits = hitmap(app.size, &app, size_class(app.size));
+            let rows: Vec<Rect> = hits
+                .iter()
+                .filter(|(_, t)| matches!(t, Target::SelectRow(_)))
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(rows.len(), 1, "{w}×{h} 命中区随过滤后条数收缩:{rows:?}");
+            click(&mut app, rows[0]);
+            assert_eq!(app.rc_sel, 0, "{w}×{h} 点行 = 选中");
+        }
+        // Esc 清空:两条都回来,命中区回到全量条数
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.domain_len(), 2, "Esc 清空过滤词");
+        app.size = Rect::new(0, 0, 80, 30);
+        let hits = hitmap(app.size, &app, size_class(app.size));
+        assert_eq!(
+            hits.iter()
+                .filter(|(_, t)| matches!(t, Target::SelectRow(_)))
+                .count(),
+            2,
+            "清空后命中区回到全量"
+        );
+        let r = hits
+            .iter()
+            .find(|(_, t)| matches!(t, Target::SelectRow(1)))
+            .map(|(r, _)| *r)
+            .expect("第 2 行有命中区");
+        click(&mut app, r);
+        assert_eq!(app.rc_sel, 1, "点第 2 行");
+        app.update(Message::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(app.rc_sel, 0, "↑ 与点行同一本账");
+    }
+
+    #[test]
+    fn 过滤后选中行不错位_建议命令作用于看得见的那一行() {
+        let mut app = filter_app();
+        filter_type(&mut app, "research");
+        assert_eq!(app.rc_sel, 0, "键入后选中回顶");
+        app.update(Message::Key(key('c')));
+        assert!(app.rc_bake_sel, "过滤后仍可取用(只读)");
+        assert_eq!(
+            app.selected_recipe().map(|r| r.name.as_str()),
+            Some("research-desk"),
+            "取用的是看得见的那一行,不是原始数组同下标的另一条"
+        );
+        assert!(app.queue.is_empty(), "取用不入队、不执行:{:?}", app.queue);
+        // 换成一个没有命中的词:可见列表空,门不放行、不给半条命令
+        filter_type(&mut app, "desk");
+        assert_eq!(app.selected_recipe().map(|r| r.name.as_str()), None);
+        assert!(
+            app.bake_suggest_gate().is_err(),
+            "无可见配方行时门不放行(不给半条命令)"
+        );
     }
 
     #[test]

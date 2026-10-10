@@ -160,7 +160,7 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     if app.assembling {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("装配中:动作已锁定", p.dim()));
-    } else if app.home_input || app.data_input {
+    } else if app.home_input || app.data_input || app.rc_filter_on {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
     } else if app.reg_state == crate::app::RegState::RepoInput {
