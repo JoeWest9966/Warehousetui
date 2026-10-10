@@ -316,6 +316,33 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('r'),
     },
     HelpRow {
+        key: "r",
+        desc: "编目:登记一台机器(两段式,预审不落文件)",
+        screen: Some(Screen::Vps),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('r'),
+    },
+    HelpRow {
+        key: "d",
+        desc: "编目:删选中的机器(先确认)",
+        screen: Some(Screen::Vps),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('d'),
+    },
+    HelpRow {
+        key: "l",
+        desc: "编目:重读 vps 编目(只读)",
+        screen: Some(Screen::Vps),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('l'),
+    },
+    HelpRow {
         key: "n",
         desc: "设置:轮换 NW_HOME",
         screen: Some(Screen::Settings),
@@ -403,22 +430,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
 /// 发射仪式两段可点、浮层吞底层点击、捕获默认开的 Shift 代价、
 /// 以及 `--no-mouse` 与设置屏 `m` 两条逃逸。测试断言这些短语都在场。
 pub(crate) const MOUSE_LINES: &[&str] = &[
-    "点导航 / 屏 Tab 切屏;点列表行 = 选中(同 ↑/↓)",
-    "滚轮:可选列表移选中;装配 stderr 日志区回看",
-    "发射仪式「发射/返航」两段可点;浮层不穿透底层点击",
-    "捕获默认开的代价:拖拽选中 / 复制需按 Shift",
-    "逃逸:--no-mouse 启动,或设置屏 m 关(重启生效)",
+    "点导航/Tab 切屏;点行 = 选中(同 ↑/↓)",
+    "滚轮移选中;装配 stderr 日志可回看",
+    "发射仪式「发射/返航」两段可点;浮层吞点击不穿透",
+    "捕获默认开的代价:复制要按 Shift",
+    "逃逸:--no-mouse / 设置屏 m 关(重启生效)",
 ];
 
-fn render_help(frame: &mut Frame, area: Rect, app: &App) {
-    let p = &app.palette;
-    // 浮层矩形与命中区(`layout::help_hits`)同一个 `popup_rect` + 同尺寸常量,
-    // 渲染与「点任意处关」永不分歧。
-    let popup = popup_rect(area, HELP_W, HELP_H);
-    let block = Block::bordered()
-        .border_style(p.accent())
-        .title(Span::styled(" 帮助 ", p.accent().bold()));
-    let mut lines: Vec<Line> = Vec::with_capacity(HELP_ROWS.len() + MOUSE_LINES.len() + 4);
+/// 帮助浮层正文(键位对照表 + 鼠标章节 + 尾注):渲染开窗与 ↑/↓ 滚动的
+/// 钳位都按它算,一处真相。样式在此一次上齐,开窗只切行、不重上色。
+fn help_lines(p: &crate::theme::Palette) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::with_capacity(HELP_ROWS.len() + MOUSE_LINES.len() + 3);
     for row in HELP_ROWS {
         lines.push(Line::from(vec![
             Span::raw("    "),
@@ -428,13 +450,41 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::from(Span::styled("  鼠标(默认开捕获)", p.accent())));
     for m in MOUSE_LINES {
-        lines.push(Line::from(format!("    {m}")));
+        lines.push(Line::from(Span::styled(format!("    {m}"), p.dim())));
     }
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  装配幂等可重入,取消安全;失败永远带证据五字段。",
         p.dim(),
     )));
+    lines
+}
+
+fn render_help(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    // 浮层矩形与命中区(`layout::help_hits`)同一个 `popup_rect` + 同尺寸常量,
+    // 渲染与「点任意处关」永不分歧。
+    let popup = popup_rect(area, HELP_W, HELP_H);
+    let block = Block::bordered()
+        .border_style(p.accent())
+        .title(Span::styled(" 帮助 ", p.accent().bold()));
+    // 正文开窗(#53):帮助自 #62 补齐键位与鼠标章后,行数已超过最小常畅态
+    // (80×30 内层 24 行)放得下的量。超量时 ↑/↓ 滚动(见 `on_key` 的帮助分支),
+    // 末行给「还有内容」的可见提示——**不静默截断**:截断等于把键位藏起来,
+    // 而本浮层的全部意义就是「按 ? 看到的每一行都在实现里存在」。
+    let all = help_lines(p);
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let view = inner_h.saturating_sub(1); // 末行留给滚动提示
+    let max_off = all.len().saturating_sub(view);
+    let off = app.help_offset.min(max_off);
+    let mut lines: Vec<Line> = all.iter().skip(off).take(view).cloned().collect();
+    if max_off > 0 {
+        let hint = match (off == 0, off >= max_off) {
+            (true, _) => "  ↓ 还有下文",
+            (false, true) => "  ↑ 还有上文",
+            (false, false) => "  ↑↓ 还有上下文",
+        };
+        lines.push(Line::from(Span::styled(hint, p.dim())));
+    }
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block).style(p.surface()), popup);
 }
@@ -520,6 +570,18 @@ mod tests {
     /// 场景全部钉死:with_runner(引擎状态固定「测试注入」)+ splash 关 +
     /// NW_HOME 置 /nw + ls 固定夹具——CI 三平台 HOME/配置不同也不漂。
     #[test]
+    fn zz_dump_help_tmp() {
+        let mut app = crate::app::App::new();
+        app.splash = false;
+        app.help = true;
+        std::fs::write(
+            "/tmp/help.txt",
+            crate::testutil::frame_display(&app, 80, 44),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn golden_常畅态_80x30_整帧逐字节() {
         use crate::engine::FakeRunner;
         use std::sync::Arc;
@@ -535,8 +597,8 @@ mod tests {
 │  ⚙ 装配  ││┌ 派 (profiles) ────────────────────────────┐┌ 指令 ─────────────┐│
 │  ✚ 健康  │││   派         lockId     装配于      状态  ││ ▸ 跑一次体检   (h)││
 │  ▤ 配方  │││✗  desk       9f8e       2026-10-01  漂移  ││   发起装配…   (a) ││
-│  ✦ 设置  │││●  lab        a1b2       —           ok    ││   浏览配方     (l)││
-│          │││                                           ││   刷新 ls      (r)││
+│  ▩ 编目  │││●  lab        a1b2       —           ok    ││   浏览配方     (l)││
+│  ✦ 设置  │││                                           ││   刷新 ls      (r)││
 │          │││                                           │└───────────────────┘│
 │          │││                                           │┌ 最近日志 ─────────┐│
 │          │││                                           ││驾驶舱已就绪       ││

@@ -1778,13 +1778,17 @@ fn 切屏保留过滤词但退输入态_输入态不吞新屏的键() {
     assert!(!app.rc_filter_on, "Enter 收词退输入态");
     assert_eq!(app.rc_filter, "night", "收词后过滤词留着");
     // 切屏(j):过滤词保留,输入态已退,新屏的键位照常
+    // (#53 起屏序六块:概览/装配/健康/配方/编目/设置,配方之后是编目屏)
     key(&mut app, crossterm::event::KeyCode::Char('j'));
-    assert_eq!(app.screen, Screen::Settings, "j 切到下一屏");
+    assert_eq!(app.screen, Screen::Vps, "j 切到下一屏(编目册屏)");
     assert!(!app.rc_filter_on, "切屏后输入态不驻留");
     assert_eq!(app.rc_filter, "night", "过滤词跨屏保留");
     key(&mut app, crossterm::event::KeyCode::Char('j'));
-    assert_eq!(app.screen, Screen::Overview, "新屏的键位照常");
+    assert_eq!(app.screen, Screen::Settings, "新屏的键位照常");
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    assert_eq!(app.screen, Screen::Overview, "再切绕回概览");
     // 回配方屏:列表仍是过滤态(标题显命中/总数,状态可见)
+    key(&mut app, crossterm::event::KeyCode::Char('k'));
     key(&mut app, crossterm::event::KeyCode::Char('k'));
     key(&mut app, crossterm::event::KeyCode::Char('k'));
     assert_eq!(app.screen, Screen::Recipes, "k 回配方屏");

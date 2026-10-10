@@ -524,6 +524,249 @@ impl RecheckData {
     }
 }
 
+// ---- 编目册骨架(spec #50 工单 #53,ADR-0009):投影三件 ----
+
+/// 编目册的一道闸结论(#53 抽出的骨架第一件之一)。
+///
+/// `id` 是冻结面(vps 五道:`register.name` / `register.ips` /
+/// `register.port` / `register.logins` / `register.secret_guard`),
+/// `message` 措辞不承诺;`status` 三态 `pass` / `fail` / `skip`
+/// (skip = 没跑到这道闸,前面某道已拒)——与 validate 的「结果四态」
+/// 同一套词,面板直接复用 [`State`],不新造词汇。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CatalogGate {
+    pub id: String,
+    pub status: String,
+    pub message: String,
+}
+
+impl CatalogGate {
+    /// 三态按结果四态落(`State::from` 认 pass/warn/fail/skip 四词)。
+    pub fn state(&self) -> State {
+        State::from(self.status.as_str())
+    }
+
+    /// 这一道闸没过(引擎铁律:有 fail 就一个字节都不落)。
+    pub fn is_fail(&self) -> bool {
+        self.status == "fail"
+    }
+}
+
+/// 编目册的一条地址:`label` 是引擎给的展示名(如 `home` / `office`),
+/// `addr` 原样。两槽都必在(上游 `VpsAddr` 无 omitempty)。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CatalogAddr {
+    pub label: String,
+    pub addr: String,
+}
+
+/// 编目册的一条登录:`user` 是机上的用户名,`key_ref` 是**密钥引用**
+/// (opaque 指针:`$ENV` / `!command` / ssh-agent / 密钥路径)。
+/// **指针不是密钥**,所以原样呈现是安全的;上游字段名是 `ref`
+/// (Rust 保留字,本地改名不改语义)。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CatalogLogin {
+    pub user: String,
+    #[serde(rename = "ref")]
+    pub key_ref: String,
+}
+
+/// 编目册**条目投影**(#53 抽出的骨架第一件):名字 / 若干条地址 /
+/// 端口 / 若干条登录 / 备注。
+///
+/// 字段恒在、不为 null:缺字段由展示层显式「——」(不推导、不补全),
+/// 这一层只负责把引擎原文搬过来。与命令组无关——vps / key /
+/// subscription / tag 四本册子共用这一个投影形状,各写一个薄适配器
+/// (`VpsEntry::view` 是第一个)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CatalogEntryView {
+    pub name: String,
+    /// (label, addr) 原样;引擎没给地址 = 空数组(不是 null)。
+    pub addrs: Vec<CatalogAddr>,
+    /// 端口;缺 = None(展示层给「——」)。
+    pub port: Option<String>,
+    /// (user, ref) 原样;ref 原样呈现,摘要不印。
+    pub logins: Vec<CatalogLogin>,
+    /// 备注;上游 `note` 是唯一 `omitempty` 槽——真「没有就没有」。
+    pub note: Option<String>,
+}
+
+impl CatalogEntryView {
+    /// 地址一行:`label=addr` 逐条;空数组给「——」。
+    pub fn addr_line(&self) -> String {
+        if self.addrs.is_empty() {
+            return "——".to_string();
+        }
+        self.addrs
+            .iter()
+            .map(|a| format!("{}={}", a.label, a.addr))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// 登录一行:`user→ref` 逐条;空数组给「——」。ref 原样(指针不是密钥)。
+    pub fn login_line(&self) -> String {
+        if self.logins.is_empty() {
+            return "——".to_string();
+        }
+        self.logins
+            .iter()
+            .map(|l| format!("{}→{}", l.user, l.key_ref))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// 一本编目册的投影(#53 抽出的骨架第一件):**编目路径 + 条目清单 +
+/// 闸结论**。字段恒在不为 null;`gates` 只在登记回音里出现(ls 回音
+/// 恒空数组)。
+///
+/// 这一层只做投影与排序,不做呈现决策(那是 `screens::catalog` 的列表件)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CatalogSheet {
+    /// 编目文件路径(引擎原文,如 `<root>/vps.json`)。
+    pub catalog_path: String,
+    pub entries: Vec<CatalogEntryView>,
+    pub gates: Vec<CatalogGate>,
+}
+
+impl CatalogSheet {
+    /// 确定性排序:按条目名稳定排序(引擎自己已按唯一键排序,面板再排
+    /// 一次不改变结果,只保证「同一份回音永远同一屏」——快照可复现)。
+    pub fn sorted(mut self) -> Self {
+        self.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        self
+    }
+
+    /// 闸里有 fail(登记铁律:任一不过 = 一个字节都不落)。
+    pub fn has_fail(&self) -> bool {
+        self.gates.iter().any(CatalogGate::is_fail)
+    }
+}
+
+// ---- vps 组(`nw/vps-*.v1`,编目 `<root>/vps.json`,工单 #53) ----
+
+/// vps 编目条目形状(= 编目形状,引擎 `VpsEntry` 逐字对应)。
+/// `port` 可缺(上游不用 omitempty 但允许 0/缺),`note` 是唯一真可缺槽。
+#[derive(Clone, Debug, Deserialize)]
+pub struct VpsEntry {
+    pub name: String,
+    #[serde(default)]
+    pub ips: Vec<CatalogAddr>,
+    #[serde(default)]
+    pub port: Option<i64>,
+    #[serde(default)]
+    pub logins: Vec<CatalogLogin>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+impl VpsEntry {
+    /// 薄适配器:编目条目 → 编目册投影(后三本册子各写一个同形状的)。
+    pub fn view(&self) -> CatalogEntryView {
+        CatalogEntryView {
+            name: self.name.clone(),
+            addrs: self.ips.clone(),
+            port: self.port.map(|p| p.to_string()),
+            logins: self.logins.clone(),
+            note: self.note.clone(),
+        }
+    }
+}
+
+/// `nw vps register <名> …` 的 data(预审与落账共用同一形状,
+/// `written` 区分「文件不落」与真写入)。
+///
+/// 反 D6 纪律:`ips` / `logins` **只在过了第⑤道闸之后才填**——失败时
+/// data 不带疑似密钥的 ref(上游 `vps/register.go` 的口径,面板不补全、
+/// 不猜测缺字段)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct VpsRegisterData {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub ips: Vec<CatalogAddr>,
+    #[serde(default)]
+    pub port: Option<i64>,
+    #[serde(default)]
+    pub logins: Vec<CatalogLogin>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub written: bool,
+    #[serde(default)]
+    pub updated: bool,
+    #[serde(default)]
+    pub action: String,
+    /// 五道闸,**恒 5 行**,id 冻结、三态 pass/fail/skip。
+    #[serde(default)]
+    pub gates: Vec<CatalogGate>,
+}
+
+impl VpsRegisterData {
+    /// 登记回音 → 编目册投影(条目 + 编目路径 + 闸结论)。
+    pub fn sheet(&self) -> CatalogSheet {
+        CatalogSheet {
+            catalog_path: self.catalog_path.clone(),
+            entries: vec![CatalogEntryView {
+                name: self.name.clone(),
+                addrs: self.ips.clone(),
+                port: self.port.map(|p| p.to_string()),
+                logins: self.logins.clone(),
+                note: self.note.clone(),
+            }],
+            gates: self.gates.clone(),
+        }
+    }
+
+    /// 闸里有 fail(落账闸的口径来源:任一不过不得进入落账段)。
+    pub fn has_fail(&self) -> bool {
+        self.gates.iter().any(CatalogGate::is_fail)
+    }
+}
+
+/// `nw vps ls` 的 data:编目路径 + 机器清单。
+/// 编目不存在 = 空数组 rc 0(合法空态,不是错误)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct VpsLsData {
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub machines: Vec<VpsEntry>,
+}
+
+impl VpsLsData {
+    /// ls 投影 → 编目册投影(确定性排序后的清单)。
+    pub fn sheet(&self) -> CatalogSheet {
+        CatalogSheet {
+            catalog_path: self.catalog_path.clone(),
+            entries: self.machines.iter().map(VpsEntry::view).collect(),
+            gates: Vec::new(),
+        }
+        .sorted()
+    }
+}
+
+/// `nw vps rm <名>` 的 data:删不存在的名 → rc 3 + 这份证据,
+/// 且**文件一个字节都不动**(`removed` = false、`written` = false)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct VpsRmData {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub removed: bool,
+    #[serde(default)]
+    pub written: bool,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub remaining: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,5 +1033,130 @@ mod tests {
         let d: RecheckData = e.data_as().unwrap();
         assert!(d.checked.is_empty() && d.drift.is_empty());
         assert_eq!(d.state_of("whatever"), State::Skip, "没查过的不冒充没问题");
+    }
+
+    // ---- #53 编目册骨架:vps 三形状 + 投影 ----
+
+    #[test]
+    fn 解析_vps_ls_data_编目条目形状与缺字段容忍() {
+        let e = envelope_with_schema(
+            "nw/vps-ls.v1",
+            "0.1.0",
+            json!({
+                "catalogPath": "/data/root/vps.json",
+                "machines": [
+                    {
+                        "name": "gate",
+                        "ips": [{"label": "home", "addr": "10.0.0.1"}],
+                        "port": 22,
+                        "logins": [{"user": "root", "ref": "$DEPLOY_KEY"}],
+                        "note": "门口那台"
+                    },
+                    {"name": "bare",
+                     "ips": [],
+                     "logins": [],
+                     "note": ""}
+                ]
+            }),
+        );
+        let d: VpsLsData = e.data_as().unwrap();
+        assert_eq!(d.machines.len(), 2);
+        let sheet = d.sheet();
+        // 确定性排序:按名字(bare < gate),同一份回音永远同一屏
+        assert_eq!(sheet.entries[0].name, "bare");
+        assert_eq!(sheet.entries[1].name, "gate");
+        // ref 是指针不是密钥:原样进投影,展示安全
+        assert_eq!(sheet.entries[1].logins[0].key_ref, "$DEPLOY_KEY");
+        // 缺字段显式「——」由投影行给,不在这一层造默认值
+        assert_eq!(sheet.entries[0].addr_line(), "——");
+        assert_eq!(sheet.entries[0].login_line(), "——");
+        assert!(sheet.entries[0].port.is_none());
+        assert_eq!(sheet.entries[1].addr_line(), "home=10.0.0.1");
+        assert_eq!(sheet.entries[1].login_line(), "root→$DEPLOY_KEY");
+        assert_eq!(sheet.catalog_path, "/data/root/vps.json");
+    }
+
+    #[test]
+    fn 解析_vps_ls_data_编目不存在是空数组不是错误() {
+        // 上游口径:编目不存在 = 合法空态,回空数组 rc 0
+        let e = envelope_with_schema(
+            "nw/vps-ls.v1",
+            "0.1.0",
+            json!({"catalogPath": "/data/root/vps.json", "machines": []}),
+        );
+        let d: VpsLsData = e.data_as().unwrap();
+        assert!(d.sheet().entries.is_empty());
+    }
+
+    #[test]
+    fn 解析_vps_register_data_五道闸恒五行_失败不带疑似密钥的ref() {
+        let e = envelope_with_schema(
+            "nw/vps-register.v1",
+            "0.1.0",
+            json!({
+                "name": "gate",
+                "ips": [],
+                "logins": [],
+                "catalogPath": "/data/root/vps.json",
+                "written": false,
+                "updated": false,
+                "action": "rejected",
+                "gates": [
+                    {"id": "register.name", "status": "pass", "message": "名字认"},
+                    {"id": "register.ips", "status": "pass", "message": "地址认"},
+                    {"id": "register.port", "status": "pass", "message": "端口认"},
+                    {"id": "register.logins", "status": "pass", "message": "登录认"},
+                    {"id": "register.secret_guard", "status": "fail", "message": "ref 像私钥本体"}
+                ]
+            }),
+        );
+        let d: VpsRegisterData = e.data_as().unwrap();
+        assert_eq!(d.gates.len(), 5, "五道闸恒 5 行");
+        // 反 D6:第⑤道闸没过时 ips/logins 不填(失败 data 不带疑似密钥的 ref)
+        assert!(d.ips.is_empty() && d.logins.is_empty());
+        assert!(d.has_fail(), "有 fail 就不得进入落账段");
+        let sheet = d.sheet();
+        assert_eq!(sheet.gates.len(), 5);
+        assert_eq!(sheet.gates[4].state(), State::Fail);
+        assert_eq!(sheet.gates[0].state(), State::Pass);
+        assert!(!d.written, "预审段文件不落");
+    }
+
+    #[test]
+    fn 解析_vps_rm_data_删不存在的名给证据且未动文件() {
+        let e = envelope_with_schema(
+            "nw/vps-rm.v1",
+            "0.1.0",
+            json!({
+                "name": "ghost",
+                "catalogPath": "/data/root/vps.json",
+                "removed": false,
+                "written": false,
+                "action": "not_found",
+                "remaining": 2
+            }),
+        );
+        let d: VpsRmData = e.data_as().unwrap();
+        assert_eq!(d.action, "not_found");
+        assert!(!d.removed && !d.written, "文件一个字节都不动");
+        assert_eq!(d.remaining, 2);
+    }
+
+    #[test]
+    fn 编目册骨架_闸三态与条目行_缺字段给破折号不自造() {
+        let g = CatalogGate {
+            id: "register.port".into(),
+            status: "skip".into(),
+            message: "前面已拒".into(),
+        };
+        assert_eq!(g.state(), State::Skip, "skip = 没跑到这道闸,不是错误");
+        assert!(!g.is_fail());
+        let e = CatalogEntryView::default();
+        assert_eq!(e.addr_line(), "——");
+        assert_eq!(e.login_line(), "——");
+        // 编目册投影:字段恒在不为 null
+        let sheet = CatalogSheet::default();
+        assert!(sheet.entries.is_empty() && sheet.gates.is_empty());
+        assert!(sheet.catalog_path.is_empty());
     }
 }

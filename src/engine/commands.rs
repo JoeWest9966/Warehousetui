@@ -84,6 +84,88 @@ pub fn source_register_commit(repo: &str, kind: &str, root: &str) -> Vec<String>
     a
 }
 
+/// vps 登记·预审段(工单 #53,ADR-0009 §1 获准两段式代跑):
+/// 五道闸(`register.name` / `register.ips` / `register.port` /
+/// `register.logins` / `register.secret_guard`)全跑一遍,拟落账记录进
+/// JSON,**文件不落**——铁律是不带 `--yes`(确认闸),本函数连 `--yes`
+/// 的位置都没有,从类型层面杜绝预审误落账(同
+/// [`source_register_preaudit`])。
+///
+/// 槽位纪律:**只认 `--root <数据仓根>`**。`--repo` 是 `source register`
+/// 的外部源仓库链接槽,喂给 vps 组 = 未知 flag → rc 3(工单 #51 §3)。
+/// 形状(上游 `cli.go` `runVpsRegister` / `vps/register.go`):
+/// `nw vps register <名> --ip <label>=<addr> … --login <user>=<ref> … [--port N] [--note <话>] [--root <目录>]`。
+/// 多组 `--ip` / `--login` 可重复,顺序即入参数组顺序(引擎自己排序落盘)。
+pub fn vps_register_preaudit(
+    name: &str,
+    ips: &[(String, String)],
+    port: Option<u16>,
+    logins: &[(String, String)],
+    note: Option<&str>,
+    root: &str,
+) -> Vec<String> {
+    let mut a = vec!["vps".into(), "register".into(), name.to_string()];
+    for (label, addr) in ips {
+        a.push("--ip".into());
+        a.push(format!("{label}={addr}"));
+    }
+    if let Some(p) = port {
+        a.push("--port".into());
+        a.push(p.to_string());
+    }
+    for (user, key_ref) in logins {
+        a.push("--login".into());
+        a.push(format!("{user}={key_ref}"));
+    }
+    if let Some(n) = note.filter(|n| !n.is_empty()) {
+        a.push("--note".into());
+        a.push(n.to_string());
+    }
+    a.push("--root".into());
+    a.push(root.to_string());
+    a
+}
+
+/// vps 登记·落账段(工单 #53):与预审同参,多一枚 `--yes` 确认闸——
+/// 引擎才把 `vps.json` 写进数据仓根。**只能由图形确认后的落账转换
+/// 调用**;预审段用的 [`vps_register_preaudit`] 连 `--yes` 的位置都没有,
+/// 两段从构造函数形状上分开,误下发靠类型杜绝。落账 = 预审 + `--yes`,
+/// 不另改槽位。
+pub fn vps_register_commit(
+    name: &str,
+    ips: &[(String, String)],
+    port: Option<u16>,
+    logins: &[(String, String)],
+    note: Option<&str>,
+    root: &str,
+) -> Vec<String> {
+    let mut a = vps_register_preaudit(name, ips, port, logins, note, root);
+    a.push("--yes".into());
+    a
+}
+
+/// vps 编目册**只读**投影(工单 #53,ADR-0009 §1 准许代跑):列数据仓根
+/// 下 `vps.json` 里的机器。编目不存在 = 空数组 rc 0(合法空态)。
+/// 只认 `--root <数据仓根>`——**不喂 `--repo`**(那是 source register
+/// 的外部源链接槽,喂进来 = 未知 flag → rc 3)。
+pub fn vps_ls(root: &str) -> Vec<String> {
+    vec!["vps".into(), "ls".into(), "--root".into(), root.to_string()]
+}
+
+/// vps 删一台机器(工单 #53,ADR-0009 §1:代跑,但面板加一道图形确认)。
+/// 上游**没有 `--yes`**(点名即删),所以本函数也不产生确认旗标——面板
+/// 的图形确认是面板侧的编排,不改引擎语义(下发的 argv 与在 shell 里
+/// 敲的逐字相同)。删不存在的名 → rc 3 且文件一个字节都不动。
+pub fn vps_rm(name: &str, root: &str) -> Vec<String> {
+    vec![
+        "vps".into(),
+        "rm".into(),
+        name.to_string(),
+        "--root".into(),
+        root.to_string(),
+    ]
+}
+
 /// 三条前提缺哪一条:两种配方域建议命令(bake / new)共用这一份判定,
 /// 措辞各归各自的 gate enum——判定只有一处,说法不互相冒充。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -418,6 +500,87 @@ mod tests {
             !a.iter().any(|s| s == "--yes"),
             "预审段铁律:argv 里不许出现 --yes(文件不落)"
         );
+    }
+
+    #[test]
+    fn vps_登记预审_永不带_yes_多组ip与login按序落槽() {
+        // 形状实测自上游 usage:`nw vps register <名> --ip <label>=<addr> …
+        // --login <user>=<ref> … [--port N] [--note <话>] [--root <目录>]`
+        let a = vps_register_preaudit(
+            "gate",
+            &[
+                ("home".to_string(), "10.0.0.1".to_string()),
+                ("office".to_string(), "10.0.0.2".to_string()),
+            ],
+            Some(22),
+            &[("root".to_string(), "$DEPLOY_KEY".to_string())],
+            Some("门口那台"),
+            "/data/root",
+        );
+        assert_eq!(
+            a,
+            vec![
+                "vps",
+                "register",
+                "gate",
+                "--ip",
+                "home=10.0.0.1",
+                "--ip",
+                "office=10.0.0.2",
+                "--port",
+                "22",
+                "--login",
+                "root=$DEPLOY_KEY",
+                "--note",
+                "门口那台",
+                "--root",
+                "/data/root"
+            ]
+        );
+        assert!(
+            !a.iter().any(|s| s == "--yes"),
+            "预审段铁律:argv 里不许出现 --yes(文件不落)"
+        );
+        assert!(
+            !a.iter().any(|s| s == "--repo"),
+            "vps 组只认 --root;--repo 是 source register 的外部源链接槽,喂进来 = 未知 flag"
+        );
+        // 空备注等于没给(上游 note 是唯一 omitempty 槽)
+        let no_note = vps_register_preaudit("gate", &[], None, &[], Some(""), "/data/root");
+        assert!(!no_note.iter().any(|s| s == "--note"), "空备注不下发");
+    }
+
+    #[test]
+    fn vps_登记落账_等于预审加一枚_yes_不另改槽位() {
+        let ips = vec![("home".to_string(), "10.0.0.1".to_string())];
+        let logins = vec![("root".to_string(), "$DEPLOY_KEY".to_string())];
+        let p = vps_register_preaudit("gate", &ips, Some(22), &logins, None, "/data/root");
+        let c = vps_register_commit("gate", &ips, Some(22), &logins, None, "/data/root");
+        assert_eq!(c, [p, vec!["--yes".into()]].concat(), "落账 = 预审 + --yes");
+        assert_eq!(
+            c.iter().filter(|s| *s == "--yes").count(),
+            1,
+            "确认闸恰好一枚"
+        );
+    }
+
+    #[test]
+    fn vps_ls_与_rm_只认_root_且rm无确认旗标() {
+        assert_eq!(
+            vps_ls("/data/root"),
+            vec!["vps", "ls", "--root", "/data/root"]
+        );
+        assert_eq!(
+            vps_rm("gate", "/data/root"),
+            vec!["vps", "rm", "gate", "--root", "/data/root"]
+        );
+        for a in [vps_ls("/r"), vps_rm("gate", "/r")] {
+            assert!(!a.iter().any(|s| s == "--repo"), "四组只认 --root");
+            assert!(
+                !a.iter().any(|s| s == "--yes"),
+                "上游 rm 没有确认闸,面板不自己造一枚下发"
+            );
+        }
     }
 
     #[test]

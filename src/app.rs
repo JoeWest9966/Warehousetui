@@ -9,9 +9,11 @@ use tokio::sync::mpsc;
 use crate::engine::{
     capability::{self, Capability, Probe},
     commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, Gate, LsData, State,
+    VpsLsData,
 };
 use crate::input::{self, InputAction};
 use crate::layout::{hitmap, size_class, ScrollDir, Target};
+use crate::screens::{catalog, RegisterSpec};
 use crate::term::{self, ColorCap};
 use crate::theme::{cached_degrade, Palette, ThemeKind};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -24,15 +26,20 @@ pub enum Screen {
     Assemble,
     Health,
     Recipes,
+    /// 编目册屏(#53):vps 登记册端到端(登记两段式 + ls 投影 + rm 确认)。
+    /// 第一本编目册;后三本(key / subscription / tag)只换数据源与
+    /// 登记规格,不换屏与骨架(`screens::catalog`)。
+    Vps,
     Settings,
 }
 
 impl Screen {
-    pub const ALL: [Screen; 5] = [
+    pub const ALL: [Screen; 6] = [
         Screen::Overview,
         Screen::Assemble,
         Screen::Health,
         Screen::Recipes,
+        Screen::Vps,
         Screen::Settings,
     ];
 
@@ -42,6 +49,7 @@ impl Screen {
             Screen::Assemble => "装配",
             Screen::Health => "健康",
             Screen::Recipes => "配方",
+            Screen::Vps => "编目",
             Screen::Settings => "设置",
         }
     }
@@ -52,6 +60,7 @@ impl Screen {
             Screen::Assemble => "⚙",
             Screen::Health => "✚",
             Screen::Recipes => "▤",
+            Screen::Vps => "▩",
             Screen::Settings => "✦",
         }
     }
@@ -303,6 +312,20 @@ pub struct App {
     pub reg_kind_sel: usize,
     /// 预审回音(确认态呈现;为 None 时 Review 不成立)。
     pub reg_result: Option<EngineOutput>,
+    /// 编目册屏(#53):vps 两段式登记流(与命令组无关的骨架件)。
+    pub vps_flow: crate::screens::RegisterFlow,
+    /// vps 登记表单(名字 / 若干条地址 / 端口 / 若干条登录 / 备注)。
+    pub vps_form: crate::screens::VpsForm,
+    /// vps 编目册投影(`nw vps ls` 回音定型后落在这里;None = 还没读到)。
+    pub vps_ls: Option<crate::engine::VpsLsData>,
+    /// ls 在途(不拿上一轮投影冒充本次)。
+    pub vps_ls_loading: bool,
+    /// 编目册选中行(↑/↓ 与鼠标点行同源)。
+    pub vps_sel: usize,
+    /// 删除确认浮层(ADR-0009 §2:面板加的一道图形确认)。
+    pub vps_rm_confirm: bool,
+    /// 最近一次 `vps rm` 回音(证据五字段原样呈现)。
+    pub vps_rm_result: Option<EngineOutput>,
     /// 配方域建议命令的只读选中态(#39,键 `c`):命令可见可取用,
     /// 但面板**不执行**它(ADR-0003:执行权留给操作者)。选中行/切域即复位。
     pub rc_bake_sel: bool,
@@ -322,6 +345,10 @@ pub struct App {
     pub pending_editor: bool,
     /// 启动 splash:800ms 或任意键跳过(R3 决议)。
     pub splash: bool,
+    /// 帮助浮层的正文滚动偏移(#53):键位与鼠标章补齐后正文超过最小常畅态
+    /// (80×30 内层 24 行)放得下的量,超量时 ↑/↓ 在浮层内滚动,末行给
+    /// 「还有内容」提示——不静默截断(截断等于把键位藏起来)。开关浮层即归零。
+    pub help_offset: usize,
     /// NW_HOME 手填输入模式(设置屏 i 进入;浮层优先级见 on_key)。
     pub home_input: bool,
     /// 手填缓冲区(只收可打印字符;上限见 [`input::BUF_CAP`])。
@@ -423,6 +450,13 @@ impl App {
             reg_kind: RegKind::Skill,
             reg_kind_sel: 0,
             reg_result: None,
+            vps_flow: crate::screens::RegisterFlow::new(),
+            vps_form: crate::screens::new_form(),
+            vps_ls: None,
+            vps_ls_loading: false,
+            vps_sel: 0,
+            vps_rm_confirm: false,
+            vps_rm_result: None,
             rc_bake_sel: false,
             rc_filter: String::new(),
             rc_filter_on: false,
@@ -430,6 +464,7 @@ impl App {
             queue: Vec::new(),
             pending_editor: false,
             splash: true,
+            help_offset: 0,
             home_input: false,
             home_buf: String::new(),
             data_input: false,
@@ -486,6 +521,17 @@ impl App {
                 self.hl_loading = true;
                 self.hl_result = None;
             }
+            // vps 编目册(#53):ls 只读在途;register 落账段点亮写互斥
+            // (预审段不点亮——它不写任何文件)。
+            Some("vps") => match args.get(1).map(String::as_str) {
+                Some("ls") => {
+                    self.vps_ls_loading = true;
+                }
+                Some("register") if args.iter().any(|a| a == "--yes") => {
+                    self.assembling = true;
+                }
+                _ => {}
+            },
             // recheck(#40)在途:清掉上一轮结论,不拿旧结论冒充本次
             Some("source") if args.get(1).map(String::as_str) == Some("recheck") => {
                 self.hl_loading = true;
@@ -559,6 +605,7 @@ impl App {
                     Screen::Assemble => self.as_sel = i,
                     Screen::Health => self.hl_sel = i,
                     Screen::Recipes => self.rc_sel = i,
+                    Screen::Vps => self.vps_sel = i.min(self.vps_len().saturating_sub(1)),
                     Screen::Settings => {}
                 }
             }
@@ -619,6 +666,10 @@ impl App {
                 let n = self.domain_len();
                 (&mut self.rc_sel, n)
             }
+            Screen::Vps => {
+                let n = self.vps_len();
+                (&mut self.vps_sel, n)
+            }
             Screen::Settings => return, // 设置屏无可滚列表
         };
         if n == 0 {
@@ -647,12 +698,19 @@ impl App {
     fn dismiss_popup(&mut self) {
         if self.help {
             self.help = false;
+            self.help_offset = 0; // 关浮层即归零:重开总是从首行看起
         } else if self.as_confirm {
             self.as_confirm = false;
             self.push_log("发射取消");
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
+        } else if self.vps_rm_confirm {
+            self.vps_rm_confirm = false;
+            self.push_log("删除已取消:vps.json 一个字节都没动");
+        } else if self.vps_flow.phase != catalog::RegPhase::Idle {
+            // 编目册登记返航与 Esc 完全同路(骨架件同一语义)
+            self.cancel_vps_register();
         }
     }
 
@@ -791,6 +849,9 @@ impl App {
                     self.push_log("登记预审回音已丢弃(流程已返航)");
                 }
             }
+            // 编目册回音(#53):ls 只读 / register 两段式 / rm 带面板确认。
+            // 只认真实 argv——精确的无参组级探针仍归下面的能力回音路。
+            "vps" if Capability::from_probe(&out.args).is_none() => self.on_vps_echo(out),
             // 外部源漂移复核回音(#40):只读,只认真实 argv(带 --root 或
             // --name);精确的无参探针仍归下面的能力回音路。
             "source"
@@ -827,6 +888,14 @@ impl App {
         if self.help {
             match k.code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => self.dismiss_popup(),
+                // 正文滚动(#53):复用 ↑/↓(不新开键),钳在 [0, 行数-可见行数]。
+                // 滚动手感与装配日志窗格同源:向上 = 看更早的内容。
+                KeyCode::Up => {
+                    self.help_offset = self.help_offset.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.help_offset = self.help_offset.saturating_add(1);
+                }
                 _ => {}
             }
             return;
@@ -848,6 +917,16 @@ impl App {
         // 但只在本屏在场时吞键——切屏即退输入态,过滤词保留可预期。
         if self.rc_filter_on && self.screen == Screen::Recipes {
             self.on_key_rc_filter(k);
+            return;
+        }
+        // 编目册登记两段式(#53):与外部源登记同级的浮层优先级,
+        // 骨架件同构(`screens::catalog::RegisterFlow`)。
+        if self.vps_flow.phase != catalog::RegPhase::Idle {
+            self.on_key_vps_flow(k);
+            return;
+        }
+        if self.vps_rm_confirm {
+            self.on_key_vps_rm_confirm(k);
             return;
         }
         // 登记两段式(#30 #31):输入 → 预审 → 确认 → 落账 → 结果,
@@ -881,7 +960,10 @@ impl App {
         }
         match k.code {
             KeyCode::Char('q') if !self.assembling => self.quit = true,
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => {
+                self.help = true;
+                self.help_offset = 0; // 重开从首行看起
+            }
             // j/k 是壳级切屏;↑/↓ 留给各屏自己的列表(见 HUD)
             KeyCode::Char('j') | KeyCode::Tab => self.next_screen(),
             KeyCode::Char('k') | KeyCode::BackTab => self.prev_screen(),
@@ -905,6 +987,7 @@ impl App {
             Screen::Assemble => self.key_assemble(k),
             Screen::Health => self.key_health(k),
             Screen::Recipes => self.key_recipes(k),
+            Screen::Vps => self.key_catalog(k),
             Screen::Settings => self.key_settings(k),
         }
     }
@@ -1517,14 +1600,358 @@ impl App {
         let Some(out) = self.reg_result.as_ref() else {
             return false;
         };
-        if !out.ok {
-            return false;
-        }
-        out.envelope
+        // 落账闸口径与编目册登记共用一处(#53 抽出的骨架件):退出码 0 +
+        // 回音可定型 + 闸无 fail。外部源登记的闸面是 `acceptance[]`,
+        // 折算成同一件 `catalog::Audit` 后走同一个谓词——同一个布尔,
+        // 不换说法。
+        let audit = out
+            .envelope
             .as_ref()
             .and_then(|e| e.data_as::<crate::engine::RegisterData>())
-            .map(|d| !d.has_fail())
-            .unwrap_or(false)
+            .map(|d| catalog::Audit {
+                entry: None,
+                catalog_path: d.catalog_path.clone(),
+                gates: d
+                    .acceptance
+                    .iter()
+                    .map(|a| crate::engine::CatalogGate {
+                        id: a.id.clone(),
+                        status: a.status.clone(),
+                        message: a.message.clone(),
+                    })
+                    .collect(),
+            });
+        catalog::preaudit_passed(out, audit.as_ref())
+    }
+
+    // ---- 编目册屏·vps(spec #50 工单 #53,ADR-0009) ----
+
+    /// 编目册屏的机器行数(`vps ls` 投影条数;没读到 = 0)。
+    pub fn vps_len(&self) -> usize {
+        self.vps_ls.as_ref().map(|d| d.machines.len()).unwrap_or(0)
+    }
+
+    /// 选中机器的名字(删除确认与键位行同源)。
+    pub fn selected_vps_name(&self) -> Option<String> {
+        let d = self.vps_ls.as_ref()?;
+        d.machines
+            .get(self.vps_sel.min(d.machines.len().saturating_sub(1)))
+            .map(|m| m.name.clone())
+    }
+
+    /// vps 入口门(#29 能力门 + #27 数据仓根,与外部源登记同两道、互不冒充):
+    /// 引擎明确「有 vps 组」且数据仓根可用才放行;否则入口禁用并指路。
+    pub fn vps_entry_enabled(&self) -> bool {
+        self.data_root_cause().is_none() && self.capabilities.enabled(Capability::Vps)
+    }
+
+    /// 入口不可用时的一句指路(与册体提示同源)。
+    pub fn vps_gate_hint(&self) -> String {
+        match self.data_root_cause() {
+            Some(_) => self.data_root_gate_msg(),
+            None => capability::GATE_HINT.to_string(),
+        }
+    }
+
+    /// 编目册屏键位:r 登记 / ↑/↓ 选机器 / d 删除(带确认)。
+    fn key_catalog(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Char('r') if !self.assembling => self.start_vps_register(),
+            KeyCode::Down => {
+                let n = self.vps_len();
+                if n > 0 {
+                    self.vps_sel = (self.vps_sel + 1) % n;
+                }
+            }
+            KeyCode::Up => {
+                let n = self.vps_len();
+                if n > 0 {
+                    self.vps_sel = (self.vps_sel + n - 1) % n;
+                }
+            }
+            KeyCode::Char('d') => self.start_vps_rm(),
+            KeyCode::Char('l') => self.run_vps_ls(),
+            _ => {}
+        }
+    }
+
+    /// 发起 vps 登记:先过两道门 + 写互斥,再进表单态。
+    pub fn start_vps_register(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:登记与装配互斥,稍后再试");
+            return;
+        }
+        if !self.vps_entry_enabled() {
+            self.push_log(format!("登记入口不可用:{}", self.vps_gate_hint()));
+            return;
+        }
+        self.vps_rm_confirm = false;
+        self.vps_flow.begin();
+        self.vps_form = catalog::new_form();
+        self.push_log("登记机器:填名字/地址/端口/登录/备注,Enter 预审,Esc/q 返航");
+    }
+
+    /// 登记流程键位(表单 / 等回音 / 确认 / 落账在途 / 结果)。
+    fn on_key_vps_flow(&mut self, k: KeyEvent) {
+        match self.vps_flow.phase {
+            catalog::RegPhase::Form => match catalog::on_key_form(&mut self.vps_form, k) {
+                catalog::FormAction::Submit => self.dispatch_vps_register(),
+                catalog::FormAction::Cancel => self.cancel_vps_register(),
+                catalog::FormAction::Edited => {}
+            },
+            catalog::RegPhase::PreAudit | catalog::RegPhase::Commit => {
+                if matches!(k.code, KeyCode::Esc) {
+                    self.cancel_vps_register();
+                }
+            }
+            catalog::RegPhase::Review => match k.code {
+                KeyCode::Enter => self.dispatch_vps_commit(),
+                KeyCode::Esc => self.cancel_vps_register(),
+                _ => {}
+            },
+            catalog::RegPhase::Done => {
+                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.cancel_vps_register();
+                }
+            }
+            catalog::RegPhase::Idle => {}
+        }
+    }
+
+    /// 下发预审(两段式第一段):不带 `--yes`,文件不落;下发前重过两道门。
+    pub fn dispatch_vps_register(&mut self) {
+        if !self.vps_entry_enabled() {
+            self.push_log(format!("登记不下发:{}", self.vps_gate_hint()));
+            self.cancel_vps_register();
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("登记不下发:{}", self.data_root_gate_msg()));
+            self.cancel_vps_register();
+            return;
+        };
+        let spec = match catalog::spec_from_form(&self.vps_form) {
+            Ok(s) => s,
+            Err(bad) => {
+                // 面板侧就拒(空名字 / label=addr 拆不出两侧),留表单可改,
+                // 不喂给引擎跑一趟。
+                self.push_log(format!("登记被拒:{},留表单可改", bad.join(";")));
+                return;
+            }
+        };
+        self.vps_flow.preaudit_sent();
+        self.queue.push(spec.preaudit(&root));
+        self.push_log(format!(
+            "登记预审已入队:vps register {}(不带 --yes,文件不落)",
+            spec.name
+        ));
+    }
+
+    /// 落账(两段式第二段):图形确认后才可能到达——全流程唯一能产生
+    /// `--yes` 的转换。重过三道闸(入口 / 数据仓根 / 预审结论),全过才
+    /// 下发并点亮写互斥;任何一道不过都不下发写命令。
+    pub fn dispatch_vps_commit(&mut self) {
+        if self.vps_flow.phase != catalog::RegPhase::Review || !self.vps_can_commit() {
+            self.push_log("落账未下发:预审未通过(五道闸有 fail 或退出码非 0)");
+            return;
+        }
+        if !self.vps_entry_enabled() {
+            self.push_log(format!("落账未下发:{}", self.vps_gate_hint()));
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("落账未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        let Ok(spec) = catalog::spec_from_form(&self.vps_form) else {
+            self.push_log("落账未下发:表单已不可定型(返航后从表单重来)");
+            return;
+        };
+        self.vps_flow.commit_sent();
+        self.assembling = true;
+        self.queue.push(spec.commit(&root));
+        self.push_log(format!(
+            "登记落账已入队:vps register {} --yes(--root {})",
+            spec.name, root
+        ));
+    }
+
+    /// vps 落账闸(呈现口径):预审通过 = rc 0 且五道闸无 fail 且 data 可定型。
+    pub fn vps_can_commit(&self) -> bool {
+        let Some(out) = self.vps_flow.result.as_ref() else {
+            return false;
+        };
+        catalog::preaudit_passed(out, catalog::VpsSpec::audit(out).as_ref())
+    }
+
+    /// 返航:任一态 Esc 同义,状态清空不留半条记录。
+    pub fn cancel_vps_register(&mut self) {
+        self.vps_flow.abandon();
+        self.vps_form = catalog::new_form();
+        self.push_log("登记返航");
+    }
+
+    /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
+    fn start_vps_rm(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:删除与装配互斥,稍后再试");
+            return;
+        }
+        if !self.vps_entry_enabled() {
+            self.push_log(format!("删除未下发:{}", self.vps_gate_hint()));
+            return;
+        }
+        let Some(name) = self.selected_vps_name() else {
+            self.push_log("删除未下发:没有选中的机器(↑/↓ 先选一行)");
+            return;
+        };
+        self.vps_rm_confirm = true;
+        self.push_log(format!("删除确认:{name}(Enter 确认,Esc/q 取消)"));
+    }
+
+    fn on_key_vps_rm_confirm(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => self.dispatch_vps_rm(),
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
+            _ => {}
+        }
+    }
+
+    /// 下发删除:argv 与在 shell 里敲的逐字相同(面板只决定何时递出去)。
+    fn dispatch_vps_rm(&mut self) {
+        let Some(name) = self.selected_vps_name() else {
+            self.vps_rm_confirm = false;
+            self.push_log("删除未下发:没有选中的机器");
+            return;
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("删除未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        self.vps_rm_confirm = false;
+        self.vps_rm_result = None;
+        self.queue.push(commands::vps_rm(&name, &root));
+        self.push_log(format!("删除已入队:vps rm {name} --root {root}"));
+    }
+
+    /// 读一次编目册(只读;编目不存在 = 空数组 rc 0,合法空态)。
+    pub fn run_vps_ls(&mut self) {
+        if !self.vps_entry_enabled() {
+            self.push_log(format!("编目册未读:{}", self.vps_gate_hint()));
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("编目册未读:{}", self.data_root_gate_msg()));
+            return;
+        };
+        self.vps_ls_loading = true;
+        self.queue.push(commands::vps_ls(&root));
+        self.push_log("vps ls 已入队(只读,不写任何文件)");
+    }
+
+    /// 编目册回音路由(#53):ls 只读 / register 两段式 / rm。
+    fn on_vps_echo(&mut self, out: EngineOutput) {
+        match out.args.get(1).map(String::as_str) {
+            Some("ls") => {
+                self.vps_ls_loading = false;
+                match out.envelope.as_ref().and_then(|e| e.data_as::<VpsLsData>()) {
+                    Some(d) => {
+                        let n = d.machines.len();
+                        self.vps_ls = Some(d);
+                        self.clamp_vps_sel();
+                        self.push_log(format!("vps 编目册已刷新:{n} 台机器(只读)"));
+                    }
+                    None => self.push_log(format!("vps ls 结果不可用:{}", out.headline())),
+                }
+            }
+            Some("register") => {
+                let is_commit = out.args.iter().any(|a| a == "--yes");
+                if is_commit {
+                    let echo_ok = out.ok;
+                    match self.vps_flow.commit_back(out) {
+                        Some(true) => {
+                            self.assembling = false;
+                            self.push_log("登记落账完成:vps.json 已写入数据仓根(一次 git 变更)");
+                            self.run_vps_ls();
+                        }
+                        Some(false) => {
+                            self.assembling = false;
+                            let h = self
+                                .vps_flow
+                                .result
+                                .as_ref()
+                                .map(|o| o.headline())
+                                .unwrap_or_default();
+                            self.push_log(format!("登记落账失败:{h}"));
+                        }
+                        None => {
+                            // 在途返航收不回引擎的写:回音报成功则刷新并明示
+                            // 「写可能已落盘」(与外部源登记同一收敛行为)。
+                            self.assembling = false;
+                            if echo_ok {
+                                self.run_vps_ls();
+                                self.push_log(
+                                    "登记写盘可能已完成:编目册已刷新,vps.json 走 PR + 家长审复核"
+                                        .to_string(),
+                                );
+                            } else {
+                                self.push_log("登记落账回音已丢弃(流程已返航,写未成功)");
+                            }
+                        }
+                    }
+                } else if self.vps_flow.preaudit_back(out) {
+                    let h = self
+                        .vps_flow
+                        .result
+                        .as_ref()
+                        .map(|o| o.headline())
+                        .unwrap_or_default();
+                    self.push_log(format!("登记预审完成:{h}"));
+                } else {
+                    self.push_log("登记预审回音已丢弃(流程已返航)");
+                }
+            }
+            Some("rm") => {
+                let typed = out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::VpsRmData>());
+                let rm_ok = out.ok;
+                let rm_headline = out.headline();
+                self.vps_rm_result = Some(out);
+                match typed {
+                    Some(d) if d.removed => {
+                        self.push_log(format!(
+                            "已删除 {}:剩余 {} 台(一次 git 变更,走 PR + 家长审)",
+                            d.name, d.remaining
+                        ));
+                        self.run_vps_ls();
+                    }
+                    Some(d) => {
+                        // 删不存在的名:rc 3 + 证据五字段 + 文件一个字节不动
+                        self.push_log(format!(
+                            "没删成:{} 不在编目里(action {}),vps.json 一个字节都没动",
+                            d.name, d.action
+                        ));
+                    }
+                    None => {
+                        let _ = rm_ok;
+                        self.push_log(format!("删除结果不可用:{rm_headline}"))
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 选中行钳回可见范围内(刷新后旧下标可能越界)。
+    fn clamp_vps_sel(&mut self) {
+        let n = self.vps_len();
+        if n == 0 {
+            self.vps_sel = 0;
+        } else {
+            self.vps_sel = self.vps_sel.min(n - 1);
+        }
     }
 
     /// 轮换 NW_HOME:写进程环境(子进程继承)、持久化、顺手刷新 ls。
@@ -4426,14 +4853,65 @@ mod tests {
         let mut app = fake_app();
         app.splash = false;
         app.help = true;
-        let s = crate::testutil::frame_display(&app, 80, 44);
+        // 正文开窗(#53):80×30 最小常畅态内层只有 24 行, HELP_ROWS + 鼠标章
+        // + 尾注已超过它——所以这条测试**滚完整个浮层**再断言,顺带守「没有
+        // 一行是因为放不下被静默丢掉的」。滚到底仍看不到的行 = 真丢了。
+        let mut seen = String::new();
+        for _ in 0..HELP_ROWS.len() + MOUSE_LINES.len() + 4 {
+            seen.push_str(&crate::testutil::frame_display(&app, 80, 44));
+            seen.push('\n');
+            app.update(Message::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )));
+        }
         for row in HELP_ROWS {
-            assert!(s.contains(row.key), "帮助应显示键位 `{}`", row.key);
-            assert!(s.contains(row.desc), "帮助应显示说明 `{}`", row.desc);
+            assert!(seen.contains(row.key), "帮助应显示键位 `{}`", row.key);
+            assert!(seen.contains(row.desc), "帮助应显示说明 `{}`", row.desc);
         }
         for m in MOUSE_LINES {
-            assert!(s.contains(m), "鼠标章节应含 `{m}`");
+            assert!(seen.contains(m), "鼠标章节应含 `{m}`");
         }
+    }
+
+    /// 帮助正文开窗(#53):超量时 ↑/↓ 在浮层内滚动,钳在 [0, 行数-可见行数],
+    /// 且给出「还有下文/上文」的可见提示——不静默截断。
+    #[test]
+    fn 帮助浮层_超量时上下滚动不越界_末行给还有内容的提示() {
+        let mut app = fake_app();
+        app.splash = false;
+        app.help = true;
+        // 80×30:内层 24 行,可见 23 行(末行留给提示),正文 30 行 → 需滚动
+        let first = crate::testutil::frame_display(&app, 80, 30);
+        assert!(first.contains("↓ 还有下文"), "首屏应提示还有下文:{first}");
+        assert!(!first.contains("↑ 还有上文"), "首屏不该提示还有上文");
+        // 一路向下:不越界(偏移钳住),且提示翻面
+        for _ in 0..40 {
+            app.update(Message::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )));
+        }
+        let last = crate::testutil::frame_display(&app, 80, 30);
+        assert!(last.contains("↑ 还有上文"), "滚到底应提示还有上文:{last}");
+        assert!(!last.contains("↓ 还有下文"), "滚到底不该再提示还有下文");
+        // 回到顶部:提示翻回来
+        for _ in 0..40 {
+            app.update(Message::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        }
+        let back = crate::testutil::frame_display(&app, 80, 30);
+        assert!(back.contains("↓ 还有下文"), "回顶应再次提示还有下文:{back}");
+        // 关浮层即归零:重开总是从首行看起
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.help);
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.help_offset, 0, "重开归零");
     }
 
     /// 反向守「实现里每个屏的分支键,帮助都写了」:对每屏盲按 a-z + ↑/↓/Enter/Esc,

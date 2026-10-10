@@ -738,7 +738,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
 // ---- 登记两段式浮层(spec #25 / 工单 #30):输入 → kind → 预审回音 → 确认 ----
 
 /// 按显示宽截断(不切宽字符,防 CJK 混排错位)。
-fn clip(s: &str, w: usize) -> String {
+pub(crate) fn clip(s: &str, w: usize) -> String {
     let mut out = String::new();
     let mut used = 0usize;
     for ch in s.chars() {
@@ -754,7 +754,7 @@ fn clip(s: &str, w: usize) -> String {
 
 /// 按显示宽折行:优先在空格处断(schema、URL、人话短语不被拦腰切开),
 /// 无处可断才按字符硬切。证据整句可见,不被弹层宽度截尾。
-fn wrap(s: &str, w: usize) -> Vec<String> {
+pub(crate) fn wrap(s: &str, w: usize) -> Vec<String> {
     let w = w.max(1);
     let mut out: Vec<String> = Vec::new();
     let mut rest: Vec<char> = s.chars().collect();
@@ -795,7 +795,7 @@ fn wrap(s: &str, w: usize) -> Vec<String> {
 
 /// 五字段证据落行:`[code/rc] message` 折行呈现,指路与详情随后缩进——
 /// 错误/警告取前几条原样给人话,不静默降级成一句「出错了」。
-fn push_evidence(
+pub(crate) fn push_evidence(
     lines: &mut Vec<Line>,
     label: &str,
     head_style: ratatui::style::Style,

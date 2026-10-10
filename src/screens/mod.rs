@@ -7,12 +7,18 @@ use crate::app::App;
 use crate::ui::screen_block;
 
 mod assemble;
+pub(crate) mod catalog;
 mod health;
 mod overview;
-mod recipes;
+pub(crate) mod recipes;
 mod settings;
 
 pub use assemble::render_assemble;
+#[allow(unused_imports)]
+pub use catalog::{
+    new_form, render_catalog, Audit, FormAction, RegPhase, RegisterFlow, RegisterSpec, VpsField,
+    VpsForm, VpsSpec,
+};
 pub use health::render_health;
 pub use overview::render_overview;
 pub use recipes::render_recipes;
@@ -27,6 +33,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         crate::app::Screen::Assemble => render_assemble(frame, area, app),
         crate::app::Screen::Health => render_health(frame, area, app),
         crate::app::Screen::Recipes => render_recipes(frame, area, app),
+        crate::app::Screen::Vps => render_catalog(frame, area, app),
         crate::app::Screen::Settings => render_settings(frame, area, app),
     }
 }

@@ -205,7 +205,58 @@ fn screen_hits(content: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect,
         Screen::Assemble => assemble_hits(inner, app, class, hits),
         Screen::Health => health_hits(inner, app, hits),
         Screen::Recipes => recipes_hits(inner, app, class, hits),
+        Screen::Vps => vps_hits(inner, app, hits),
         Screen::Settings => {}
+    }
+}
+
+/// 编目册屏命中区(#53):机器清单整块产行命中(点行 = 选中,同 ↑/↓);
+/// 登记浮层与删除确认弹层只产键位行两段(渲染 `catalog::render_catalog`
+/// 同一个 `popup_rect` 基准,弹层优先级高于册体)。
+fn vps_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
+    if app.vps_flow.phase != crate::screens::catalog::RegPhase::Idle {
+        // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
+        if app.vps_flow.phase == crate::screens::catalog::RegPhase::Review && app.vps_can_commit() {
+            let popup = popup_rect(
+                inner,
+                crate::screens::catalog::REG_W,
+                crate::screens::catalog::REG_H,
+            );
+            if popup.width > 0 && popup.height > 0 {
+                let key_y = popup.y + popup.height - 2;
+                two_key_segments(popup, key_y, REG_KEY_REVIEW_COMMIT, RITUAL_KEY_RETURN, hits);
+            }
+        }
+        return;
+    }
+    if app.vps_rm_confirm {
+        let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
+        if popup.width > 0 && popup.height > 0 {
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
+        }
+        return;
+    }
+    // 册体:机器清单行命中(渲染每台 4 行,命中按台给整块)
+    let n = app.vps_len();
+    if n == 0 {
+        return;
+    }
+    let rows = inner.height.saturating_sub(2); // 首行编目路径 + 末行键位行
+    let per = 4u16;
+    let mut y = inner.y + 1;
+    for i in 0..n as u16 {
+        if y + per > inner.y + inner.height.saturating_sub(1) {
+            break;
+        }
+        if rows == 0 {
+            break;
+        }
+        hits.push((
+            Rect::new(inner.x, y, inner.width, per),
+            Target::SelectRow(i as usize),
+        ));
+        y += per;
     }
 }
 
@@ -425,6 +476,10 @@ pub const REG_KEY_KIND_LAUNCH: &str = "  Enter 预审 ";
 /// 登记确认屏键位行的左段(#31 落账段,与 [`REG_KEY_KIND_LAUNCH`] 同法):
 /// 只在落账闸放行时铺——不可落账时整屏仍归返航(命中侧同条件分叉)。
 pub const REG_KEY_REVIEW_COMMIT: &str = "  Enter 落账 ";
+
+/// 编目册删除确认的键位行左段(#53,ADR-0009 §2 的图形确认):
+/// 渲染(`catalog::render_rm_confirm`)与命中(`vps_hits`)同一份文案。
+pub const REG_KEY_RM_CONFIRM: &str = "  Enter 确认删除 ";
 
 /// 登记四个浮层的尺寸(spec #25 / 工单 #30 #31):渲染与命中同一组常量,
 /// 几何零分歧;`popup_rect` 的收窄规则两边同用。
@@ -694,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn hitmap_常畅态_80x30_导航五屏齐() {
+    fn hitmap_常畅态_80x30_导航六屏齐() {
         let app = test_app();
         let a = area(80, 30);
         let hits = hitmap(a, &app, size_class(a));
@@ -703,7 +758,11 @@ mod tests {
             .iter()
             .filter(|(_, t)| matches!(t, Target::NavTo(_)))
             .count();
-        assert_eq!(nav, 5, "导航五屏齐全");
+        assert_eq!(
+            nav,
+            Screen::ALL.len(),
+            "导航屏数同 Screen::ALL(#53 起六屏:概览/装配/健康/配方/编目/设置)"
+        );
         // 顺序同 Screen::ALL:顶栏占 y=0,导航块边框占 y=1,首项自 y=2
         for (i, screen) in Screen::ALL.iter().enumerate() {
             let r = first(&hits, |t| matches!(t, Target::NavTo(s) if s == screen)).unwrap();
@@ -804,7 +863,11 @@ mod tests {
             .iter()
             .filter(|(_, t)| matches!(t, Target::NavTo(_)))
             .collect();
-        assert_eq!(nav.len(), 5, "五屏 Tab 齐全");
+        assert_eq!(
+            nav.len(),
+            Screen::ALL.len(),
+            "屏 Tab 数同 Screen::ALL(#53 起六屏)"
+        );
         let mut x = 0u16;
         for (i, screen) in Screen::ALL.iter().enumerate() {
             let (r, t) = nav[i];
