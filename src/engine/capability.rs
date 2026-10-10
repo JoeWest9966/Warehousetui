@@ -2,14 +2,30 @@
 //! 入口禁用并指路,面板绝不自己造替代品、也绝不替引擎回答。
 //!
 //! 探测铁律(与 ADR-0007「跟随引擎」同源):
-//! - **一次无害调用 + 读引擎自己的回答**:回 envelope = 子命令存在;
+//! - **一次无害调用 + 读引擎自己的回答**:回 envelope = 子命令在;
 //!   stderr 人话「未知子命令」= 不存在;解析不出结论(引擎缺失/无响应)
-//!   = 探测失败。四条探针实测于所配 `nw 0.1.0` 皆无副作用(只读,
-//!   不落任何文件)。
+//!   = 探测失败。探针皆无副作用(只读,不落任何文件)。
 //! - **不建本地能力常量表**:下面的映射只记「面板入口 → 探什么命令」,
 //!   答案永远来自引擎当下这一跑,不记某版本有没有——上游一发版面板
 //!   自动跟上。
 //! - 探测失败走既有指路屏语义(见 [`GateHint`]),不瘫痪、不冒充。
+//!
+//! # 入口清单怎么长(#63 立的规矩)
+//!
+//! **入口清单由面板定义,可用性由引擎决定**:下面 [`Capability::ALL`] 的每一项
+//! 都是面板自己要在设置屏摆出来的入口;它当下开不开,只由那一跑探针的回答
+//! 决定。两条边界钉死:
+//! 1. **探针必须指向上游真实存在的命令面**。`--category` 是
+//!    `nw source register` 的旗标、不是子命令,所以「类别」不配占一个能力项
+//!    (#63 移除)——问一个上游不回答的问题,门就一直关着,操作者还以为引擎旧。
+//!    上游新增 kind 时同理:先在上游 `cli.go` 的 `Run` switch 里看见它,再谈探针。
+//! 2. **新增入口必须落在 #51 差异表里点名过**(`notes/51-follow-sync-diff.md`
+//!    §5),不许谁想加就加:入口清单是面板对操作者的承诺,每加一项就多一次
+//!    无害调用、多一行设置屏。
+//!
+//! 组级探针(`["key"]` 这种,与既有 `["vps"]` 同粒度)无害:无子命令即在组分派处
+//! 被拒(rc 3 + 对应 envelope),不落文件、不读 stdin。`get` 永远不进探针清单
+//! (`nw key get` / `nw subscription get` 是上游唯一回显本体的两个出口)。
 
 use std::collections::HashMap;
 
@@ -32,48 +48,70 @@ pub enum Capability {
     /// 探针无参即在「位置参数必须恰好一个」处被拒(rc 3 + `nw/recipe-new.v1`
     /// envelope),无害、不写任何文件。
     RecipeNew,
-    /// 类别(上游 master 有、所配 0.1.0 无):`nw category`。
-    Category,
-    /// vps(上游 master 有、所配 0.1.0 无):`nw vps`。
+    /// vps 命令组(一台机器的连接信息编目,`vps.json`):`nw vps`。
+    /// 组级探针,与下面三条同粒度。
     Vps,
+    /// key 命令组(github key 编目,`keys.json`):`nw key`。
+    /// 组级探针(与 [`Capability::Vps`] 同粒度):无子命令即在组分派处被拒
+    /// (rc 3 + `nw/key-register.v1` envelope),不落文件、不读 stdin
+    /// (本体只从 `key register --token-stdin` 进,探针不带那枚旗标)。
+    Key,
+    /// 订阅命令组(订阅链接编目,`subscriptions.json`):`nw subscription`。
+    /// 组级探针:无子命令即被拒(rc 3 + `nw/subscription-register.v1`
+    /// envelope),同上无害。
+    Subscription,
+    /// 标签命令组(标签编目,`tags.json`):`nw tag`。
+    /// 组级探针:无子命令即被拒(rc 3 + `nw/tag-add.v1` envelope),同上无害。
+    Tag,
 }
 
 impl Capability {
     /// 面板入口清单(设置屏按此渲染,顺序即显示顺序)。
-    pub const ALL: [Capability; 6] = [
+    ///
+    /// 这份清单由**面板**定义(#63 立的规矩):每一项都要能在上游 `cli.go`
+    /// 的 `Run` switch 里指到一个真实命令面,且必须在 #51 差异表里点名过;
+    /// 开不开由引擎当跑的探针回答决定,清单本身不预告任何版本有无。
+    pub const ALL: [Capability; 8] = [
         Capability::SourceRegister,
         Capability::SourceRecheck,
         Capability::RecipeBake,
         Capability::RecipeNew,
-        Capability::Category,
         Capability::Vps,
+        Capability::Key,
+        Capability::Subscription,
+        Capability::Tag,
     ];
 
     /// 入口名(操作者视角,禁用与指路文案用)。
+    /// 词一律有出处:登记/复核/烘焙/新建/订阅/标签是面板领域词(CONTEXT.md),
+    /// vps / key 是上游命令组名本身——不自造词。
     pub fn label(self) -> &'static str {
         match self {
             Capability::SourceRegister => "外部源登记",
             Capability::SourceRecheck => "外部源复核",
             Capability::RecipeBake => "配方烘焙",
             Capability::RecipeNew => "配方新建",
-            Capability::Category => "类别",
             Capability::Vps => "vps",
+            Capability::Key => "key",
+            Capability::Subscription => "订阅",
+            Capability::Tag => "标签",
         }
     }
 
     /// 探针 argv:一次无害调用(不带 --yes / --repo 等会动文件的旗标)。
-    /// 实测六条探针在 0.1.0 上皆为纯读:register 无参在旗标校验处即拒,
-    /// recheck 只读编目,recipe bake 无参在「恰好要一个配方」处即拒,
-    /// recipe new 无参在「位置参数必须恰好一个」处即拒,
-    /// 未知子命令直接回 usage。
+    /// 探针只指向上游真实存在的命令面:四段式子命令(register/recheck/bake/new)
+    /// 无参即在各自参数校验处被拒,四条组级探针(vps/key/subscription/tag)
+    /// 无子命令即在组分派处被拒——都不落文件、不读 stdin、不回显本体。
     pub fn probe_args(self) -> Vec<String> {
         match self {
             Capability::SourceRegister => vec!["source".into(), "register".into()],
             Capability::SourceRecheck => vec!["source".into(), "recheck".into()],
             Capability::RecipeBake => vec!["recipe".into(), "bake".into()],
             Capability::RecipeNew => vec!["recipe".into(), "new".into()],
-            Capability::Category => vec!["category".into()],
             Capability::Vps => vec!["vps".into()],
+            Capability::Key => vec!["key".into()],
+            Capability::Subscription => vec!["subscription".into()],
+            Capability::Tag => vec!["tag".into()],
         }
     }
 
@@ -175,9 +213,11 @@ mod tests {
 
     #[tokio::test]
     async fn 探针回未知子命令_stderr_判缺能力() {
-        // 所配 0.1.0 对 `nw category` 的真实回放:rc 3、stdout 空、
-        // stderr 人话「未知子命令」—— 引擎没有这个能力。
-        let out = out_for(&["category"], 3, "", &["nw: 未知子命令 \"category\""]).await;
+        // 老引擎(没有 key 命令组)对 `nw key` 的回放形态:rc 3、stdout 空、
+        // stderr 人话「未知子命令」—— 引擎没有这个能力,入口禁用。
+        // (#63 删掉的「类别」探针正是这一形态:上游 `cli.go` 的 Run switch
+        //  里没有 category 分支,走 default 回同一句话,所以那一行永远关着。)
+        let out = out_for(&["key"], 3, "", &["nw: 未知子命令 \"key\""]).await;
         assert_eq!(interpret(&out), Probe::Unavailable);
     }
 
@@ -194,14 +234,53 @@ mod tests {
         assert_eq!(interpret(&blank), Probe::Unknown);
     }
 
+    #[tokio::test]
+    async fn 组级探针无子命令即拒_回_envelope_判可用() {
+        // 所配 0.1.0 对 `nw key`(无子命令)的真实回放:rc 3 +
+        // nw/key-register.v1 envelope —— 命令组在,且不落文件、不读 stdin
+        // (entry.RunGroup 只把分派结果收进内存缓冲再出口)。
+        let out = out_for(
+            &["key"],
+            3,
+            r#"{"schema":"nw/key-register.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"key 下需要子命令 register / ls / get / rm"}],"warnings":[],"data":{}}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(interpret(&out), Probe::Available);
+        // 三条组级探针各问各的,互不复用结论
+        for cap in [Capability::Key, Capability::Subscription, Capability::Tag] {
+            assert_eq!(cap.probe_args().len(), 1, "{cap:?} 是组级探针");
+            assert_eq!(
+                Capability::from_probe(&cap.probe_args()),
+                Some(cap),
+                "{cap:?} 探针认得出自己"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 组内未知子命令_不误判成缺能力() {
+        // 上游各组自己的未知子命令话术是「未知 key 子命令 %q」,**不含**
+        // 「未知子命令」这个连续子串 —— 「组在、子命令拼错」不会被 interpret()
+        // 误判成缺能力(判据不用为组级探针放宽)。
+        let out = out_for(
+            &["key"],
+            3,
+            r#"{"schema":"nw/key-register.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[],"data":{}}"#,
+            &["nw key: 未知 key 子命令 \"regsiter\""],
+        )
+        .await;
+        assert_eq!(interpret(&out), Probe::Available);
+    }
+
     #[test]
     fn 未探测默认未决_只有明确可用才开门() {
         let gate = Gate::default();
-        assert_eq!(gate.get(Capability::Category), Probe::Unknown);
-        assert!(!gate.enabled(Capability::Category), "未决不放行");
+        assert_eq!(gate.get(Capability::Tag), Probe::Unknown);
+        assert!(!gate.enabled(Capability::Tag), "未决不放行");
         let mut g = Gate::default();
-        g.record(Capability::Category, Probe::Unavailable);
-        assert!(!g.enabled(Capability::Category), "禁用不放行");
+        g.record(Capability::Tag, Probe::Unavailable);
+        assert!(!g.enabled(Capability::Tag), "禁用不放行");
         g.record(Capability::SourceRegister, Probe::Available);
         assert!(g.enabled(Capability::SourceRegister), "明确可用才放行");
     }
@@ -226,8 +305,11 @@ mod tests {
         ];
         assert_eq!(Capability::from_probe(&real), None);
         // 别的能力的探针也不互认
-        let cat: Vec<String> = vec!["category".into()];
-        assert_eq!(Capability::from_probe(&cat), Some(Capability::Category));
+        let tag: Vec<String> = vec!["tag".into()];
+        assert_eq!(Capability::from_probe(&tag), Some(Capability::Tag));
+        // 组级探针不带子命令:真实的 `nw tag add <标签>` 不是探针
+        let real_tag: Vec<String> = vec!["tag".into(), "add".into(), "pi".into()];
+        assert_eq!(Capability::from_probe(&real_tag), None);
     }
 
     #[test]
@@ -248,6 +330,41 @@ mod tests {
             Capability::RecipeNew.probe_args(),
             Capability::RecipeBake.probe_args()
         );
+    }
+
+    #[test]
+    fn 入口清单八项_顺序即设置屏显示顺序() {
+        // #63:入口清单由面板定义、可用性由引擎决定。清单形态钉死:去掉指向上游
+        // 不存在子命令的「类别」,补 key / 订阅 / 标签 三条组级探针,共八项。
+        let labels: Vec<&str> = Capability::ALL.into_iter().map(|c| c.label()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "外部源登记",
+                "外部源复核",
+                "配方烘焙",
+                "配方新建",
+                "vps",
+                "key",
+                "订阅",
+                "标签",
+            ]
+        );
+        // 每一项的探针都指着上游真实存在的命令面,且两两不重复
+        let mut probes: Vec<Vec<String>> = Capability::ALL
+            .into_iter()
+            .map(|c| c.probe_args())
+            .collect();
+        for p in &probes {
+            assert!(!p.is_empty(), "探针不许空");
+            assert!(
+                p.iter().all(|a| !a.starts_with('-')),
+                "探针只给命令面,不带旗标:{p:?}"
+            );
+        }
+        probes.sort();
+        probes.dedup();
+        assert_eq!(probes.len(), Capability::ALL.len(), "探针两两不重复");
     }
 
     #[test]

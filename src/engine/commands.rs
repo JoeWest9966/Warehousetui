@@ -650,7 +650,9 @@ mod tests {
         );
         assert!(
             !a.iter().any(|s| s == "--category"),
-            "类别输入不给(所配引擎无该能力,记录落未分类)"
+            "类别输入不给:--category 是 0.1.0 就有的 source register 可重复旗标,\
+             不是引擎能力缺口;要不要给类别输入是产品范围问题(ADR-0006),\
+             理由不能写成「引擎没这个能力」"
         );
         // 预审与落账只差确认闸一枚棋:同根、同链、不同后果
         let p = source_register_preaudit("owner/repo", "skill", "/data/root");

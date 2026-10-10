@@ -866,10 +866,10 @@ async fn 喂入内容不经运行器进入日志或渲染或配置_机密本体�
 #[test]
 fn 设置屏能力清单_缺能力禁用并指路_紧凑态不截断() {
     use crate::engine::{Capability, FakeRunner, Probe};
-    let runner = FakeRunner::with_stderr(&[("category", 3, "", "nw: 未知子命令 \"category\"")]);
+    // 老引擎(没有 tag 命令组)对 `nw tag` 的回放:stderr 人话「未知子命令」
+    let runner = FakeRunner::with_stderr(&[("tag", 3, "", "nw: 未知子命令 \"tag\"")]);
     let mut app = App::with_runner(std::sync::Arc::new(runner));
-    app.capabilities
-        .record(Capability::Category, Probe::Unavailable);
+    app.capabilities.record(Capability::Tag, Probe::Unavailable);
     app.capabilities.record(Capability::Vps, Probe::Unavailable);
     app.capabilities
         .record(Capability::SourceRegister, Probe::Available);
@@ -878,7 +878,7 @@ fn 设置屏能力清单_缺能力禁用并指路_紧凑态不截断() {
     app.screen = Screen::Settings;
     // 常畅态:禁用组 + 指路句都在
     let s = draw(&app, 110, 30);
-    assert!(s.contains("入口禁用:类别、vps"), "禁用组可见:{s}");
+    assert!(s.contains("入口禁用:vps、标签"), "禁用组可见:{s}");
     assert!(s.contains("缺的是引擎能力,不是面板坏了"), "指路句可见:{s}");
     assert!(s.contains("✓外部源登记"), "齐备能力可见:{s}");
     // 紧凑态 66×50(保证最小):能力行渲染不炸、禁用组可见
@@ -896,7 +896,7 @@ fn 设置屏能力清单_recipe_new_与烘焙同组不同项_紧凑态不截断(
     for cap in Capability::ALL {
         app.capabilities.record(cap, Probe::Available);
     }
-    // 常畅态:六项能力一排,recipe new 与 bake 并列(同组不同项)
+    // 常畅态:八项能力一排(顺序 = 入口清单),recipe new 与 bake 并列(同组不同项)
     let s = crate::testutil::frame_display(&app, 110, 30);
     assert!(s.contains("✓配方烘焙"), "烘焙能力在场:{s}");
     assert!(s.contains("✓配方新建"), "新建能力在场:{s}");
@@ -913,13 +913,18 @@ fn 设置屏能力清单_recipe_new_与烘焙同组不同项_紧凑态不截断(
         );
     }
     assert!(c.contains("配方新建"), "紧凑态新建能力可见:{c}");
+    assert!(c.contains("标签"), "紧凑态标签能力可见:{c}");
+    // 八项入口一个不少:紧凑态 64 列放不下一行时按显示宽度折行,但不许丢入口
+    for cap in Capability::ALL {
+        assert!(c.contains(cap.label()), "紧凑态 {cap:?} 入口不许被折掉:{c}");
+    }
 }
 
 #[test]
 fn 设置屏能力_无响应回未决不冒充禁用() {
     use crate::engine::{Capability, FakeRunner, Probe};
     // found=true 但探针无回答:空 stdout、无「未知子命令」——归未决
-    let runner = FakeRunner::with_stderr(&[("category", -1, "", "")]);
+    let runner = FakeRunner::with_stderr(&[("tag", -1, "", "")]);
     let mut app = App::with_runner(std::sync::Arc::new(runner));
     for cap in Capability::ALL {
         app.capabilities.record(cap, Probe::Unknown);

@@ -196,8 +196,9 @@ pub enum RegState {
     Done,
 }
 
-/// 登记类别二选一(引擎 `--kind` 槽位;所配 0.1.0 无 category,记录
-/// 落「未分类」——类别输入一律不给,spec #25)。
+/// 登记类别二选一(引擎 `--kind` 槽位;`--category` 是 0.1.0 就有的
+/// `source register` 可重复旗标,不是能力缺口——要不要给类别输入是产品
+/// 范围问题(ADR-0006),不是引擎有没有的问题;类别输入一律不给,spec #25)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegKind {
     Skill,
@@ -3252,16 +3253,11 @@ mod tests {
 
     // ---- #29 能力探测门(App 行为缝:探针下发 / 三路回音 / 入口门 / 指路) ----
 
-    /// 缺能力夹具:category/vps 按 0.1.0 实证形态回放(空 stdout + rc 3 +
+    /// 缺能力夹具:tag/vps 按 0.1.0 实证形态回放(空 stdout + rc 3 +
     /// stderr 人话「未知子命令」),source register/recheck 回 envelope(存在)。
     fn missing_caps_runner() -> FakeRunner {
         FakeRunner::with_stderr(&[
-            (
-                "category",
-                3,
-                "",
-                "nw: 未知子命令 \"category\"\n用法见 stderr",
-            ),
+            ("tag", 3, "", "nw: 未知子命令 \"tag\"\n用法见 stderr"),
             ("vps", 3, "", "nw: 未知子命令 \"vps\""),
             (
                 "source register",
@@ -3288,9 +3284,9 @@ mod tests {
     fn capable_runner() -> FakeRunner {
         FakeRunner::with_stderr(&[
             (
-                "category",
+                "tag",
                 0,
-                r#"{"schema":"nw/category.v1","nw":"0.2.0","ok":true,"errors":[],"warnings":[],"data":{"categories":[]}}"#,
+                r#"{"schema":"nw/tag-add.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{}}"#,
                 "",
             ),
             (
@@ -3365,8 +3361,8 @@ mod tests {
         let mut app = App::with_runner(Arc::new(missing_caps_runner()));
         let (tx, mut rx) = mpsc::unbounded_channel();
         feed_bootstrap(&mut app, &tx, &mut rx);
-        // 实证锚点:0.1.0 无 category/vps,这两个入口一律不呈现为可用
-        assert!(!app.entry_enabled(Capability::Category));
+        // 实证锚点:0.1.0 无 tag/vps 两个命令组,这两个入口一律不呈现为可用
+        assert!(!app.entry_enabled(Capability::Tag));
         assert!(!app.entry_enabled(Capability::Vps));
         // 能力齐备的两个:入口正常呈现
         assert!(app.entry_enabled(Capability::SourceRegister));
@@ -3375,7 +3371,7 @@ mod tests {
         app.splash = false;
         app.screen = Screen::Settings;
         let s = crate::testutil::frame_display(&app, 110, 30);
-        assert!(s.contains("入口禁用:类别、vps"), "缺能力入口禁用可见:{s}");
+        assert!(s.contains("入口禁用:vps、标签"), "缺能力入口禁用可见:{s}");
         assert!(
             s.contains(crate::engine::GATE_HINT),
             "指路文案可见(缺的是引擎能力,不是面板坏了)"
@@ -3393,7 +3389,7 @@ mod tests {
         app2.screen = Screen::Settings;
         let s2 = crate::testutil::frame_display(&app2, 110, 30);
         assert!(!s2.contains("入口禁用"), "齐备时无禁用组:{s2}");
-        assert!(s2.contains("✓类别"), "齐备时类别入口呈现为可用");
+        assert!(s2.contains("✓标签"), "齐备时标签入口呈现为可用");
     }
 
     #[tokio::test]
