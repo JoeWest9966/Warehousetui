@@ -27,8 +27,9 @@ pub enum Screen {
     Health,
     Recipes,
     /// 编目册屏(#53):vps 登记册端到端(登记两段式 + ls 投影 + rm 确认)。
-    /// 第一本编目册;后三本(key / subscription / tag)只换数据源与
-    /// 登记规格,不换屏与骨架(`screens::catalog`)。
+    /// 第一本编目册;#54 起屏内可换册(机器 / 标签,`m` 键)——后两本
+    /// (key / subscription)只换数据源与登记规格,不换屏与骨架
+    /// (`screens::catalog`)。
     Vps,
     Settings,
 }
@@ -326,6 +327,32 @@ pub struct App {
     pub vps_rm_confirm: bool,
     /// 最近一次 `vps rm` 回音(证据五字段原样呈现)。
     pub vps_rm_result: Option<EngineOutput>,
+    /// 编目册屏当前翻开哪一本(#54:`m` 换册)。屏只有一块,册子是屏内
+    /// 维度——理由见 `screens::catalog::CatalogKind`。
+    pub catalog_kind: crate::screens::CatalogKind,
+    /// 标签册的登记流(#54):复用骨架件 [`crate::screens::RegisterFlow`],
+    /// 但 tag add 没有 `--yes`,只走 Form → Commit → Done/Review
+    /// (没有「文件不落」的预审段,见 `screens::catalog::TagSpec`)。
+    pub tag_flow: crate::screens::RegisterFlow,
+    /// 标签册表单(标签名 + 若干条 `kind/条目` 引用);挂标签与摘引用/删
+    /// 标签共用,用途由 `mode` 分。
+    pub tag_form: crate::screens::TagForm,
+    /// 最近一次 `nw tag ls` 回音(#54 反查,本票主价值)。只由刚下发那一次
+    /// 写入,面板不缓存、不轮询、不冒充「上次结果」。
+    pub tag_ls_echo: Option<EngineOutput>,
+    /// 反查在途(不拿上一轮结论冒充本次)。
+    pub tag_ls_loading: bool,
+    /// 最近一次反查问的是哪一条(由回音 argv 推导:`None` = 列全部)。
+    /// 只为把「列全部 / 只列一个」这档差别显式画出来——操作者看得见自己
+    /// 问的是什么,不靠记性。
+    pub tag_lookup: Option<String>,
+    /// 标签册选中行(↑/↓ 与鼠标点行同源)。
+    pub tag_sel: usize,
+    /// 摘引用 / 删标签确认浮层(ADR-0009 §2:上游 rm 没有 `--yes`,面板加
+    /// 一道图形确认)。
+    pub tag_rm_confirm: bool,
+    /// 最近一次 `nw tag rm` 回音(证据五字段原样呈现)。
+    pub tag_rm_result: Option<EngineOutput>,
     /// 配方域建议命令的只读选中态(#39,键 `c`):命令可见可取用,
     /// 但面板**不执行**它(ADR-0003:执行权留给操作者)。选中行/切域即复位。
     pub rc_bake_sel: bool,
@@ -457,6 +484,15 @@ impl App {
             vps_sel: 0,
             vps_rm_confirm: false,
             vps_rm_result: None,
+            catalog_kind: crate::screens::CatalogKind::Vps,
+            tag_flow: crate::screens::RegisterFlow::new(),
+            tag_form: crate::screens::new_tag_form(crate::screens::TagFormMode::Add),
+            tag_ls_echo: None,
+            tag_ls_loading: false,
+            tag_lookup: None,
+            tag_sel: 0,
+            tag_rm_confirm: false,
+            tag_rm_result: None,
             rc_bake_sel: false,
             rc_filter: String::new(),
             rc_filter_on: false,
@@ -528,6 +564,17 @@ impl App {
                     self.vps_ls_loading = true;
                 }
                 Some("register") if args.iter().any(|a| a == "--yes") => {
+                    self.assembling = true;
+                }
+                _ => {}
+            },
+            // 标签册(#54):ls 反查只读在途;add 没有 `--yes`,那一条 argv
+            // 本身就是写命令,点亮写互斥;rm 同 vps rm(面板确认后才到这儿)。
+            Some("tag") => match args.get(1).map(String::as_str) {
+                Some("ls") => {
+                    self.tag_ls_loading = true;
+                }
+                Some("add") => {
                     self.assembling = true;
                 }
                 _ => {}
@@ -605,6 +652,10 @@ impl App {
                     Screen::Assemble => self.as_sel = i,
                     Screen::Health => self.hl_sel = i,
                     Screen::Recipes => self.rc_sel = i,
+                    // 编目册:点行选中按当前是哪一本走(#54)
+                    Screen::Vps if self.catalog_kind == catalog::CatalogKind::Tag => {
+                        self.tag_sel = i.min(self.tag_len().saturating_sub(1));
+                    }
                     Screen::Vps => self.vps_sel = i.min(self.vps_len().saturating_sub(1)),
                     Screen::Settings => {}
                 }
@@ -667,8 +718,15 @@ impl App {
                 (&mut self.rc_sel, n)
             }
             Screen::Vps => {
-                let n = self.vps_len();
-                (&mut self.vps_sel, n)
+                // 编目册选中行按当前是哪一本走(#54:两本各有自己的投影
+                // 与选中态,换册不串味)。
+                if self.catalog_kind == catalog::CatalogKind::Tag {
+                    let n = self.tag_len();
+                    (&mut self.tag_sel, n)
+                } else {
+                    let n = self.vps_len();
+                    (&mut self.vps_sel, n)
+                }
             }
             Screen::Settings => return, // 设置屏无可滚列表
         };
@@ -708,9 +766,14 @@ impl App {
         } else if self.vps_rm_confirm {
             self.vps_rm_confirm = false;
             self.push_log("删除已取消:vps.json 一个字节都没动");
+        } else if self.tag_rm_confirm {
+            self.tag_rm_confirm = false;
+            self.push_log("删除已取消:tags.json 一个字节都没动");
         } else if self.vps_flow.phase != catalog::RegPhase::Idle {
             // 编目册登记返航与 Esc 完全同路(骨架件同一语义)
             self.cancel_vps_register();
+        } else if self.tag_flow.phase != catalog::RegPhase::Idle {
+            self.cancel_tag_flow();
         }
     }
 
@@ -852,6 +915,9 @@ impl App {
             // 编目册回音(#53):ls 只读 / register 两段式 / rm 带面板确认。
             // 只认真实 argv——精确的无参组级探针仍归下面的能力回音路。
             "vps" if Capability::from_probe(&out.args).is_none() => self.on_vps_echo(out),
+            // 标签册回音(#54):ls 反查两态 / add 无确认闸 / rm 两态。
+            // 只认真实 argv(精确的无参 `tag` 探针仍归能力回音路)。
+            "tag" if Capability::from_probe(&out.args).is_none() => self.on_tag_echo(out),
             // 外部源漂移复核回音(#40):只读,只认真实 argv(带 --root 或
             // --name);精确的无参探针仍归下面的能力回音路。
             "source"
@@ -927,6 +993,17 @@ impl App {
         }
         if self.vps_rm_confirm {
             self.on_key_vps_rm_confirm(k);
+            return;
+        }
+        // 标签册浮层(#54):骨架件同一个 `RegisterFlow`。**rm 确认是嵌套在
+        // 表单流里的一道浮层**(表单 Enter 才出现),所以它比流程态更里层,
+        // 优先受理——否则 Enter 会被表单再收一次,确认框永远点不着。
+        if self.tag_rm_confirm {
+            self.on_key_tag_rm_confirm(k);
+            return;
+        }
+        if self.tag_flow.phase != catalog::RegPhase::Idle {
+            self.on_key_tag_flow(k);
             return;
         }
         // 登记两段式(#30 #31):输入 → 预审 → 确认 → 落账 → 结果,
@@ -1653,8 +1730,43 @@ impl App {
         }
     }
 
-    /// 编目册屏键位:r 登记 / ↑/↓ 选机器 / d 删除(带确认)。
+    /// 编目册屏键位:`m` 换册(机器 / 标签);机器册 r 登记 / ↑/↓ 选 /
+    /// d 删除 / l 重读;标签册 r 挂标签 / d 摘引用删标签 / Enter 反查这一条 /
+    /// l 反查全部(#54)。
     fn key_catalog(&mut self, k: KeyEvent) {
+        if let KeyCode::Char('m') = k.code {
+            self.cycle_catalog_kind();
+            return;
+        }
+        if self.catalog_kind == catalog::CatalogKind::Tag {
+            match k.code {
+                KeyCode::Char('r') if !self.assembling => self.start_tag_add(),
+                KeyCode::Char('d') => self.start_tag_rm(),
+                // 反查这一条(带参 `tag ls <标签>`):本票主价值的第二个态
+                KeyCode::Enter => {
+                    let Some(name) = self.selected_tag_name() else {
+                        self.push_log("反查未下发:没有选中的标签(↑/↓ 先选一行)");
+                        return;
+                    };
+                    self.run_tag_ls(Some(&name));
+                }
+                KeyCode::Down => {
+                    let n = self.tag_len();
+                    if n > 0 {
+                        self.tag_sel = (self.tag_sel + 1) % n;
+                    }
+                }
+                KeyCode::Up => {
+                    let n = self.tag_len();
+                    if n > 0 {
+                        self.tag_sel = (self.tag_sel + n - 1) % n;
+                    }
+                }
+                KeyCode::Char('l') => self.run_tag_ls(None),
+                _ => {}
+            }
+            return;
+        }
         match k.code {
             KeyCode::Char('r') if !self.assembling => self.start_vps_register(),
             KeyCode::Down => {
@@ -1951,6 +2063,421 @@ impl App {
             self.vps_sel = 0;
         } else {
             self.vps_sel = self.vps_sel.min(n - 1);
+        }
+    }
+
+    // ---- 编目册屏·标签册(spec #50 工单 #54,ADR-0009) ----
+
+    /// 当前是哪一本(`m` 换册)。换册只改维度、不清另一本的投影——
+    /// 两本各有自己的账,回来还在(不重跑、不轮询)。
+    pub fn cycle_catalog_kind(&mut self) {
+        self.catalog_kind = self.catalog_kind.next();
+        let k = self.catalog_kind;
+        self.push_log(format!(
+            "换册:{}册({});{}",
+            k.label(),
+            k.file(),
+            if k == catalog::CatalogKind::Tag {
+                "按 l 反查全部标签(只读)"
+            } else {
+                "按 l 重读机器编目(只读)"
+            }
+        ));
+    }
+
+    /// 编目册屏当前这一本的投影(两本各自的数据源汇到同一个
+    /// `CatalogSheet`——列表件只有一份,见 `screens::catalog`)。
+    pub fn catalog_sheet(&self) -> Option<crate::engine::CatalogSheet> {
+        match self.catalog_kind {
+            catalog::CatalogKind::Vps => self.vps_ls.as_ref().map(|d| d.sheet()),
+            catalog::CatalogKind::Tag => self
+                .tag_ls_echo
+                .as_ref()
+                .filter(|o| o.ok)
+                .and_then(|o| o.envelope.as_ref())
+                .and_then(|e| e.data_as::<crate::engine::TagLsData>())
+                .map(|d| d.sheet()),
+        }
+    }
+
+    /// 反查回音的失败态(带参问错了名字 = rc 3 / 回音不可定型)。
+    /// `None` = 没有失败态。**只标签册有这一态**:机器册的 `vps ls` 没有
+    /// 位置参数,失败时只留日志(51 §6.11:两种语义不都画成空列表)。
+    pub fn catalog_ls_error(&self) -> Option<&EngineOutput> {
+        if self.catalog_kind != catalog::CatalogKind::Tag {
+            return None;
+        }
+        let out = self.tag_ls_echo.as_ref()?;
+        let typed = out
+            .envelope
+            .as_ref()
+            .and_then(|e| e.data_as::<crate::engine::TagLsData>());
+        (typed.is_none() || !out.ok).then_some(out)
+    }
+
+    /// 册体首行的口径词:机器册给册名,标签册把「列全部 / 只列一个」
+    /// 这档差别显式画出来(51 §6.11:两种语义不都画成空列表)。
+    pub fn catalog_scope_label(&self) -> String {
+        match self.catalog_kind {
+            catalog::CatalogKind::Vps => "机器".to_string(),
+            catalog::CatalogKind::Tag => match self.tag_lookup.as_deref() {
+                Some(name) => format!("反查 {name}"),
+                None => "全部标签".to_string(),
+            },
+        }
+    }
+
+    /// 编目册当前这一本的选中行(↑/↓ 与鼠标点行同源)。
+    pub fn catalog_sel(&self) -> usize {
+        match self.catalog_kind {
+            catalog::CatalogKind::Vps => self.vps_sel,
+            catalog::CatalogKind::Tag => self.tag_sel,
+        }
+    }
+
+    /// 标签册的行数(反查投影条数;没查到 = 0)。
+    pub fn tag_len(&self) -> usize {
+        self.catalog_sheet().map(|s| s.entries.len()).unwrap_or(0)
+    }
+
+    /// 选中标签的名字(反查这一条 / 摘引用删标签同源)。
+    pub fn selected_tag_name(&self) -> Option<String> {
+        let sheet = self.catalog_sheet()?;
+        sheet
+            .entries
+            .get(self.tag_sel.min(sheet.entries.len().saturating_sub(1)))
+            .map(|e| e.name.clone())
+    }
+
+    /// 标签册入口门(#29 能力门 + #27 数据仓根,与 vps 册同两道、互不冒充)。
+    pub fn tag_entry_enabled(&self) -> bool {
+        self.data_root_cause().is_none() && self.capabilities.enabled(Capability::Tag)
+    }
+
+    /// 入口不可用时的一句指路(与册体提示同源)。
+    pub fn tag_gate_hint(&self) -> String {
+        match self.data_root_cause() {
+            Some(_) => self.data_root_gate_msg(),
+            None => capability::GATE_HINT.to_string(),
+        }
+    }
+
+    /// 标签册选中行钳回可见范围内(反查刷新后旧下标可能越界)。
+    fn clamp_tag_sel(&mut self) {
+        let n = self.tag_len();
+        if n == 0 {
+            self.tag_sel = 0;
+        } else {
+            self.tag_sel = self.tag_sel.min(n - 1);
+        }
+    }
+
+    /// 反查(#54 主价值,只读):不带参列全部标签及各引用,带参只列那一条。
+    /// 编目不存在 = 空数组 rc 0(合法空态);带参查不到 = rc 3(问错了名字)。
+    pub fn run_tag_ls(&mut self, name: Option<&str>) {
+        if !self.tag_entry_enabled() {
+            self.push_log(format!("反查未下发:{}", self.tag_gate_hint()));
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("反查未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        self.tag_ls_loading = true;
+        self.tag_ls_echo = None; // 在途:不拿上一轮结论冒充本次
+        self.tag_lookup = name.map(str::to_string);
+        let argv = match name {
+            Some(n) => commands::tag_ls_one(n, &root),
+            None => commands::tag_ls(&root),
+        };
+        let scope = match name {
+            Some(n) => format!("只列 {n}"),
+            None => "列全部标签".to_string(),
+        };
+        self.queue.push(argv);
+        self.push_log(format!("tag ls 已入队({scope},只读不写任何文件)"));
+    }
+
+    /// 发起挂标签:进表单态(Enter 即下发——上游没有 `--yes`,面板不自己
+    /// 造一道确认,ADR-0009 §2)。
+    pub fn start_tag_add(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:挂标签与装配互斥,稍后再试");
+            return;
+        }
+        if !self.tag_entry_enabled() {
+            self.push_log(format!("挂标签入口不可用:{}", self.tag_gate_hint()));
+            return;
+        }
+        self.tag_rm_confirm = false;
+        self.tag_flow.begin();
+        self.tag_form = catalog::new_tag_form(catalog::TagFormMode::Add);
+        self.push_log("挂标签:填标签名与若干条 kind/条目 引用,Enter 挂上去,Esc/q 返航");
+    }
+
+    /// 发起摘引用 / 删标签:表单预填选中的标签名(引用留空 = 删整个标签)。
+    pub fn start_tag_rm(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:删除与装配互斥,稍后再试");
+            return;
+        }
+        if !self.tag_entry_enabled() {
+            self.push_log(format!("删除未下发:{}", self.tag_gate_hint()));
+            return;
+        }
+        let Some(name) = self.selected_tag_name() else {
+            self.push_log("删除未下发:没有选中的标签(↑/↓ 先选一行)");
+            return;
+        };
+        self.tag_rm_confirm = false;
+        self.tag_flow.begin();
+        self.tag_form = catalog::new_tag_form(catalog::TagFormMode::Rm);
+        self.tag_form.name = name.clone();
+        // 光标落在引用字段:名字已预填,摘引用/删标签的动作全在引用行
+        // (留空 = 删整个标签)。不预填该标签现有的引用——摘哪几条由操作者
+        // 明确点出来,面板不替他决定(全预填 + 一路 Enter = 悄悄摘光)。
+        self.tag_form.field = catalog::TagField::Refs;
+        self.push_log(format!(
+            "摘引用 / 删标签 {name}:引用留空 = 删整个标签,填 kind/条目 = 只摘那几条"
+        ));
+    }
+
+    /// 标签册流程键位(表单 / 写在途 / 结论)。
+    fn on_key_tag_flow(&mut self, k: KeyEvent) {
+        match self.tag_flow.phase {
+            catalog::RegPhase::Form => match catalog::on_key_tag_form(&mut self.tag_form, k) {
+                catalog::FormAction::Submit => self.dispatch_tag_write(),
+                catalog::FormAction::Cancel => self.cancel_tag_flow(),
+                catalog::FormAction::Edited => {}
+            },
+            catalog::RegPhase::Commit => {
+                if matches!(k.code, KeyCode::Esc) {
+                    self.cancel_tag_flow();
+                }
+            }
+            // tag add 没有引擎确认闸,面板也不自己造一道(ADR-0009 §2):
+            // 写已随那一次下发完成,结论屏只有返航,没有「Enter 落账」段。
+            catalog::RegPhase::Review | catalog::RegPhase::Done => {
+                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.cancel_tag_flow();
+                }
+            }
+            catalog::RegPhase::PreAudit | catalog::RegPhase::Idle => {}
+        }
+    }
+
+    /// 下发标签册的写命令:`tag add`(无确认闸,表单 Enter 即下发)或
+    /// `tag rm`(面板加一道图形确认后才到这里)。幂等由**复用同一份 argv**
+    /// 保证——同一条命令重跑,tags.json 一个字节不变。
+    pub fn dispatch_tag_write(&mut self) {
+        if !self.tag_entry_enabled() {
+            self.push_log(format!("未下发:{}", self.tag_gate_hint()));
+            self.cancel_tag_flow();
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("未下发:{}", self.data_root_gate_msg()));
+            self.cancel_tag_flow();
+            return;
+        };
+        let spec = match catalog::spec_from_tag_form(&self.tag_form) {
+            Ok(s) => s,
+            Err(bad) => {
+                // 面板侧就拒(空标签名 / kind 不在已知集合),留表单可改,
+                // 不喂给引擎跑一趟。
+                self.push_log(format!("被拒:{},留表单可改", bad.join(";")));
+                return;
+            }
+        };
+        match self.tag_form.mode {
+            catalog::TagFormMode::Add => {
+                self.tag_flow.commit_sent();
+                self.assembling = true;
+                self.queue.push(spec.commit(&root));
+                self.push_log(format!(
+                    "挂标签已下发:tag add {}(追加合并、幂等,无确认闸;--root {})",
+                    spec.name, root
+                ));
+            }
+            catalog::TagFormMode::Rm => {
+                // 图形确认(ADR-0009 §2):面板只决定「什么时候递出去」,
+                // 下发的 argv 与在 shell 里敲的逐字相同。
+                self.tag_rm_confirm = true;
+                self.push_log(format!("删除确认:{}(Enter 确认,Esc/q 取消)", spec.name));
+            }
+        }
+    }
+
+    /// 摘引用 / 删标签确认键位。
+    fn on_key_tag_rm_confirm(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => self.dispatch_tag_rm(),
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
+            _ => {}
+        }
+    }
+
+    /// 下发 `tag rm`:引用行为空 = 删整个标签,带引用 = 只摘那几条。
+    fn dispatch_tag_rm(&mut self) {
+        let Ok(spec) = catalog::spec_from_tag_form(&self.tag_form) else {
+            self.tag_rm_confirm = false;
+            self.push_log("删除未下发:表单已不可定型(返航后从表单重来)");
+            return;
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("删除未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        self.tag_rm_confirm = false;
+        self.tag_rm_result = None;
+        let refs = spec.refs.len();
+        self.queue
+            .push(commands::tag_rm(&spec.name, &spec.refs, &root));
+        // 表单的使命到此结束(确认即消费):收流并复位,下一趟 `d` 开的是一张
+        // 新表单——否则上一张引用行还摊在那儿,键会继续往里灌。
+        self.tag_flow.abandon();
+        self.tag_form = catalog::new_tag_form(catalog::TagFormMode::Add);
+        let scope = if refs == 0 {
+            "删整个标签".to_string()
+        } else {
+            format!("只摘 {refs} 条引用")
+        };
+        self.push_log(format!(
+            "删除已入队:tag rm {}({scope};--root {})",
+            spec.name, root
+        ));
+    }
+
+    /// 返航:任一态 Esc 同义,状态清空不留半条记录。
+    pub fn cancel_tag_flow(&mut self) {
+        self.tag_flow.abandon();
+        self.tag_rm_confirm = false;
+        self.tag_form = catalog::new_tag_form(catalog::TagFormMode::Add);
+        self.push_log("标签册返航");
+    }
+
+    /// 标签册回音路由(#54):ls 反查两态 / add 无确认闸 / rm 两态。
+    fn on_tag_echo(&mut self, out: EngineOutput) {
+        match out.args.get(1).map(String::as_str) {
+            Some("ls") => {
+                self.tag_ls_loading = false;
+                let asked = out
+                    .args
+                    .iter()
+                    .skip(2)
+                    .find(|a| !a.starts_with("--"))
+                    .cloned();
+                match out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::TagLsData>())
+                {
+                    Some(d) => {
+                        let n = d.tags.len();
+                        if asked.is_some() {
+                            self.tag_lookup = asked.clone();
+                        }
+                        self.tag_ls_echo = Some(out);
+                        self.clamp_tag_sel();
+                        let scope = match asked.as_deref() {
+                            Some(name) => format!("标签 {name}:{n} 条"),
+                            None => format!("全部标签:{n} 条"),
+                        };
+                        self.push_log(format!("反查完成({scope},只读)"));
+                    }
+                    None => {
+                        // 带参问错了名字(rc 3)/ 回音不可定型:留证据,册体
+                        // 不画空列表(51 §6.11)
+                        let h = out.headline().to_string();
+                        self.tag_ls_echo = Some(out);
+                        self.push_log(format!("反查没结果:{h}"));
+                    }
+                }
+            }
+            Some("add") => {
+                self.assembling = false;
+                let echo_ok = out.ok;
+                let typed = out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::TagAddData>());
+                match self.tag_flow.commit_back(out) {
+                    Some(true) => {
+                        let (name, cleaned) = match typed {
+                            Some(ref d) => (d.name.clone(), d.cleaned_count()),
+                            None => (String::new(), 0),
+                        };
+                        let cleaned_line = if cleaned > 0 {
+                            format!(";悬空引用已清 {cleaned} 条(已明示)")
+                        } else {
+                            String::new()
+                        };
+                        self.push_log(format!(
+                            "挂标签完成:{name} 已写入 tags.json(一次 git 变更){cleaned_line}"
+                        ));
+                        self.run_tag_ls(None);
+                    }
+                    Some(false) => {
+                        let h = self
+                            .tag_flow
+                            .result
+                            .as_ref()
+                            .map(|o| o.headline())
+                            .unwrap_or_default();
+                        self.push_log(format!("没挂成:{h}(四道闸有 fail,一个字节都没落)"));
+                    }
+                    None => {
+                        // 在途返航收不回引擎的写:回音报成功则反查刷新并明示
+                        // 「写可能已落盘」(与 vps 登记同一收敛行为)
+                        if echo_ok {
+                            self.run_tag_ls(None);
+                            self.push_log(
+                                "挂标签写盘可能已完成:标签册已刷新,tags.json 走 PR + 家长审复核"
+                                    .to_string(),
+                            );
+                        } else {
+                            self.push_log("挂标签回音已丢弃(流程已返航,写未成功)");
+                        }
+                    }
+                }
+            }
+            Some("rm") => {
+                let typed = out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::TagRmData>());
+                self.tag_rm_result = Some(out);
+                match typed {
+                    Some(d) if d.removed => {
+                        let what = if d.action == "ref_removed" {
+                            format!("已从 {} 摘掉引用(标签还在)", d.name)
+                        } else {
+                            format!("已删除标签 {}", d.name)
+                        };
+                        self.push_log(format!(
+                            "{what}:剩余 {} 个标签(一次 git 变更,走 PR + 家长审)",
+                            d.remaining
+                        ));
+                        self.run_tag_ls(None);
+                    }
+                    Some(d) => {
+                        // 删不存在的标签:rc 3 + 证据五字段 + 文件一个字节不动
+                        self.push_log(format!(
+                            "没删成:{} 不在编目里(action {}),tags.json 一个字节都没动",
+                            d.name, d.action
+                        ));
+                    }
+                    None => {
+                        let h = self
+                            .tag_rm_result
+                            .as_ref()
+                            .map(|o| o.headline())
+                            .unwrap_or_default();
+                        self.push_log(format!("删除结果不可用:{h}"));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4740,6 +5267,7 @@ mod tests {
     #[derive(PartialEq, Debug)]
     struct KeySnap {
         screen: Screen,
+        catalog_kind: crate::screens::CatalogKind,
         ov_sel: usize,
         as_sel: usize,
         as_confirm: bool,
@@ -4772,6 +5300,7 @@ mod tests {
             rc_sel: a.rc_sel,
             rc_bake_sel: a.rc_bake_sel,
             reg_state: a.reg_state,
+            catalog_kind: a.catalog_kind,
             help: a.help,
             quit: a.quit,
             home_input: a.home_input,
@@ -4829,6 +5358,9 @@ mod tests {
             }
             if let Some(m) = row.mode {
                 app.hl_mode = m;
+            }
+            if let Some(b) = row.book {
+                app.catalog_kind = b;
             }
             if row.prep == Prep::HelpOpen {
                 app.help = true;

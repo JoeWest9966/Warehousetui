@@ -210,10 +210,31 @@ fn screen_hits(content: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect,
     }
 }
 
-/// 编目册屏命中区(#53):机器清单整块产行命中(点行 = 选中,同 ↑/↓);
+/// 编目册屏命中区(#53 / #54):清单整块产行命中(点行 = 选中,同 ↑/↓);
 /// 登记浮层与删除确认弹层只产键位行两段(渲染 `catalog::render_catalog`
 /// 同一个 `popup_rect` 基准,弹层优先级高于册体)。
 fn vps_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
+    let kind = app.catalog_kind;
+    // 标签册浮层:rm 确认弹层的键位行两段可点(其余态同手填浮层惰性)
+    if kind == crate::screens::catalog::CatalogKind::Tag {
+        if app.tag_flow.phase != crate::screens::catalog::RegPhase::Idle {
+            return;
+        }
+        if app.tag_rm_confirm {
+            let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
+            if popup.width > 0 && popup.height > 0 {
+                let key_y = popup.y + popup.height - 2;
+                two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
+            }
+            return;
+        }
+        let n = app.tag_len();
+        if n == 0 {
+            return;
+        }
+        push_sheet_rows(inner, n, kind.row_lines(), hits);
+        return;
+    }
     if app.vps_flow.phase != crate::screens::catalog::RegPhase::Idle {
         // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
         if app.vps_flow.phase == crate::screens::catalog::RegPhase::Review && app.vps_can_commit() {
@@ -242,14 +263,19 @@ fn vps_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     if n == 0 {
         return;
     }
-    let rows = inner.height.saturating_sub(2); // 首行编目路径 + 末行键位行
-    let per = 4u16;
+    push_sheet_rows(inner, n, kind.row_lines(), hits);
+}
+
+/// 册体清单的行命中:首行是「当前是哪一本 + 编目路径」,末行是键位行,
+/// 中间每条目占 `per` 行(`CatalogKind::row_lines`,渲染与命中共用)。
+fn push_sheet_rows(inner: Rect, n: usize, per: u16, hits: &mut Vec<(Rect, Target)>) {
+    let rows = inner.height.saturating_sub(2);
+    if rows == 0 || per == 0 {
+        return;
+    }
     let mut y = inner.y + 1;
     for i in 0..n as u16 {
         if y + per > inner.y + inner.height.saturating_sub(1) {
-            break;
-        }
-        if rows == 0 {
             break;
         }
         hits.push((

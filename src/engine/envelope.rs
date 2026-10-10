@@ -571,13 +571,33 @@ pub struct CatalogLogin {
     pub key_ref: String,
 }
 
+/// 编目册的一条**引用**(#54 标签册的槽):`<kind>/<条目>` 拆两半,
+/// kind 的已知集合一处定义在 `engine::commands::TAG_REF_KINDS`
+/// (`{skill, extension, vps}`,上游 `tag/tag.go`)。悬空引用(指向已消失
+/// 条目)由引擎在写操作前静默清掉,上报面是 `data.cleaned`——面板显式
+/// 呈现清了几条,不假装没发生。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CatalogRef {
+    pub kind: String,
+    pub id: String,
+}
+
+impl CatalogRef {
+    /// 展示串:`kind/id`(引擎原文的拼法,面板不另译一个词)。
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.kind, self.id)
+    }
+}
+
 /// 编目册**条目投影**(#53 抽出的骨架第一件):名字 / 若干条地址 /
-/// 端口 / 若干条登录 / 备注。
+/// 端口 / 若干条登录 / 备注 / 若干条引用。
 ///
 /// 字段恒在、不为 null:缺字段由展示层显式「——」(不推导、不补全),
 /// 这一层只负责把引擎原文搬过来。与命令组无关——vps / key /
 /// subscription / tag 四本册子共用这一个投影形状,各写一个薄适配器
-/// (`VpsEntry::view` 是第一个)。
+/// (`VpsEntry::view` 是第一个)。`refs` 是标签册的槽(#54):机器册条目
+/// 恒空数组,标签册条目的地址/端口/登录/备注恒空——**哪本册子填哪几槽
+/// 是固定的**,展示层按在槽里的字段画,不靠猜。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CatalogEntryView {
     pub name: String,
@@ -589,6 +609,8 @@ pub struct CatalogEntryView {
     pub logins: Vec<CatalogLogin>,
     /// 备注;上游 `note` 是唯一 `omitempty` 槽——真「没有就没有」。
     pub note: Option<String>,
+    /// (kind, id) 原样;标签册的槽(一标签挂多条目、跨 kind)。
+    pub refs: Vec<CatalogRef>,
 }
 
 impl CatalogEntryView {
@@ -614,6 +636,18 @@ impl CatalogEntryView {
             .map(|l| format!("{}→{}", l.user, l.key_ref))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// 引用一行:`kind/id` 逐条;空数组给「——」。
+    pub fn ref_line(&self) -> String {
+        if self.refs.is_empty() {
+            return "——".to_string();
+        }
+        self.refs
+            .iter()
+            .map(|r| format!("{}/{}", r.kind, r.id))
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 }
 
@@ -670,6 +704,7 @@ impl VpsEntry {
             port: self.port.map(|p| p.to_string()),
             logins: self.logins.clone(),
             note: self.note.clone(),
+            refs: Vec::new(),
         }
     }
 }
@@ -716,6 +751,7 @@ impl VpsRegisterData {
                 port: self.port.map(|p| p.to_string()),
                 logins: self.logins.clone(),
                 note: self.note.clone(),
+                refs: Vec::new(),
             }],
             gates: self.gates.clone(),
         }
@@ -766,6 +802,121 @@ pub struct VpsRmData {
     #[serde(default)]
     pub remaining: u32,
 }
+
+// ---- tag 组(`nw/tag-*.v1`,编目 `<root>/tags.json`,工单 #54) ----
+
+/// 标签册的一条(反查投影):标签名 + 它挂着的引用。**刻意是投影形状**:
+/// `refs` 是 `{kind, id}` 两槽,没有任何「本体」槽(标签是扁平明文词,
+/// `--ref` 走 argv 不走 stdin,无机密面)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct TagEntry {
+    pub name: String,
+    #[serde(default)]
+    pub refs: Vec<CatalogRef>,
+}
+
+impl TagEntry {
+    /// 薄适配器:标签条目 → 编目册投影(与 `VpsEntry::view` 同形状,
+    /// 只填自己那一槽:引用)。
+    pub fn view(&self) -> CatalogEntryView {
+        CatalogEntryView {
+            name: self.name.clone(),
+            refs: self.refs.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+/// `nw tag ls [<标签>]` 的 data:编目路径 + 标签清单。**两种调用同一形状**
+/// (无参列全部,带参最多一条)——「列全部」与「只列一个」在 argv 上区分,
+/// data 面不另造行类型。
+///
+/// 两态可预测(51 §6.11,面板必须分开呈现):编目不存在 = 空数组 rc 0
+/// (合法空态);带参查不到 = **rc 3**(问错了名字,不是空结果)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct TagLsData {
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub tags: Vec<TagEntry>,
+}
+
+impl TagLsData {
+    /// 反查投影 → 编目册投影(确定性排序后的清单)。
+    pub fn sheet(&self) -> CatalogSheet {
+        CatalogSheet {
+            catalog_path: self.catalog_path.clone(),
+            entries: self.tags.iter().map(TagEntry::view).collect(),
+            gates: Vec::new(),
+        }
+        .sorted()
+    }
+}
+
+/// `nw tag add <标签> --ref …` 的 data。**没有 `--yes`**,所以预审与落账
+/// 在 tag 这边是同一份 argv、同一形状:`written` / `updated` / `action`
+/// 区分「这一次到底写没写」(重跑同一条命令 = `updated` 而字节不变)。
+///
+/// `cleaned` 是**悬空引用清理**:本次落盘前被静默清掉的、指向已消失条目
+/// 的引用。引擎只在 data 里给,面板必须显式呈现清了几条(工单 #54 验收
+/// 第 4 条),不假装没发生。
+#[derive(Clone, Debug, Deserialize)]
+pub struct TagAddData {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub written: bool,
+    #[serde(default)]
+    pub updated: bool,
+    #[serde(default)]
+    pub action: String,
+    /// 这一标签当前的引用清单(追加合并后的结果)。
+    #[serde(default)]
+    pub refs: Vec<CatalogRef>,
+    /// 本次静默清掉的悬空引用(条数 = 界面要明示的那个数)。
+    #[serde(default)]
+    pub cleaned: Vec<CatalogRef>,
+    /// 四道闸,**恒 4 行**:`tag.add.name` / `tag.add.ref-kind` /
+    /// `tag.add.ref-id` / `tag.add.ref-exists`;id 冻结、三态 pass/fail/skip。
+    #[serde(default)]
+    pub gates: Vec<CatalogGate>,
+}
+
+impl TagAddData {
+    /// 登记回音 → 编目册投影(条目 = 这一标签 + 它的引用)。
+    pub fn sheet(&self) -> CatalogSheet {
+        CatalogSheet {
+            catalog_path: self.catalog_path.clone(),
+            entries: vec![CatalogEntryView {
+                name: self.name.clone(),
+                refs: self.refs.clone(),
+                ..Default::default()
+            }],
+            gates: self.gates.clone(),
+        }
+    }
+
+    /// 悬空引用清理了几条(界面明示用,不静默)。
+    pub fn cleaned_count(&self) -> usize {
+        self.cleaned.len()
+    }
+
+    /// 闸里有 fail(引擎铁律:任一不过 = 一个字节都不落)。
+    pub fn has_fail(&self) -> bool {
+        self.gates.iter().any(CatalogGate::is_fail)
+    }
+}
+
+/// `nw tag rm <标签> [--ref …]` 的 data 与 `nw vps rm` **逐字相同**——
+/// 上游 `entry.RmOutcome` 是四组共用的同一个类型(`entry/commands.go`),
+/// 不是两个形状。#53 落地时按第一个命令组命名为 [`VpsRmData`];标签册
+/// 直接复用同一形状,不复制第二份(工单 #54 验收第 5 条)。
+///
+/// `action` 第三态 `ref_removed`(只摘引用,标签还在)/ `not_found`
+/// (什么都没动);删不存在的标签 → rc 3 且文件一个字节都不动。
+pub type TagRmData = VpsRmData;
 
 #[cfg(test)]
 mod tests {
@@ -1154,9 +1305,199 @@ mod tests {
         let e = CatalogEntryView::default();
         assert_eq!(e.addr_line(), "——");
         assert_eq!(e.login_line(), "——");
+        assert_eq!(e.ref_line(), "——");
         // 编目册投影:字段恒在不为 null
         let sheet = CatalogSheet::default();
         assert!(sheet.entries.is_empty() && sheet.gates.is_empty());
         assert!(sheet.catalog_path.is_empty());
+    }
+
+    // ---- #54 标签册:三形状 + 反查两态 + 悬空清理明示 ----
+
+    #[test]
+    fn 解析_tag_ls_data_反查两态同一形状_无参列全部带参最多一条() {
+        // 无参 = 列全部标签及各引用
+        let all = envelope_with_schema(
+            "nw/tag-ls.v1",
+            "0.1.0",
+            json!({
+                "catalogPath": "/data/root/tags.json",
+                "tags": [
+                    {"name": "pi", "refs": [
+                        {"kind": "skill", "id": "deep-research"},
+                        {"kind": "vps", "id": "gate"}
+                    ]},
+                    {"name": "bare", "refs": []}
+                ]
+            }),
+        );
+        let d: TagLsData = all.data_as().unwrap();
+        let sheet = d.sheet();
+        assert_eq!(sheet.entries.len(), 2);
+        // 确定性排序:同一份回音永远同一屏(bare < pi)
+        assert_eq!(sheet.entries[0].name, "bare");
+        assert_eq!(sheet.entries[1].name, "pi");
+        assert_eq!(
+            sheet.entries[1].ref_line(),
+            "skill/deep-research · vps/gate"
+        );
+        assert_eq!(sheet.entries[0].ref_line(), "——", "空引用显式破折号,不补全");
+        // 带参 = 只列那一条(同一 data 形状,最多一条)
+        let one = envelope_with_schema(
+            "nw/tag-ls.v1",
+            "0.1.0",
+            json!({
+                "catalogPath": "/data/root/tags.json",
+                "tags": [{"name": "pi", "refs": [{"kind": "skill", "id": "deep-research"}]}]
+            }),
+        );
+        let d1: TagLsData = one.data_as().unwrap();
+        assert_eq!(d1.sheet().entries.len(), 1, "带参反查最多一条");
+        assert_eq!(d1.sheet().entries[0].name, "pi");
+    }
+
+    #[test]
+    fn 解析_tag_ls_data_编目不存在是空数组不是错误() {
+        // 合法空态:tags.json 不存在 = 空册 rc 0(与「带参查不到 = rc 3」
+        // 是两种语义,面板分开呈现,不都画成空列表)
+        let e = envelope_with_schema(
+            "nw/tag-ls.v1",
+            "0.1.0",
+            json!({"catalogPath": "/data/root/tags.json", "tags": []}),
+        );
+        let d: TagLsData = e.data_as().unwrap();
+        assert!(d.sheet().entries.is_empty());
+    }
+
+    #[test]
+    fn 解析_tag_add_data_四道闸恒四行_悬空清理条数在场() {
+        let e = envelope_with_schema(
+            "nw/tag-add.v1",
+            "0.1.0",
+            json!({
+                "name": "pi",
+                "catalogPath": "/data/root/tags.json",
+                "written": true,
+                "updated": false,
+                "action": "added",
+                "refs": [{"kind": "skill", "id": "deep-research"}],
+                "cleaned": [
+                    {"kind": "extension", "id": "gone-pack"},
+                    {"kind": "vps", "id": "ghost"}
+                ],
+                "gates": [
+                    {"id": "tag.add.name", "status": "pass", "message": "标签认"},
+                    {"id": "tag.add.ref-kind", "status": "pass", "message": "kind 认"},
+                    {"id": "tag.add.ref-id", "status": "pass", "message": "条目认"},
+                    {"id": "tag.add.ref-exists", "status": "pass", "message": "对端编目里有"}
+                ]
+            }),
+        );
+        let d: TagAddData = e.data_as().unwrap();
+        assert_eq!(d.gates.len(), 4, "四道闸恒 4 行");
+        assert_eq!(d.gates[3].id, "tag.add.ref-exists");
+        assert!(!d.has_fail());
+        assert!(d.written && !d.updated, "第一次挂 = 写");
+        // 悬空清理:条数必须能原样数出来(界面明示,不静默)
+        assert_eq!(d.cleaned_count(), 2);
+        assert_eq!(d.cleaned[0].label(), "extension/gone-pack");
+        let sheet = d.sheet();
+        assert_eq!(sheet.entries[0].name, "pi");
+        assert_eq!(sheet.entries[0].ref_line(), "skill/deep-research");
+        assert_eq!(sheet.gates.len(), 4);
+    }
+
+    #[test]
+    fn 解析_tag_add_data_任一闸不过则一个字节都不落() {
+        // 第③道闸(ref-id)不过:引擎不写文件,data 的 written/updated 皆假
+        let e = envelope_with_schema(
+            "nw/tag-add.v1",
+            "0.1.0",
+            json!({
+                "name": "pi",
+                "catalogPath": "/data/root/tags.json",
+                "written": false,
+                "updated": false,
+                "action": "rejected",
+                "refs": [],
+                "cleaned": [],
+                "gates": [
+                    {"id": "tag.add.name", "status": "pass", "message": "标签认"},
+                    {"id": "tag.add.ref-kind", "status": "pass", "message": "kind 认"},
+                    {"id": "tag.add.ref-id", "status": "fail", "message": "条目名为空"},
+                    {"id": "tag.add.ref-exists", "status": "skip", "message": "前面已拒"}
+                ]
+            }),
+        );
+        let d: TagAddData = e.data_as().unwrap();
+        assert!(d.has_fail(), "有 fail 就不得算落账");
+        assert!(!d.written && !d.updated, "一个字节都不落");
+        assert_eq!(d.gates[2].state(), State::Fail);
+        assert_eq!(d.gates[3].state(), State::Skip, "skip = 没跑到这道闸");
+        assert_eq!(d.cleaned_count(), 0, "没落盘就没有悬空清理");
+    }
+
+    #[test]
+    fn 解析_tag_add_data_重跑同一条命令字节不变_幂等() {
+        // 追加合并、幂等:第二次同 argv 回音 updated 而 refs 不变
+        let e = envelope_with_schema(
+            "nw/tag-add.v1",
+            "0.1.0",
+            json!({
+                "name": "pi",
+                "catalogPath": "/data/root/tags.json",
+                "written": false,
+                "updated": true,
+                "action": "unchanged",
+                "refs": [{"kind": "skill", "id": "deep-research"}],
+                "cleaned": [],
+                "gates": [
+                    {"id": "tag.add.name", "status": "pass", "message": ""},
+                    {"id": "tag.add.ref-kind", "status": "pass", "message": ""},
+                    {"id": "tag.add.ref-id", "status": "pass", "message": ""},
+                    {"id": "tag.add.ref-exists", "status": "pass", "message": ""}
+                ]
+            }),
+        );
+        let d: TagAddData = e.data_as().unwrap();
+        assert!(!d.written && d.updated, "重跑 = 不写新字节,只报已合并");
+        assert_eq!(d.sheet().entries[0].refs.len(), 1, "引用不翻倍");
+    }
+
+    #[test]
+    fn 解析_tag_rm_data_两态与删不存在的标签不动文件() {
+        // 带 --ref 只摘引用:标签还在
+        let one = envelope_with_schema(
+            "nw/tag-rm.v1",
+            "0.1.0",
+            json!({
+                "name": "pi",
+                "catalogPath": "/data/root/tags.json",
+                "removed": true,
+                "written": true,
+                "action": "ref_removed",
+                "remaining": 1
+            }),
+        );
+        let d: TagRmData = one.data_as().unwrap();
+        assert_eq!(d.action, "ref_removed", "第三态:只摘引用,标签还在");
+        assert!(d.removed && d.written);
+        // 删不存在的标签:rc 3 + 证据 + 文件一个字节都不动
+        let ghost = envelope_with_schema(
+            "nw/tag-rm.v1",
+            "0.1.0",
+            json!({
+                "name": "ghost",
+                "catalogPath": "/data/root/tags.json",
+                "removed": false,
+                "written": false,
+                "action": "not_found",
+                "remaining": 2
+            }),
+        );
+        let g: TagRmData = ghost.data_as().unwrap();
+        assert_eq!(g.action, "not_found");
+        assert!(!g.removed && !g.written, "文件一个字节都不动");
+        assert_eq!(g.remaining, 2);
     }
 }

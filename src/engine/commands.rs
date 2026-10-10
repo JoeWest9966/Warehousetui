@@ -166,6 +166,80 @@ pub fn vps_rm(name: &str, root: &str) -> Vec<String> {
     ]
 }
 
+// ---- tag 组(工单 #54,ADR-0009 §1:add 代跑无确认闸 / ls 只读 / rm 代跑带面板确认) ----
+
+/// `--ref <kind>/<条目>` 的 kind **已知集合一处定义**(上游 `tag/tag.go`
+/// 的 knownRefKinds):新 kind 随上游加,面板不靠存在性间接放行。
+pub const TAG_REF_KINDS: [&str; 3] = ["skill", "extension", "vps"];
+
+/// 拆一条 `<kind>/<条目>` 引用:两侧都非空、kind 在已知集合内才认。
+/// 面板侧就拒、不喂给引擎猜(引擎第③道闸也拒,但那是引擎的事);
+/// 坏行由调用方留证据、留驻可改。
+pub fn parse_tag_ref(row: &str) -> Option<(String, String)> {
+    let (kind, id) = row.trim().split_once('/')?;
+    let (kind, id) = (kind.trim(), id.trim());
+    if kind.is_empty() || id.is_empty() || !TAG_REF_KINDS.contains(&kind) {
+        return None;
+    }
+    Some((kind.to_string(), id.to_string()))
+}
+
+/// 挂标签(工单 #54,ADR-0009 §1:代跑,**无确认闸**)。形状(上游
+/// `cli.go` `runTagAdd` / `tag/add.go`):
+/// `nw tag add <标签> --ref <kind>/<条目> … [--root <目录>]`。
+///
+/// 上游**没有 `--yes`**:追加合并、幂等,没有「覆盖」可确认。所以本函数
+/// **不产生确认旗标**——面板也不自己造一道(ADR-0009 §2:那会改引擎语义,
+/// 多一枚未知 flag 直接 rc 3)。幂等由面板复用同一份 argv 保证:同一条
+/// 命令重跑,`tags.json` 一个字节不变。
+///
+/// 槽位纪律同 vps 组:只认 `--root <数据仓根>`,**不喂 `--repo`**。
+pub fn tag_add(name: &str, refs: &[(String, String)], root: &str) -> Vec<String> {
+    let mut a = vec!["tag".into(), "add".into(), name.to_string()];
+    for (kind, id) in refs {
+        a.push("--ref".into());
+        a.push(format!("{kind}/{id}"));
+    }
+    a.push("--root".into());
+    a.push(root.to_string());
+    a
+}
+
+/// 反查(工单 #54 的**主价值**,只读):不带参列全部标签及各引用,带参
+/// 只列那一条。形状:`nw tag ls [<标签>] [--root <目录>]`。
+/// 编目不存在 = 空数组 rc 0(合法空态);带参查不到 = **rc 3**(问错了名字,
+/// 不是空结果——两种语义面板分开呈现,不都画成空列表)。
+pub fn tag_ls(root: &str) -> Vec<String> {
+    vec!["tag".into(), "ls".into(), "--root".into(), root.to_string()]
+}
+
+/// 反查一条标签(同 [`tag_ls`],多一个位置参数)。
+pub fn tag_ls_one(name: &str, root: &str) -> Vec<String> {
+    vec![
+        "tag".into(),
+        "ls".into(),
+        name.to_string(),
+        "--root".into(),
+        root.to_string(),
+    ]
+}
+
+/// 摘引用 / 删标签(工单 #54,ADR-0009 §1:代跑,面板加一道图形确认)。
+/// 形状:`nw tag rm <标签> [--ref <kind>/<条目> …] [--root <目录>]`。
+/// 带 `--ref` 只摘那几条引用(标签还在,action `ref_removed`);不带删整个
+/// 标签。上游没有 `--yes`,本函数也不产生确认旗标。删不存在的标签 →
+/// rc 3 且 `tags.json` 一个字节都不动。
+pub fn tag_rm(name: &str, refs: &[(String, String)], root: &str) -> Vec<String> {
+    let mut a = vec!["tag".into(), "rm".into(), name.to_string()];
+    for (kind, id) in refs {
+        a.push("--ref".into());
+        a.push(format!("{kind}/{id}"));
+    }
+    a.push("--root".into());
+    a.push(root.to_string());
+    a
+}
+
 /// 三条前提缺哪一条:两种配方域建议命令(bake / new)共用这一份判定,
 /// 措辞各归各自的 gate enum——判定只有一处,说法不互相冒充。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -580,6 +654,113 @@ mod tests {
                 !a.iter().any(|s| s == "--yes"),
                 "上游 rm 没有确认闸,面板不自己造一枚下发"
             );
+        }
+    }
+
+    // ---- 工单 #54:tag 组(add 无确认闸 / ls 反查 / rm 两态) ----
+
+    #[test]
+    fn tag_ref的kind已知集合一处定义_坏行面板侧就拒() {
+        assert_eq!(TAG_REF_KINDS, ["skill", "extension", "vps"]);
+        // 两侧都非空 + kind 在集合内才认
+        assert_eq!(
+            parse_tag_ref("skill/deep-research"),
+            Some(("skill".to_string(), "deep-research".to_string()))
+        );
+        assert_eq!(
+            parse_tag_ref(" vps / gate "),
+            Some(("vps".to_string(), "gate".to_string())),
+            "两侧空白容忍(面板侧 Trim,不喂给引擎猜)"
+        );
+        for bad in [
+            "skill/",   // 空条目
+            "/gate",    // 空 kind
+            "recipe/x", // kind 不在已知集合
+            "skill",    // 没有分隔
+        ] {
+            assert_eq!(parse_tag_ref(bad), None, "坏行 `{bad}` 应被面板侧拒下");
+        }
+        // 上游口径(`tag/add.go` 第③道闸):**第一个斜杠切 kind**,skill 的 id
+        // 自带斜杠(`<仓库>/<条目>`)——只认第一刀,不是坏行。
+        assert_eq!(
+            parse_tag_ref("skill/o/r/deep-research"),
+            Some(("skill".to_string(), "o/r/deep-research".to_string())),
+            "skill 的 id = <仓库>/<条目>,自带斜杠"
+        );
+    }
+
+    #[test]
+    fn tag_add_无确认闸_同一份argv可重跑_幂等由面板复用保证() {
+        let refs = vec![
+            ("skill".to_string(), "deep-research".to_string()),
+            ("vps".to_string(), "gate".to_string()),
+        ];
+        let a = tag_add("pi", &refs, "/data/root");
+        assert_eq!(
+            a,
+            vec![
+                "tag",
+                "add",
+                "pi",
+                "--ref",
+                "skill/deep-research",
+                "--ref",
+                "vps/gate",
+                "--root",
+                "/data/root"
+            ]
+        );
+        // 铁律:上游没有 --yes,面板**不自己造一枚**(多一枚未知 flag 直接 rc 3)
+        assert!(!a.iter().any(|s| s == "--yes"), "tag add 没有确认闸");
+        assert!(!a.iter().any(|s| s == "--repo"), "tag 组只认 --root");
+        // 幂等:面板复用同一份 argv,重跑字节不变
+        assert_eq!(tag_add("pi", &refs, "/data/root"), a);
+        // 无引用也合法(标签可以先建后挂——追加合并)
+        assert_eq!(
+            tag_add("pi", &[], "/r"),
+            vec!["tag", "add", "pi", "--root", "/r"]
+        );
+    }
+
+    #[test]
+    fn tag_ls两态_无参列全部_带参反查一条() {
+        assert_eq!(
+            tag_ls("/data/root"),
+            vec!["tag", "ls", "--root", "/data/root"]
+        );
+        assert_eq!(
+            tag_ls_one("pi", "/data/root"),
+            vec!["tag", "ls", "pi", "--root", "/data/root"]
+        );
+        // 反查是只读:两个形态都不带任何写旗标
+        for a in [tag_ls("/r"), tag_ls_one("pi", "/r")] {
+            assert!(!a.iter().any(|s| s == "--yes" || s == "--ref"));
+        }
+    }
+
+    #[test]
+    fn tag_rm两态_带ref只摘引用_不带删整个标签() {
+        let refs = vec![("extension".to_string(), "theme-pack".to_string())];
+        assert_eq!(
+            tag_rm("pi", &refs, "/data/root"),
+            vec![
+                "tag",
+                "rm",
+                "pi",
+                "--ref",
+                "extension/theme-pack",
+                "--root",
+                "/data/root"
+            ]
+        );
+        // 不带 --ref = 删整个标签(引用行为空即这一态)
+        assert_eq!(
+            tag_rm("pi", &[], "/data/root"),
+            vec!["tag", "rm", "pi", "--root", "/data/root"]
+        );
+        // 上游 rm 没有 --yes:面板的图形确认是面板侧编排,不下发旗标
+        for a in [tag_rm("pi", &refs, "/r"), tag_rm("pi", &[], "/r")] {
+            assert!(!a.iter().any(|s| s == "--yes"));
         }
     }
 
