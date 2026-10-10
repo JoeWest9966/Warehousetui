@@ -159,7 +159,14 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::raw(" 帮助 "));
     if app.assembling {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled("装配中:动作已锁定", p.dim()));
+        // 中止键只在真有 up 在途时给(#59):登记落账也点这盏灯,但它的
+        // 返航语义归登记流自己,不在这里混成一个键。
+        let hint = if app.as_running {
+            "装配中:x 中止 · 其余动作已锁定"
+        } else {
+            "装配中:动作已锁定"
+        };
+        spans.push(Span::styled(hint, p.dim()));
     } else if app.home_input || app.data_input || app.rc_filter_on {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
@@ -213,6 +220,8 @@ pub(crate) struct HelpRow {
     pub(crate) book: Option<crate::screens::CatalogKind>,
     pub(crate) prep: Prep,
     pub(crate) code: KeyCode,
+    /// 派发前先把 App 布成「有 up 在途」(#59 中止键的受理面前提)。
+    pub(crate) running: bool,
 }
 
 /// 帮助浮层键位对照表(单一真相源):顺序即浮层里的自上而下。
@@ -226,6 +235,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('j'),
     },
@@ -236,6 +246,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Down,
     },
@@ -246,6 +257,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('a'),
     },
@@ -256,6 +268,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
     },
@@ -266,8 +279,20 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+    },
+    HelpRow {
+        key: "x",
+        desc: "装配:中止在途子进程(进程真止,日志不清)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: true,
+        prep: Prep::Shell,
+        code: KeyCode::Char('x'),
     },
     HelpRow {
         key: "m",
@@ -276,6 +301,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('m'),
     },
@@ -286,6 +312,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
     },
@@ -296,6 +323,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: Some(HealthMode::Recheck),
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
     },
@@ -306,6 +334,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: Some(Domain::Recipes),
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('h'),
     },
@@ -316,6 +345,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: Some(Domain::Recipes),
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('c'),
     },
@@ -326,6 +356,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: Some(Domain::Sources),
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
     },
@@ -336,6 +367,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
     },
@@ -346,6 +378,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('d'),
     },
@@ -356,6 +389,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('l'),
     },
@@ -366,6 +400,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('m'),
     },
@@ -376,6 +411,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: Some(crate::screens::CatalogKind::Subscription),
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('g'),
     },
@@ -386,6 +422,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: Some(crate::screens::CatalogKind::Tag),
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
     },
@@ -396,6 +433,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('n'),
     },
@@ -406,6 +444,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('i'),
     },
@@ -416,6 +455,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('d'),
     },
@@ -426,6 +466,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('e'),
     },
@@ -436,6 +477,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('m'),
     },
@@ -446,6 +488,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::HelpOpen,
         code: KeyCode::Esc,
     },
@@ -456,6 +499,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('t'),
     },
@@ -466,6 +510,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('?'),
     },
@@ -476,6 +521,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         domain: None,
         mode: None,
         book: None,
+        running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('q'),
     },
@@ -510,6 +556,19 @@ fn help_lines(p: &crate::theme::Palette) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(Span::styled(
         "  装配幂等可重入,取消安全;失败永远带证据五字段。",
+        p.dim(),
+    )));
+    // 两个取消语义不许混(#59):一个还没下发,一个进程已跑了一半。
+    lines.push(Line::from(Span::styled(
+        "  发射前 Esc 返航 = 还没下发,什么都没发生;",
+        p.dim(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  发射后 x 中止 = 子进程真止,可能停在未收敛中间态 ——",
+        p.dim(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  面板不宣布成功也不假装失败:重跑同一装配命令收敛,doctor 说了算。",
         p.dim(),
     )));
     lines
@@ -716,6 +775,20 @@ mod tests {
         app.assembling = true;
         let s = render_to_string(&app, 100, 30);
         assert!(s.contains("装配中"));
+    }
+
+    #[test]
+    fn 装配态_hud_真有up在途才给中止键提示() {
+        // 中止键只在 up 在途时给(#59):登记落账也点这盏灯,但它的返航语义
+        // 归登记流自己,HUD 不在这里混成一个键。
+        let mut app = ui_app();
+        app.assembling = true;
+        app.as_running = true;
+        let s = render_to_string(&app, 100, 30);
+        assert!(s.contains("x 中止"), "在途要给中止键提示:{s}");
+        app.as_running = false;
+        let s2 = render_to_string(&app, 100, 30);
+        assert!(!s2.contains("x 中止"), "非 up 在途不给中止键提示:{s2}");
     }
 
     #[test]

@@ -290,6 +290,13 @@ pub struct App {
     /// 滚减,钳在 [0, len)。只影响 log_block 取窗,七步判定仍读全量。
     pub as_log_offset: usize,
     pub as_result: Option<EngineOutput>,
+    /// 有一程 `up` 在途(#59):中止键的受理面(只有它在场才受理 `x`),
+    /// 回音到达或中止后即灭。与 `assembling` 分开:后者是全局写互斥,
+    /// 登记落账 / 编目落账也点它,那些流程有自己的返航语义,不归装配中止管。
+    pub as_running: bool,
+    /// 在途那一程是被**中止**掉的(#59):进程可能已写了一半,迟到的回音
+    /// 按它丢弃——不替引擎宣布成功,也不假装失败。下一次 up 下发时清零。
+    pub as_aborted: bool,
 
     // ---- 健康 ----
     pub hl_mode: HealthMode,
@@ -510,6 +517,8 @@ impl App {
             as_log: Vec::new(),
             as_log_offset: 0,
             as_result: None,
+            as_running: false,
+            as_aborted: false,
             hl_mode: HealthMode::Doctor,
             hl_sel: 0,
             hl_result: None,
@@ -630,6 +639,8 @@ impl App {
                 self.as_log.clear();
                 self.as_log_offset = 0; // 新一轮装配从最新一行跟起
                 self.as_result = None;
+                self.as_running = true; // 中止键从此可受理(#59)
+                self.as_aborted = false; // 新一程:旧程的中止标记不赖到它头上
                 self.push_log(format!("装配启动:{}", args.join(" ")));
             }
             Some("ls") => {
@@ -865,6 +876,28 @@ impl App {
         };
     }
 
+    /// 中止在途装配(#59):在途 `nw up` 子进程**真止**(进程级 kill,不等它
+    /// 自己跑完),面板回锁定集选择器态;stderr 日志一行不清(`as_log` /
+    /// `as_log_offset` 原样)——那是操作者判断「停在哪一步」的唯一依据。
+    ///
+    /// 中止之后状态由谁裁决:引擎铁律「清单是唯一提交点、永远最后写」,
+    /// 所以中止可能落在一个**未收敛的中间态**。面板不替引擎宣布成功,也不
+    /// 假装失败,只把两条路指给操作者:① 重跑同一条装配命令即可收敛
+    /// (`up` 幂等);② 收敛与否以健康屏 `doctor` 复核为准。
+    ///
+    /// 与发射前的「返航」是两个语义:返航时命令还没下发,什么都没发生;
+    /// 中止时进程可能已经写了一半。
+    pub fn abort_assembling(&mut self) {
+        self.runner.abort(); // 进程级:真止在途子进程
+        self.assembling = false;
+        self.as_confirm = false;
+        self.as_running = false;
+        self.as_aborted = true; // 迟到的 up 回音按此丢弃
+        self.push_log("装配已中止:在途 nw up 子进程已止(进程级,不等它跑完)");
+        self.push_log("中止可能停在未收敛中间态:面板不宣布成功也不假装失败");
+        self.push_log("重跑同一条装配命令即可收敛(up 幂等);收敛与否以健康屏 doctor 复核为准");
+    }
+
     /// 关闭当前浮层,与键盘 Esc 完全同路:帮助只关灯,发射仪式
     /// 「返航」取消并留日志(鼠标/键盘共用,语义不许漂移)。
     fn dismiss_popup(&mut self) {
@@ -969,7 +1002,18 @@ impl App {
                 }
             }
             "up" => {
+                if self.as_aborted {
+                    // 中止后的迟到回音(#59):这一程是被杀掉的,半途的 stdout
+                    // 不是可信 envelope —— 丢弃,不拿半个结果冒充结论。
+                    // (RealRunner 中止后本就不推回音,这里兜底其它实现。)
+                    // 只裁决这一条回音:assembling / as_running 归中止键自己
+                    // 收敛,这里再动一次可能踩到另一笔在途写。
+                    self.as_aborted = false;
+                    self.push_log("装配回音已丢弃(已中止:半个结果不算结论)");
+                    return;
+                }
                 self.assembling = false;
+                self.as_running = false;
                 let ok = out.ok;
                 self.push_log(format!(
                     "装配结束:{} (rc {})",
@@ -1260,6 +1304,10 @@ impl App {
             KeyCode::Enter if !self.assembling && self.reg_state == RegState::Idle && n > 0 => {
                 self.as_confirm = true
             }
+            // 装配中止(#59):在途才受理,键位取本屏未占用的 `x`。Esc 是
+            // 发射前「返航」的既有语义(还没下发,什么都没发生),两个取消
+            // 不许共用一键——按下去之前操作者就该知道会停的是什么。
+            KeyCode::Char('x') if self.as_running => self.abort_assembling(),
             _ => {}
         }
     }
@@ -3967,6 +4015,152 @@ mod tests {
         assert!(app.as_result.is_some());
     }
 
+    // ---- #59 up 中途取消:进程级中止,日志不清空,收敛路由指给健康屏 ----
+
+    /// 在途 up 的夹具(键位派发前把面板布成「装配跑着」)。
+    fn up_inflight_app() -> (Arc<FakeRunner>, App) {
+        let runner = Arc::new(FakeRunner::new(&[]));
+        let mut app = App::with_runner(runner.clone());
+        app.screen = Screen::Assemble;
+        app.assembling = true;
+        app.as_running = true;
+        app.as_log = vec!["铺骨架…".into(), "落组件…".into()];
+        app.as_log_offset = 1;
+        app.ls = Some(
+            serde_json::from_str::<LsData>(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"9f8e"}]}"#,
+            )
+            .unwrap(),
+        );
+        (runner, app)
+    }
+
+    #[test]
+    fn 中止键_在途子进程真止_面板回选择器态_日志一行不清() {
+        let (runner, mut app) = up_inflight_app();
+        // 在途互斥不变:再按 Enter 不开发射仪式(给忙,不排队)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.as_confirm, "在途时不接第二次发射(互斥语义不变)");
+        app.update(Message::Key(key('x')));
+        assert_eq!(
+            runner.abort_count(),
+            1,
+            "中止确有一次到达运行器(进程级那一枪)"
+        );
+        assert!(!app.assembling, "装配态灯灭");
+        assert!(!app.as_running, "在途标记收敛");
+        assert!(!app.as_confirm, "回选择器态(不是确认态)");
+        assert_eq!(
+            app.as_log,
+            vec!["铺骨架…".to_string(), "落组件…".to_string()],
+            "中止不清空既有 stderr 日志:那是判断停在哪一步的唯一依据"
+        );
+        assert_eq!(app.as_log_offset, 1, "滚轮偏移也不动");
+        assert!(app.as_result.is_none(), "不拿半个结果冒充结论");
+        // 人话:不宣布成功也不假装失败,只指路
+        let said = app.log.join("\n");
+        assert!(said.contains("装配已中止"), "留证据:{said}");
+        assert!(
+            said.contains("不宣布成功也不假装失败"),
+            "中止后状态不归面板裁决:{said}"
+        );
+        assert!(
+            said.contains("重跑同一条装配命令即可收敛") && said.contains("doctor"),
+            "收敛路由:重跑同一条命令 + 健康屏 doctor 复核:{said}"
+        );
+        // 面板真回到选择器态:能重新打开发射仪式(互斥语义不变——忙时不排队,
+        // 中止后不忙了才接)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.as_confirm, "回选择器态后可重新发射");
+    }
+
+    #[test]
+    fn 中止后_迟到的up回音被丢弃_下一程照常入账() {
+        let (_runner, mut app) = up_inflight_app();
+        app.update(Message::Key(key('x')));
+        // 迟到的回音(进程被杀前已产出的半个 envelope):丢弃,不入账
+        let half = EngineOutput {
+            args: vec!["up".into()],
+            exit_code: crate::engine::ExitCode::Ok,
+            ok: true,
+            stderr_tail: vec![],
+            envelope: None,
+            raw_stdout: "{}".into(),
+            parse_error: None,
+        };
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(half))));
+        assert!(app.as_result.is_none(), "半个结果不入账");
+        assert!(!app.assembling, "互斥收敛");
+        assert!(
+            app.log.iter().any(|l| l.contains("已中止")),
+            "丢弃也留证据:{:?}",
+            app.log
+        );
+        // 新一程:经唯一入口下发,旧程的中止标记不赖到它头上
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.spawn_engine(vec!["up".into(), "--lock".into(), "/x.nwlock".into()], &tx);
+        assert!(app.as_running && !app.as_aborted, "新一程重新在途");
+        let done = EngineOutput {
+            args: vec!["up".into(), "--lock".into(), "/x.nwlock".into()],
+            exit_code: crate::engine::ExitCode::Ok,
+            ok: true,
+            stderr_tail: vec![],
+            envelope: None,
+            raw_stdout: "{}".into(),
+            parse_error: None,
+        };
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(done))));
+        assert!(app.as_result.is_some(), "新一程的回音照常入账");
+    }
+
+    #[test]
+    fn 发射前返航_与_发射后中止_两个语义不混() {
+        let runner = Arc::new(FakeRunner::new(&[]));
+        let mut app = App::with_runner(runner.clone());
+        app.screen = Screen::Assemble;
+        // 发射前返航:命令还没下发,什么都没发生 —— 不碰运行器
+        app.as_confirm = true;
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.as_confirm, "返航关仪式");
+        assert_eq!(runner.abort_count(), 0, "返航不中止任何进程(还没下发)");
+        assert!(
+            app.log.iter().any(|l| l.contains("发射取消")),
+            "返航留自己的话:{:?}",
+            app.log
+        );
+        // 发射后中止:在途子进程真止
+        app.assembling = true;
+        app.as_running = true;
+        app.update(Message::Key(key('x')));
+        assert_eq!(runner.abort_count(), 1, "中止才动进程");
+        assert!(
+            app.log.iter().any(|l| l.contains("装配已中止")),
+            "中止留自己的话:{:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn 中止键_只认up在途_不误杀登记落账() {
+        // 登记落账也点 assembling 灯,但它的返航语义归登记流自己:x 不越界
+        let runner = Arc::new(FakeRunner::new(&[]));
+        let mut app = App::with_runner(runner.clone());
+        app.assembling = true;
+        app.reg_state = RegState::Commit;
+        app.update(Message::Key(key('x')));
+        assert_eq!(runner.abort_count(), 0, "没有 up 在途:一枪都不放");
+        assert!(app.assembling, "登记落账的互斥不被装配中止键关掉");
+    }
+
     // ---- #9 NW_HOME 手填输入(App 行为缝) ----
 
     /// 摸进程环境/配置文件的测试串行化,免得并行互相踩。
@@ -6276,6 +6470,11 @@ mod tests {
             }
             if let Some(b) = row.book {
                 app.catalog_kind = b;
+            }
+            if row.running {
+                // 中止键的受理面前提:有 up 在途
+                app.assembling = true;
+                app.as_running = true;
             }
             if row.prep == Prep::HelpOpen {
                 app.help = true;

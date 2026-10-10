@@ -98,6 +98,21 @@ fn 装配屏运行中七步与日志() {
     );
 }
 
+/// 装配在途两档都给中止键提示(#59):日志窗Pane 标题带着 `x`,操作者翻日志的
+/// 视线不用离开窗Pane 去找键。
+#[test]
+fn 装配中_日志窗给中止键提示_两档都在() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_running = true;
+    app.as_log = vec!["铺骨架…".into()];
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(s.contains("x 中止"), "{w}×{h} 在途给中止键提示:{s}");
+    }
+}
+
 #[test]
 fn 健康屏_doctor_七面与横幅() {
     let mut app = fake_app();

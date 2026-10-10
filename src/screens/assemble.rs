@@ -131,8 +131,16 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
             Line::from("  Enter   发射仪式(先看清单再上车)"),
             Line::from("  ↑/↓     选锁定集"),
             Line::from(""),
+            // 两个取消语义分开说(#59):返航在发射前(还没下发,什么都没发生),
+            // 中止在发射后(在途子进程真止,可能已写了一半)——不共用一键,
+            // 也不共用一句话;收敛路由指「重跑同一条命令」+ 健康屏 doctor。
+            Line::from(Span::styled("  Esc 返航 = 还没下发,什么都没发生;", p.dim())),
             Line::from(Span::styled(
-                "up 幂等可重入;取消安全,重跑同一命令继续。",
+                "  x 中止 = 在途子进程真止,可能写了一半;",
+                p.dim(),
+            )),
+            Line::from(Span::styled(
+                "  up 幂等:重跑同一命令收敛,doctor 说了算。",
                 p.dim(),
             )),
         ])
@@ -294,7 +302,9 @@ fn log_block(app: &App, p: &crate::theme::Palette, height: u16) -> Paragraph<'st
     Paragraph::new(log).block(
         Block::bordered()
             .border_style(p.dim())
-            .title(Span::styled(" stderr 实时日志 ", p.dim())),
+            // 中止键(#59)跟着日志窗Pane走:两档共用这一处,操作者翻日志的
+            // 视线不用离开窗Pane去找键。
+            .title(Span::styled(" stderr 实时日志 · x 中止 ", p.dim())),
     )
 }
 

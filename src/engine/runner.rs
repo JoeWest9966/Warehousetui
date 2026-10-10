@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, oneshot};
 
 use super::envelope::{Envelope, Evidence};
 use super::ExitCode;
@@ -121,12 +122,24 @@ impl EngineOutput {
 ///
 /// 「stdin 是终端会一直挂住等人敲」由**引擎侧**拦(上游 `--token-stdin` 的
 /// TTY 闸),面板只经管道喂入、永不复刻那道判定。
+///
+/// # 在途中止(#59)
+///
+/// `spawn` 把子进程真正跑起来之后,运行器要还能被叫停:装配屏的中止键经
+/// [`CommandRunner::abort`] 走这一路。`abort(&self)` 是**同步**方法(面板
+/// 键位处理器是同步的),trait 因此保持 object-safe(`Arc<dyn CommandRunner>`
+/// 照样注入 App)。默认空操作 = 「没有在途可止」;`RealRunner` 真杀,
+/// `FakeRunner` 记账(测试据此守「中止确有一次到达运行器」)。
 pub trait CommandRunner: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     fn run(&self, args: &[String]) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>>;
 
     fn spawn(&self, args: Vec<String>, tx: mpsc::UnboundedSender<EngineEvent>);
+
+    /// 中止在途子进程(#59):`spawn` 起来的那一程真止(SIGKILL,不等它跑完)。
+    /// 没有在途子进程时是空操作。只杀**在途**的,不记历史、不预留将来。
+    fn abort(&self) {}
 
     /// stdin 喂入路径(一次性执行):把 `stdin` 原样写进子进程 stdin 后立即 drop。
     /// `stdin` 是本体字节(密钥 / 订阅链接),绝不进返回的 `EngineOutput`。
@@ -145,14 +158,35 @@ pub trait CommandRunner: Send + Sync + 'static {
     );
 }
 
+/// 在途子进程的中止把手槽(#59):`spawn` 把「可以叫停」这个一次性发送端
+/// 存进来,`abort()` 取走并发送。
+///
+/// 为什么不直接存 `tokio::process::Child`:`Child` 归等待它的那个异步块
+/// 所有(要 `wait_with_output()` 收拢 stdout/stderr 尾巴),槽里抢不走所有权;
+/// 而「叫停」只是一个一次性许可,oneshot 通道足够表达,且让 `abort(&self)`
+/// 保持同步签名。
+type AbortSlot = Arc<Mutex<Option<oneshot::Sender<()>>>>;
+
+/// 从中止槽里取走把手:取走即出槽——叫停只有一次机会,也不留陈旧把手
+/// (否则后来的 `abort()` 会朝一个已关闭的通道空发,面板却报「已中止」)。
+fn take_abort_slot(slot: &AbortSlot) -> Option<oneshot::Sender<()>> {
+    slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// 真实 `nw` runner。
 pub struct RealRunner {
     pub bin: PathBuf,
+    /// 在途子进程的中止把手(#59):有在途才有值,进程终结即出槽。
+    /// 只放最近一个——写盘互斥铁律下同一时刻只有一个写在途( spec #25 )。
+    abort: AbortSlot,
 }
 
 impl RealRunner {
     pub fn new(bin: PathBuf) -> Self {
-        Self { bin }
+        Self {
+            bin,
+            abort: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// 建命令。`feed_stdin = false` 时 stdin 关掉(`Stdio::null()`),与开 stdin
@@ -242,6 +276,12 @@ impl RealRunner {
 
     /// `spawn` 的喂入变体:`stdin = Some(字节)` 时开管道并喂入(写后即关、即弃),
     /// `None` 时不喂入(stdin 关掉,与改动前逐字节一致)。
+    ///
+    /// 中止(#59):把手在**下发前**就进槽——`tokio::spawn` 的任务可能要等一个
+    /// 调度周期才首跑,等它跑起来再登记,这中间的 `abort()` 会叫不到人。任务
+    /// 起来后 `select!` 在「进程自然终结」与「收到中止」之间等:中止 = 真杀
+    /// (`start_kill` 不等确认)+ 收尸(不留 zombie),并**不再推 Finished**
+    /// ——半途的 stdout 不是可信 envelope,结论由面板按「已中止」丢弃。
     fn spawn_fed(
         &self,
         args: Vec<String>,
@@ -249,8 +289,14 @@ impl RealRunner {
         tx: mpsc::UnboundedSender<EngineEvent>,
     ) {
         let bin = self.bin.clone();
+        let abort = self.abort.clone();
+        let (abort_tx, abort_rx) = oneshot::channel::<()>();
+        *abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(abort_tx);
         tokio::spawn(async move {
-            let runner = RealRunner { bin };
+            let runner = RealRunner {
+                bin,
+                abort: abort.clone(),
+            };
             let spawned = if stdin.is_some() {
                 runner.command(&args, true).spawn()
             } else {
@@ -259,6 +305,8 @@ impl RealRunner {
             let mut cmd = match spawned {
                 Ok(c) => c,
                 Err(e) => {
+                    // 没起来成:把手出槽,不留一个叫不到人的陈旧把手
+                    take_abort_slot(&abort);
                     let out = EngineOutput::from_parts(
                         &args,
                         -1,
@@ -282,7 +330,37 @@ impl RealRunner {
             let (collect_tx, mut collect_rx) = mpsc::unbounded_channel::<String>();
             let tx_lines = tx.clone();
             let streamer = child_stderr_lines(cmd.stderr.take(), tx_lines, collect_tx);
-            let output = cmd.wait_with_output().await;
+            // stdout 另起一个读者任务(#59):`wait_with_output` 会连人带管把
+            // `Child` 消耗掉,中止枝就再也借不到 `cmd` 去 `start_kill`。改成
+            // 「读者任务 + `wait()`」两件,`cmd` 全程可借;并发读也保住
+            // 「stdout 大到填满管道也不堵死」的性质。
+            let stdout_reader = cmd.stdout.take().map(|so| {
+                tokio::spawn(async move {
+                    let mut so = so;
+                    let mut buf = Vec::new();
+                    let _ = so.read_to_end(&mut buf).await;
+                    buf
+                })
+            });
+            // 进程自己跑完,或操作者按中止(#59)。中止这一枝:真杀
+            // (`start_kill` 不等确认)+ 收尸,然后就此返回——不推 Finished
+            // (半途的 stdout 不是可信 envelope,面板的中止键已把状态收敛回
+            // 选择器态并留了证据)。
+            let status = tokio::select! {
+                res = cmd.wait() => Some(res),
+                _ = abort_rx => None,
+            };
+            // 把手出槽:这一程已终结(自然或中止),不留陈旧把手
+            take_abort_slot(&abort);
+            let Some(status) = status else {
+                let _ = cmd.start_kill();
+                let _ = cmd.wait().await; // 收尸:不收会留 zombie 到面板退出
+                return; // 已中止:无回音
+            };
+            let stdout = match stdout_reader {
+                Some(h) => h.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
             if let Some(h) = streamer {
                 let _ = h.await;
             }
@@ -294,22 +372,19 @@ impl RealRunner {
             if tail.len() > CAP {
                 tail.drain(0..tail.len() - CAP);
             }
-            let out = match output {
-                Ok(o) => EngineOutput::from_parts(
+            let out = match status {
+                Ok(st) => EngineOutput::from_parts(
                     &args,
-                    o.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                    st.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&stdout).into_owned(),
                     tail,
                 ),
-                Err(e) => {
-                    let out = EngineOutput::from_parts(
-                        &args,
-                        -1,
-                        String::new(),
-                        vec![format!("等待进程结束失败:{e}")],
-                    );
-                    out
-                }
+                Err(e) => EngineOutput::from_parts(
+                    &args,
+                    -1,
+                    String::new(),
+                    vec![format!("等待进程结束失败:{e}")],
+                ),
             };
             let _ = tx.send(EngineEvent::Finished(Box::new(out)));
         });
@@ -344,6 +419,13 @@ impl CommandRunner for RealRunner {
         tx: mpsc::UnboundedSender<EngineEvent>,
     ) {
         self.spawn_fed(args, Some(stdin), tx);
+    }
+
+    fn abort(&self) {
+        // 取走把手即发:没有在途子进程时槽是空的,这一枪是空操作。
+        if let Some(tx) = take_abort_slot(&self.abort) {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -433,6 +515,9 @@ pub struct FakeRunner {
     /// 记录「收到过几次 stdin 喂入」——只记次数,**绝不存内容**(铁律:面板侧不留
     /// 副本)。测试靠它守「喂入确有一次到达运行器」,而内容一个字节都不进结构。
     stdin_feeds: AtomicUsize,
+    /// 记录「收到过几次中止」(#59):只记次数。FakeRunner 没有真进程可杀,
+    /// 用计数表达「中止到过运行器」,让面板侧的中止路可测。
+    aborts: AtomicUsize,
 }
 
 impl FakeRunner {
@@ -454,6 +539,7 @@ impl FakeRunner {
                 })
                 .collect(),
             stdin_feeds: AtomicUsize::new(0),
+            aborts: AtomicUsize::new(0),
         }
     }
 
@@ -478,12 +564,19 @@ impl FakeRunner {
                 })
                 .collect(),
             stdin_feeds: AtomicUsize::new(0),
+            aborts: AtomicUsize::new(0),
         }
     }
 
     /// 测试探针:这条 FakeRunner 累计收到过几次 stdin 喂入(只记次数,**绝不存内容**)。
     pub fn stdin_feed_count(&self) -> usize {
         self.stdin_feeds.load(Ordering::SeqCst)
+    }
+
+    /// 测试探针(#59):累计收到过几次中止。FakeRunner 没有真进程可杀,
+    /// 只记次数——面板的「中止确有一次到达运行器」由此可守。
+    pub fn abort_count(&self) -> usize {
+        self.aborts.load(Ordering::SeqCst)
     }
 
     fn match_for(&self, args: &[String]) -> EngineOutput {
@@ -544,6 +637,11 @@ impl CommandRunner for FakeRunner {
         let mut out = self.match_for(&args);
         out.args = args;
         let _ = tx.send(EngineEvent::Finished(Box::new(out)));
+    }
+
+    fn abort(&self) {
+        // 没有真进程可杀:记「中止到过」即够(面板侧的路由另由 App 的状态机裁决)
+        self.aborts.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -810,5 +908,57 @@ mod tests {
             !format!("{out:?}").contains("secret"),
             "MissingRunner 即弃喂入内容"
         );
+    }
+
+    // ---- #59 在途中止:进程级真止,半途不回音 ----
+
+    #[tokio::test]
+    async fn 真实运行器_abort_真杀在途子进程_且不再推回音() {
+        // 在途 = `sh -c 'sleep 1; touch 记号文件'`:abort 若没真杀,这一程会
+        // 跑完并落下记号文件。两条都断言不到(没有回音、且记号没落下),
+        // 「进程被真杀」才算证明——只断言「没回音」是证明不了杀掉的。
+        let mark = std::env::temp_dir().join(format!("nwt-abort-59-{}", std::process::id()));
+        let _ = std::fs::remove_file(&mark);
+        let r = RealRunner::new(PathBuf::from("sh"));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        r.spawn(
+            vec!["-c".into(), format!("sleep 1; touch {}", mark.display())],
+            tx,
+        );
+        // 没有在途可止时再补一枪也是空操作(不 panic、不误伤后来者)
+        r.abort();
+        r.abort();
+        // 1.5s 窗口内只能是「没回音」(超时或通道关闭),不许出现 Finished
+        let late = tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv()).await;
+        assert!(
+            !matches!(late, Ok(Some(EngineEvent::Finished(_)))),
+            "中止后不再推 Finished:半途的 stdout 不是可信 envelope,得到 {late:?}"
+        );
+        assert!(!mark.exists(), "在途子进程被真杀:跑完才有的记号没落下");
+        let _ = std::fs::remove_file(&mark);
+        // 中止过的运行器还能接着用:新一程照常推回音(槽没被焊死)
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        r.spawn(vec!["--version".into()], tx2);
+        let mut seen = false;
+        while let Some(ev) = rx2.recv().await {
+            if let EngineEvent::Finished(_) = ev {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "中止后重新 spawn 仍推回音");
+    }
+
+    #[tokio::test]
+    async fn fake_runner_abort_只记账_不碰stdin计数() {
+        // FakeRunner 没有真进程可杀,用计数表达「中止到过运行器」——
+        // 面板侧的中止路由此可测;且它不假装推过任何回音。
+        let r = FakeRunner::new(&[("ls", 0, LS_FIXTURE)]);
+        assert_eq!(r.abort_count(), 0, "起初没收到中止");
+        r.abort();
+        assert_eq!(r.abort_count(), 1, "中止一次计一次");
+        r.abort();
+        assert_eq!(r.abort_count(), 2);
+        assert_eq!(r.stdin_feeds.load(Ordering::SeqCst), 0, "与喂入计数不相干");
     }
 }
