@@ -240,6 +240,129 @@ pub fn tag_rm(name: &str, refs: &[(String, String)], root: &str) -> Vec<String> 
     a
 }
 
+// ---- subscription 组(工单 #56,ADR-0009 §1:register 两段式经 stdin / ls 只读 /
+// ---- rm 代跑带面板确认;get 一律只给建议命令) ----
+
+/// 订阅登记·预审段(工单 #56):跑四道闸、拟落账,**文件不落**——铁律是
+/// 不带 `--yes`,本函数连 `--yes` 的位置都没有(与
+/// [`vps_register_preaudit`] 同构,误下发靠类型杜绝)。
+///
+/// 形状(上游 `cli.go` `runSubscriptionRegister`):
+/// `nw subscription register --name <名> --client <应用> --token-stdin [--expires <YYYY-MM-DD>] [--root <目录>]`。
+///
+/// **argv 面没有任何明文链接形参**:链接本体只从 stdin 进(`--token-stdin`
+/// 是「声明从 stdin 进」的开关,不是载荷;误粘的 argv 会进 ps / history)。
+/// 所以这个函数**不收本体参数**——本体由调用方经
+/// [`crate::engine::CommandRunner::spawn_with_stdin`] 喂进去,两者在类型
+/// 层面就是两条路。`expires` 空 = 永不过期(上游闸③认空串),此时**不产生
+/// `--expires` 旗标**。
+///
+/// 槽位纪律同 vps / tag 组:只认 `--root <数据仓根>`,**不喂 `--repo`**。
+pub fn subscription_register_preaudit(
+    name: &str,
+    client: &str,
+    expires: Option<&str>,
+    root: &str,
+) -> Vec<String> {
+    let mut a = vec![
+        "subscription".into(),
+        "register".into(),
+        "--name".into(),
+        name.to_string(),
+        "--client".into(),
+        client.to_string(),
+        "--token-stdin".into(),
+    ];
+    if let Some(e) = expires.filter(|e| !e.trim().is_empty()) {
+        a.push("--expires".into());
+        a.push(e.to_string());
+    }
+    a.push("--root".into());
+    a.push(root.to_string());
+    a
+}
+
+/// 订阅登记·落账段(工单 #56):与预审同参,多一枚 `--yes` 确认闸——引擎才把
+/// `subscriptions.json` 写进数据仓根。**只能由图形确认后的落账转换调用**;
+/// 落账 = 预审 + `--yes`,不另改槽位。链接本体同样只经 stdin 喂入
+/// (喂入是一次性的:预审与落账各喂一次,见 ADR-0009 §3)。
+pub fn subscription_register_commit(
+    name: &str,
+    client: &str,
+    expires: Option<&str>,
+    root: &str,
+) -> Vec<String> {
+    let mut a = subscription_register_preaudit(name, client, expires, root);
+    a.push("--yes".into());
+    a
+}
+
+/// 订阅编目册**只读**投影(工单 #56,ADR-0009 §1 准许代跑):列数据仓根下
+/// `subscriptions.json` 里的订阅。编目不存在 = 空数组 rc 0(合法空态)。
+/// 投影**没有链接槽、不印指纹**;`status` / `daysLeft` 由引擎在读取时按
+/// UTC 现算。只认 `--root <数据仓根>`——**不喂 `--repo`**。
+pub fn subscription_ls(root: &str) -> Vec<String> {
+    vec![
+        "subscription".into(),
+        "ls".into(),
+        "--root".into(),
+        root.to_string(),
+    ]
+}
+
+/// 删一条订阅(工单 #56,ADR-0009 §1:代跑,面板加一道图形确认)。形状:
+/// `nw subscription rm <名> [--root <目录>]`。上游**没有 `--yes`**(点名
+/// 即删),本函数也不产生确认旗标——面板的图形确认是面板侧的编排,不改
+/// 引擎语义。删不存在的名 → rc 3 且文件一个字节都不动。
+pub fn subscription_rm(name: &str, root: &str) -> Vec<String> {
+    vec![
+        "subscription".into(),
+        "rm".into(),
+        name.to_string(),
+        "--root".into(),
+        root.to_string(),
+    ]
+}
+
+/// 算出的**建议命令**:argv(下发形态,面板**不**下发)与给人看的展示串。
+/// bake(#39)/ recipe new(#58)与本条 subscription get 建议命令共用这一个
+/// 形状——argv 与展示串同源同层,`App` 没有任何路径会下发它。
+///
+/// 与 bake / recipe new 的唯一差别:展示串多一段管道(`| jq -r .data.url`)——
+/// 上游不开 `--raw`,要裸链接自己拼管道(ADR-0009 §1:上游的裁法本身就是
+/// 「别让这玩意有个方便的出口」,面板跟着)。argv 仍是一条完整可执行的命令
+/// (不含管道段),旗标一处真相。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggest {
+    /// 完整 argv(含二进制名之后的所有元素)。
+    pub argv: Vec<String>,
+    /// 操作者可见的命令文案(`nw ` 起头,可直接复制)。
+    pub display: String,
+}
+
+/// 取回订阅链接本体的**建议命令**(ADR-0009 §1 裁定:面板**不代跑**
+/// `subscription get`——`data.url` 是上游唯一回显本体的出口,屏显铺一条
+/// 活订阅链接的扩散面(终端滚动历史 / 截图 / 快照帧)面板没有任何机制兜住)。
+///
+/// 纯函数:无 IO、不读环境、不碰能力账——本模块只算命令,永远不把它下发。
+/// 形状:`nw subscription get --name <名> [--root <目录>] | jq -r .data.url`
+/// (上游 usage 原话的形态;`--root` 照面板既有纪律显式给,不让引擎拿当前
+/// 目录兜底)。
+pub fn subscription_get_suggest(name: &str, root: &str) -> Suggest {
+    let argv = vec![
+        "subscription".into(),
+        "get".into(),
+        "--name".into(),
+        name.to_string(),
+        "--root".into(),
+        root.to_string(),
+    ];
+    Suggest {
+        display: format!("nw {} | jq -r .data.url", argv.join(" ")),
+        argv,
+    }
+}
+
 /// 三条前提缺哪一条:两种配方域建议命令(bake / new)共用这一份判定,
 /// 措辞各归各自的 gate enum——判定只有一处,说法不互相冒充。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1003,5 +1126,104 @@ mod tests {
         let mut pc = p.clone();
         pc.push("--yes".into());
         assert_eq!(a, pc, "落账 = 预审 + --yes,不另改槽位");
+    }
+
+    // ---- 工单 #56:subscription 组(register 两段式经 stdin / ls / rm / get 只给建议) ----
+
+    #[test]
+    fn 订阅登记_argv面无链接本体_只经_stdin_声明与_root_进() {
+        let p =
+            subscription_register_preaudit("airport", "Mihomo", Some("2026-03-01"), "/data/root");
+        assert_eq!(
+            p,
+            vec![
+                "subscription",
+                "register",
+                "--name",
+                "airport",
+                "--client",
+                "Mihomo",
+                "--token-stdin",
+                "--expires",
+                "2026-03-01",
+                "--root",
+                "/data/root",
+            ]
+        );
+        // 链接本体一个字节都不在 argv 里:上游只认 stdin(--token-stdin 是开关
+        // 不是载荷;误粘的 argv 会进 ps / history)
+        assert!(
+            !p.iter().any(|s| s.contains("https://")),
+            "argv 面没有任何明文链接形参:{p:?}"
+        );
+        assert!(
+            !p.iter().any(|s| s == "--token" || s == "--password"),
+            "上游 usage 禁 --token / --password 二字,面板不造这种旗标"
+        );
+        assert!(
+            !p.iter().any(|s| s == "--yes"),
+            "预审段连 --yes 的位置都没有"
+        );
+        assert!(
+            !p.iter().any(|s| s == "--repo"),
+            "subscription 组只认 --root"
+        );
+        // 到期日可省 = 永不过期:空串不产生 --expires 旗标(上游闸③认空串)
+        let forever = subscription_register_preaudit("airport", "Mihomo", Some(""), "/data/root");
+        assert!(
+            !forever.iter().any(|s| s == "--expires"),
+            "没给到期日不下发 --expires:{forever:?}"
+        );
+        assert_eq!(
+            forever,
+            subscription_register_preaudit("airport", "Mihomo", None, "/data/root"),
+            "空串与没给是同一种语义(永不过期)"
+        );
+        // 落账 = 预审 + 恰好一枚 --yes,不另改槽位
+        let c = subscription_register_commit("airport", "Mihomo", Some("2026-03-01"), "/data/root");
+        assert_eq!(c, [p.clone(), vec!["--yes".into()]].concat());
+        assert_eq!(c.iter().filter(|s| *s == "--yes").count(), 1);
+    }
+
+    #[test]
+    fn 订阅_ls_只读_rm_只认_root_且无确认旗标() {
+        assert_eq!(
+            subscription_ls("/data/root"),
+            vec!["subscription", "ls", "--root", "/data/root"]
+        );
+        assert_eq!(
+            subscription_rm("airport", "/data/root"),
+            vec!["subscription", "rm", "airport", "--root", "/data/root"]
+        );
+        for a in [subscription_ls("/r"), subscription_rm("airport", "/r")] {
+            assert!(!a.iter().any(|s| s == "--repo"), "四组只认 --root");
+            assert!(
+                !a.iter().any(|s| s == "--yes"),
+                "上游 rm 没有确认闸,面板不自己造一枚下发"
+            );
+        }
+    }
+
+    #[test]
+    fn 订阅_get_只给建议命令_带管道且永不带写旗标() {
+        let s = subscription_get_suggest("airport", "/data/root");
+        // 展示串照上游 usage 的形态:要裸链接自己拼管道(上游不开 --raw)
+        assert_eq!(
+            s.display,
+            "nw subscription get --name airport --root /data/root | jq -r .data.url"
+        );
+        // argv 是完整可执行的一条(不含管道段),旗标一处真相
+        assert_eq!(s.argv[..3], ["subscription", "get", "--name"]);
+        assert!(!s.display.contains("--yes"), "get 是只读出口,永不带写旗标");
+        assert!(!s.display.contains("--raw"), "上游不开 --raw,面板也不造");
+        assert!(
+            s.argv.contains(&"--root".to_string()),
+            "root 槽照面板既有纪律显式给,不让引擎拿当前目录兜底"
+        );
+        assert_eq!(
+            s,
+            subscription_get_suggest("airport", "/data/root"),
+            "纯函数:同名同根永远同一条命令(可测、可复制)"
+        );
     }
 }

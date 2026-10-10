@@ -216,6 +216,40 @@ fn screen_hits(content: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect,
 fn vps_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     let kind = app.catalog_kind;
     // 标签册浮层:rm 确认弹层的键位行两段可点(其余态同手填浮层惰性)
+    if kind == crate::screens::catalog::CatalogKind::Subscription {
+        // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
+        if app.sub_flow.phase != crate::screens::catalog::RegPhase::Idle {
+            if app.sub_flow.phase == crate::screens::catalog::RegPhase::Review
+                && app.sub_can_commit()
+            {
+                let popup = popup_rect(
+                    inner,
+                    crate::screens::catalog::REG_W,
+                    crate::screens::catalog::REG_H,
+                );
+                if popup.width > 0 && popup.height > 0 {
+                    let key_y = popup.y + popup.height - 2;
+                    two_key_segments(popup, key_y, REG_KEY_REVIEW_COMMIT, RITUAL_KEY_RETURN, hits);
+                }
+            }
+            return;
+        }
+        if app.sub_rm_confirm {
+            let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
+            if popup.width > 0 && popup.height > 0 {
+                let key_y = popup.y + popup.height - 2;
+                two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
+            }
+            return;
+        }
+        // 册体:订阅清单行命中(渲染每台 2 行,命中按条给整块)
+        let n = app.sub_len();
+        if n == 0 {
+            return;
+        }
+        push_sheet_rows(inner, n, kind.row_lines(), hits);
+        return;
+    }
     if kind == crate::screens::catalog::CatalogKind::Tag {
         if app.tag_flow.phase != crate::screens::catalog::RegPhase::Idle {
             return;

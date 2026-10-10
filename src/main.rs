@@ -130,6 +130,11 @@ async fn run_loop(
         for args in std::mem::take(&mut app.queue) {
             app.spawn_engine(args, etx);
         }
+        // 喂入队列(#56):argv 同一个唯一入口,只多一份一次性 stdin 本体
+        // (订阅链接;写后即关、即弃,不进回音/日志/配置)。
+        for (args, body) in std::mem::take(&mut app.fed_queue) {
+            app.spawn_engine_fed(args, body, etx);
+        }
         // 外部编辑器逃逸口:挂起我们的终端,让 $EDITOR 用,完事再点火。
         if std::mem::take(&mut app.pending_editor) {
             open_editor(terminal, app)?;

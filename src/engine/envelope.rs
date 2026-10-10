@@ -611,6 +611,20 @@ pub struct CatalogEntryView {
     pub note: Option<String>,
     /// (kind, id) 原样;标签册的槽(一标签挂多条目、跨 kind)。
     pub refs: Vec<CatalogRef>,
+    /// 消费这条链接的应用(订阅册的槽;上游字段名 `client`,"它是字段不是
+    /// 名字"——如 Mihomo)。缺 = None(展示层给「——」)。
+    pub client: Option<String>,
+    /// 到期日(订阅册的槽):严格 `YYYY-MM-DD` 原值;`""` / None = 永不过期
+    /// (上游口径:expires 恒在,空串 = 永不过期)。
+    pub expires: Option<String>,
+    /// 到期三态(订阅册的槽):`active` / `expiring` / `expired`。**读取时按
+    /// UTC 日期现算、永不写进文件**(上游 `status.go`);回音缺这一格 =
+    /// None(展示层显式「——」,面板不自己算一套)。
+    pub status: Option<String>,
+    /// 剩余天数(订阅册的槽):从今天(UTC)到到期日的整天数,过期为负;
+    /// 没给到期日 = 引擎给 `null` → None(0 天和「没这回事」是两件事,
+    /// 上游刻意用 nil 指针而不是 0 占位)。
+    pub days_left: Option<i64>,
 }
 
 impl CatalogEntryView {
@@ -648,6 +662,24 @@ impl CatalogEntryView {
             .map(|r| format!("{}/{}", r.kind, r.id))
             .collect::<Vec<_>>()
             .join(" · ")
+    }
+
+    /// 到期日一行(订阅册):没给到期日 = 永不过期(上游 `expires` 空串的口径,
+    /// 展示层照原话说,不推导、不补一个日期)。
+    pub fn expires_line(&self) -> String {
+        match self.expires.as_deref().map(str::trim) {
+            Some(e) if !e.is_empty() => e.to_string(),
+            _ => "永不过期".to_string(),
+        }
+    }
+
+    /// 剩余天数一行(订阅册):引擎没给(没给到期日 = `null`,或回音缺字段)=
+    /// 「——」,不猜、不拿 0 占位。
+    pub fn days_left_line(&self) -> String {
+        match self.days_left {
+            Some(n) => n.to_string(),
+            None => "——".to_string(),
+        }
     }
 }
 
@@ -705,6 +737,7 @@ impl VpsEntry {
             logins: self.logins.clone(),
             note: self.note.clone(),
             refs: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -752,6 +785,7 @@ impl VpsRegisterData {
                 logins: self.logins.clone(),
                 note: self.note.clone(),
                 refs: Vec::new(),
+                ..Default::default()
             }],
             gates: self.gates.clone(),
         }
@@ -917,6 +951,161 @@ impl TagAddData {
 /// `action` 第三态 `ref_removed`(只摘引用,标签还在)/ `not_found`
 /// (什么都没动);删不存在的标签 → rc 3 且文件一个字节都不动。
 pub type TagRmData = VpsRmData;
+
+// ---- subscription 组(`nw/subscription-*.v1`,编目 `<root>/subscriptions.json`,工单 #56) ----
+
+/// 订阅册的一条(ls 投影):**没有 url 槽、也没有任何指纹字段**(上游
+/// `SubSummary` 六个键冻结;R1:链接即凭据,`ls` 永不回显本体,沿 #18
+/// 三不印)——分享清单、截图、贴日志都不泄密。这是**投影**不是引用:
+/// 想读链接本体只有 `nw subscription get` 一条路(且面板不代跑,ADR-0009)。
+///
+/// `status` / `days_left` 是**读取时算的到期标记**(上游 `status.go`):
+/// 不在文件里、也永不写回文件;三态按 UTC 日期与今天比,今天起 7 天内
+/// (含第 7 天)= `expiring`,过去 = `expired`,更远与「没给到期日」=
+/// `active`。**只标记不治理**:过期不改退出码、不提醒、不靠 ANSI 颜色。
+#[derive(Clone, Debug, Deserialize)]
+pub struct SubSummary {
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub client: String,
+    #[serde(default)]
+    pub expires: String,
+    #[serde(default)]
+    pub status: String,
+    /// 上游 `daysLeft` 是 `*int`:没给到期日 = JSON `null`(键恒在)。
+    #[serde(default, rename = "daysLeft")]
+    pub days_left: Option<i64>,
+}
+
+impl SubSummary {
+    /// 薄适配器:订阅条目 → 编目册投影(与 `VpsEntry::view` / `TagEntry::view`
+    /// 同形状,只填自己那一组槽:client / 到期日 / 到期三态 / 剩余天数)。
+    /// **绝不填链接槽**——投影里没有这一格,结构上放不下。
+    pub fn view(&self) -> CatalogEntryView {
+        CatalogEntryView {
+            name: self.name.clone(),
+            client: Some(self.client.clone()),
+            expires: Some(self.expires.clone()),
+            status: Some(self.status.clone()),
+            days_left: self.days_left,
+            ..Default::default()
+        }
+    }
+}
+
+/// `nw subscription ls` 的 data:编目路径 + 订阅清单。编目不存在 =
+/// 空数组 rc 0(合法空态);坏账 = rc 3 点名路径(绝不静默当成空编目)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct SubLsData {
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub subscriptions: Vec<SubSummary>,
+}
+
+impl SubLsData {
+    /// ls 投影 → 编目册投影(确定性排序后的清单)。
+    pub fn sheet(&self) -> CatalogSheet {
+        CatalogSheet {
+            catalog_path: self.catalog_path.clone(),
+            entries: self.subscriptions.iter().map(SubSummary::view).collect(),
+            gates: Vec::new(),
+        }
+        .sorted()
+    }
+
+    /// 到期三态的条数汇总(`active` / `expiring` / `expired` 各自几条)。
+    /// 面板不自己算一套:这里只是把引擎已给的三态**点数**,阈值与日期口径
+    /// 全在引擎侧(上游 `status.go`,7 天不配置化)。
+    pub fn status_counts(&self) -> SubStatusCounts {
+        let mut c = SubStatusCounts::default();
+        for s in &self.subscriptions {
+            match s.status.as_str() {
+                "active" => c.active += 1,
+                "expiring" => c.expiring += 1,
+                "expired" => c.expired += 1,
+                _ => c.unknown += 1,
+            }
+        }
+        c
+    }
+}
+
+/// 到期三态汇总(册体那一行「几条 active · 几条 expiring · 几条 expired」)。
+/// `unknown` = 回音缺 `status` 字段的条数——**显式计数不猜**,不并进任何一态。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubStatusCounts {
+    pub active: usize,
+    pub expiring: usize,
+    pub expired: usize,
+    pub unknown: usize,
+}
+
+/// `nw subscription register` 的 data(预审与落账共用同一形状,`written`
+/// 区分「文件不落」与真写入)。
+///
+/// **一个能放链接本体的字段都没有**(上游 `RegisterResult` 刻意不留 url
+/// 槽:register 是「链接进仓」的写入口,却不是「链接出来」的出口——想泄
+/// 都没有地方放)。`client` / `expires` 只在过了各自那道闸之后才填,
+/// 被拒时是零值(失败也带 data 是硬约定)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct SubRegisterData {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub client: String,
+    #[serde(default)]
+    pub expires: String,
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub written: bool,
+    #[serde(default)]
+    pub updated: bool,
+    #[serde(default)]
+    pub action: String,
+    /// 四道闸,**恒 4 行**:`subscription.register.name` / `.client` /
+    /// `.expires` / `.body`;id 冻结、三态 pass/fail/skip。
+    #[serde(default)]
+    pub gates: Vec<CatalogGate>,
+}
+
+impl SubRegisterData {
+    /// 登记回音 → 编目册投影(条目 = 这一条订阅;没有链接槽)。
+    pub fn sheet(&self) -> CatalogSheet {
+        CatalogSheet {
+            catalog_path: self.catalog_path.clone(),
+            entries: vec![SubSummary {
+                name: self.name.clone(),
+                kind: self.kind.clone(),
+                client: self.client.clone(),
+                expires: self.expires.clone(),
+                // 登记回音不带到期标记(那是读侧 ls / get 现算的),所以
+                // 这一格恒空——展示层显式「——」,不拿登记那一刻冒充读取
+                // 那一刻(上游口径:标记永不写进文件)。
+                status: String::new(),
+                days_left: None,
+            }
+            .view()],
+            gates: self.gates.clone(),
+        }
+    }
+
+    /// 闸里有 fail(落账闸的口径来源:任一不过 = 一个字节都不落)。
+    pub fn has_fail(&self) -> bool {
+        self.gates.iter().any(CatalogGate::is_fail)
+    }
+}
+
+/// `nw subscription rm <名>` 的 data 与 `nw vps rm` **逐字相同**——上游
+/// `entry.RmOutcome` 是四组共用的同一个类型。删不存在的名 → rc 3 且
+/// `subscriptions.json` 一个字节都不动;删光最后一条留空 `entries` 数组
+/// 的文件,不删文件。
+pub type SubRmData = VpsRmData;
 
 #[cfg(test)]
 mod tests {

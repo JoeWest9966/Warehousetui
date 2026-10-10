@@ -353,6 +353,25 @@ pub struct App {
     pub tag_rm_confirm: bool,
     /// 最近一次 `nw tag rm` 回音(证据五字段原样呈现)。
     pub tag_rm_result: Option<EngineOutput>,
+    /// 订阅册(#56):两段式登记流(复用骨架件 `crate::screens::RegisterFlow`;
+    /// 链接本体只经 stdin 进,预审与落账各喂一次)。
+    pub sub_flow: crate::screens::RegisterFlow,
+    /// 订阅登记表单:名字 / 应用(client)/ 到期日 + **链接本体喂入框(掩码)**。
+    /// `body` 是 `SecretBody`——在途内存、Debug 不打印内容、随流程 drop。
+    pub sub_form: crate::screens::SubForm,
+    /// 订阅编目册投影(`nw subscription ls` 回音定型后落在这里;None = 还没读到)。
+    pub sub_ls: Option<crate::engine::SubLsData>,
+    /// ls 在途(不拿上一轮投影冒充本次)。
+    pub sub_ls_loading: bool,
+    /// 订阅册选中行(↑/↓ 与鼠标点行同源)。
+    pub sub_sel: usize,
+    /// 删除确认浮层(ADR-0009 §2:上游 rm 没有 `--yes`,面板加一道图形确认)。
+    pub sub_rm_confirm: bool,
+    /// 最近一次 `subscription rm` 回音(证据五字段原样呈现)。
+    pub sub_rm_result: Option<EngineOutput>,
+    /// 取回链接本体的建议命令是否已收进日志(#56,键 `g`):命令可见可取用,
+    /// 但面板**不执行**它(ADR-0009 §1:get 一律只给建议命令)。
+    pub sub_get_logged: bool,
     /// 配方域建议命令的只读选中态(#39,键 `c`):命令可见可取用,
     /// 但面板**不执行**它(ADR-0003:执行权留给操作者)。选中行/切域即复位。
     pub rc_bake_sel: bool,
@@ -368,6 +387,12 @@ pub struct App {
     pub log: Vec<String>,
     /// 键位处理器排队的引擎命令,由主循环取出执行(键位无 tx)。
     pub queue: Vec<Vec<String>>,
+    /// **喂入队列**(#56): argv + 一次性 stdin 本体。与 [`App::queue`] 分开而
+    /// 不是把 `Vec<String>` 换成 enum:绝大多数命令不喂 stdin,分开让「这条命令
+    /// 带本体」在队列层面就显眼(也不会让既有入队点全部改写)。本体是
+    /// [`crate::screens::SecretBody`](不打印内容的外包类型),在此只做在途中转,
+    /// 喂给子进程后即弃。
+    pub fed_queue: Vec<(Vec<String>, crate::screens::SecretBody)>,
     /// 设置屏按 e 请求外部编辑器;主循环挂起终端再拉起(见 main)。
     pub pending_editor: bool,
     /// 启动 splash:800ms 或任意键跳过(R3 决议)。
@@ -493,6 +518,15 @@ impl App {
             tag_sel: 0,
             tag_rm_confirm: false,
             tag_rm_result: None,
+            sub_flow: crate::screens::RegisterFlow::new(),
+            sub_form: crate::screens::new_sub_form(),
+            sub_ls: None,
+            sub_ls_loading: false,
+            sub_sel: 0,
+            sub_rm_confirm: false,
+            sub_rm_result: None,
+            sub_get_logged: false,
+            fed_queue: Vec::new(),
             rc_bake_sel: false,
             rc_filter: String::new(),
             rc_filter_on: false,
@@ -536,6 +570,31 @@ impl App {
 
     /// 唯一的引擎调用入口:登记进行态,再交给 runner。
     pub fn spawn_engine(&mut self, args: Vec<String>, tx: &mpsc::UnboundedSender<EngineEvent>) {
+        self.note_engine_dispatch(&args);
+        self.runner.spawn(args, tx.clone());
+    }
+
+    /// **喂入版**引擎调用入口(#56): argv 同一个入口、同一套进行态登记,差别
+    /// 只在多一份一次性 stdin 本体(订阅链接 / 将来的密钥本体)。喂入内容是
+    /// 一次性值:原样写进子进程 stdin 后立即 drop,**绝不进 `EngineOutput` /
+    /// 日志 / 配置 / 崩溃上报**(ADR-0009 §3,`engine::runner` 的喂入通道)。
+    ///
+    /// 与 [`App::spawn_engine`] 分成两个方法(而不是一个 `Option<Vec<u8>>` 参数)
+    /// 是让「这条命令带机密本体」在调用处就难看得出。
+    pub fn spawn_engine_fed(
+        &mut self,
+        args: Vec<String>,
+        body: crate::screens::SecretBody,
+        tx: &mpsc::UnboundedSender<EngineEvent>,
+    ) {
+        self.note_engine_dispatch(&args);
+        self.runner
+            .spawn_with_stdin(args, body.into_bytes(), tx.clone());
+    }
+
+    /// 下发前的进行态登记(喂入与非喂入两条路共用这一处:同一条 argv 的互斥 /
+    /// 在途灯不该因为「带不带 stdin」而分叉)。
+    fn note_engine_dispatch(&mut self, args: &[String]) {
         match args.first().map(String::as_str) {
             Some("up") => {
                 self.assembling = true;
@@ -579,6 +638,17 @@ impl App {
                 }
                 _ => {}
             },
+            // 订阅册(#56):ls 只读在途;register 落账段点亮写互斥(预审段不
+            // 点亮——它不写任何文件;本体经 stdin 喂入,见 `spawn_engine_fed`)。
+            Some("subscription") => match args.get(1).map(String::as_str) {
+                Some("ls") => {
+                    self.sub_ls_loading = true;
+                }
+                Some("register") if args.iter().any(|a| a == "--yes") => {
+                    self.assembling = true;
+                }
+                _ => {}
+            },
             // recheck(#40)在途:清掉上一轮结论,不拿旧结论冒充本次
             Some("source") if args.get(1).map(String::as_str) == Some("recheck") => {
                 self.hl_loading = true;
@@ -586,7 +656,6 @@ impl App {
             }
             _ => {}
         }
-        self.runner.spawn(args, tx.clone());
     }
 
     pub fn update(&mut self, msg: Message) {
@@ -774,6 +843,13 @@ impl App {
             self.cancel_vps_register();
         } else if self.tag_flow.phase != catalog::RegPhase::Idle {
             self.cancel_tag_flow();
+        } else if self.sub_rm_confirm {
+            self.sub_rm_confirm = false;
+            self.push_log("删除已取消:subscriptions.json 一个字节都没动");
+        } else if self.sub_flow.phase != catalog::RegPhase::Idle {
+            // 编目册登记返航与 Esc 完全同路(骨架件同一语义);在途链接本体
+            // 随表单 drop(ADR-0009 §3:面板侧不留副本)。
+            self.cancel_sub_register();
         }
     }
 
@@ -918,6 +994,9 @@ impl App {
             // 标签册回音(#54):ls 反查两态 / add 无确认闸 / rm 两态。
             // 只认真实 argv(精确的无参 `tag` 探针仍归能力回音路)。
             "tag" if Capability::from_probe(&out.args).is_none() => self.on_tag_echo(out),
+            // 订阅册回音(#56):ls 只读 / register 两段式(本体经 stdin)/ rm。
+            // 只认真实 argv(精确的无参 `subscription` 探针仍归能力回音路)。
+            "subscription" if Capability::from_probe(&out.args).is_none() => self.on_sub_echo(out),
             // 外部源漂移复核回音(#40):只读,只认真实 argv(带 --root 或
             // --name);精确的无参探针仍归下面的能力回音路。
             "source"
@@ -1004,6 +1083,16 @@ impl App {
         }
         if self.tag_flow.phase != catalog::RegPhase::Idle {
             self.on_key_tag_flow(k);
+            return;
+        }
+        // 订阅册浮层(#56):同一个骨架件。删除确认是独立一道图形确认
+        // (ADR-0009 §2),登记流里没有 rm 那一步,所以两道浮层平级即可。
+        if self.sub_rm_confirm {
+            self.on_key_sub_rm_confirm(k);
+            return;
+        }
+        if self.sub_flow.phase != catalog::RegPhase::Idle {
+            self.on_key_sub_flow(k);
             return;
         }
         // 登记两段式(#30 #31):输入 → 预审 → 确认 → 落账 → 结果,
@@ -1738,6 +1827,29 @@ impl App {
             self.cycle_catalog_kind();
             return;
         }
+        if self.catalog_kind == catalog::CatalogKind::Subscription {
+            match k.code {
+                KeyCode::Char('r') if !self.assembling => self.start_sub_register(),
+                // 取回链接本体:只给建议命令,面板不代跑 get(ADR-0009 §1)
+                KeyCode::Char('g') => self.log_sub_get_suggest(),
+                KeyCode::Char('d') => self.start_sub_rm(),
+                KeyCode::Down => {
+                    let n = self.sub_len();
+                    if n > 0 {
+                        self.sub_sel = (self.sub_sel + 1) % n;
+                    }
+                }
+                KeyCode::Up => {
+                    let n = self.sub_len();
+                    if n > 0 {
+                        self.sub_sel = (self.sub_sel + n - 1) % n;
+                    }
+                }
+                KeyCode::Char('l') => self.run_sub_ls(),
+                _ => {}
+            }
+            return;
+        }
         if self.catalog_kind == catalog::CatalogKind::Tag {
             match k.code {
                 KeyCode::Char('r') if !self.assembling => self.start_tag_add(),
@@ -2077,10 +2189,10 @@ impl App {
             "换册:{}册({});{}",
             k.label(),
             k.file(),
-            if k == catalog::CatalogKind::Tag {
-                "按 l 反查全部标签(只读)"
-            } else {
-                "按 l 重读机器编目(只读)"
+            match k {
+                catalog::CatalogKind::Tag => "按 l 反查全部标签(只读)",
+                catalog::CatalogKind::Subscription => "按 l 重读订阅编目(只读,含到期三态)",
+                catalog::CatalogKind::Vps => "按 l 重读机器编目(只读)",
             }
         ));
     }
@@ -2097,6 +2209,7 @@ impl App {
                 .and_then(|o| o.envelope.as_ref())
                 .and_then(|e| e.data_as::<crate::engine::TagLsData>())
                 .map(|d| d.sheet()),
+            catalog::CatalogKind::Subscription => self.sub_ls.as_ref().map(|d| d.sheet()),
         }
     }
 
@@ -2124,6 +2237,7 @@ impl App {
                 Some(name) => format!("反查 {name}"),
                 None => "全部标签".to_string(),
             },
+            catalog::CatalogKind::Subscription => "全部订阅".to_string(),
         }
     }
 
@@ -2132,6 +2246,7 @@ impl App {
         match self.catalog_kind {
             catalog::CatalogKind::Vps => self.vps_sel,
             catalog::CatalogKind::Tag => self.tag_sel,
+            catalog::CatalogKind::Subscription => self.sub_sel,
         }
     }
 
@@ -2470,6 +2585,366 @@ impl App {
                     None => {
                         let h = self
                             .tag_rm_result
+                            .as_ref()
+                            .map(|o| o.headline())
+                            .unwrap_or_default();
+                        self.push_log(format!("删除结果不可用:{h}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- 编目册屏·订阅册(spec #50 工单 #56,ADR-0009) ----
+
+    /// 订阅册的行数(ls 投影条数;没读到 = 0)。
+    pub fn sub_len(&self) -> usize {
+        self.sub_ls
+            .as_ref()
+            .map(|d| d.subscriptions.len())
+            .unwrap_or(0)
+    }
+
+    /// 选中订阅的名字(删除确认 / 取回建议命令同源)。
+    pub fn selected_sub_name(&self) -> Option<String> {
+        let d = self.sub_ls.as_ref()?;
+        d.subscriptions
+            .get(self.sub_sel.min(d.subscriptions.len().saturating_sub(1)))
+            .map(|s| s.name.clone())
+    }
+
+    /// 订阅册入口门(#29 能力门 + #27 数据仓根,与 vps / tag 册同两道、互不冒充)。
+    pub fn sub_entry_enabled(&self) -> bool {
+        self.data_root_cause().is_none() && self.capabilities.enabled(Capability::Subscription)
+    }
+
+    /// 入口不可用时的一句指路(与册体提示同源)。
+    pub fn sub_gate_hint(&self) -> String {
+        match self.data_root_cause() {
+            Some(_) => self.data_root_gate_msg(),
+            None => capability::GATE_HINT.to_string(),
+        }
+    }
+
+    /// 取回链接本体的**建议命令**(ADR-0009 §1:面板不代跑 `subscription get`)。
+    /// 纯函数层产 argv + 展示串(`engine::commands::subscription_get_suggest`,
+    /// 与 bake / recipe new 同源同层);`App` 只在这里读它,**没有任何路径会
+    /// 把它下发**——队列里永远不会出现 `subscription get`。
+    pub fn sub_get_suggest(&self) -> Option<crate::engine::commands::Suggest> {
+        let name = self.selected_sub_name()?;
+        let root = self.usable_data_root()?;
+        Some(crate::engine::commands::subscription_get_suggest(
+            &name, &root,
+        ))
+    }
+
+    /// 把取回链接的建议命令收进日志(键 `g`):命令文案可取用,执行权留给操作者。
+    /// **只收命令不收本体**——这条命令本身不含链接,面板也从不代跑它。
+    pub fn log_sub_get_suggest(&mut self) {
+        match self.sub_get_suggest() {
+            Some(s) => {
+                self.push_log(format!("取回链接(面板不代跑,自己执行):{}", s.display));
+                self.push_log("get 是上游唯一回显本体的出口:别把它贴回面板(不进日志/配置/快照)。");
+                self.sub_get_logged = true;
+            }
+            None => self.push_log(format!("取回链接未给出:{}", self.sub_gate_hint())),
+        }
+    }
+
+    /// 读一次订阅编目册(只读;编目不存在 = 空数组 rc 0,合法空态)。
+    /// 投影**没有链接槽**:到期三态与剩余天数由引擎在读取时按 UTC 现算。
+    pub fn run_sub_ls(&mut self) {
+        if !self.sub_entry_enabled() {
+            self.push_log(format!("订阅册未读:{}", self.sub_gate_hint()));
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("订阅册未读:{}", self.data_root_gate_msg()));
+            return;
+        };
+        self.sub_ls_loading = true;
+        self.queue.push(commands::subscription_ls(&root));
+        self.push_log("subscription ls 已入队(只读,不写任何文件)");
+    }
+
+    /// 发起订阅登记:先过两道门 + 写互斥,再进表单态(含掩码喂入框)。
+    pub fn start_sub_register(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:登记与装配互斥,稍后再试");
+            return;
+        }
+        if !self.sub_entry_enabled() {
+            self.push_log(format!("登记入口不可用:{}", self.sub_gate_hint()));
+            return;
+        }
+        self.sub_rm_confirm = false;
+        self.sub_flow.begin();
+        self.sub_form = crate::screens::new_sub_form();
+        self.push_log("登记订阅:填名字/应用/到期日,在链接框贴一次本体,Enter 预审,Esc/q 返航");
+    }
+
+    /// 订阅登记流程键位(表单 / 等回音 / 确认 / 落账在途 / 结果)。
+    fn on_key_sub_flow(&mut self, k: KeyEvent) {
+        match self.sub_flow.phase {
+            catalog::RegPhase::Form => match catalog::on_key_sub_form(&mut self.sub_form, k) {
+                catalog::FormAction::Submit => self.dispatch_sub_register(),
+                catalog::FormAction::Cancel => self.cancel_sub_register(),
+                catalog::FormAction::Edited => {}
+            },
+            catalog::RegPhase::PreAudit | catalog::RegPhase::Commit => {
+                if matches!(k.code, KeyCode::Esc) {
+                    self.cancel_sub_register();
+                }
+            }
+            catalog::RegPhase::Review => match k.code {
+                KeyCode::Enter => self.dispatch_sub_commit(),
+                KeyCode::Esc => self.cancel_sub_register(),
+                _ => {}
+            },
+            catalog::RegPhase::Done => {
+                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.cancel_sub_register();
+                }
+            }
+            catalog::RegPhase::Idle => {}
+        }
+    }
+
+    /// 下发预审(两段式第一段):不带 `--yes`,文件不落;**链接本体经 stdin
+    /// 喂入这一次**(喂入是一次性的,落账那一下要再喂一次)。
+    pub fn dispatch_sub_register(&mut self) {
+        if !self.sub_entry_enabled() {
+            self.push_log(format!("登记不下发:{}", self.sub_gate_hint()));
+            self.cancel_sub_register();
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("登记不下发:{}", self.data_root_gate_msg()));
+            self.cancel_sub_register();
+            return;
+        };
+        let spec = match catalog::spec_from_sub_form(&self.sub_form) {
+            Ok(s) => s,
+            Err(bad) => {
+                // 面板侧就拒(空名字 / 空 client / 到期日形状不对 / 本体没喂入),
+                // 留表单可改,不喂给引擎跑一趟。
+                self.push_log(format!("登记被拒:{},留表单可改", bad.join(";")));
+                return;
+            }
+        };
+        self.sub_flow.preaudit_sent();
+        let fed = spec.preaudit(&root);
+        let n = self.sub_form.body.len();
+        // 本体在面板侧的唯一副本在表单里(在途内存):预审这一下**克隆**一份喂
+        // 出去,表单里那份留到落账那一下再喂一次(两段式各喂一次,喂入是一次性
+        // 的)。喂出的副本随进程结束即弃;表单里那份随返航 / 落账完成即 drop。
+        self.fed_queue.push((fed, self.sub_form.body.clone()));
+        self.push_log(format!(
+            "登记预审已入队:subscription register --name {}(不带 --yes,文件不落;已喂入 {n} 字节)",
+            spec.name
+        ));
+    }
+
+    /// 落账(两段式第二段):图形确认后才可能到达——全流程唯一能产生 `--yes`
+    /// 的转换。重过三道闸(入口 / 数据仓根 / 预审结论),全过才下发并点亮写
+    /// 互斥;任何一道不过都不下发写命令。**本体再喂一次 stdin**。
+    pub fn dispatch_sub_commit(&mut self) {
+        if self.sub_flow.phase != catalog::RegPhase::Review || !self.sub_can_commit() {
+            self.push_log("落账未下发:预审未通过(四道闸有 fail 或退出码非 0)");
+            return;
+        }
+        if !self.sub_entry_enabled() {
+            self.push_log(format!("落账未下发:{}", self.sub_gate_hint()));
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("落账未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        let Ok(spec) = catalog::spec_from_sub_form(&self.sub_form) else {
+            self.push_log("落账未下发:表单已不可定型(返航后从表单重来)");
+            return;
+        };
+        self.sub_flow.commit_sent();
+        self.assembling = true;
+        let fed = spec.commit(&root);
+        let n = self.sub_form.body.len();
+        // 本体在面板侧的唯一副本在表单里(在途内存):预审这一下**克隆**一份喂
+        // 出去,表单里那份留到落账那一下再喂一次(两段式各喂一次,喂入是一次性
+        // 的)。喂出的副本随进程结束即弃;表单里那份随返航 / 落账完成即 drop。
+        self.fed_queue.push((fed, self.sub_form.body.clone()));
+        self.push_log(format!(
+            "登记落账已入队:subscription register --name {} --yes(--root {};已再喂入 {n} 字节)",
+            spec.name, root
+        ));
+    }
+
+    /// 订阅落账闸(呈现口径):预审通过 = rc 0 且四道闸无 fail 且 data 可定型。
+    pub fn sub_can_commit(&self) -> bool {
+        let Some(out) = self.sub_flow.result.as_ref() else {
+            return false;
+        };
+        catalog::preaudit_passed(out, catalog::SubscriptionSpec::audit(out).as_ref())
+    }
+
+    /// 返航:任一态 Esc 同义,状态清空不留半条记录(在途本体随表单一起 drop)。
+    pub fn cancel_sub_register(&mut self) {
+        self.sub_flow.abandon();
+        self.sub_form = crate::screens::new_sub_form();
+        self.push_log("登记返航(在途链接本体已 drop,面板侧不留副本)");
+    }
+
+    /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
+    fn start_sub_rm(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:删除与装配互斥,稍后再试");
+            return;
+        }
+        if !self.sub_entry_enabled() {
+            self.push_log(format!("删除未下发:{}", self.sub_gate_hint()));
+            return;
+        }
+        let Some(name) = self.selected_sub_name() else {
+            self.push_log("删除未下发:没有选中的订阅(↑/↓ 先选一行)");
+            return;
+        };
+        self.sub_rm_confirm = true;
+        self.push_log(format!("删除确认:{name}(Enter 确认,Esc/q 取消)"));
+    }
+
+    fn on_key_sub_rm_confirm(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => self.dispatch_sub_rm(),
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
+            _ => {}
+        }
+    }
+
+    /// 下发删除:argv 与在 shell 里敲的逐字相同(面板只决定何时递出去)。
+    fn dispatch_sub_rm(&mut self) {
+        let Some(name) = self.selected_sub_name() else {
+            self.sub_rm_confirm = false;
+            self.push_log("删除未下发:没有选中的订阅");
+            return;
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("删除未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        self.sub_rm_confirm = false;
+        self.sub_rm_result = None;
+        self.queue.push(commands::subscription_rm(&name, &root));
+        self.push_log(format!("删除已入队:subscription rm {name} --root {root}"));
+    }
+
+    /// 订阅册选中行钳回可见范围内(刷新后旧下标可能越界)。
+    fn clamp_sub_sel(&mut self) {
+        let n = self.sub_len();
+        if n == 0 {
+            self.sub_sel = 0;
+        } else {
+            self.sub_sel = self.sub_sel.min(n - 1);
+        }
+    }
+
+    /// 订阅册回音路由(#56):ls 只读 / register 两段式(本体经 stdin)/ rm。
+    fn on_sub_echo(&mut self, out: EngineOutput) {
+        match out.args.get(1).map(String::as_str) {
+            Some("ls") => {
+                self.sub_ls_loading = false;
+                match out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::SubLsData>())
+                {
+                    Some(d) => {
+                        let n = d.subscriptions.len();
+                        let counts = d.status_counts();
+                        self.sub_ls = Some(d);
+                        self.clamp_sub_sel();
+                        self.sub_get_logged = false;
+                        self.push_log(format!(
+                            "订阅册已刷新:{n} 条(active {} · expiring {} · expired {},只读)",
+                            counts.active, counts.expiring, counts.expired
+                        ));
+                    }
+                    None => self.push_log(format!("subscription ls 结果不可用:{}", out.headline())),
+                }
+            }
+            Some("register") => {
+                let is_commit = out.args.iter().any(|a| a == "--yes");
+                if is_commit {
+                    let echo_ok = out.ok;
+                    match self.sub_flow.commit_back(out) {
+                        Some(true) => {
+                            self.assembling = false;
+                            self.push_log(
+                                "登记落账完成:subscriptions.json 已写入数据仓根(一次 git 变更)"
+                                    .to_string(),
+                            );
+                            self.run_sub_ls();
+                        }
+                        Some(false) => {
+                            self.assembling = false;
+                            let h = self
+                                .sub_flow
+                                .result
+                                .as_ref()
+                                .map(|o| o.headline())
+                                .unwrap_or_default();
+                            self.push_log(format!("登记落账失败:{h}"));
+                        }
+                        None => {
+                            // 在途返航收不回引擎的写(与 vps / 外部源登记同一收敛行为)
+                            self.assembling = false;
+                            if echo_ok {
+                                self.run_sub_ls();
+                                self.push_log(
+                                    "登记写盘可能已完成:订阅册已刷新,subscriptions.json 走 PR + 家长审复核"
+                                        .to_string(),
+                                );
+                            } else {
+                                self.push_log("登记落账回音已丢弃(流程已返航,写未成功)");
+                            }
+                        }
+                    }
+                } else if self.sub_flow.preaudit_back(out) {
+                    let h = self
+                        .sub_flow
+                        .result
+                        .as_ref()
+                        .map(|o| o.headline())
+                        .unwrap_or_default();
+                    self.push_log(format!("登记预审完成:{h}"));
+                } else {
+                    self.push_log("登记预审回音已丢弃(流程已返航)");
+                }
+            }
+            Some("rm") => {
+                let typed = out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::SubRmData>());
+                self.sub_rm_result = Some(out);
+                match typed {
+                    Some(d) if d.removed => {
+                        self.push_log(format!(
+                            "已删除订阅 {}:剩余 {} 条(一次 git 变更,走 PR + 家长审)",
+                            d.name, d.remaining
+                        ));
+                        self.run_sub_ls();
+                    }
+                    Some(d) => {
+                        // 删不存在的名:rc 3 + 证据五字段 + 文件一个字节都不动
+                        self.push_log(format!(
+                            "没删成:{} 不在编目里(action {}),subscriptions.json 一个字节都没动",
+                            d.name, d.action
+                        ));
+                    }
+                    None => {
+                        let h = self
+                            .sub_rm_result
                             .as_ref()
                             .map(|o| o.headline())
                             .unwrap_or_default();
