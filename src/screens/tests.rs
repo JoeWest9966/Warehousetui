@@ -88,7 +88,14 @@ fn 装配屏运行中七步与日志() {
     app.as_log = vec!["铺骨架…".into(), "落组件…".into()];
     let s = draw(&app, 110, 30);
     assert!(s.contains("七步"));
-    assert!(s.contains("落组件"));
+    assert!(
+        s.contains("落组件"),
+        "stderr 日志原样上屏(操作者唯一的人话面)"
+    );
+    assert!(
+        !s.contains("✓ 3 落组件"),
+        "七步不按 stderr 措辞打勾(#60):{s:?}"
+    );
 }
 
 #[test]
@@ -572,35 +579,27 @@ fn 纵向密度_50行高无大片空白() {
 
 // ---- #18 紧凑态内层栏收起(66×50 快照)+ 常畅态回归 ----
 
-/// 66×50 紧凑态:装配七步栏收成一行进度——位置化标记 + 当前阶段名,
-/// 随 stderr 日志推进打 ✓;日志独占余下全部行(不再被 14 列竖栏挤压)。
+/// 66×50 紧凑态:装配七步栏收成一行进度——七格未决标记 + 明示粗粒度;
+/// 日志独占余下全部行(不再被 14 列竖栏挤压)。
+/// #60 起判定不再读 stderr 措辞:引擎七步执行期间不打增量进度,在途
+/// 一律未决,结论等 envelope 落地后按 `nw/up.v1` 冻结字段判。
 #[test]
 fn 紧凑_装配收起一行进度_66x50() {
     let mut app = fake_app();
     app.screen = Screen::Assemble;
     app.assembling = true;
-    app.as_log = vec![
-        "0 前置 …".into(),
-        "1 引导 …".into(),
-        "2 铺骨架 …".into(),
-        "3 落组件 …".into(),
-    ];
+    // 旧实现的毒丸:七个步骤名逐字进 stderr 日志,字符串匹配会把七步全打 ✓
+    app.as_log = STEPS_LOG_ALL.iter().map(|s| s.to_string()).collect();
     let s = draw(&app, 66, 50);
     assert!(
-        s.contains("七步 ✓✓✓✓▸·· 4 合配置"),
-        "一行进度:4 步完成、当前第 5 步可辨识,原文拿到: {s:?}"
+        s.contains("七步 ······· 引擎无增量进度,跑完给结论"),
+        "一行进度:七格未决 + 明示粗粒度,原文拿到: {s:?}"
     );
+    assert!(!s.contains('✓'), "在途一个 ✓ 都不该有: {s:?}");
     assert!(!s.contains("┌ 七步 "), "七步竖栏必须收起");
     assert!(
         s.contains("stderr 实时日志") && s.contains("0 前置 …"),
         "日志全宽可见,早先行也在(行数变多)"
-    );
-    // 全部完成:七格满✓,不再有未完成的「·」悬挂
-    app.as_log = STEPS_LOG_ALL.iter().map(|s| s.to_string()).collect();
-    let done = draw(&app, 66, 50);
-    assert!(
-        done.contains("七步 ✓✓✓✓✓✓✓ 全部完成"),
-        "七步全完成:满格标记,原文拿到: {done:?}"
     );
 }
 
@@ -645,6 +644,8 @@ fn 紧凑_配方五域收起tab行_66x50() {
 }
 
 /// ≥ 断点回归:80×30 常畅态两处内层栏保持既有竖栏(快照基线不回退)。
+/// 七步竖栏仍在场,但 #60 起装配中一律未决(引擎无增量进度),不再按
+/// stderr 措辞打 ✓。
 #[test]
 fn 常畅_内层栏回归_80x30竖轨在场() {
     let mut app = fake_app();
@@ -653,7 +654,11 @@ fn 常畅_内层栏回归_80x30竖轨在场() {
     app.as_log = vec!["0 前置 …".into(), "1 引导 …".into()];
     let s = draw(&app, 80, 30);
     assert!(s.contains("┌ 七步 "), "常畅态七步竖栏原样在场");
-    assert!(s.contains("✓ 0 前置"), "竖栏逐步打勾原样在场");
+    assert!(
+        s.contains("· 0 前置"),
+        "竖栏未决态原样在场(不按日志打勾):{s:?}"
+    );
+    assert!(s.contains("跑完给结论"), "明示粗粒度");
 
     let mut app2 = fake_app();
     app2.screen = Screen::Recipes;
@@ -680,15 +685,111 @@ fn 日志偏移取窗_跳过偏移行_七步判定不受影响() {
     assert!(!s2.contains("行09") && !s2.contains("行08"), "偏移行移出窗");
     assert!(s2.contains("行07"), "更早的行入窗");
     assert!(s2.contains("行00"), "窗内仍有更早内容");
-    // 越界/陈旧偏移:min 钳制取窗不 panic;七步判定读全量 as_log,不受取窗影响
+    // 越界/陈旧偏移:min 钳制取窗不 panic;#60 起七步判定不读 as_log,取窗照旧
     app.as_log.push("5 写清单 完成".into());
     app.as_log_offset = 100;
     let s3 = draw(&app, 80, 30);
     assert!(!s3.contains("行0"), "取窗钳在日志内,不越界");
     assert!(
-        s3.contains("✓ 5 写清单"),
-        "七步判定读全量日志:行被移出窗仍打勾"
+        !s3.contains("✓ 5 写清单"),
+        "日志里出现步骤名不再打勾(#60):{s3:?}"
     );
+    assert!(
+        s3.contains("跑完给结论"),
+        "偏移把日志行推出窗也不影响粗粒度明示:{s3:?}"
+    );
+}
+
+// ---- #60 七步进度改稳健判定:判据只取冻结面,不取 stderr 措辞 ----
+
+/// 装配中:七个步骤名逐字进 stderr 日志(旧实现的字符串匹配会把七步全打
+/// ✓),现在一律未决 + 明示「引擎无增量进度」。两档外观结构不变。
+#[test]
+fn 装配中七步一律未决_明示粗粒度_不按stderr措辞打勾() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_log = STEPS_LOG_ALL.iter().map(|s| s.to_string()).collect();
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(!s.contains('✓'), "{w}×{h} 在途一个 ✓ 都不该有:{s:?}");
+        assert!(s.contains("跑完给结论"), "{w}×{h} 明示粗粒度");
+    }
+    // 常畅态:竖栏在场、七行未决、底注明示
+    let comfy = draw(&app, 80, 30);
+    assert!(comfy.contains("┌ 七步 "), "常畅态七步竖栏原样在场");
+    for name in ["0 前置", "6 自检"] {
+        assert!(comfy.contains(&format!("· {name}")), "未决态:{name}");
+    }
+    // 紧凑态:收成一行进度,那一行不带「当前步」名(没有增量信号可指)
+    let compact = draw(&app, 66, 50);
+    assert!(!compact.contains("┌ 七步 "), "七步竖栏必须收起");
+    let line = compact
+        .lines()
+        .find(|l| l.contains("七步 ") && l.contains('·'))
+        .expect("一行进度在场");
+    assert!(
+        line.contains("七步 ······· 引擎无增量进度,跑完给结论"),
+        "一行进度原文:{line:?}"
+    );
+    for name in ["0 前置", "4 合配置", "6 自检"] {
+        assert!(!line.contains(name), "一行进度不指认当前步:{name}:{line:?}");
+    }
+}
+
+const UP_FULL: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","profileDir":"/d","runtimeKey":"rk-1","components":["retention"],"skeletonFiles":["settings.json"],"configKeys":["models.json"],"envPresent":[],"envMissing":[],"convergeHash":"abc123","lockId":"9f8e","upgraded":false,"installedAt":"2026-10-01"}}"#;
+
+/// 跑完后:七步结论只认 `nw/up.v1` data 的冻结字段在场。六面有结论;
+/// 自检在 up 面恒无字段(上游由 CLI 层另起 doctor 复核),明示归 doctor。
+#[test]
+fn 跑完后七步结论按up_v1冻结字段判() {
+    let mut app = fake_app();
+    app.assembling = true;
+    feed(&mut app, out(&["up", "--lock", "9f8e"], 0, UP_FULL));
+    assert!(!app.assembling);
+    app.screen = Screen::Assemble;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("✓✓✓✓✓✓·"), "六面有结论、自检未决,原文拿到:{s:?}");
+    assert!(s.contains("6 面有结论;自检归 doctor(up 不自检)"), "{s:?}");
+}
+
+/// 失败在早段(data 为 null):七步结论明说「引擎没给」,不用 ✓/· 假装。
+#[test]
+fn up失败早段_七步结论明说没给() {
+    let mut app = fake_app();
+    app.assembling = true;
+    feed(
+        &mut app,
+        out(
+            &["up", "--lock", "9f8e"],
+            4,
+            r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":false,"errors":[{"code":"APPLY_FAILED","exitCode":4,"message":"sha256 不符","hint":"重新 bake"}],"warnings":[],"data":null}"#,
+        ),
+    );
+    app.screen = Screen::Assemble;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("引擎没给七步结论(up 面 data 无字段)"), "{s:?}");
+    assert!(!s.contains("✓"), "一个 ✓ 都不编:{s:?}");
+}
+
+/// 契约守卫同源:schema 不是 `nw/up.v1`(如未来的 up.v2)时,七步结论
+/// 明说取不到,绝不按旧形状降级解析出一排 ✓。
+#[test]
+fn schema不是up_v1_七步结论不按旧形状猜() {
+    let mut app = fake_app();
+    app.assembling = true;
+    feed(
+        &mut app,
+        out(
+            &["up", "--lock", "9f8e"],
+            0,
+            r#"{"schema":"nw/up.v2","nw":"9.9.9","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","runtimeKey":"rk","skeletonFiles":[],"components":[],"configKeys":[],"convergeHash":"z"}}"#,
+        ),
+    );
+    app.screen = Screen::Assemble;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("结论取不到:envelope 不是 nw/up.v1"), "{s:?}");
+    assert!(!s.contains("✓✓"), "不按旧形状凑一排 ✓:{s:?}");
 }
 
 // ---- #28 契约守卫:不认识的 schema 走证据面板呈现 ----
