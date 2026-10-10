@@ -81,7 +81,7 @@ _Avoid_: 响应、输出
 _Avoid_: 客户端（暗示另一套契约面）、GUI
 
 **代跑（run on behalf）**：
-面板自己把引擎命令跑完。准许清单：`ls` / `up` / `doctor` + `validate`（ADR-0003）、`source register` / `source recheck`（ADR-0006，后者只读）。
+面板自己把引擎命令跑完。准许清单（ADR-0009 新口径，**六类**）：只读三类 `ls` / `doctor` + `validate` / `source recheck`；写动作三类 `up` / `source register` / **编目册写动作**（`vps` / `key` / `subscription` 的 register 两段式 + rm，`tag` 的 add + rm）。`key get` / `subscription get` 一律只给建议命令——上游唯一回显本体的两个出口，面板不接。
 _Avoid_: 自动执行、一键执行
 
 **建议命令（suggested command）**：
@@ -94,6 +94,7 @@ _Avoid_: 兼容、适配（太被动;适配暗示以面板为主位）
 
 **契约守卫（schema guard）**：
 面板只认自己认识 `data` 形状的 envelope schema；不认识时合成「需升级 nw」五字段证据（带收到的 schema 原文与引擎版本），`data` 不解码、不按旧形状降级解析。这是面板自己的契约知识,与引擎能力探测是两回事。
+**认识形状 ≠ 准许代跑**：契约守卫答「我听不听得懂」，能力探测门答「它会不会做」，两层分工不被混淆（ADR-0009）。
 _Avoid_: 版本校验、兼容层
 
 **能力探测门（capability gate）**：
@@ -136,6 +137,40 @@ _Avoid_: 错误页
 **ls 五域**：
 `nw ls` 的五个恒存在域——recipes / components / sources / profiles / locks；侧边导航与概览屏的骨架。
 _Avoid_: 分类、清单（与 manifest 撞名）
+
+### 编目册（catalog books）
+
+**编目（catalog）**：
+数据仓对一类**条目**的记录，一个 JSON 文件。上游现有五本，都住在数据仓根部：`catalog.json`（外部源，skills[] + extensions[]）/ `vps.json`（machines[]）/ `keys.json`（entries[]）/ `subscriptions.json`（entries[]）/ `tags.json`（tags[]）。机器写、确定性排序、永不手改。
+_Avoid_: 注册表、市场
+
+**条目（entry）**：
+编目里的一个单元。外部条目住 `catalog.json`、vps 条目住 `vps.json`（kind `vps`）、key 条目 kind `github-key`、订阅条目 kind `subscription-url`；条目可打标签。
+_Avoid_: 记录、行
+
+**登记（register）**：
+把一条条目写进编目（`register` 的动词）；写入口唯一，要改就重跑 register 覆盖写。注意与上游另一个词**登记包**（写 `settings.json` 的 `packages`）不是一回事。
+_Avoid_: 注册、录入
+
+**投影（projection）**：
+`ls` 给出的可读视图，刻意不是编目形状本身（去掉本体槽）。key 的投影没有 secret 槽、也不印指纹；subscription 的投影没有 url 槽。
+_Avoid_: 视图、摘要
+
+**闸（gate）**：
+register 的逐条校验，任一不过 = 一个字节都不落。vps 五道 / key 三道 / subscription 四道 / tag 四道，`data.gates[]` 恒 N 行、id 是稳定面、三态 pass/fail/skip（复用「结果四态」词）。
+_Avoid_: 校验项、检查
+
+**反查（reverse lookup）**：
+按标签列出条目，只走 `nw tag ls [<标签>]`；不开 `nw ls` 第六域、不掺过滤。
+_Avoid_: 搜索、检索
+
+**密钥引用（key ref）**：
+vps 登录里指向机密的 **opaque 串**（`$ENV` / `!command` / ssh-agent / 密钥路径），nw 存原样、不解析、不连接；**指针不是密钥**，所以 `nw vps` 没有密码参数面。
+_Avoid_: 密钥、凭据引用
+
+**到期标记（expiry marking）**：
+订阅的 `status` / `daysLeft` 三态 active / expiring / expired，按 **UTC 日期在读取时算、永不写进文件**，7 天阈值不配置化，只标记不治理（不改退出码、不提醒、不靠 ANSI 颜色）。
+_Avoid_: 过期、续期
 
 ### 尺寸与呈现
 

@@ -13,11 +13,23 @@ use super::State;
 
 /// 契约守卫(#28):面板**认识**的 envelope schema 集合。
 ///
-/// 只收面板认识其 data 形状、或明确知道其存在的引擎 schema(调研底稿
-/// §3 的 `nw/<cmd>.v1` 全集)。不在集合里的一律走「需升级 nw」证据:
-/// 不 panic、不按旧形状降级解析(`data_as` 直接返回 None)。
-/// 这是面板自己的契约知识,不是引擎能力表(那是 #29 的探测门)。
-const KNOWN_SCHEMAS: [&str; 8] = [
+/// 只收面板认识其 data 形状、或明确知道其存在的引擎 schema。不在集合里的
+/// 一律走「需升级 nw」证据:不 panic、不按旧形状降级解析(`data_as` 直接
+/// 返回 None)。这是面板自己的契约知识,不是引擎能力表(那是 #29 的探测门)。
+///
+/// # 认识形状 ≠ 准许代跑(ADR-0009)
+///
+/// 本集合答的是「我听不听得懂这个 envelope」,与「面板会不会把这个命令
+/// 跑起来」是两件事:编目册 14 个 schema 全在集合里(契约对齐),但其中
+/// `key get` / `subscription get` 的回音面板**只给建议命令、不代跑**
+/// (ADR-0009 §1:上游唯一回显本体的两个出口)。两层分工不被混淆。
+///
+/// 前 8 个是跟随引擎第 1–7 轮的既有面(调研底稿 §3 的 `nw/<cmd>.v1` 全集);
+/// 后 14 个是第 8 轮跟随同步(spec #50 / 工单 #51)补上的四组编目命令面,
+/// 逐个列在 `notes/51-follow-sync-diff.md` §1 的契约表里——**上游
+/// `cli.go` 的 `Schema*` 常量是唯一真相源,加一个 schema 必须能指回它**。
+const KNOWN_SCHEMAS: [&str; 22] = [
+    // ---- 既有 8 个(第 1–7 轮) ----
     "nw/validate.v1",
     "nw/up.v1",
     "nw/doctor.v1",
@@ -26,6 +38,25 @@ const KNOWN_SCHEMAS: [&str; 8] = [
     "nw/ls.v1",
     "nw/source-register.v1",
     "nw/source-recheck.v1",
+    // ---- 第 8 轮新增 14 个:四组编目(vps 3 / key 4 / subscription 4 / tag 3) ----
+    // vps:register 两段式 + ls 只读 + rm;编目 <root>/vps.json
+    "nw/vps-register.v1",
+    "nw/vps-ls.v1",
+    "nw/vps-rm.v1",
+    // key:register(stdin 本体)+ ls 投影 + **get 是唯一回显处** + rm;编目 keys.json
+    "nw/key-register.v1",
+    "nw/key-ls.v1",
+    "nw/key-get.v1",
+    "nw/key-rm.v1",
+    // subscription:register(stdin 本体)+ ls 投影(到期三态)+ get 唯一回显处 + rm;编目 subscriptions.json
+    "nw/subscription-register.v1",
+    "nw/subscription-ls.v1",
+    "nw/subscription-get.v1",
+    "nw/subscription-rm.v1",
+    // tag:add(追加合并,无 --yes)+ ls 反查 + rm 两态;编目 tags.json
+    "nw/tag-add.v1",
+    "nw/tag-ls.v1",
+    "nw/tag-rm.v1",
 ];
 
 /// schema 是否在面板认识的集合内(契约守卫的判据)。
@@ -654,6 +685,62 @@ mod tests {
         assert_eq!(d["nw"], "9.9.9");
         // 五字段里的 hint 给升级指引,不回显任何密钥(只放 schema/版本)
         assert!(g.hint.as_deref().unwrap().contains("升级"));
+    }
+
+    #[test]
+    fn 契约守卫_四组编目十四个schema全都认识_第8轮跟随同步() {
+        // spec #50 / 工单 #51:上游自所配 0.1.0 起长出四组编目命令共 14 个
+        // schema(cli.go 的 Schema* 常量,逐个指回 notes/51-follow-sync-diff.md
+        // §1 的契约表)。此前面板一个都不认识——只要代跑任一编目命令就合成
+        // 「需升级 nw」,而 nw --version 报的正是 0.1.0:落后的不是引擎是面板
+        // 的契约表(ADR-0007「双真相源必然打架」的现形)。
+        for schema in [
+            "nw/vps-register.v1",
+            "nw/vps-ls.v1",
+            "nw/vps-rm.v1",
+            "nw/key-register.v1",
+            "nw/key-ls.v1",
+            "nw/key-get.v1",
+            "nw/key-rm.v1",
+            "nw/subscription-register.v1",
+            "nw/subscription-ls.v1",
+            "nw/subscription-get.v1",
+            "nw/subscription-rm.v1",
+            "nw/tag-add.v1",
+            "nw/tag-ls.v1",
+            "nw/tag-rm.v1",
+        ] {
+            let mut e = envelope_with_schema(schema, "0.1.0", json!({"gates": []}));
+            assert!(
+                e.schema_known(),
+                "{schema} 必须在认识集合内(否则误报需升级)"
+            );
+            e.apply_schema_guard(0);
+            assert!(
+                e.schema_guard.is_none(),
+                "{schema} 认识,不该合成「需升级 nw」证据"
+            );
+        }
+        assert_eq!(KNOWN_SCHEMAS.len(), 22, "既有 8 + 编目 14");
+    }
+
+    #[test]
+    fn 契约守卫_认识形状不等于准许代跑_两层分工不被混淆() {
+        // ADR-0009:key get / subscription get 的 schema 在认识集合里(契约对齐),
+        // 但面板对这两个命令只给建议命令、不代跑——认识形状答「我听不听得懂」,
+        // 准许代跑答「面板会不会跑起来」,两件事。这里守前一半:认识集合里
+        // 确有这两个 schema(它们不是「需升级」),代跑边界由 ADR-0009 裁定、
+        // 由功能票(#56/#57)落地,不在契约守卫这一层。
+        assert!(is_known_schema("nw/key-get.v1"));
+        assert!(is_known_schema("nw/subscription-get.v1"));
+        // 反面:真不认识的仍走守卫,不因为集合扩了就放松
+        let mut e = envelope_with_schema("nw/vps-ls.v2", "9.9.9", json!({}));
+        assert!(!e.schema_known(), "v2 仍不认识");
+        e.apply_schema_guard(3);
+        assert_eq!(
+            e.schema_guard.unwrap().code.as_deref(),
+            Some("SCHEMA_UNKNOWN")
+        );
     }
 
     #[test]

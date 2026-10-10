@@ -9,3 +9,5 @@
 - 「建议动作」= 面板给出可复制的命令文案，执行权留给用户；将来要一键代跑，先立新 ADR。
 
 > **修订（ADR-0006，accepted）**：「三类」已扩为「四类」——`nw source register`（代跑到落账，两段式确认）与 `nw source recheck`（只读，落健康屏）获准；其余写动作仍只展示证据与建议命令。
+
+> **再修订（ADR-0009，accepted）**：新口径为「**六类**」。只读三类不变（`ls` / `doctor` + `validate` / `source recheck`）；写动作三类为 `up`、`source register`、**编目册写动作**（`vps` register + rm / `key` register + rm / `subscription` register + rm / `tag` add + rm，均两段式或带面板图形确认，见 ADR-0009）。`key get` / `subscription get` 一律只给建议命令——上游唯一回显本体的两个出口，面板不接。
