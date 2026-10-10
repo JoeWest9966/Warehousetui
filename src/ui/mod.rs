@@ -8,8 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Screen};
-use crate::layout::{size_class, SizeClass, NAV_WIDTH};
+use crossterm::event::KeyCode;
+
+use crate::app::{App, Domain, HealthMode, Screen};
+use crate::layout::{popup_rect, size_class, SizeClass, HELP_H, HELP_W, NAV_WIDTH};
 use crate::screens;
 use crate::theme::Palette;
 
@@ -39,7 +41,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_hud(frame, rows[2], app);
 
     if app.help {
-        render_help(frame, area, app);
+        // 传 body 区(去掉顶栏 1 行)而非整帧:与 `layout::help_hits` 的
+        // `area_pad(area,1)` 同源,浮层可见区与「点任意处关」命中区永不分歧。
+        render_help(frame, rows[1], app);
     }
     let _ = p;
 }
@@ -181,41 +185,256 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)).style(p.surface()), area);
 }
 
+/// 帮助浮层的派发前预设:帮助列出的键有的要靠浮层在场才触发
+/// (如 Esc 关浮层)。测试据此布场,再派发 `code` 验证「实现确有这条分支」。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Prep {
+    /// 壳级:把 app.screen / rc_domain / hl_mode 布好就直接派发。
+    Shell,
+    /// 先打开帮助浮层再派发(验证 Esc/q 关浮层)。
+    HelpOpen,
+}
+
+/// 帮助浮层的一行键位:渲染与「帮助↔实现不脱节」测试共用这一份
+/// (`app::tests` 的对照测试遍历它),是帮助内容的单一真相源。
+/// - `key` = 浮层展示的键名(可列别名,如 `a / h / l`);`desc` = 一句说明。
+/// - `screen` / `domain` / `mode` = 测试派发前把 App 布到的上下文
+///   (`None` = 壳级 / 默认域);`prep` = 额外浮层预设;`code` = 代表性键码。
+/// - **增删一个键位必须同步改这里与 `app.rs` 的 handler**:正向测试守
+///   「帮助写的键实现里都有」,反向清点守「实现有的键帮助都写了」。
+pub(crate) struct HelpRow {
+    pub(crate) key: &'static str,
+    pub(crate) desc: &'static str,
+    pub(crate) screen: Option<Screen>,
+    pub(crate) domain: Option<Domain>,
+    pub(crate) mode: Option<HealthMode>,
+    pub(crate) prep: Prep,
+    pub(crate) code: KeyCode,
+}
+
+/// 帮助浮层键位对照表(单一真相源):顺序即浮层里的自上而下。
+/// 别名不逐列——`↑/↓` 之 `n/p`、`h/l` 之 `←/→`、`j/k` 之 `Tab/BackTab`
+/// 与主键同义,帮助只呈现主键(与 README 键位表同粒度)。
+pub(crate) const HELP_ROWS: &[HelpRow] = &[
+    HelpRow {
+        key: "j / k",
+        desc: "切屏(下一屏 / 上一屏)",
+        screen: None,
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('j'),
+    },
+    HelpRow {
+        key: "↑ / ↓",
+        desc: "列表上下移(各屏可选列表)",
+        screen: None,
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Down,
+    },
+    HelpRow {
+        key: "a / h / l",
+        desc: "概览:跳 装配 / 健康 / 配方",
+        screen: Some(Screen::Overview),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('a'),
+    },
+    HelpRow {
+        key: "r",
+        desc: "概览:刷新 ls",
+        screen: Some(Screen::Overview),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('r'),
+    },
+    HelpRow {
+        key: "Enter",
+        desc: "装配:打开发射仪式(再按发射)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Enter,
+    },
+    HelpRow {
+        key: "m",
+        desc: "健康:切 体检 / 校验 / 复核",
+        screen: Some(Screen::Health),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('m'),
+    },
+    HelpRow {
+        key: "r",
+        desc: "健康:复核(重跑 / 全查外部源)",
+        screen: Some(Screen::Health),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('r'),
+    },
+    HelpRow {
+        key: "Enter",
+        desc: "健康复核屏:只查选中外部源",
+        screen: Some(Screen::Health),
+        domain: None,
+        mode: Some(HealthMode::Recheck),
+        prep: Prep::Shell,
+        code: KeyCode::Enter,
+    },
+    HelpRow {
+        key: "h / l",
+        desc: "配方:切换五域",
+        screen: Some(Screen::Recipes),
+        domain: Some(Domain::Recipes),
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('h'),
+    },
+    HelpRow {
+        key: "c",
+        desc: "配方:取用烘焙建议命令(只读)",
+        screen: Some(Screen::Recipes),
+        domain: Some(Domain::Recipes),
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('c'),
+    },
+    HelpRow {
+        key: "r",
+        desc: "配方:登记外部源(外部源域)",
+        screen: Some(Screen::Recipes),
+        domain: Some(Domain::Sources),
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('r'),
+    },
+    HelpRow {
+        key: "n",
+        desc: "设置:轮换 NW_HOME",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('n'),
+    },
+    HelpRow {
+        key: "i",
+        desc: "设置:手填 NW_HOME",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('i'),
+    },
+    HelpRow {
+        key: "d",
+        desc: "设置:手填数据仓根",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('d'),
+    },
+    HelpRow {
+        key: "e",
+        desc: "设置:拉起 $EDITOR",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('e'),
+    },
+    HelpRow {
+        key: "m",
+        desc: "设置:切换鼠标捕获(重启生效)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('m'),
+    },
+    HelpRow {
+        key: "Esc",
+        desc: "返回 / 关闭浮层",
+        screen: None,
+        domain: None,
+        mode: None,
+        prep: Prep::HelpOpen,
+        code: KeyCode::Esc,
+    },
+    HelpRow {
+        key: "t",
+        desc: "切换主题(任意屏)",
+        screen: None,
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('t'),
+    },
+    HelpRow {
+        key: "?",
+        desc: "本帮助",
+        screen: None,
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('?'),
+    },
+    HelpRow {
+        key: "q",
+        desc: "退出(装配态 / 输入中禁用)",
+        screen: None,
+        domain: None,
+        mode: None,
+        prep: Prep::Shell,
+        code: KeyCode::Char('q'),
+    },
+];
+
+/// 鼠标章节正文:逐条对应 README「鼠标(默认开捕获)」已写全部条目——
+/// 点导航/Tab 切屏与点行选中、滚轮两用(移选中 / 翻装配 stderr 日志)、
+/// 发射仪式两段可点、浮层吞底层点击、捕获默认开的 Shift 代价、
+/// 以及 `--no-mouse` 与设置屏 `m` 两条逃逸。测试断言这些短语都在场。
+pub(crate) const MOUSE_LINES: &[&str] = &[
+    "点导航 / 屏 Tab 切屏;点列表行 = 选中(同 ↑/↓)",
+    "滚轮:可选列表移选中;装配 stderr 日志区回看",
+    "发射仪式「发射/返航」两段可点;浮层不穿透底层点击",
+    "捕获默认开的代价:拖拽选中 / 复制需按 Shift",
+    "逃逸:--no-mouse 启动,或设置屏 m 关(重启生效)",
+];
+
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
+    // 浮层矩形与命中区(`layout::help_hits`)同一个 `popup_rect` + 同尺寸常量,
+    // 渲染与「点任意处关」永不分歧。
+    let popup = popup_rect(area, HELP_W, HELP_H);
     let block = Block::bordered()
         .border_style(p.accent())
         .title(Span::styled(" 帮助 ", p.accent().bold()));
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled("  移动 ", p.accent()).to_string()),
-        Line::from("    j / ↓      下一屏"),
-        Line::from("    k / ↑      上一屏"),
-        Line::from("    h / l      面板内左右(数据屏内)"),
-        Line::from(""),
-        Line::from(Span::styled("  动作 ", p.accent()).to_string()),
-        Line::from("    Enter      确认 / 进入"),
-        Line::from("    Esc        返回 / 关闭浮层"),
-        Line::from("    t          切换主题"),
-        Line::from("    i          手填 NW_HOME(设置屏)"),
-        Line::from("    d          手填数据仓根(设置屏)"),
-        Line::from("    r          登记外部源(配方屏·外部源域)"),
-        Line::from("    ?          本帮助"),
-        Line::from("    q          退出(装配态 / 输入中禁用)"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  装配幂等可重入,取消安全;失败永远带证据五字段。",
-            p.dim(),
-        )),
-    ];
-    let w = 44u16.min(area.width.saturating_sub(4));
-    let h = 18u16.min(area.height.saturating_sub(2));
-    let popup = Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
-    );
+    let mut lines: Vec<Line> = Vec::with_capacity(HELP_ROWS.len() + MOUSE_LINES.len() + 4);
+    for row in HELP_ROWS {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{:<10}", row.key), p.accent()),
+            Span::raw(row.desc),
+        ]));
+    }
+    lines.push(Line::from(Span::styled("  鼠标(默认开捕获)", p.accent())));
+    for m in MOUSE_LINES {
+        lines.push(Line::from(format!("    {m}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  装配幂等可重入,取消安全;失败永远带证据五字段。",
+        p.dim(),
+    )));
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block).style(p.surface()), popup);
 }

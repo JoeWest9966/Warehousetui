@@ -3978,4 +3978,211 @@ mod tests {
             "未设根时没有可选中行(指路屏)"
         );
     }
+
+    // ---- #62 帮助浮层↔实现 双向对齐(纯文档,零行为变更) ----
+
+    /// 可观测状态快照:帮助对照测试据此判断「这个键按下去到底动没动」。
+    /// 覆盖任何键位可能改到的字段(屏 / 各屏选中 / 模式 / 域 / 浮层 / 退出 /
+    /// 手填 / 编辑器 / 鼠标 / NW_HOME / 日志长度 / 队列长度)。
+    #[derive(PartialEq, Debug)]
+    struct KeySnap {
+        screen: Screen,
+        ov_sel: usize,
+        as_sel: usize,
+        as_confirm: bool,
+        hl_mode: HealthMode,
+        hl_sel: usize,
+        rc_domain: Domain,
+        rc_sel: usize,
+        rc_bake_sel: bool,
+        reg_state: RegState,
+        help: bool,
+        quit: bool,
+        home_input: bool,
+        data_input: bool,
+        pending_editor: bool,
+        mouse_enabled: bool,
+        nw_home: String,
+        log_len: usize,
+        queue_len: usize,
+    }
+
+    fn key_snap(a: &App) -> KeySnap {
+        KeySnap {
+            screen: a.screen,
+            ov_sel: a.ov_sel,
+            as_sel: a.as_sel,
+            as_confirm: a.as_confirm,
+            hl_mode: a.hl_mode,
+            hl_sel: a.hl_sel,
+            rc_domain: a.rc_domain,
+            rc_sel: a.rc_sel,
+            rc_bake_sel: a.rc_bake_sel,
+            reg_state: a.reg_state,
+            help: a.help,
+            quit: a.quit,
+            home_input: a.home_input,
+            data_input: a.data_input,
+            pending_editor: a.pending_editor,
+            mouse_enabled: a.mouse_enabled,
+            nw_home: a.nw_home.clone(),
+            log_len: a.log.len(),
+            queue_len: a.queue.len(),
+        }
+    }
+
+    /// 一次性临时目录(数据仓根要真实可读,闸才放行;进程级唯一,建好即用)。
+    fn help_env_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nwt-help-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// 帮助对照测试的就绪态:数据仓根指向真实可读临时目录(三道闸放行)、
+    /// 五项能力全 Available、五域夹具各备 ≥2 行——让每个键位都能触发
+    /// 可观测变化(派发只入队,不真跑子进程)。`dir` 由调用方建好并持有。
+    fn help_ready_app(dir: &str) -> App {
+        let mut app = fake_app();
+        app.splash = false;
+        app.data_root = Some(dir.to_string());
+        for cap in Capability::ALL {
+            app.capabilities.record(cap, Probe::Available);
+        }
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0"},{"name":"lab-desk","version":"0.1.0"}],"components":[],"sources":[{"name":"tiny-skills"},{"name":"more-skills"}],"profiles":[{"name":"desk","state":"drift"},{"name":"lab","state":"ok"}],"locks":[{"lockId":"9f8e","recipe":"research-desk"},{"lockId":"a1b2","recipe":"lab-desk"}]}"#,
+            )
+            .unwrap(),
+        );
+        app
+    }
+
+    /// 正向守「帮助列出的每个键,实现里都有真实分支」:遍历 `HELP_ROWS`,
+    /// 按行把 App 布到对应上下文,派发代表性键码,断言可观测状态确曾改变
+    /// (帮助不写幽灵键)。增删键位只改 `HELP_ROWS` 一处即双向生效。
+    #[test]
+    fn 帮助列出的每个键_实现里都有真实分支() {
+        use crate::ui::{Prep, HELP_ROWS};
+        let (_g, _cfg) = env_locked();
+        let dir = help_env_dir();
+        let dir = dir.to_str().unwrap().to_string();
+        for row in HELP_ROWS {
+            let mut app = help_ready_app(&dir);
+            if let Some(s) = row.screen {
+                app.screen = s;
+            }
+            if let Some(d) = row.domain {
+                app.rc_domain = d;
+            }
+            if let Some(m) = row.mode {
+                app.hl_mode = m;
+            }
+            if row.prep == Prep::HelpOpen {
+                app.help = true;
+            }
+            let before = key_snap(&app);
+            app.update(Message::Key(KeyEvent::new(row.code, KeyModifiers::NONE)));
+            assert_ne!(
+                key_snap(&app),
+                before,
+                "帮助列的键 `{}`({})在实现里应有真实分支",
+                row.key,
+                row.desc
+            );
+        }
+    }
+
+    /// 守「HELP_ROWS 单一真相源真的渲染进了浮层」:逐行断言键名与说明都在
+    /// 渲染文本里,鼠标章节每一行也都在——渲染与对照表不脱节。
+    #[test]
+    fn 帮助浮层渲染出对照表每一行() {
+        use crate::ui::{HELP_ROWS, MOUSE_LINES};
+        let mut app = fake_app();
+        app.splash = false;
+        app.help = true;
+        let s = crate::testutil::frame_display(&app, 80, 44);
+        for row in HELP_ROWS {
+            assert!(s.contains(row.key), "帮助应显示键位 `{}`", row.key);
+            assert!(s.contains(row.desc), "帮助应显示说明 `{}`", row.desc);
+        }
+        for m in MOUSE_LINES {
+            assert!(s.contains(m), "鼠标章节应含 `{m}`");
+        }
+    }
+
+    /// 反向守「实现里每个屏的分支键,帮助都写了」:对每屏盲按 a-z + ↑/↓/Enter/Esc,
+    /// 凡使状态改变者即「实现里有分支」,断言帮助对照表必有兼容行覆盖它。
+    /// 概览 `n/p` 是 ↑/↓ 的别名(帮助只呈现 ↑/↓,同 README 粒度),显式排除免误报。
+    /// 新增实现键若忘加进 HELP_ROWS,此测试当场红。
+    #[test]
+    fn 实现每个屏的按键_帮助都写了() {
+        use crate::ui::HELP_ROWS;
+        let (_g, _cfg) = env_locked();
+        let dir = help_env_dir();
+        let dir = dir.to_str().unwrap().to_string();
+        let aliases = [
+            (Screen::Overview, KeyCode::Char('n')),
+            (Screen::Overview, KeyCode::Char('p')),
+        ];
+        let mut candidates: Vec<KeyCode> =
+            (b'a'..=b'z').map(|b| KeyCode::Char(b as char)).collect();
+        candidates.extend([KeyCode::Up, KeyCode::Down, KeyCode::Enter, KeyCode::Esc]);
+        for screen in Screen::ALL {
+            for code in &candidates {
+                if aliases.contains(&(screen, *code)) {
+                    continue;
+                }
+                let mut app = help_ready_app(&dir);
+                app.screen = screen;
+                let before = key_snap(&app);
+                app.update(Message::Key(KeyEvent::new(*code, KeyModifiers::NONE)));
+                if key_snap(&app) == before {
+                    continue; // 该屏此键无分支
+                }
+                let token = match code {
+                    KeyCode::Char(c) => c.to_string(),
+                    KeyCode::Up => "↑".to_string(),
+                    KeyCode::Down => "↓".to_string(),
+                    KeyCode::Enter => "Enter".to_string(),
+                    KeyCode::Esc => "Esc".to_string(),
+                    _ => unreachable!(),
+                };
+                let documented = HELP_ROWS.iter().any(|r| {
+                    (r.screen == Some(screen) || r.screen.is_none())
+                        && r.key
+                            .split(['/', ' '])
+                            .filter(|t| !t.is_empty())
+                            .any(|t| t == token)
+                });
+                assert!(
+                    documented,
+                    "屏 {screen:?} 的键 `{token}` 在实现里有分支,但帮助对照表没写(补 HELP_ROWS)"
+                );
+            }
+        }
+    }
+
+    /// 鼠标章节覆盖 README「鼠标(默认开捕获)」已写全部条目:点导航/Tab 切屏与
+    /// 点行选中、滚轮两用、发射仪式两段、浮层吞点击、Shift 放行复制、
+    /// `--no-mouse` 与设置屏 `m` 两逃逸——每条都有短语在场。
+    #[test]
+    fn 帮助鼠标章节_覆盖_readme_全部条目() {
+        use crate::ui::MOUSE_LINES;
+        let joined = MOUSE_LINES.join("\n");
+        for phrase in [
+            "切屏",
+            "选中",
+            "滚轮",
+            "装配",
+            "发射",
+            "返航",
+            "浮层",
+            "不穿透",
+            "Shift",
+            "--no-mouse",
+            "设置屏 m",
+        ] {
+            assert!(joined.contains(phrase), "鼠标章节缺 README 条目 `{phrase}`");
+        }
+    }
 }

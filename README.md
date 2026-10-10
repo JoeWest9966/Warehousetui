@@ -45,9 +45,9 @@ cargo build --release
 |---|---|---|
 | 概览 | 警示带 + 派四态表 + 四域计数卡 + 指令栏 + 最近日志 | `↑/↓` 选派,`r` 刷 ls,`a`/`h`/`l` 跳屏 |
 | 装配 | 选锁定集 → 发射仪式 → 七步 + stderr 实时日志 | `↑/↓` 选锁,`Enter` 发射仪式,再 `Enter` 发射 |
-| 健康 | doctor 七面卡片 / validate 27 项清单 + 证据五字段 | `r` 复核,`m` 切模式,`↑/↓` 翻阅 |
-| 配方 | 五域两栏只读浏览(recipes/components/sources/profiles/locks) | `h/l` 切域,`↑/↓` 选行 |
-| 设置 | 引擎发现状态、NW_HOME、数据仓根、主题、配置入口 | `n` 轮换 NW_HOME,`d` 手填数据仓根,`e` 拉起 $EDITOR,`t` 主题 |
+| 健康 | doctor 七面卡片 / validate 27 项清单 + 证据五字段 | `r` 复核,`m` 切模式,`Enter` 复核选中条,`↑/↓` 翻阅 |
+| 配方 | 五域两栏只读浏览(recipes/components/sources/profiles/locks) | `h/l` 切域,`↑/↓` 选行,`c` 取用烘焙建议命令(只读),`r` 登记外部源(外部源域) |
+| 设置 | 引擎发现状态、NW_HOME、数据仓根、主题、配置入口 | `n` 轮换 NW_HOME,`i` 手填 NW_HOME,`d` 手填数据仓根,`e` 拉起 $EDITOR,`m` 切换鼠标捕获,`t` 主题 |
 
 通用:`j/k` 切屏 · `Enter` 确认 · `Esc` 返回 · `?` 帮助 · `q` 退出(装配态禁用)。
 

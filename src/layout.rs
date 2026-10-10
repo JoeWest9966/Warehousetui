@@ -564,9 +564,15 @@ fn register_hits(
 }
 
 /// 帮助浮层:与 `render_help` 同尺寸居中,点任意处关闭(不区分内外)。
+/// 尺寸用共享常量 `HELP_W` / `HELP_H`,渲染侧同一个 `popup_rect`——
+/// 可见浮层与「点任意处关」的命中区几何永不分歧。
 fn help_hits(area: Rect, hits: &mut Vec<(Rect, Target)>) {
-    hits.push((popup_rect(area, 44, 18), Target::DismissPopup));
+    hits.push((popup_rect(area, HELP_W, HELP_H), Target::DismissPopup));
 }
+
+/// 帮助浮层尺寸:渲染(`ui::render_help`)与命中(`help_hits`)共用。
+pub(crate) const HELP_W: u16 = 60;
+pub(crate) const HELP_H: u16 = 30;
 
 /// 与壳/浮层渲染同款的居中弹层矩形(`recipes` 登记浮层渲染直接调用,
 /// 与命中侧同一个函数——居中与收窄规则永不分歧)。
@@ -848,8 +854,8 @@ mod tests {
         let hits = hitmap(a, &app, size_class(a));
         assert_eq!(
             first(&hits, |t| *t == Target::DismissPopup),
-            Some(Rect::new(18, 6, 44, 18)),
-            "帮助浮层与渲染同尺寸居中,点任意处关闭"
+            Some(Rect::new(10, 2, 60, 26)),
+            "帮助浮层与渲染同尺寸居中(body 区 60×30 钳到 26),点任意处关闭"
         );
         assert!(
             hits.iter().all(|(_, t)| matches!(t, Target::DismissPopup)),
