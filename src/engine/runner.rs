@@ -8,7 +8,8 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use super::envelope::{Envelope, Evidence};
@@ -108,12 +109,40 @@ impl EngineOutput {
 /// `run` 一次性执行;`spawn` 流式执行(stderr 实时推送)。
 /// 返回 `Pin<Box<dyn Future>>` 而非 `async fn`,保持 object-safe
 /// (`Arc<dyn CommandRunner>` 可注入 App,测试可换 FakeRunner)。
+///
+/// # stdin 喂入通道(#55)
+///
+/// `run_with_stdin` / `spawn_with_stdin` 是**单独**的喂入路径:本体(密钥 /
+/// 订阅链接)只从 stdin 进(argv 面无任何明文形参 —— 误粘的 argv 会进 ps /
+/// history)。喂入内容是**一次性值**:运行器原样写进子进程 stdin 后立即 drop,
+/// 绝不进 `EngineOutput` / `EngineEvent` / `App` 任何字段,也不进日志 / 配置 /
+/// 崩溃上报。不喂入时走 `run` / `spawn`,行为与开此通道前逐字节一致。把「能喂
+/// stdin」与「不能喂 stdin」分成两个方法,是让误用在类型层就难看得出。
+///
+/// 「stdin 是终端会一直挂住等人敲」由**引擎侧**拦(上游 `--token-stdin` 的
+/// TTY 闸),面板只经管道喂入、永不复刻那道判定。
 pub trait CommandRunner: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     fn run(&self, args: &[String]) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>>;
 
     fn spawn(&self, args: Vec<String>, tx: mpsc::UnboundedSender<EngineEvent>);
+
+    /// stdin 喂入路径(一次性执行):把 `stdin` 原样写进子进程 stdin 后立即 drop。
+    /// `stdin` 是本体字节(密钥 / 订阅链接),绝不进返回的 `EngineOutput`。
+    fn run_with_stdin(
+        &self,
+        args: &[String],
+        stdin: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>>;
+
+    /// stdin 喂入路径(流式执行):同 `run_with_stdin`,stderr 实时推送。
+    fn spawn_with_stdin(
+        &self,
+        args: Vec<String>,
+        stdin: Vec<u8>,
+        tx: mpsc::UnboundedSender<EngineEvent>,
+    );
 }
 
 /// 真实 `nw` runner。
@@ -126,18 +155,44 @@ impl RealRunner {
         Self { bin }
     }
 
-    fn command(&self, args: &[String]) -> tokio::process::Command {
+    /// 建命令。`feed_stdin = false` 时 stdin 关掉(`Stdio::null()`),与开 stdin
+    /// 通道前逐字节一致;`true` 时开管道,供 `run_with_stdin` 喂入本体
+    /// (机密只从 stdin 进,argv 面无任何明文形参)。
+    fn command(&self, args: &[String], feed_stdin: bool) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.bin);
         cmd.args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+            .stdin(if feed_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
         cmd
     }
 
     async fn run_inner(&self, args: Vec<String>) -> EngineOutput {
-        match self.command(&args).spawn() {
+        self.run_inner_fed(args, None).await
+    }
+
+    /// `stdin = Some(字节)` 时开管道并喂入本体(写后即关、即弃);`None` 时不喂入,
+    /// stdin 仍关掉 —— 与开 stdin 通道前逐字节一致。喂入内容绝不进 EngineOutput。
+    async fn run_inner_fed(&self, args: Vec<String>, stdin: Option<Vec<u8>>) -> EngineOutput {
+        let spawned = if stdin.is_some() {
+            self.command(&args, true).spawn()
+        } else {
+            self.command(&args, false).spawn()
+        };
+        match spawned {
             Ok(mut child) => {
+                // 喂入(#55):原样写进子进程 stdin 后立即关闭;内容随进程结束即弃,
+                // 不进 EngineOutput / 日志 / 配置任何一处。
+                if let (Some(bytes), Some(mut sink)) = (stdin, child.stdin.take()) {
+                    tokio::spawn(async move {
+                        let _ = sink.write_all(&bytes).await;
+                        // sink 关闭(子进程读到 EOF),bytes 在此作用域结束即弃
+                    });
+                }
                 // stderr 收集(一次性执行场景给日志尾巴)
                 let (stx, mut srx) = mpsc::unbounded_channel::<String>();
                 if let Some(se) = child.stderr.take() {
@@ -184,22 +239,24 @@ impl RealRunner {
             ),
         }
     }
-}
 
-impl CommandRunner for RealRunner {
-    fn name(&self) -> &'static str {
-        "real"
-    }
-
-    fn run(&self, args: &[String]) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>> {
-        Box::pin(self.run_inner(args.to_vec()))
-    }
-
-    fn spawn(&self, args: Vec<String>, tx: mpsc::UnboundedSender<EngineEvent>) {
+    /// `spawn` 的喂入变体:`stdin = Some(字节)` 时开管道并喂入(写后即关、即弃),
+    /// `None` 时不喂入(stdin 关掉,与改动前逐字节一致)。
+    fn spawn_fed(
+        &self,
+        args: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        tx: mpsc::UnboundedSender<EngineEvent>,
+    ) {
         let bin = self.bin.clone();
         tokio::spawn(async move {
             let runner = RealRunner { bin };
-            let mut cmd = match runner.command(&args).spawn() {
+            let spawned = if stdin.is_some() {
+                runner.command(&args, true).spawn()
+            } else {
+                runner.command(&args, false).spawn()
+            };
+            let mut cmd = match spawned {
                 Ok(c) => c,
                 Err(e) => {
                     let out = EngineOutput::from_parts(
@@ -212,6 +269,13 @@ impl CommandRunner for RealRunner {
                     return;
                 }
             };
+            // 喂入(#55):原样写进子进程 stdin 后立即关闭;None = 不喂入,
+            // 与开 stdin 通道前逐字节一致。内容随进程结束即弃,不进任何结构。
+            if let (Some(bytes), Some(mut sink)) = (stdin, cmd.stdin.take()) {
+                tokio::spawn(async move {
+                    let _ = sink.write_all(&bytes).await;
+                });
+            }
             // stderr 实时逐行推 UI(装配日志窗格的数据源),同时收拢成
             // Finished 的尾巴 —— 版本探测等从 stderr 读真相的调用要用它
             // (nw --version 的裸版本号在 stderr;尾巴空 = 顶栏永远「未知」)。
@@ -249,6 +313,37 @@ impl CommandRunner for RealRunner {
             };
             let _ = tx.send(EngineEvent::Finished(Box::new(out)));
         });
+    }
+}
+
+impl CommandRunner for RealRunner {
+    fn name(&self) -> &'static str {
+        "real"
+    }
+
+    fn run(&self, args: &[String]) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>> {
+        Box::pin(self.run_inner(args.to_vec()))
+    }
+
+    fn run_with_stdin(
+        &self,
+        args: &[String],
+        stdin: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>> {
+        Box::pin(self.run_inner_fed(args.to_vec(), Some(stdin)))
+    }
+
+    fn spawn(&self, args: Vec<String>, tx: mpsc::UnboundedSender<EngineEvent>) {
+        self.spawn_fed(args, None, tx);
+    }
+
+    fn spawn_with_stdin(
+        &self,
+        args: Vec<String>,
+        stdin: Vec<u8>,
+        tx: mpsc::UnboundedSender<EngineEvent>,
+    ) {
+        self.spawn_fed(args, Some(stdin), tx);
     }
 }
 
@@ -304,7 +399,29 @@ impl CommandRunner for MissingRunner {
         Box::pin(async move { out })
     }
 
+    fn run_with_stdin(
+        &self,
+        args: &[String],
+        stdin: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>> {
+        // 没有进程可喂:本体即弃(EnvMissing 与是否喂入无关,绝不保留内容)。
+        drop(stdin);
+        let out = self.output(args);
+        Box::pin(async move { out })
+    }
+
     fn spawn(&self, args: Vec<String>, tx: mpsc::UnboundedSender<EngineEvent>) {
+        let out = self.output(&args);
+        let _ = tx.send(EngineEvent::Finished(Box::new(out)));
+    }
+
+    fn spawn_with_stdin(
+        &self,
+        args: Vec<String>,
+        stdin: Vec<u8>,
+        tx: mpsc::UnboundedSender<EngineEvent>,
+    ) {
+        drop(stdin); // 没有进程可喂:本体即弃
         let out = self.output(&args);
         let _ = tx.send(EngineEvent::Finished(Box::new(out)));
     }
@@ -313,6 +430,9 @@ impl CommandRunner for MissingRunner {
 /// 回放 runner:规则按「args 包含子串」匹配,stdout 给 fixture JSON。
 pub struct FakeRunner {
     rules: Vec<(String, EngineOutput)>,
+    /// 记录「收到过几次 stdin 喂入」——只记次数,**绝不存内容**(铁律:面板侧不留
+    /// 副本)。测试靠它守「喂入确有一次到达运行器」,而内容一个字节都不进结构。
+    stdin_feeds: AtomicUsize,
 }
 
 impl FakeRunner {
@@ -333,6 +453,7 @@ impl FakeRunner {
                     )
                 })
                 .collect(),
+            stdin_feeds: AtomicUsize::new(0),
         }
     }
 
@@ -356,7 +477,13 @@ impl FakeRunner {
                     )
                 })
                 .collect(),
+            stdin_feeds: AtomicUsize::new(0),
         }
+    }
+
+    /// 测试探针:这条 FakeRunner 累计收到过几次 stdin 喂入(只记次数,**绝不存内容**)。
+    pub fn stdin_feed_count(&self) -> usize {
+        self.stdin_feeds.load(Ordering::SeqCst)
     }
 
     fn match_for(&self, args: &[String]) -> EngineOutput {
@@ -387,7 +514,33 @@ impl CommandRunner for FakeRunner {
         Box::pin(async move { out })
     }
 
+    fn run_with_stdin(
+        &self,
+        args: &[String],
+        stdin: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>> {
+        // 记「收到过」即弃:内容绝不进任何结构(只计数,铁律面板侧不留副本)。
+        self.stdin_feeds.fetch_add(1, Ordering::SeqCst);
+        drop(stdin);
+        let mut out = self.match_for(args);
+        out.args = args.to_vec();
+        Box::pin(async move { out })
+    }
+
     fn spawn(&self, args: Vec<String>, tx: mpsc::UnboundedSender<EngineEvent>) {
+        let mut out = self.match_for(&args);
+        out.args = args;
+        let _ = tx.send(EngineEvent::Finished(Box::new(out)));
+    }
+
+    fn spawn_with_stdin(
+        &self,
+        args: Vec<String>,
+        stdin: Vec<u8>,
+        tx: mpsc::UnboundedSender<EngineEvent>,
+    ) {
+        self.stdin_feeds.fetch_add(1, Ordering::SeqCst);
+        drop(stdin); // 记「收到过」即弃:内容绝不进任何结构
         let mut out = self.match_for(&args);
         out.args = args;
         let _ = tx.send(EngineEvent::Finished(Box::new(out)));
@@ -537,5 +690,125 @@ mod tests {
         let d: super::super::LsData = out.envelope.as_ref().unwrap().data_as().unwrap();
         assert_eq!(d.profiles[0].name, "desk");
         assert_eq!(out.headline(), "完成");
+    }
+
+    // ---- #55 stdin 喂入通道:只铺管子,不开放任何命令 ----
+
+    #[tokio::test]
+    async fn 真实运行器_把一段文本喂进子进程stdin() {
+        // 用只回显 stdin 的 helper(`cat`)当子进程:喂进去的标记应从 stdout 回来,
+        // 证明运行器确能把本体写进子进程 stdin(机密本体的喂入前提)。
+        let r = RealRunner::new(PathBuf::from("cat"));
+        let marker = "nw-body-feed-55";
+        let out = r
+            .run_with_stdin(&[], format!("{marker}\n").into_bytes())
+            .await;
+        assert_eq!(out.exit_code, ExitCode::Ok, "cat 读到 EOF 后退出 0");
+        assert!(
+            out.raw_stdout.contains(marker),
+            "标记经 cat 回显,证明喂进了子进程 stdin:{:?}",
+            out.raw_stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn 真实运行器_spawn_也把一段文本喂进子进程stdin() {
+        let r = RealRunner::new(PathBuf::from("cat"));
+        let marker = "nw-body-feed-spawn-55";
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        r.spawn_with_stdin(vec![], format!("{marker}\n").into_bytes(), tx);
+        let mut finished = None;
+        while let Some(ev) = rx.recv().await {
+            if let EngineEvent::Finished(o) = ev {
+                finished = Some(o);
+                break;
+            }
+        }
+        let out = finished.expect("必须收到 Finished");
+        assert_eq!(out.exit_code, ExitCode::Ok);
+        assert!(
+            out.raw_stdout.contains(marker),
+            "spawn 路径同样把标记喂进 cat stdin:{:?}",
+            out.raw_stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn 喂入内容不落入_engine_output_任何字段_也不进argv() {
+        // 用一个不读 stdin 的子进程(测试二进制匹配不到测试即退),喂入唯一标记;
+        // 子进程退出后,返回的 EngineOutput 的 Debug(含所有字段)都不该含这个标记,
+        // argv / command_string 也不含 —— 本体只从 stdin 进,绝不落到结果结构。
+        let exe = std::env::current_exe().expect("当前测试二进制路径");
+        let r = RealRunner::new(exe);
+        let marker = "FEED-SECRET-55-DO-NOT-LEAK";
+        let out = r
+            .run_with_stdin(
+                &["--exact".into(), "this_test_nonexistent_xyz".into()],
+                marker.as_bytes().to_vec(),
+            )
+            .await;
+        let dbg = format!("{out:?}");
+        assert!(
+            !dbg.contains(marker),
+            "标记不该出现在 EngineOutput 的任何字段(喂入即弃):{dbg}"
+        );
+        assert!(
+            !out.args.iter().any(|a| a.contains(marker)),
+            "标记不进 argv:{:?}",
+            out.args
+        );
+        assert!(!out.command_string().contains(marker));
+    }
+
+    #[tokio::test]
+    async fn 未喂入时_stdin仍是关掉的_子进程立刻读到eof() {
+        // 回归:未喂入路径必须保持 Stdio::null()(与改动前逐字节一致)。
+        // cat 读 stdin 到 EOF 才退出:stdin 若是 null,cat 立即 EOF、输出为空、退 0;
+        // 若误开了空管道且不关,cat 会挂住等数据 —— 超时即视为回归。
+        let r = RealRunner::new(PathBuf::from("cat"));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), r.run(&[]))
+            .await
+            .expect("未喂入路径不该挂住:stdin 必须关掉");
+        assert!(
+            out.raw_stdout.is_empty(),
+            "stdin 关掉,cat 读不到字节:{:?}",
+            out.raw_stdout
+        );
+        assert_eq!(out.exit_code, ExitCode::Ok, "cat 应立即 EOF 并退出 0");
+    }
+
+    #[tokio::test]
+    async fn fake_runner_记录收到stdin喂入_但不存内容() {
+        // FakeRunner 能表达「收到 / 没收到 stdin 喂入」(计数),否则测试守不住;
+        // 且只记次数、绝不存内容。未喂入的 run/spawn 不增加计数。
+        let r = FakeRunner::new(&[("ls", 0, LS_FIXTURE)]);
+        assert_eq!(r.stdin_feed_count(), 0, "起初没收到喂入");
+        let _ = r.run(&["ls".into()]).await;
+        assert_eq!(r.stdin_feed_count(), 0, "未喂入的 run 不计数");
+        let _ = r.run_with_stdin(&["ls".into()], b"secret".to_vec()).await;
+        assert_eq!(r.stdin_feed_count(), 1, "喂入一次计一次");
+        // 回放内容与未喂入一致,且喂入内容绝不进结构
+        let out = r
+            .run_with_stdin(&["ls".into()], b"another-secret".to_vec())
+            .await;
+        assert_eq!(r.stdin_feed_count(), 2);
+        assert!(
+            !format!("{out:?}").contains("another-secret"),
+            "FakeRunner 只记次数、不存喂入内容"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_runner_喂入路径即弃_仍给env_missing() {
+        // MissingRunner 没有进程可喂:喂入方法即弃本体,结论与未喂入一致(EnvMissing)。
+        let r = MissingRunner {
+            attempted: vec!["PATH".into()],
+        };
+        let out = r.run_with_stdin(&["key".into()], b"secret".to_vec()).await;
+        assert_eq!(out.exit_code, ExitCode::EnvMissing);
+        assert!(
+            !format!("{out:?}").contains("secret"),
+            "MissingRunner 即弃喂入内容"
+        );
     }
 }

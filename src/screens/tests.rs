@@ -727,6 +727,39 @@ fn 设置屏_引擎版本行常驻_复用既有版本调用() {
     );
 }
 
+#[tokio::test]
+async fn 喂入内容不经运行器进入日志或渲染或配置_机密本体不回显不落盘() {
+    // #55:喂入是运行器能力,但本体绝不进日志行 / 渲染缓冲 / 配置。用 FakeRunner
+    // 记录「收到过喂入」,再把 Finished 路由进 App:喂入的标记(模拟机密)不该出现在
+    // 任何日志行、屏渲染或配置里 —— 守「永不回显密钥」铁律,不是靠注释守。
+    let runner = Arc::new(FakeRunner::new(&[(
+        "ls",
+        0,
+        r#"{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}}"#,
+    )]));
+    let mut app = App::with_runner(runner.clone());
+    let marker = "SUPER-SECRET-TOKEN-55-XYZ";
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    runner.spawn_with_stdin(
+        vec!["ls".into(), "--repo".into(), "/x".into()],
+        marker.as_bytes().to_vec(),
+        tx,
+    );
+    assert_eq!(runner.stdin_feed_count(), 1, "喂入确有一次到达运行器");
+    if let Some(EngineEvent::Finished(o)) = rx.recv().await {
+        feed(&mut app, *o);
+    }
+    assert!(
+        app.log.iter().all(|l| !l.contains(marker)),
+        "最近日志不回显喂入的机密:{:?}",
+        app.log
+    );
+    let s = draw(&app, 110, 30);
+    assert!(!s.contains(marker), "渲染缓冲不回显喂入的机密");
+    let (cfg, _) = crate::engine::config::load();
+    assert!(!format!("{cfg:?}").contains(marker), "配置不落喂入的机密");
+}
+
 // ---- #29 能力探测门(设置屏能力清单渲染) ----
 
 #[test]
