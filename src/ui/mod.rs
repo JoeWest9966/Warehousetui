@@ -361,7 +361,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
     },
     HelpRow {
         key: "m",
-        desc: "编目:换一册(机器 / 标签 / 订阅)",
+        desc: "编目:换一册(机器 / 标签 / 订阅 / 钥匙)",
         screen: Some(Screen::Vps),
         domain: None,
         mode: None,

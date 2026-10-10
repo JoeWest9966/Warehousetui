@@ -625,6 +625,18 @@ pub struct CatalogEntryView {
     /// 没给到期日 = 引擎给 `null` → None(0 天和「没这回事」是两件事,
     /// 上游刻意用 nil 指针而不是 0 占位)。
     pub days_left: Option<i64>,
+    /// kind(钥匙册的槽;上游 `KeyEntry.Kind`,条目级,恒 `github-key`)。
+    /// 缺 = None(展示层给「——」)。订阅册也有 kind 但投影不画它。
+    pub kind: Option<String>,
+    /// 服务哪个主机(钥匙册的槽;上游 `KeyEntry.Host`,缺省 github.com)。
+    /// 缺 = None(展示层给「——」)。
+    pub host: Option<String>,
+    /// 作用域(钥匙册的槽;上游 `KeyEntry.Scopes`,**只登记不设闸**)。恒数组,
+    /// 空 = 未声明作用域。
+    pub scopes: Vec<String>,
+    /// 轮换日(钥匙册的槽;上游 `KeyEntry.RotatedAt`,严格 YYYY-MM-DD,新登记
+    /// = 登记日 UTC)。缺 = None(展示层给「——」)。
+    pub rotated_at: Option<String>,
 }
 
 impl CatalogEntryView {
@@ -679,6 +691,24 @@ impl CatalogEntryView {
         match self.days_left {
             Some(n) => n.to_string(),
             None => "——".to_string(),
+        }
+    }
+
+    /// 作用域一行(钥匙册):只报**条数**(上游 `--scope` 只登记不设闸,面板不
+    /// 代管、不提醒、不评审;0 条显式「未声明」,不猜、不补)。
+    pub fn scopes_line(&self) -> String {
+        match self.scopes.len() {
+            0 => "未声明(0 条)".to_string(),
+            1 => "1 条".to_string(),
+            n => format!("{n} 条"),
+        }
+    }
+
+    /// 轮换日一行(钥匙册):缺字段显式「——」,不猜、不补一个日期。
+    pub fn rotated_at_line(&self) -> String {
+        match self.rotated_at.as_deref().map(str::trim) {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => "——".to_string(),
         }
     }
 }
@@ -1106,6 +1136,128 @@ impl SubRegisterData {
 /// `subscriptions.json` 一个字节都不动;删光最后一条留空 `entries` 数组
 /// 的文件,不删文件。
 pub type SubRmData = VpsRmData;
+
+// ---- key 组(`nw/key-*.v1`,编目 `<root>/keys.json`,工单 #57) ----
+
+/// 钥匙册的一条(ls 投影):**没有 secret 槽、也没有任何指纹字段**(上游
+/// `KeySummary` 五个键冻结;`KeyEntry` 有 secret 槽,但 ls **刻意不是
+/// `KeyEntry`** —— 投影结构上放不下本体,#18 三不印):分享清单、截图、贴
+/// 日志都不泄密,面板连「这像是哪把钥匙」都不该让人推断出来。这是**投影**
+/// 不是引用:想读本体只有 `nw key get` 一条路(且面板不代跑,ADR-0009 §1)。
+///
+/// `scopes` 恒为数组(上游不用 omitempty,没给 = `[]`,一种形状);`rotatedAt`
+/// 恒在(新登记 = 登记日 UTC,机器写产物不该有「没有轮换日」的第三态)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct KeySummary {
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default, rename = "rotatedAt")]
+    pub rotated_at: String,
+}
+
+impl KeySummary {
+    /// 薄适配器:钥匙条目 → 编目册投影(与 `VpsEntry::view` / `TagEntry::view` /
+    /// `SubSummary::view` 同形状,只填自己那一组槽:kind / host / 作用域 /
+    /// 轮换日)。**绝不填 secret 槽**——投影里没有这一格,结构上放不下。
+    pub fn view(&self) -> CatalogEntryView {
+        CatalogEntryView {
+            name: self.name.clone(),
+            kind: Some(self.kind.clone()),
+            host: Some(self.host.clone()),
+            scopes: self.scopes.clone(),
+            rotated_at: Some(self.rotated_at.clone()),
+            ..Default::default()
+        }
+    }
+}
+
+/// `nw key ls` 的 data:编目路径 + 钥匙清单。编目不存在 = 空数组 rc 0
+/// (合法空态);坏账 = rc 3 点名路径(绝不静默当成空编目)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct KeyLsData {
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub keys: Vec<KeySummary>,
+}
+
+impl KeyLsData {
+    /// ls 投影 → 编目册投影(确定性排序后的清单)。
+    pub fn sheet(&self) -> CatalogSheet {
+        CatalogSheet {
+            catalog_path: self.catalog_path.clone(),
+            entries: self.keys.iter().map(KeySummary::view).collect(),
+            gates: Vec::new(),
+        }
+        .sorted()
+    }
+}
+
+/// `nw key register` 的 data(预审与落账共用同一形状,`written` 区分「文件不落」
+/// 与真写入)。
+///
+/// **一个能放本体的字段都没有**(上游 `RegisterResult` 刻意不留 secret 槽:
+/// register 是「本体进仓」的写入口,却不是「本体出来」的出口——想泄都没有地方
+/// 放)。`host` / `scopes` / `rotatedAt` 只在过了全部三道闸之后才填,被拒时是
+/// 零值(失败也带 data 是硬约定)。
+#[derive(Clone, Debug, Deserialize)]
+pub struct KeyRegisterData {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default, rename = "rotatedAt")]
+    pub rotated_at: String,
+    #[serde(default, rename = "catalogPath")]
+    pub catalog_path: String,
+    #[serde(default)]
+    pub written: bool,
+    #[serde(default)]
+    pub updated: bool,
+    #[serde(default)]
+    pub action: String,
+    /// 三道闸,**恒 3 行**:`key.register.name` / `key.register.host` /
+    /// `key.register.body`;id 冻结、三态 pass/fail/skip。
+    #[serde(default)]
+    pub gates: Vec<CatalogGate>,
+}
+
+impl KeyRegisterData {
+    /// 登记回音 → 编目册投影(条目 = 这一把钥匙;没有 secret 槽)。
+    pub fn sheet(&self) -> CatalogSheet {
+        CatalogSheet {
+            catalog_path: self.catalog_path.clone(),
+            entries: vec![KeySummary {
+                name: self.name.clone(),
+                kind: self.kind.clone(),
+                host: self.host.clone(),
+                scopes: self.scopes.clone(),
+                rotated_at: self.rotated_at.clone(),
+            }
+            .view()],
+            gates: self.gates.clone(),
+        }
+    }
+
+    /// 闸里有 fail(落账闸的口径来源:任一不过 = 一个字节都不落)。
+    pub fn has_fail(&self) -> bool {
+        self.gates.iter().any(CatalogGate::is_fail)
+    }
+}
+
+/// `nw key rm <名>` 的 data 与 `nw vps rm` **逐字相同**——上游 `entry.RmOutcome`
+/// 是四组共用的同一个类型。删不存在的名 → rc 3 且 `keys.json` 一个字节都不动;
+/// 删光最后一条留空 `entries` 数组的文件,不删文件。
+pub type KeyRmData = VpsRmData;
 
 #[cfg(test)]
 mod tests {

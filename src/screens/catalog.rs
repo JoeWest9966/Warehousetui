@@ -1,7 +1,9 @@
-//! 编目册屏(spec #50 工单 #53 / #54 / #56,ADR-0009):第一本编目册(vps)
+//! 编目册屏(spec #50 工单 #53 / #54 / #56 / #57,ADR-0009):第一本编目册(vps)
 //! 端到端打通,同时立起**编目册骨架三件**;#54 加第二本(标签册),验证骨架在
 //! 「无确认闸的写路径」上也站得住;#56 加第三本(订阅册),验证骨架在
-//! 「本体只经 stdin 进」的机密路径上也站得住(到期三态按 UTC 现算)。
+//! 「本体只经 stdin 进」的机密路径上也站得住(到期三态按 UTC 现算);#57 加第四本
+//! (钥匙册),机密纪律最严的一本——本体只经 stdin 进、投影无本体槽也不印指纹、
+//! get 一律只给建议命令(连「这像是哪把钥匙」都不该让人推断出来)。
 //!
 //! 三件骨架(ADR-0009 Consequences):
 //! 1. envelope 投影类型(条目 + 编目路径 + 闸结论,字段恒在不为 null)——
@@ -25,12 +27,12 @@
 //! JSON)。键 `m` 换册。
 //!
 //! 机密纪律(ADR-0009 §3):`logins[].ref` 是**指针不是密钥**,原样呈现安全;
-//! 摘要行不印 ref 与 addr(照引擎 stderr 摘要的口径)。三本册子里只有订阅册
-//! 有「本体」:链接本体**只经 stdin 进**,面板侧只以 [`SecretBody`] 这一
+//! 摘要行不印 ref 与 addr(照引擎 stderr 摘要的口径)。订阅册与钥匙册有「本体」:
+//! 链接 / 钥匙本体都**只经 stdin 进**,面板侧只以 [`SecretBody`] 这一
 //! 「在途内存、不打印内容的外包类型」存在——喂入框渲染成掩码、日志只记
-//! 字节数、Debug 不打印内容、不进 config,流程结束即 drop。vps 组 argv 面
-//! 无密码参数(误粘 PEM 由引擎第⑤道闸拦);tag 组连指针槽都没有
-//! (`--ref` 走 argv 不走 stdin)。
+//! 字节数、Debug 不打印内容、不进 config,流程结束即 drop。钥匙册更严:投影
+//! 无本体槽也不印指纹,`get` 一律只给建议命令。vps 组 argv 面无密码参数
+//! (误粘 PEM 由引擎第⑤道闸拦);tag 组连指针槽都没有(`--ref` 走 argv 不走 stdin)。
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -42,7 +44,8 @@ use crossterm::event::KeyCode;
 use crate::app::{App, DataRootCause};
 use crate::engine::{
     capability, capability::Capability, CatalogEntryView, CatalogGate, CatalogRef, CatalogSheet,
-    EngineOutput, State, SubRegisterData, SubStatusCounts, TagAddData, VpsLsData, VpsRegisterData,
+    EngineOutput, KeyRegisterData, State, SubRegisterData, SubStatusCounts, TagAddData, VpsLsData,
+    VpsRegisterData,
 };
 use crate::input::{self, InputAction};
 use crate::layout::{popup_rect, REG_INPUT_H, REG_INPUT_W};
@@ -218,21 +221,26 @@ pub enum CatalogKind {
     Tag,
     /// 订阅册:`<root>/subscriptions.json`(工单 #56;本票主价值是到期三态)。
     Subscription,
+    /// 钥匙册:`<root>/keys.json`(工单 #57;机密纪律最严的一本:本体只经 stdin
+    /// 进,投影无本体槽也不印指纹,get 只给建议命令)。
+    Key,
 }
 
 impl CatalogKind {
-    pub const ALL: [CatalogKind; 3] = [
+    pub const ALL: [CatalogKind; 4] = [
         CatalogKind::Vps,
         CatalogKind::Tag,
         CatalogKind::Subscription,
+        CatalogKind::Key,
     ];
 
-    /// 册名(操作者视角;词有出处:vps / 标签 / 订阅都是上游命令组名,不自造)。
+    /// 册名(操作者视角;词有出处:vps / 标签 / 订阅 / 钥匙都是上游命令组名,不自造)。
     pub fn label(self) -> &'static str {
         match self {
             CatalogKind::Vps => "机器",
             CatalogKind::Tag => "标签",
             CatalogKind::Subscription => "订阅",
+            CatalogKind::Key => "钥匙",
         }
     }
 
@@ -242,15 +250,17 @@ impl CatalogKind {
             CatalogKind::Vps => "vps.json",
             CatalogKind::Tag => "tags.json",
             CatalogKind::Subscription => "subscriptions.json",
+            CatalogKind::Key => "keys.json",
         }
     }
 
-    /// 这一本的能力门(#29 组级探针:`vps` / `tag` / `subscription`)。
+    /// 这一本的能力门(#29 组级探针:`vps` / `tag` / `subscription` / `key`)。
     pub fn capability(self) -> Capability {
         match self {
             CatalogKind::Vps => Capability::Vps,
             CatalogKind::Tag => Capability::Tag,
             CatalogKind::Subscription => Capability::Subscription,
+            CatalogKind::Key => Capability::Key,
         }
     }
 
@@ -261,6 +271,7 @@ impl CatalogKind {
             CatalogKind::Vps => 4,          // 名字+端口 / 地址 / 登录 / 备注
             CatalogKind::Tag => 2,          // 名字 / 引用
             CatalogKind::Subscription => 2, // 名字+client / 到期日+三态+剩余天数
+            CatalogKind::Key => 4,          // 名字+kind / 主机 / 作用域条数 / 轮换日
         }
     }
 
@@ -270,6 +281,7 @@ impl CatalogKind {
             CatalogKind::Vps => vps_detail_rows,
             CatalogKind::Tag => tag_detail_rows,
             CatalogKind::Subscription => sub_detail_rows,
+            CatalogKind::Key => key_detail_rows,
         }
     }
 
@@ -278,7 +290,8 @@ impl CatalogKind {
         match self {
             CatalogKind::Vps => CatalogKind::Tag,
             CatalogKind::Tag => CatalogKind::Subscription,
-            CatalogKind::Subscription => CatalogKind::Vps,
+            CatalogKind::Subscription => CatalogKind::Key,
+            CatalogKind::Key => CatalogKind::Vps,
         }
     }
 }
@@ -607,6 +620,71 @@ impl RegisterSpec for SubscriptionSpec {
     }
 }
 
+// ---- key 命令组的登记规格(工单 #57,ADR-0009 §1:两段式 + 本体经 stdin) ----
+
+/// 钥匙登记的命令组规格:名字 / 服务哪个主机 / 若干条作用域 / 轮换日。
+/// **没有钥匙本体槽**——本体只经 stdin 进(见 [`SecretBody`]),规格里放不下它,
+/// 所以也从规格上杜绝「误把钥匙拼进 argv」。
+///
+/// 两段式与 vps / subscription 同构(预审无 `--yes`、落账多一枚 `--yes`),差别
+/// 只在 argv 形状与「喂一次 stdin」:`App` 在下发这两段时各喂一次本体。
+///
+/// `scopes` / `rotated_at` **只登记、不设闸**(ADR-0009 §3:多宽、何时轮换归
+/// 所有者自裁,面板不代管、不提醒、不评审);形状错(空 scope / 非 YYYY-MM-DD)
+/// 由面板侧就拒,不喂给引擎猜。`host` 空 = 缺省 github.com(不下发 `--host`)。
+/// `rotated_at` `None` = 缺省登记日 UTC(不下发 `--rotated-at`)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeySpec {
+    pub name: String,
+    /// 服务哪个主机;空 = 缺省 github.com(上游 CLI flag 缺省)。
+    pub host: String,
+    /// 若干条作用域(只登记不设闸;顺序即入参数组顺序)。
+    pub scopes: Vec<String>,
+    /// 轮换日(严格 YYYY-MM-DD);`None` / 空 = 缺省登记日 UTC(不下发 `--rotated-at`)。
+    pub rotated_at: Option<String>,
+}
+
+impl RegisterSpec for KeySpec {
+    fn title() -> &'static str {
+        "登记钥匙 · key"
+    }
+
+    fn preaudit(&self, root: &str) -> Vec<String> {
+        crate::engine::commands::key_register_preaudit(
+            &self.name,
+            &self.host,
+            &self.scopes,
+            self.rotated_at.as_deref(),
+            root,
+        )
+    }
+
+    fn commit(&self, root: &str) -> Vec<String> {
+        crate::engine::commands::key_register_commit(
+            &self.name,
+            &self.host,
+            &self.scopes,
+            self.rotated_at.as_deref(),
+            root,
+        )
+    }
+
+    fn audit(out: &EngineOutput) -> Option<Audit> {
+        let env = out.envelope.as_ref()?;
+        // 同 tag / subscription:形状不认不猜。`KeyRegisterData` 字段全带 default,
+        // 任何一个已认识的 schema 都能被解析成「空钥匙 + 零道闸」——那正是「看起来
+        // 正常其实什么都没解析」。所以再钉一道 schema 相符。
+        if env.schema != "nw/key-register.v1" {
+            return None;
+        }
+        env.data_as::<KeyRegisterData>().map(|d| Audit {
+            entry: d.sheet().entries.into_iter().next(),
+            catalog_path: d.catalog_path.clone(),
+            gates: d.gates.clone(),
+        })
+    }
+}
+
 /// 订阅册表单的字段(顺序即 ↑/↓ 轮转顺序)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SubField {
@@ -769,6 +847,215 @@ pub fn spec_from_sub_form(form: &SubForm) -> Result<SubscriptionSpec, Vec<String
 /// 新建一张空订阅表单(供 `App` 发起登记用)。
 pub fn new_sub_form() -> SubForm {
     SubForm::default()
+}
+
+// ---- 钥匙册表单(工单 #57:名字 / 主机 / 作用域(多行)/ 轮换日 + 本体喂入框) ----
+
+/// 钥匙册表单的字段(顺序即 ↑/↓ 轮转顺序)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum KeyField {
+    #[default]
+    Name,
+    Host,
+    Scopes,
+    RotatedAt,
+    /// 钥匙本体喂入框(掩码;只经 stdin 进)。
+    Body,
+}
+
+impl KeyField {
+    pub const ALL: [KeyField; 5] = [
+        KeyField::Name,
+        KeyField::Host,
+        KeyField::Scopes,
+        KeyField::RotatedAt,
+        KeyField::Body,
+    ];
+
+    /// 字段标签(呈现与键位提示同源)。
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyField::Name => "名字",
+            KeyField::Host => "主机",
+            KeyField::Scopes => "作用域",
+            KeyField::RotatedAt => "轮换日",
+            KeyField::Body => "钥匙",
+        }
+    }
+
+    /// 多行字段(一行一条)——单行字段给 false。
+    pub fn multi(self) -> bool {
+        matches!(self, KeyField::Scopes)
+    }
+
+    /// 喂入框(掩码字段)——键入走 [`on_key_key_form`] 的掩码分支,不进任何字符串缓冲。
+    pub fn is_body(self) -> bool {
+        matches!(self, KeyField::Body)
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
+    }
+}
+
+/// 钥匙登记表单:名字 / 主机 / 若干条作用域(一行一条)/ 轮换日 + **钥匙本体
+/// 喂入框**(掩码)。与 [`VpsForm`](多行作用域)和 [`SubForm`](掩码本体)同构,
+/// 是两者的合并:单行字段 + 一个多行字段 + 一个掩码字段。**不复制第二份表单
+/// 机制**——字段各归其槽,只借 [`input::on_key`] 与 [`on_key_secret`] 这两条
+/// 既有的键入分发。
+#[derive(Clone, Default)]
+pub struct KeyForm {
+    pub name: String,
+    /// 服务哪个主机;空 = 缺省 github.com(不下发 `--host`)。
+    pub host: String,
+    /// 若干条作用域(一行一条;空行 = 没填这条,不是坏行)。
+    pub scopes: Vec<String>,
+    /// 轮换日(严格 YYYY-MM-DD;空 = 缺省登记日 UTC)。
+    pub rotated_at: String,
+    /// 钥匙本体(在途内存;掩码渲染、Debug 不打印内容、随流程 drop)。
+    pub body: SecretBody,
+    pub field: KeyField,
+    /// 多行字段里的当前行(单行字段恒 0)。
+    pub row: usize,
+}
+
+impl KeyForm {
+    fn new() -> Self {
+        Self {
+            scopes: vec![String::new()],
+            ..Self::default()
+        }
+    }
+
+    /// 当前单行/多行字段的缓冲(喂入框借 [`SecretBody`],不走这里)。
+    fn buf(&mut self) -> &mut String {
+        match self.field {
+            KeyField::Name => &mut self.name,
+            KeyField::Host => &mut self.host,
+            KeyField::RotatedAt => &mut self.rotated_at,
+            KeyField::Scopes => {
+                while self.row >= self.scopes.len() {
+                    self.scopes.push(String::new());
+                }
+                &mut self.scopes[self.row]
+            }
+            // 喂入框的键入在 on_key_key_form 里就被接走,走不到这里;
+            // 给 name 只是为让 match 完备(不新增第二条真路径)。
+            KeyField::Body => &mut self.name,
+        }
+    }
+
+    fn rows(&self) -> usize {
+        if self.field.multi() {
+            self.scopes.len()
+        } else {
+            1
+        }
+    }
+
+    /// ↑/↓ 移字段(五行轮转,到顶/到底不越界、不绕回)。
+    fn move_field(&mut self, down: bool) {
+        let i = self.field.index();
+        let n = KeyField::ALL.len();
+        self.field = KeyField::ALL[if down {
+            (i + 1).min(n - 1)
+        } else {
+            i.saturating_sub(1)
+        }];
+        self.row = 0;
+    }
+
+    /// 作用域字段新行(追加一条空行,行光标跟上)。
+    fn add_row(&mut self) {
+        if self.field.multi() {
+            self.scopes.push(String::new());
+            self.row = self.scopes.len() - 1;
+        }
+    }
+
+    /// 删当前行(至少留一行——表单不塌成空)。
+    fn drop_row(&mut self) {
+        if self.field.multi() && self.scopes.len() > 1 {
+            self.scopes.remove(self.row);
+            self.row = self.row.min(self.scopes.len() - 1);
+        }
+    }
+}
+
+/// 钥匙册表单段键位:↑/↓ 移字段、n 新行、d 删行、Enter 预审、Esc/q 返航。
+/// 喂入框的键入走掩码分支(字节数可用于日志,字符不进任何字符串)。
+pub fn on_key_key_form(form: &mut KeyForm, k: crossterm::event::KeyEvent) -> FormAction {
+    match k.code {
+        KeyCode::Up => {
+            form.move_field(false);
+            return FormAction::Edited;
+        }
+        KeyCode::Down => {
+            form.move_field(true);
+            return FormAction::Edited;
+        }
+        KeyCode::Char('n') if form.field.multi() => {
+            form.add_row();
+            return FormAction::Edited;
+        }
+        KeyCode::Char('d') if form.field.multi() && form.rows() > 1 => {
+            form.drop_row();
+            return FormAction::Edited;
+        }
+        _ => {}
+    }
+    if form.field.is_body() {
+        return on_key_secret(&mut form.body, k);
+    }
+    match input::on_key(form.buf(), k) {
+        InputAction::Submit => FormAction::Submit,
+        InputAction::Cancel => FormAction::Cancel,
+        InputAction::Edited | InputAction::Ignored => FormAction::Edited,
+    }
+}
+
+/// 钥匙登记的发起规格由表单算出(供 `App` 下发两段用)。面板侧就拒(空名字 /
+/// 轮换日形状不对 / 本体没喂入),留表单可改,不喂给引擎跑一趟。作用域多宽、
+/// 何时轮换**只登记不设闸**——面板不代管、不提醒、不评审。
+pub fn spec_from_key_form(form: &KeyForm) -> Result<KeySpec, Vec<String>> {
+    let name = form.name.trim().to_string();
+    let host = form.host.trim().to_string();
+    let rotated_at = form.rotated_at.trim().to_string();
+    let mut bad = Vec::new();
+    if name.is_empty() {
+        bad.push("名字为空".into());
+    }
+    // 轮换日形状错(非严格 YYYY-MM-DD)面板侧就拒(与到期日同一条 strict 形状校验;
+    // 空 = 缺省登记日 UTC,合法)。只校形状,不设闸、不评审。
+    if !valid_expires(&rotated_at) {
+        bad.push(format!(
+            "轮换日「{rotated_at}」不是严格 YYYY-MM-DD(可留空 = 登记日 UTC)"
+        ));
+    }
+    if form.body.is_empty() {
+        bad.push("钥匙本体还没喂入(只经 stdin 进:在钥匙框贴一次)".into());
+    }
+    if !bad.is_empty() {
+        return Err(bad);
+    }
+    // 作用域:一行一条,空行 = 没填这条(不是坏行);非空行原样收(只登记不设闸)。
+    let scopes = form
+        .scopes
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    Ok(KeySpec {
+        name,
+        host,
+        scopes,
+        rotated_at: (!rotated_at.is_empty()).then_some(rotated_at),
+    })
+}
+
+/// 新建一张空钥匙表单(供 `App` 发起登记用)。
+pub fn new_key_form() -> KeyForm {
+    KeyForm::new()
 }
 
 // ---- vps 登记表单(多组 --ip / --login 用「一行一条」的多行缓冲) ----
@@ -985,6 +1272,9 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
                         CatalogKind::Subscription => {
                             "  订阅册还没读到:按 l 重读(只读),按 r 登记第一条订阅。"
                         }
+                        CatalogKind::Key => {
+                            "  钥匙册还没读到:按 l 重读(只读),按 r 登记第一把钥匙。"
+                        }
                     },
                     p.dim(),
                 ))),
@@ -1000,6 +1290,9 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
                             CatalogKind::Subscription => {
                                 "  编目里还没有订阅(合法空态:subscriptions.json 不存在 = 空册)。"
                             }
+                            CatalogKind::Key => {
+                                "  编目里还没有钥匙(合法空态:keys.json 不存在 = 空册)。"
+                            }
                         },
                         p.text(),
                     )));
@@ -1013,6 +1306,9 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
                             }
                             CatalogKind::Subscription => {
                                 "  按 r 登记第一条(两段式:链接本体只经 stdin 进,Enter 预审摊开四道闸)。"
+                            }
+                            CatalogKind::Key => {
+                                "  按 r 登记第一把(两段式:钥匙本体只经 stdin 进,Enter 预审摊开三道闸)。"
                             }
                         },
                         p.dim(),
@@ -1037,14 +1333,22 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
             }
             lines.extend(sub_get_lines(app, w, p));
         }
+        // 钥匙册(工单 #57):取回钥匙本体的建议命令(面板不代跑 get,ADR-0009 §1)。
+        // **投影里没有本体槽、也不印指纹**,册体任何一行都不出现本体。
+        if kind == CatalogKind::Key {
+            lines.extend(key_get_lines(app, w, p));
+        }
         // 边界表述(ADR-0009 §5):编目条目绝不进配方 / 锁定集 / bundle / 装配
-        // 命令,面板侧不提供任何把它烤进去的入口(两本各一句,同一条纪律)。
+        // 命令,面板侧不提供任何把它烤进去的入口(各本一句,同一条纪律)。
         match kind {
             CatalogKind::Tag => {
                 lines.push(Line::from(Span::styled(clip(TAG_BOUNDARY, w), p.dim())))
             }
             CatalogKind::Subscription => {
                 lines.push(Line::from(Span::styled(clip(SUB_BOUNDARY, w), p.dim())))
+            }
+            CatalogKind::Key => {
+                lines.push(Line::from(Span::styled(clip(KEY_BOUNDARY, w), p.dim())))
             }
             CatalogKind::Vps => {}
         }
@@ -1053,13 +1357,22 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(Span::styled(catalog_keys(app), p.dim())));
     frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
 
-    // 浮层:登记 / 删除确认(弹层优先级高于册体;三本各一套,骨架同一件)
+    // 浮层:登记 / 删除确认(弹层优先级高于册体;四本各一套,骨架同一件)
     if kind == CatalogKind::Subscription {
         // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先。
         if app.sub_rm_confirm {
             render_sub_rm_confirm(frame, area, app);
         } else if app.sub_flow.phase != RegPhase::Idle {
             render_sub_overlay(frame, area, app);
+        }
+        return;
+    }
+    if kind == CatalogKind::Key {
+        // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先(同订阅册)。
+        if app.key_rm_confirm {
+            render_key_rm_confirm(frame, area, app);
+        } else if app.key_flow.phase != RegPhase::Idle {
+            render_key_overlay(frame, area, app);
         }
         return;
     }
@@ -1107,6 +1420,15 @@ fn catalog_keys(app: &App) -> &'static str {
             return "  r 登记订阅 · l 重读 · m 换册 · Esc/q 返航 ";
         }
         return "  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ";
+    }
+    if app.catalog_kind == CatalogKind::Key {
+        if app.key_flow.phase != RegPhase::Idle || app.key_rm_confirm {
+            return "  Enter 确认 · Esc/q 返航 ";
+        }
+        if app.key_len() == 0 {
+            return "  r 登记钥匙 · l 重读 · m 换册 · Esc/q 返航 ";
+        }
+        return "  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ";
     }
     if app.catalog_kind == CatalogKind::Tag {
         if app.tag_flow.phase != RegPhase::Idle || app.tag_rm_confirm {
@@ -1623,6 +1945,43 @@ fn sub_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
     )
 }
 
+/// 钥匙册的条目明细:名字行后缀给 kind(条目级,恒 `github-key`),之下给
+/// **主机 / 作用域条数 / 轮换日**(缺字段显式「——」)。**没有本体槽,也不印
+/// 指纹**——投影里就没有这两格(上游 `KeySummary` 五键冻结),面板连「这像是
+/// 哪把钥匙」都不该让人推断出来。作用域只报**条数**(只登记不设闸,面板不代管、
+/// 不提醒、不评审)。
+fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDetailOut {
+    let kind = e
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .unwrap_or("——");
+    (
+        Some(format!("kind {kind}")),
+        vec![
+            Line::from(vec![
+                Span::raw("    主机 "),
+                Span::styled(
+                    clip(e.host.as_deref().unwrap_or("——"), width.saturating_sub(12)),
+                    p.text(),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("    作用域 "),
+                Span::styled(clip(&e.scopes_line(), width.saturating_sub(12)), p.text()),
+            ]),
+            Line::from(vec![
+                Span::raw("    轮换日 "),
+                Span::styled(
+                    clip(&e.rotated_at_line(), width.saturating_sub(12)),
+                    p.text(),
+                ),
+            ]),
+        ],
+    )
+}
+
 /// 到期三态汇总(册体那一行「几条 active · 几条 expiring · 几条 expired」)。
 /// 面板不自己算一套:三态与剩余天数由引擎在 ls 回音里按 UTC 现算给足,
 /// 这里只**点数**;回音缺 `status` 的条数单独计数,不并进任何一态、不猜。
@@ -1705,6 +2064,42 @@ fn sub_get_lines(app: &App, w: usize, p: &Palette) -> Vec<Line<'static>> {
 /// 烤进锁定集等于每次换链接重烤一次派——面板不提供任何这样的入口。
 pub const SUB_BOUNDARY: &str =
     "  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发重烤,不提供烤进去的入口)";
+
+/// 钥匙册的边界表述(ADR-0009 §5,工单 #57 验收第 7 条):与订阅同一条纪律——
+/// 钥匙是凭据,烤进锁定集 / bundle 等于把机密摊进派,面板不提供任何这样的入口。
+pub const KEY_BOUNDARY: &str =
+    "  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供烤进去的入口)";
+
+/// 取回钥匙本体的**建议命令**那一行(ADR-0009 §1 裁定:面板不代跑 `key get`——
+/// `data.key` 是上游唯一回显本体的出口,屏显铺一把活钥匙的扩散面面板兜不住)。
+/// 执行权留给操作者,面板只给命令文案(与 bake / recipe new / subscription get
+/// 同源同层,纯函数层产、永不带写旗标)。
+fn key_get_lines(app: &App, w: usize, p: &Palette) -> Vec<Line<'static>> {
+    match app.key_get_suggest() {
+        Some(s) => vec![
+            Line::from(Span::styled(
+                if app.key_get_logged {
+                    "  取回钥匙(面板不代跑,已按 g 收进日志):"
+                } else {
+                    "  取回钥匙(面板不代跑,按 g 收进日志):"
+                },
+                p.dim(),
+            )),
+            Line::from(Span::styled(clip(&s.display, w), p.accent().bold())),
+            Line::from(Span::styled(
+                clip(
+                    "  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照帧,执行权留给操作者。",
+                    w,
+                ),
+                p.dim(),
+            )),
+        ],
+        None => vec![Line::from(Span::styled(
+            "  取回钥匙:先选中一把(↑/↓ 或鼠标点行);面板只给建议命令,不代跑 get。",
+            p.dim(),
+        ))],
+    }
+}
 
 // ---- 订阅册浮层(工单 #56:两段式登记 + rm 图形确认;本体只经 stdin) ----
 
@@ -2101,6 +2496,429 @@ fn render_sub_rm_confirm(frame: &mut Frame, area: Rect, app: &App) {
                 Block::bordered()
                     .border_style(p.accent())
                     .title(Span::styled(" 删除订阅 · 确认 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+// ---- 钥匙册浮层(工单 #57:两段式登记 + rm 图形确认;本体只经 stdin) ----
+
+/// 钥匙册浮层总入口:按阶段画一个;Idle 无浮层(几何与命中共用同一
+/// `popup_rect`)。与订阅册同一条骨架([`RegPhase`]),差别全在呈现:表单多一个
+/// 多行作用域字段与一个掩码本体喂入框、预审/落账两段各喂一次本体、结论屏没有
+/// 本体槽也不印指纹。
+fn render_key_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    match app.key_flow.phase {
+        RegPhase::Idle => {}
+        RegPhase::Form => render_key_form(frame, area, app),
+        RegPhase::PreAudit => render_key_preaudit(frame, area, app),
+        RegPhase::Review => render_key_review(frame, area, app),
+        RegPhase::Commit => render_key_commit(frame, area, app),
+        RegPhase::Done => render_key_done(frame, area, app),
+    }
+}
+
+/// ① 表单:名字 / 主机 / 作用域(一行一条)/ 轮换日 / **钥匙本体喂入框(掩码)**。
+/// 当前字段带块光标;喂入框只显示「已喂入 N 字节」,字符一个都不渲染。
+fn render_key_form(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = popup_rect(area, REG_W, REG_H);
+    frame.render_widget(Clear, popup);
+    let f = &app.key_form;
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        "  钥匙本体只经 stdin 进:在「钥匙」框贴一次,界面只显示已喂入字节数;作用域/轮换日只登记不设闸",
+        p.dim(),
+    ))];
+    for field in KeyField::ALL {
+        let on = field == f.field;
+        if field.is_body() {
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {} ", field.label())),
+                Span::styled(f.body.mask(), if on { p.sel().bold() } else { p.text() }),
+                Span::styled("  (掩码:本体不进渲染/日志/配置)", p.dim()),
+            ]));
+            continue;
+        }
+        let rows: Vec<String> = match field {
+            KeyField::Name => vec![f.name.clone()],
+            KeyField::Host => vec![f.host.clone()],
+            KeyField::RotatedAt => vec![f.rotated_at.clone()],
+            KeyField::Scopes => f.scopes.clone(),
+            KeyField::Body => unreachable!("is_body 分支已接走"),
+        };
+        let hint = match field {
+            KeyField::Host => "  (留空 = github.com)",
+            KeyField::RotatedAt => "  (YYYY-MM-DD,留空 = 登记日 UTC)",
+            KeyField::Scopes => "  (一行一条,只登记不设闸)",
+            _ => "",
+        };
+        for (r, row) in rows.iter().enumerate() {
+            let cur = on && r == f.row.min(rows.len().saturating_sub(1));
+            let text = if cur {
+                format!("{row}█")
+            } else {
+                row.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::raw(if r == 0 {
+                    format!("  {} ", field.label())
+                } else {
+                    "      ".to_string()
+                }),
+                Span::styled(text, if cur { p.sel().bold() } else { p.text() }),
+                if r == 0 {
+                    Span::styled(hint, p.dim())
+                } else {
+                    Span::raw("")
+                },
+            ]));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ 移字段 · n 新行 · d 删行 · Enter 预审 · Esc/q 返航",
+        p.dim(),
+    )));
+    let budget = popup.height.saturating_sub(3) as usize;
+    lines.truncate(budget);
+    while lines.len() < budget {
+        lines.push(Line::from(""));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记钥匙 · key 表单 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ② 预审进行中:三道闸在跑,文件不落;本体这一次性喂入即将随进程结束即弃。
+fn render_key_preaudit(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = popup_rect(area, REG_INPUT_W, REG_INPUT_H);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(Span::styled("  正在预审:跑引擎的三道闸…", p.text())),
+        Line::from(Span::styled(
+            format!(
+                "  钥匙本体已喂入 {} 字节(stdin 一次性,喂后即关即弃)。",
+                app.key_form.body.len()
+            ),
+            p.dim(),
+        )),
+        Line::from(Span::styled(
+            "  不带 --yes:文件不落,拟落账记录只进回音。",
+            p.dim(),
+        )),
+        Line::from(Span::styled("  Esc 可返航(回音将丢弃)。", p.dim())),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记钥匙 · 预审 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ③ 确认态:摊开三道闸结论(按冻结 id,三态复用结果四态)+ 拟落账条目 +
+/// 落账闸结论。**本段不下发任何写命令**——Enter 落账是下一段(且会再喂一次
+/// stdin:喂入是一次性的)。投影里没有本体槽、不印指纹,这一屏也不出现本体。
+fn render_key_review(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = popup_rect(area, REG_W, REG_H);
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let out = app.key_flow.result.as_ref();
+    let audit = out.and_then(KeySpec::audit);
+    let mut lines: Vec<Line> = Vec::new();
+    match audit.as_ref() {
+        Some(a) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  编目  {}",
+                    clip(&a.catalog_path, inner_w.saturating_sub(9))
+                ),
+                p.dim(),
+            )));
+            if let Some(e) = a.entry.as_ref() {
+                lines.push(Line::from(format!(
+                    "  拟落账  {} · 主机 {} · 轮换日 {}",
+                    clip(&e.name, 16),
+                    e.host.as_deref().unwrap_or("——"),
+                    e.rotated_at_line()
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("  作用域  {}(只登记,不设闸)", e.scopes_line()),
+                    p.dim(),
+                )));
+            }
+            lines.push(Line::from(Span::styled("  闸(恒 3 行):", p.accent())));
+            for g in &a.gates {
+                let st = g.state();
+                lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(gate_label(st), p.state(st)),
+                    Span::raw(" "),
+                    Span::styled(g.id.clone(), p.dim()),
+                    Span::raw(" "),
+                    Span::styled(
+                        clip(&g.message, inner_w.saturating_sub(10 + g.id.len())),
+                        p.text(),
+                    ),
+                ]));
+            }
+            if let Some(env) = out.and_then(|o| o.envelope.as_ref()) {
+                for e in env.errors.iter().take(2) {
+                    crate::screens::recipes::push_evidence(
+                        &mut lines,
+                        "出错",
+                        p.fail(),
+                        e,
+                        inner_w,
+                    );
+                }
+            }
+            if preaudit_passed(out.unwrap(), Some(a)) {
+                lines.push(Line::from(Span::styled(
+                    "  预审通过:三道闸无 fail、退出码 0(本段不写任何文件)",
+                    p.info(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  钥匙本体仍在途内存({} 字节,掩码):落账那一下会再喂一次 stdin。",
+                        app.key_form.body.len()
+                    ),
+                    p.dim(),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  ⚠ 不可落账:闸有 fail 或退出码非 0——见上方结论",
+                    p.warn().bold(),
+                )));
+            }
+        }
+        None => {
+            let headline = out.map(|o| o.headline().to_string()).unwrap_or_default();
+            for ln in wrap(
+                &format!("  预审结果不可定型:{headline}"),
+                inner_w.saturating_sub(2),
+            )
+            .into_iter()
+            .take(3)
+            {
+                lines.push(Line::from(Span::styled(ln, p.warn())));
+            }
+            lines.push(Line::from(Span::styled(
+                "  ⚠ 不可落账:拿不到可定型的预审结论(不按旧形状解析)",
+                p.warn().bold(),
+            )));
+        }
+    }
+    let budget = popup.height.saturating_sub(3) as usize;
+    if lines.len() > budget {
+        lines.truncate(budget.saturating_sub(1));
+        lines.push(Line::from(Span::styled("  …(屏内未全显)", p.dim())));
+    }
+    while lines.len() < budget {
+        lines.push(Line::from(""));
+    }
+    let can = out
+        .map(|o| preaudit_passed(o, audit.as_ref()))
+        .unwrap_or(false);
+    lines.push(if can {
+        Line::from(vec![
+            Span::styled("  Enter 落账(再喂一次 stdin) ", p.accent().bold()),
+            Span::raw("  "),
+            Span::styled("Esc 返航 ", p.dim()),
+        ])
+    } else {
+        Line::from(Span::styled("  Esc 返航 ", p.dim()))
+    });
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记钥匙 · 预审确认 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ④ 落账在途:带 `--yes` 的写命令已下发;登记与装配互斥。
+fn render_key_commit(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = popup_rect(area, REG_W, REG_H);
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let root = app.usable_data_root().unwrap_or_else(|| "—".into());
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "  正在落账:引擎把 keys.json 写进数据仓根…",
+            p.text(),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "  写入目标  {}",
+                clip(&format!("{root}/keys.json"), inner_w.saturating_sub(13))
+            ),
+            p.dim(),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "  钥匙本体已再喂入 {} 字节(stdin 一次性;界面不显示字符)。",
+                app.key_form.body.len()
+            ),
+            p.dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  登记与装配互斥:写盘期间不接新装配。",
+            p.dim(),
+        )),
+        Line::from(Span::styled(
+            "  Esc 返航(回音将丢弃,互斥随回音收敛)",
+            p.dim(),
+        )),
+    ];
+    while lines.len() < popup.height.saturating_sub(3) as usize {
+        lines.push(Line::from(""));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记钥匙 · 落账 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ⑤ 结果屏:写盘位置 + 记录五字段(名字/主机/作用域条数/轮换日,**没有本体槽、
+/// 不印指纹**)+ git 变更提示 + 边界表述;失败路给证据五字段。
+fn render_key_done(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = popup_rect(area, REG_W, REG_H);
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let out = app.key_flow.result.as_ref();
+    let mut lines: Vec<Line> = Vec::new();
+    match out.and_then(KeySpec::audit) {
+        Some(a) if out.map(|o| o.ok).unwrap_or(false) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  已写入  {}",
+                    clip(&a.catalog_path, inner_w.saturating_sub(11))
+                ),
+                p.info().bold(),
+            )));
+            if let Some(e) = a.entry.as_ref() {
+                lines.push(Line::from(format!(
+                    "  钥匙    {} · 主机 {} · 轮换日 {}",
+                    clip(&e.name, 18),
+                    e.host.as_deref().unwrap_or("——"),
+                    e.rotated_at_line()
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("  作用域  {}(只登记,不设闸)", e.scopes_line()),
+                    p.dim(),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "  钥匙本体已从 stdin 收进 keys.json(回显它只有 key get)。",
+                p.dim(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ⚠ keys.json 是一次 git 变更:走 PR + 家长审,",
+                p.warn().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "    别把它当本地小改;钥匙册已即时刷新。",
+                p.warn(),
+            )));
+            lines.push(Line::from(Span::styled(
+                clip(KEY_BOUNDARY, inner_w),
+                p.dim(),
+            )));
+        }
+        _ => {
+            let headline = out.map(|o| o.headline().to_string()).unwrap_or_default();
+            for ln in wrap(
+                &format!("  落账未完成:{headline}"),
+                inner_w.saturating_sub(2),
+            )
+            .into_iter()
+            .take(2)
+            {
+                lines.push(Line::from(Span::styled(ln, p.fail().bold())));
+            }
+            lines.push(Line::from(Span::styled(
+                "  未写入任何文件;Esc 返航后可从表单重来(钥匙要再喂一次)。",
+                p.dim(),
+            )));
+        }
+    }
+    while lines.len() < popup.height.saturating_sub(3) as usize {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled("  Esc/q 返航 ", p.dim())));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记钥匙 · 落账结果 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// 删除确认(ADR-0009 §2:面板加一道图形确认)。删不存在的名:引擎 rc 3 +
+/// 文件一个字节都不动。
+fn render_key_rm_confirm(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = popup_rect(area, REG_INPUT_W, REG_INPUT_H);
+    frame.render_widget(Clear, popup);
+    let name = app.selected_key_name().unwrap_or_else(|| "—".into());
+    let root = app.usable_data_root().unwrap_or_else(|| "—".into());
+    let lines = vec![
+        Line::from(Span::styled(format!("  删除钥匙 {name}?"), p.text().bold())),
+        Line::from(Span::styled(
+            format!("  下发  nw key rm {name} --root {root}"),
+            p.dim(),
+        )),
+        Line::from(Span::styled(
+            "  引擎没有确认闸:点名即删。要恢复得重新登记一遍(钥匙得再喂一次)。",
+            p.warn(),
+        )),
+        Line::from(Span::styled(
+            "  删不存在的名:引擎 rc 3 + keys.json 一个字节都不动。",
+            p.dim(),
+        )),
+        Line::from(Span::styled(
+            "  Enter 确认删除 · Esc/q 返航",
+            p.accent().bold(),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 删除钥匙 · 确认 ", p.accent().bold())),
             )
             .style(p.surface()),
         popup,
@@ -3739,7 +4557,7 @@ mod tests {
     /// 复用 #53 的骨架:三本册共用同一个列表件(`catalog_sheet_lines`),订阅册
     /// 只换 [`EntryDetail`](明细画法)——不复制第二份投影 / 列表 / 落盘逻辑。
     #[test]
-    fn 三本册共用列表件_订阅册只换明细画法_且m三本轮转() {
+    fn 四本册共用列表件_订阅册只换明细画法_且m四轮转() {
         let sheet = CatalogSheet {
             catalog_path: "/r/subscriptions.json".into(),
             entries: vec![CatalogEntryView {
@@ -3785,7 +4603,7 @@ mod tests {
             "机器册不画 client 槽"
         );
         assert!(!text(tag_detail_rows).contains("到期"), "标签册不画到期槽");
-        // m 三本轮转(屏只有一块,册子是屏内维度)
+        // m 四轮转(屏只有一块,册子是屏内维度)
         let (mut app, _r) = sub_app(&[]);
         let mut kinds = vec![app.catalog_kind];
         for _ in 0..3 {
@@ -3796,11 +4614,11 @@ mod tests {
             kinds,
             vec![
                 CatalogKind::Subscription,
+                CatalogKind::Key,
                 CatalogKind::Vps,
-                CatalogKind::Tag,
-                CatalogKind::Subscription
+                CatalogKind::Tag
             ],
-            "m 换册三本轮转,不复制第二块屏"
+            "m 换册四轮转(订阅 → 钥匙 → 机器 → 标签),不复制第二块屏"
         );
     }
 
@@ -3872,6 +4690,527 @@ mod tests {
         tap(&mut app, KeyCode::Char('r'));
         assert!(app.fed_queue.is_empty(), "门不过不下发任何命令");
         assert!(app.sub_flow.phase == RegPhase::Idle, "门不过不进表单");
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("入口禁用"), "{s}");
+        assert!(s.contains("缺的是引擎能力"), "{s}");
+    }
+
+    // ---- 工单 #57:钥匙册(本体只经 stdin / 投影无本体槽不印指纹 / get 只给建议) ----
+
+    /// 钥匙 ls 回音:两把钥匙,一把声明了作用域、一把没有;`kind` / `host` /
+    /// `scopes[]` / `rotatedAt` 五键冻结——**没有 secret 槽、也没有指纹字段**。
+    const KEY_LS_ALL: &str = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"ghe.internal","scopes":[],"rotatedAt":"2025-11-02"},{"name":"deploy","kind":"github-key","host":"github.com","scopes":["repo","read:org"],"rotatedAt":"2026-01-15"}]}}"#;
+
+    /// 登记预审回音:三道闸全 pass、`written:false`(不带 `--yes`,文件不落)。
+    /// **data 里一个能放本体的字段都没有**(上游 RegisterResult 刻意不留 secret 槽)。
+    const KEY_REG_OK: &str = r#"{"schema":"nw/key-register.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"name":"deploy","kind":"github-key","host":"github.com","scopes":["repo"],"rotatedAt":"2026-03-01","catalogPath":"/r/keys.json","written":false,"updated":false,"action":"registered","gates":[{"id":"key.register.name","status":"pass","message":"钥匙名合法"},{"id":"key.register.host","status":"pass","message":"host 是合法主机名/IP"},{"id":"key.register.body","status":"pass","message":"本体非空、单行"}]}}"#;
+
+    /// 登记预审失败回音:第②道闸(host)不过 → 一个字节都不落,第③道 skip。
+    /// 主角是「github.com:22」:端口不进 host 字段(面板不校 host 形状,交给引擎)。
+    const KEY_REG_FAIL: &str = r#"{"schema":"nw/key-register.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"第②道闸没过:host 带端口","hint":"host 只登记主机名/IP,端口由使用这把钥匙的地方自己带","details":{"gate":"key.register.host"}}],"warnings":[],"data":{"name":"deploy","kind":"github-key","host":"","scopes":[],"rotatedAt":"","catalogPath":"/r/keys.json","written":false,"updated":false,"action":"rejected","gates":[{"id":"key.register.name","status":"pass","message":"钥匙名合法"},{"id":"key.register.host","status":"fail","message":"host 带端口"},{"id":"key.register.body","status":"skip","message":"前面已拒"}]}}"#;
+
+    /// 删一条钥匙成功:删光最后一条,`remaining: 0`(文件留空 entries 数组)。
+    const KEY_RM_LAST: &str = r#"{"schema":"nw/key-rm.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"name":"ci","catalogPath":"/r/keys.json","removed":true,"written":true,"action":"removed","remaining":0}}"#;
+
+    /// 删不存在的钥匙:rc 3 + 证据五字段 + 文件一个字节都不动。
+    const KEY_RM_MISS: &str = r#"{"schema":"nw/key-rm.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"key \"ghost\" 不在 keys.json 里","hint":"keys.json 是机器写的产物,永不手改","details":{"catalogPath":"/r/keys.json"}}],"warnings":[],"data":{"name":"ghost","catalogPath":"/r/keys.json","removed":false,"written":false,"action":"not_found","remaining":2}}"#;
+
+    /// key ls 的 **data 面**(直接灌 `key_ls` 状态用):只剩一条。
+    const KEY_LS_ONE: &str = r#"{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"ghe.internal","scopes":[],"rotatedAt":"2025-11-02"}]}"#;
+
+    /// 删光最后一条之后的 ls 回音:空数组(合法空态,文件不删)。
+    const KEY_LS_EMPTY_ENV: &str = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[]}}"#;
+
+    /// 一台能力齐备的钥匙册夹具:引擎有 key 组、数据仓根可用。连同 runner
+    /// 一起交还(要数「收到过几次 stdin 喂入」)。
+    fn key_app(
+        rules: &[(&str, i32, &str)],
+    ) -> (crate::app::App, std::sync::Arc<crate::engine::FakeRunner>) {
+        let runner = std::sync::Arc::new(crate::engine::FakeRunner::new(rules));
+        let mut app = crate::app::App::with_runner(runner.clone());
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.catalog_kind = CatalogKind::Key;
+        app.capabilities.record(
+            crate::engine::Capability::Key,
+            crate::engine::Probe::Available,
+        );
+        (app, runner)
+    }
+
+    /// 在钥匙册表单里填名字/主机,跳过作用域(留空 = 未声明),填轮换日,在钥匙框
+    /// 喂入本体(掩码字段)。
+    fn fill_key_form(
+        app: &mut crate::app::App,
+        name: &str,
+        host: &str,
+        rotated: &str,
+        token: &str,
+    ) {
+        for c in name.chars() {
+            tap(app, KeyCode::Char(c));
+        }
+        tap(app, KeyCode::Down); // 主机
+        for c in host.chars() {
+            tap(app, KeyCode::Char(c));
+        }
+        tap(app, KeyCode::Down); // 作用域(留空 = 未声明,只登记不设闸)
+        tap(app, KeyCode::Down); // 轮换日
+        for c in rotated.chars() {
+            tap(app, KeyCode::Char(c));
+        }
+        tap(app, KeyCode::Down); // 钥匙(掩码)框
+        for c in token.chars() {
+            tap(app, KeyCode::Char(c));
+        }
+    }
+
+    /// 登记走两段式:钥匙本体只经 stdin 进(argv 面无明文形参),三道闸摊开,
+    /// 任一不过 = 一个字节都不落、面板不放行落账。
+    #[tokio::test]
+    async fn 钥匙登记_两段式_本体只经stdin进_三道闸摊开() {
+        let (mut app, runner) = key_app(&[
+            ("key register", 0, KEY_REG_OK),
+            ("key register", 0, KEY_REG_OK),
+            ("key ls", 0, KEY_LS_ALL),
+        ]);
+        let token = "ghp_SuperSecretToken-57-XYZ";
+        tap(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.key_flow.phase, RegPhase::Form);
+        fill_key_form(&mut app, "deploy", "github.com", "2026-03-01", token);
+        tap(&mut app, KeyCode::Enter); // 预审(不带 --yes,文件不落)
+        let root = app.usable_data_root().unwrap_or_default();
+        let pre = app.fed_queue.last().cloned().unwrap_or_default();
+        assert_eq!(
+            pre.0,
+            vec![
+                "key".to_string(),
+                "register".to_string(),
+                "--name".to_string(),
+                "deploy".to_string(),
+                "--token-stdin".to_string(),
+                "--host".to_string(),
+                "github.com".to_string(),
+                "--rotated-at".to_string(),
+                "2026-03-01".to_string(),
+                "--root".to_string(),
+                root.clone(),
+            ],
+            "argv 与 nw key register 契约一致"
+        );
+        assert!(
+            !pre.0.iter().any(|a| a == "--yes"),
+            "预审段连 --yes 的位置都没有"
+        );
+        assert!(
+            !pre.0.iter().any(|a| a.contains("ghp_")),
+            "argv 面无明文钥匙:本体只从 stdin 进:{:?}",
+            pre.0
+        );
+        assert!(
+            pre.0.iter().any(|a| a == "--token-stdin"),
+            "--token-stdin 是声明不是载荷"
+        );
+        assert_eq!(app.fed_queue.len(), 1, "预审这一次喂入");
+        feed(&mut app);
+        assert_eq!(runner.stdin_feed_count(), 1, "本体经 stdin 喂过一次");
+        assert_eq!(app.key_flow.phase, RegPhase::Review, "闸结论摊开供审阅");
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        for id in [
+            "key.register.name",
+            "key.register.host",
+            "key.register.body",
+        ] {
+            assert!(s.contains(id), "闸 {id} 应摊开:{s}");
+        }
+        assert!(s.contains("预审通过"), "{s}");
+        assert!(!s.contains(token), "屏显任何位置都不出现本体:{s}");
+        assert!(!app.log.iter().any(|l| l.contains(token)), "日志不回显本体");
+        // 落账段 = 预审 + 恰好一枚 --yes,并**再喂一次** stdin
+        tap(&mut app, KeyCode::Enter);
+        let com = app.fed_queue.last().cloned().unwrap_or_default();
+        assert_eq!(
+            com.0,
+            [pre.0.clone(), vec!["--yes".into()]].concat(),
+            "落账 = 预审 + --yes"
+        );
+        assert_eq!(com.0.iter().filter(|a| *a == "--yes").count(), 1);
+        assert!(app.assembling, "落账段点亮写互斥");
+        feed(&mut app);
+        assert_eq!(
+            runner.stdin_feed_count(),
+            2,
+            "两段式各喂一次(喂入是一次性的)"
+        );
+        assert_eq!(app.key_flow.phase, RegPhase::Done, "落账回音呈现");
+        assert!(!app.assembling, "写互斥随回音收敛");
+        feed(&mut app); // 落账成功后即时重读钥匙册(只读)
+        assert_eq!(app.key_len(), 2, "钥匙册已刷新");
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("已写入"), "{s}");
+        assert!(!s.contains(token), "结果屏也没有本体:{s}");
+    }
+
+    /// 任一闸不过 = 一个字节都不落:预审失败态呈现三道闸原文,且面板**没有**
+    /// 第二条写命令可发(确认屏不给「Enter 落账」)。
+    #[tokio::test]
+    async fn 钥匙登记_闸有fail_一个字节都不落_且没有落账段() {
+        let (mut app, runner) = key_app(&[("key register", 3, KEY_REG_FAIL)]);
+        tap(&mut app, KeyCode::Char('r'));
+        // host 填「github.com:22」(面板不校 host 形状,交给引擎第②道闸按端口拒)
+        fill_key_form(&mut app, "deploy", "github.com:22", "2026-03-01", "ghp_x");
+        tap(&mut app, KeyCode::Enter);
+        assert_eq!(app.fed_queue.len(), 1, "只有一次喂入");
+        feed(&mut app);
+        assert_eq!(runner.stdin_feed_count(), 1);
+        assert_eq!(app.key_flow.phase, RegPhase::Review, "闸不过留在确认态");
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            s.contains("一个字节都没落") || s.contains("不可落账"),
+            "{s}"
+        );
+        assert!(s.contains("key.register.host"), "失败的那道闸在场:{s}");
+        assert!(s.contains("第②道闸没过"), "证据五字段原样:{s}");
+        assert!(!s.contains("Enter 落账"), "闸不过不放行,也没有落账段:{s}");
+        assert!(!app.assembling, "写互斥随回音收敛");
+        assert!(app.fed_queue.is_empty(), "没有第二条写命令可发");
+    }
+
+    /// 机密纪律**真的守**(不是注释守):喂入的钥匙标记不进最近日志、不进渲染
+    /// 缓冲、不进 config、不进 `EngineOutput` 的 Debug 串,`SecretBody` 自己的
+    /// `Debug` 也不打印内容(照 #56 已立的那条测试的形状)。
+    #[test]
+    fn 机密纪律_喂入的钥匙本体不进日志渲染配置与回音() {
+        let marker = "ghp_SuperSecretToken-57-XYZ-marker";
+        let (mut app, _runner) = key_app(&[("key register", 0, KEY_REG_OK)]);
+        // ① 外包类型自己的 Debug 不打印内容
+        let mut body = SecretBody::default();
+        for c in marker.chars() {
+            on_key_secret(
+                &mut body,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(body.len(), marker.len(), "字节数可报(唯一可说出的事实)");
+        assert!(
+            !format!("{body:?}").contains(marker),
+            "SecretBody 的 Debug 不打印内容:{body:?}"
+        );
+        assert!(format!("{body:?}").contains("字节"), "只报字节数:{body:?}");
+        // ② 走完整条登记流程,再查三面 + 回音 Debug
+        app.key_flow.begin();
+        app.key_form.name = "deploy".into();
+        app.key_form.host = "github.com".into();
+        app.key_form.body = body;
+        tap(&mut app, KeyCode::Enter);
+        feed(&mut app);
+        assert!(
+            app.log.iter().all(|l| !l.contains(marker)),
+            "最近日志不回显本体:{:?}",
+            app.log.first()
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains(marker), "渲染缓冲不回显本体:{s}");
+        let (cfg, _) = crate::engine::config::load();
+        assert!(!format!("{cfg:?}").contains(marker), "配置不落本体");
+        let out = app.key_flow.result.as_ref().unwrap();
+        assert!(
+            !format!("{out:?}").contains(marker),
+            "EngineOutput 的 Debug 串不回显本体"
+        );
+        // ③ 流程结束即 drop:返航后表单里不留副本
+        app.cancel_key_register();
+        assert!(app.key_form.body.is_empty(), "返航即 drop,面板侧不留副本");
+    }
+
+    /// ls 投影**无本体槽、不印指纹**:结构上放不下 secret,面板连「这像是哪把
+    /// 钥匙」都不该让人推断出来;作用域只报**条数**、轮换日原样(只登记不设闸)。
+    #[test]
+    fn ls投影无本体槽不印指纹_作用域轮换日只登记不设闸() {
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        tap(&mut app, KeyCode::Char('l'));
+        assert_eq!(
+            app.queue.last().map(|a| a.join(" ")).as_deref(),
+            Some(
+                format!(
+                    "key ls --root {}",
+                    app.usable_data_root().unwrap_or_default()
+                )
+                .as_str()
+            )
+        );
+        feed(&mut app);
+        let d = app.key_ls.as_ref().expect("回音可定型");
+        let sheet = d.sheet();
+        // 结构上没有本体槽:投影的 Debug 串里不可能出现令牌/指纹
+        assert!(
+            !format!("{sheet:?}").contains("ghp_"),
+            "ls 投影无本体、不印指纹:{sheet:?}"
+        );
+        let deploy = sheet.entries.iter().find(|e| e.name == "deploy").unwrap();
+        assert_eq!(deploy.kind.as_deref(), Some("github-key"));
+        assert_eq!(deploy.host.as_deref(), Some("github.com"));
+        assert_eq!(
+            deploy.scopes_line(),
+            "2 条",
+            "作用域只报条数(不代管、不评审)"
+        );
+        assert_eq!(deploy.rotated_at_line(), "2026-01-15", "轮换日原样呈现");
+        let ci = sheet.entries.iter().find(|e| e.name == "ci").unwrap();
+        assert_eq!(
+            ci.scopes_line(),
+            "未声明(0 条)",
+            "没给作用域显式未声明,不猜"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("deploy"), "{s}");
+        assert!(s.contains("github.com"), "{s}");
+        assert!(s.contains("2 条"), "{s}");
+        assert!(!s.contains("ghp_"), "册体不出现本体/指纹:{s}");
+    }
+
+    /// rm 两态可预测:删不存在的名给证据且文件一个字节不动(不刷新册体);删光
+    /// 最后一条留空数组(册体回到合法空态,不删文件)。
+    #[test]
+    fn 删钥匙_删不存在的名给证据且不动文件_删光留空数组() {
+        // ① 删不存在的名:rc 3 + 证据 + 文件一个字节都不动
+        let (mut miss, _r) = key_app(&[("key ls", 0, KEY_LS_ALL), ("key rm", 3, KEY_RM_MISS)]);
+        tap(&mut miss, KeyCode::Char('l'));
+        feed(&mut miss);
+        assert_eq!(miss.key_len(), 2);
+        tap(&mut miss, KeyCode::Down); // 选中一把
+        tap(&mut miss, KeyCode::Char('d'));
+        assert!(miss.key_rm_confirm, "面板加一道图形确认(ADR-0009 §2)");
+        assert!(
+            miss.queue
+                .iter()
+                .all(|a| a.get(1).map(String::as_str) != Some("rm")),
+            "确认前不下发"
+        );
+        tap(&mut miss, KeyCode::Enter);
+        let argv = miss.queue.last().cloned().unwrap_or_default();
+        assert_eq!(argv[1], "rm", "下发 rm");
+        assert!(
+            !argv.iter().any(|a| a == "--yes"),
+            "上游 rm 没有确认闸,面板不造一枚"
+        );
+        feed(&mut miss);
+        assert!(
+            miss.log.iter().any(|l| l.contains("一个字节都没动")),
+            "删不存在的名给证据:{:?}",
+            miss.log.first()
+        );
+        assert!(
+            miss.queue
+                .iter()
+                .all(|a| a.get(1).map(String::as_str) != Some("ls")),
+            "没删成:不刷新册体"
+        );
+        assert_eq!(miss.key_len(), 2, "册体未被刷新覆盖");
+        // ② 删光最后一条:remaining 0 → 面板即时重读(只读),册体回到合法空态
+        let (mut app, _r) = key_app(&[("key rm", 0, KEY_RM_LAST), ("key ls", 0, KEY_LS_EMPTY_ENV)]);
+        app.key_ls = Some(serde_json::from_str(KEY_LS_ONE).unwrap());
+        assert_eq!(app.key_len(), 1, "删前册里有一条");
+        app.key_sel = 0;
+        app.key_rm_confirm = true;
+        tap(&mut app, KeyCode::Enter);
+        feed(&mut app); // rm 回音
+        feed(&mut app); // 删后即时重读(只读)
+        assert_eq!(app.key_len(), 0, "删光后册体是合法空态(不是错误)");
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("合法空态"), "{s}");
+        assert!(s.contains("keys.json"), "说清是哪一本:{s}");
+    }
+
+    /// 取回钥匙本体:**只给建议命令**。面板不代跑 `key get`——队列里永远不会
+    /// 出现它;建议命令与 bake / recipe new / subscription get 同源同层
+    /// (commands.rs 纯函数层),永不带写旗标。
+    #[test]
+    fn 取回钥匙_只给建议命令_面板无任何路径会下发它() {
+        let (mut app, runner) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        let suggest = app.key_get_suggest().expect("选中一条就能算出建议命令");
+        assert_eq!(
+            suggest.display,
+            format!(
+                "nw key get --name ci --root {} | jq -r .data.key",
+                app.usable_data_root().unwrap_or_default()
+            ),
+            "形态照上游 usage:要裸钥匙自己拼管道"
+        );
+        assert!(
+            !suggest.display.contains("--yes"),
+            "get 是只读出口,永不带写旗标"
+        );
+        assert!(
+            !suggest.display.contains("--raw"),
+            "上游不开 --raw,面板也不造"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("面板不代跑"), "{s}");
+        assert!(s.contains("jq -r .data.key"), "建议命令完整在场:{s}");
+        assert!(!s.contains("ghp_"), "册体不出现本体:{s}");
+        assert!(!app.key_get_logged);
+        tap(&mut app, KeyCode::Char('g'));
+        assert!(app.key_get_logged, "g 把建议命令收进日志");
+        assert!(
+            app.log.iter().any(|l| l.contains("jq -r .data.key")),
+            "建议命令收进日志可取用:{:?}",
+            app.log.first()
+        );
+        assert!(app.queue.is_empty(), "面板不代跑 get:队列里没有它");
+        assert_eq!(runner.stdin_feed_count(), 0, "没有真实子进程被拉起喂入");
+        // 键位扫一遍:没有任何一条路径会把 key get 入队
+        for c in ['g', 'l', 'm', 'k', 'j'] {
+            tap(&mut app, KeyCode::Char(c));
+        }
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Esc] {
+            tap(&mut app, code);
+        }
+        assert!(
+            app.queue
+                .iter()
+                .chain(app.fed_queue.iter().map(|(a, _)| a))
+                .all(|a| a.get(1).map(String::as_str) != Some("get")),
+            "任何路径都不会下发 key get:{:?}",
+            app.queue
+        );
+    }
+
+    /// 复用 #53 的骨架:四本册共用同一个列表件(`catalog_sheet_lines`),钥匙册
+    /// 只换 [`EntryDetail`](明细画法)——不复制第二份投影 / 列表 / 落盘逻辑;m 四轮转。
+    #[test]
+    fn 四本册共用列表件_钥匙册只换明细画法_且m四轮转() {
+        let sheet = CatalogSheet {
+            catalog_path: "/r/keys.json".into(),
+            entries: vec![CatalogEntryView {
+                name: "deploy".into(),
+                kind: Some("github-key".into()),
+                host: Some("github.com".into()),
+                scopes: vec!["repo".into(), "read:org".into()],
+                rotated_at: Some("2026-01-15".into()),
+                ..Default::default()
+            }],
+            gates: Vec::new(),
+        };
+        let p = crate::theme::cached_degrade(
+            crate::theme::ThemeKind::Warehouse,
+            crate::term::ColorCap::Truecolor,
+        );
+        let text = |detail: EntryDetail| -> String {
+            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let key = text(key_detail_rows);
+        assert!(key.contains("kind github-key"), "钥匙册:{key}");
+        assert!(key.contains("github.com"), "钥匙册:{key}");
+        assert!(key.contains("2 条"), "作用域只报条数:{key}");
+        assert!(key.contains("2026-01-15"), "轮换日在场:{key}");
+        assert!(!key.contains("端口"), "钥匙册不画端口槽:{key}");
+        assert!(!key.contains("引用"), "钥匙册不画引用槽:{key}");
+        // 同一份投影,机器册的画法不画 kind 槽
+        assert!(
+            !text(vps_detail_rows).contains("kind"),
+            "机器册不画 kind 槽"
+        );
+        // m 四轮转(屏只有一块,册子是屏内维度)
+        let (mut app, _r) = key_app(&[]);
+        let mut kinds = vec![app.catalog_kind];
+        for _ in 0..4 {
+            app.cycle_catalog_kind();
+            kinds.push(app.catalog_kind);
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                CatalogKind::Key,
+                CatalogKind::Vps,
+                CatalogKind::Tag,
+                CatalogKind::Subscription,
+                CatalogKind::Key
+            ],
+            "m 换册四轮转,不复制第二块屏"
+        );
+    }
+
+    /// 表单面板侧就拒:空名字 / 轮换日不是严格 YYYY-MM-DD / 本体没喂入——都不喂给
+    /// 引擎跑一趟,留表单可改。作用域空行滤掉(只登记不设闸)。
+    #[test]
+    fn 表单解析_坏轮换日与未喂入_面板侧就拒() {
+        let mut f = new_key_form();
+        f.name = "deploy".into();
+        f.host = "github.com".into();
+        f.body = SecretBody(vec![b'g', b'h', b'p']);
+        // 轮换日留空 = 缺省登记日 UTC,合法
+        let spec = spec_from_key_form(&f);
+        assert!(spec.is_ok(), "轮换日留空 = 缺省登记日 UTC:{spec:?}");
+        assert_eq!(spec.unwrap().rotated_at, None, "留空不下发 --rotated-at");
+        // 形状不对(非严格 YYYY-MM-DD)
+        for bad_date in ["2026-3-1", "01/02/2026", "2026-02-30x", "20260301"] {
+            f.rotated_at = bad_date.into();
+            assert!(spec_from_key_form(&f).is_err(), "{bad_date} 应被拒");
+        }
+        f.rotated_at = "2026-03-01".into();
+        assert!(spec_from_key_form(&f).is_ok(), "好轮换日应认");
+        // 本体没喂入
+        let mut g = new_key_form();
+        g.name = "deploy".into();
+        let errs = spec_from_key_form(&g).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("还没喂入")), "{errs:?}");
+        // 作用域:一行一条,空行 = 没填这条(不是坏行);非空行原样收(只登记不设闸)
+        f.scopes = vec!["repo".into(), "  ".into(), "read:org".into()];
+        let spec = spec_from_key_form(&f).unwrap();
+        assert_eq!(
+            spec.scopes,
+            vec!["repo".to_string(), "read:org".to_string()],
+            "空行滤掉,好行原样收"
+        );
+    }
+
+    /// 钥匙册屏常畅态 / 紧凑态两档都成立(#57 验收):不引新断点、不缩放字号,
+    /// 66×50 紧凑态下也不溢出、不 panic,键位行 / 边界表述常在。
+    #[test]
+    fn 钥匙册屏_常畅与紧凑两档都渲染不溢出() {
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        for (w, h) in [(80u16, 30u16), (66, 50), (100, 40)] {
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("当前册 钥匙"), "{w}×{h} 当前是哪一本应在场:{s}");
+            assert!(s.contains("deploy"), "{w}×{h} 钥匙名应在场");
+            assert!(s.contains("github.com"), "{w}×{h} 主机行应在场");
+            assert!(s.contains("绝不进配方"), "{w}×{h} 边界表述应在场:{s}");
+            assert!(s.contains("m 换册"), "{w}×{h} 键位行应在场:{s}");
+            for ln in s.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 有行超宽:{ln}"
+                );
+            }
+        }
+    }
+
+    /// 能力门缺 key 时:入口禁用并指路,册体不呈现(不自造替代品)。
+    #[test]
+    fn 能力门缺key_入口禁用并指路() {
+        let (mut app, _r) = key_app(&[]);
+        app.capabilities.record(
+            crate::engine::Capability::Key,
+            crate::engine::Probe::Unavailable,
+        );
+        assert!(!app.key_entry_enabled());
+        tap(&mut app, KeyCode::Char('r'));
+        assert!(app.fed_queue.is_empty(), "门不过不下发任何命令");
+        assert!(app.key_flow.phase == RegPhase::Idle, "门不过不进表单");
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(s.contains("入口禁用"), "{s}");
         assert!(s.contains("缺的是引擎能力"), "{s}");

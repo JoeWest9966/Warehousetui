@@ -19,10 +19,11 @@ pub use capability::{Capability, Gate, Probe, GATE_HINT};
 pub use envelope::{
     CatalogAddr, CatalogEntryView, CatalogGate, CatalogLogin, CatalogRef, CatalogSheet,
     CheckResult, CheckedSource, ComponentRow, DoctorData, DoctorResult, Drift, Envelope, Evidence,
-    LockRow, LsData, ManifestBrief, ProfileRow, RecheckData, RecipeRow, RegisterAcceptance,
-    RegisterData, RegisterEntry, SourceRow, SubLsData, SubRegisterData, SubRmData, SubStatusCounts,
-    SubSummary, TagAddData, TagEntry, TagLsData, TagRmData, UpData, ValidateData, ValidateSummary,
-    VpsEntry, VpsLsData, VpsRegisterData, VpsRmData,
+    KeyLsData, KeyRegisterData, KeyRmData, KeySummary, LockRow, LsData, ManifestBrief, ProfileRow,
+    RecheckData, RecipeRow, RegisterAcceptance, RegisterData, RegisterEntry, SourceRow, SubLsData,
+    SubRegisterData, SubRmData, SubStatusCounts, SubSummary, TagAddData, TagEntry, TagLsData,
+    TagRmData, UpData, ValidateData, ValidateSummary, VpsEntry, VpsLsData, VpsRegisterData,
+    VpsRmData,
 };
 #[allow(unused_imports)]
 pub use runner::{CommandRunner, EngineEvent, EngineOutput, FakeRunner, MissingRunner, RealRunner};

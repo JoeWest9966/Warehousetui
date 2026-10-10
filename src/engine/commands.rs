@@ -363,6 +363,122 @@ pub fn subscription_get_suggest(name: &str, root: &str) -> Suggest {
     }
 }
 
+// ---- key 组(工单 #57,ADR-0009 §1:register 两段式经 stdin / ls 只读投影 /
+// ---- get 是唯一回显处只给建议命令 / rm 代跑带面板确认) ----
+
+/// 钥匙登记·预审段(工单 #57):跑三道闸、拟落账,**文件不落**——铁律是
+/// 不带 `--yes`,本函数连 `--yes` 的位置都没有(与 subscription 同构)。
+///
+/// 形状(上游 `cli.go` `runKeyRegister` / `key/register.go`):
+/// `nw key register --name <名> --token-stdin [--host <主机>] [--scope <域>]... [--rotated-at <YYYY-MM-DD>] [--root <目录>]`。
+///
+/// **argv 面没有任何明文形参**:钥匙本体只从 stdin 进(`--token-stdin`
+/// 是「声明从 stdin 进」的开关,不是载荷;误粘的 argv 会进 ps / history)。
+/// 所以这个函数**不收本体参数**——本体由调用方经
+/// [`crate::engine::CommandRunner::spawn_with_stdin`] 喂进去,两者在类型
+/// 层面就是两条路。
+///
+/// `--scope` / `--rotated-at` **只登记、不设闸**(ADR-0009 §3:多宽、何时
+/// 轮换归所有者自裁,面板不代管、不提醒、不评审);但形状错照样由面板侧就拒
+/// (空 scope / 非 YYYY-MM-DD,不喂给引擎猜——引擎也在闸前拒,只是不占闸行)。
+/// `host` 空 = 缺省 github.com(上游 CLI flag 缺省,此时**不产生 `--host`**;
+/// 显式 `--host ""` 会被第②道闸拒,所以空串面板也不下发)。
+/// `rotated_at` 空 = 缺省登记日 UTC(上游口径),此时**不产生 `--rotated-at`**。
+///
+/// 槽位纪律同 vps / tag / subscription 组:只认 `--root <数据仓根>`,
+/// **不喂 `--repo`**。
+pub fn key_register_preaudit(
+    name: &str,
+    host: &str,
+    scopes: &[String],
+    rotated_at: Option<&str>,
+    root: &str,
+) -> Vec<String> {
+    let mut a = vec![
+        "key".into(),
+        "register".into(),
+        "--name".into(),
+        name.to_string(),
+        "--token-stdin".into(),
+    ];
+    let host = host.trim();
+    if !host.is_empty() {
+        a.push("--host".into());
+        a.push(host.to_string());
+    }
+    for s in scopes.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        a.push("--scope".into());
+        a.push(s.to_string());
+    }
+    if let Some(r) = rotated_at.map(str::trim).filter(|r| !r.is_empty()) {
+        a.push("--rotated-at".into());
+        a.push(r.to_string());
+    }
+    a.push("--root".into());
+    a.push(root.to_string());
+    a
+}
+
+/// 钥匙登记·落账段(工单 #57):与预审同参,多一枚 `--yes` 确认闸——引擎才把
+/// `keys.json` 写进数据仓根。**只能由图形确认后的落账转换调用**;落账 = 预审
+/// 加一枚 `--yes`,不另改槽位。钥匙本体同样只经 stdin 喂入(喂入是一次性的:
+/// 预审与落账各喂一次,见 ADR-0009 §3)。
+pub fn key_register_commit(
+    name: &str,
+    host: &str,
+    scopes: &[String],
+    rotated_at: Option<&str>,
+    root: &str,
+) -> Vec<String> {
+    let mut a = key_register_preaudit(name, host, scopes, rotated_at, root);
+    a.push("--yes".into());
+    a
+}
+
+/// 钥匙编目册**只读**投影(工单 #57,ADR-0009 §1 准许代跑):列数据仓根下
+/// `keys.json` 里的钥匙。编目不存在 = 空数组 rc 0(合法空态)。投影**没有
+/// secret 槽、不印指纹**。只认 `--root <数据仓根>`——**不喂 `--repo`**。
+pub fn key_ls(root: &str) -> Vec<String> {
+    vec!["key".into(), "ls".into(), "--root".into(), root.to_string()]
+}
+
+/// 删一把钥匙(工单 #57,ADR-0009 §1:代跑,面板加一道图形确认)。形状:
+/// `nw key rm <名> [--root <目录>]`。上游**没有 `--yes`**(点名即删),本函数
+/// 也不产生确认旗标——面板的图形确认是面板侧的编排,不改引擎语义。删不存在的
+/// 名 → rc 3 且文件一个字节都不动。
+pub fn key_rm(name: &str, root: &str) -> Vec<String> {
+    vec![
+        "key".into(),
+        "rm".into(),
+        name.to_string(),
+        "--root".into(),
+        root.to_string(),
+    ]
+}
+
+/// 取回钥匙本体的**建议命令**(ADR-0009 §1 裁定:面板**不代跑** `key get`——
+/// `data.key` 是上游唯一回显本体的出口,屏显铺一把活钥匙的扩散面(终端滚动
+/// 历史 / 截图 / 快照帧)面板没有任何机制兜住)。
+///
+/// 纯函数:无 IO、不读环境、不碰能力账——本模块只算命令,永远不把它下发。
+/// 形状:`nw key get --name <名> [--root <目录>] | jq -r .data.key`(上游
+/// usage 原话的形态;`--root` 照面板既有纪律显式给,不让引擎拿当前目录兜底;
+/// 上游不开 `--raw`,要裸串自己拼管道)。
+pub fn key_get_suggest(name: &str, root: &str) -> Suggest {
+    let argv = vec![
+        "key".into(),
+        "get".into(),
+        "--name".into(),
+        name.to_string(),
+        "--root".into(),
+        root.to_string(),
+    ];
+    Suggest {
+        display: format!("nw {} | jq -r .data.key", argv.join(" ")),
+        argv,
+    }
+}
+
 /// 三条前提缺哪一条:两种配方域建议命令(bake / new)共用这一份判定,
 /// 措辞各归各自的 gate enum——判定只有一处,说法不互相冒充。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1224,6 +1340,113 @@ mod tests {
             s,
             subscription_get_suggest("airport", "/data/root"),
             "纯函数:同名同根永远同一条命令(可测、可复制)"
+        );
+    }
+
+    // ---- 工单 #57:key 组(register 两段式经 stdin / ls / rm / get 只给建议) ----
+
+    #[test]
+    fn 钥匙登记_argv面无本体_只经_stdin_声明与_root_进() {
+        let p = key_register_preaudit("deploy", "github.com", &[], None, "/data/root");
+        assert_eq!(
+            p,
+            vec![
+                "key",
+                "register",
+                "--name",
+                "deploy",
+                "--token-stdin",
+                "--host",
+                "github.com",
+                "--root",
+                "/data/root",
+            ]
+        );
+        // 本体一个字节都不在 argv 里(上游只认 stdin;误粘的 argv 会进 ps / history)
+        assert!(
+            !p.iter().any(|s| s == "--token" || s == "--password"),
+            "上游 usage 禁 --token / --password 二字,面板不造:{p:?}"
+        );
+        assert!(
+            !p.iter().any(|s| s == "--yes"),
+            "预审段连 --yes 的位置都没有"
+        );
+        assert!(!p.iter().any(|s| s == "--repo"), "key 组只认 --root");
+        // host 空 = 缺省 github.com:不产生 --host 旗标(显式 --host "" 会被第②道闸拒)
+        let no_host = key_register_preaudit("deploy", "", &[], None, "/data/root");
+        assert!(
+            !no_host.iter().any(|s| s == "--host"),
+            "host 空不下发 --host:{no_host:?}"
+        );
+        // 作用域:只登记不设闸,逐条 --scope 落槽;空 scope 面板侧就滤掉不喂给引擎
+        let scopes = vec!["repo".to_string(), "read:org".to_string(), "  ".to_string()];
+        let with_scopes = key_register_preaudit("deploy", "github.com", &scopes, None, "/r");
+        assert_eq!(
+            with_scopes.iter().filter(|s| *s == "--scope").count(),
+            2,
+            "空 scope 被滤掉:{with_scopes:?}"
+        );
+        assert!(with_scopes.contains(&"repo".to_string()));
+        assert!(with_scopes.contains(&"read:org".to_string()));
+        // 轮换日:空 = 缺省登记日 UTC,不产生 --rotated-at 旗标
+        let no_rot = key_register_preaudit("deploy", "github.com", &[], Some(""), "/r");
+        assert!(
+            !no_rot.iter().any(|s| s == "--rotated-at"),
+            "轮换日空不下发 --rotated-at:{no_rot:?}"
+        );
+        assert_eq!(
+            no_rot,
+            key_register_preaudit("deploy", "github.com", &[], None, "/r"),
+            "空串与没给同义(缺省登记日)"
+        );
+        let rot = key_register_preaudit("deploy", "github.com", &[], Some("2026-03-01"), "/r");
+        assert!(
+            rot.contains(&"--rotated-at".to_string()) && rot.contains(&"2026-03-01".to_string())
+        );
+        // 落账 = 预审 + 恰好一枚 --yes,不另改槽位
+        let c = key_register_commit("deploy", "github.com", &[], None, "/data/root");
+        assert_eq!(c, [p.clone(), vec!["--yes".into()]].concat());
+        assert_eq!(c.iter().filter(|s| *s == "--yes").count(), 1);
+    }
+
+    #[test]
+    fn 钥匙_ls_只读_rm_只认_root_且无确认旗标() {
+        assert_eq!(
+            key_ls("/data/root"),
+            vec!["key", "ls", "--root", "/data/root"]
+        );
+        assert_eq!(
+            key_rm("deploy", "/data/root"),
+            vec!["key", "rm", "deploy", "--root", "/data/root"]
+        );
+        for a in [key_ls("/r"), key_rm("deploy", "/r")] {
+            assert!(!a.iter().any(|s| s == "--repo"), "四组只认 --root");
+            assert!(
+                !a.iter().any(|s| s == "--yes"),
+                "上游 rm 没有确认闸,面板不自己造一枚下发"
+            );
+        }
+    }
+
+    #[test]
+    fn 钥匙_get_只给建议命令_带管道且永不带写旗标() {
+        let s = key_get_suggest("deploy", "/data/root");
+        // 展示串照上游 usage 的形态:要裸钥匙自己拼管道(上游不开 --raw)
+        assert_eq!(
+            s.display,
+            "nw key get --name deploy --root /data/root | jq -r .data.key"
+        );
+        assert_eq!(s.argv[..3], ["key", "get", "--name"]);
+        assert!(!s.display.contains("--yes"), "get 是只读出口,永不带写旗标");
+        assert!(!s.display.contains("--raw"), "上游不开 --raw,面板也不造");
+        assert!(
+            s.argv.contains(&"--root".to_string()),
+            "root 槽照面板既有纪律显式给"
+        );
+        assert_eq!(
+            s,
+            key_get_suggest("deploy", "/data/root"),
+            "纯函数:同名同根永远同一条命令"
         );
     }
 }

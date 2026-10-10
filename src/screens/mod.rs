@@ -16,10 +16,11 @@ mod settings;
 pub use assemble::render_assemble;
 #[allow(unused_imports)]
 pub use catalog::{
-    new_form, new_sub_form, new_tag_form, on_key_form, on_key_sub_form, on_key_tag_form,
-    render_catalog, spec_from_form, spec_from_sub_form, spec_from_tag_form, Audit, CatalogKind,
-    FormAction, RegPhase, RegisterFlow, RegisterSpec, SecretBody, SubField, SubForm,
-    SubscriptionSpec, TagField, TagForm, TagFormMode, TagSpec, VpsField, VpsForm, VpsSpec,
+    new_form, new_key_form, new_sub_form, new_tag_form, on_key_form, on_key_key_form,
+    on_key_sub_form, on_key_tag_form, render_catalog, spec_from_form, spec_from_key_form,
+    spec_from_sub_form, spec_from_tag_form, Audit, CatalogKind, FormAction, KeyField, KeyForm,
+    KeySpec, RegPhase, RegisterFlow, RegisterSpec, SecretBody, SubField, SubForm, SubscriptionSpec,
+    TagField, TagForm, TagFormMode, TagSpec, VpsField, VpsForm, VpsSpec,
 };
 pub use health::render_health;
 pub use overview::render_overview;

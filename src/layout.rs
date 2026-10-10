@@ -250,6 +250,40 @@ fn vps_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         push_sheet_rows(inner, n, kind.row_lines(), hits);
         return;
     }
+    if kind == crate::screens::catalog::CatalogKind::Key {
+        // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
+        if app.key_flow.phase != crate::screens::catalog::RegPhase::Idle {
+            if app.key_flow.phase == crate::screens::catalog::RegPhase::Review
+                && app.key_can_commit()
+            {
+                let popup = popup_rect(
+                    inner,
+                    crate::screens::catalog::REG_W,
+                    crate::screens::catalog::REG_H,
+                );
+                if popup.width > 0 && popup.height > 0 {
+                    let key_y = popup.y + popup.height - 2;
+                    two_key_segments(popup, key_y, REG_KEY_REVIEW_COMMIT, RITUAL_KEY_RETURN, hits);
+                }
+            }
+            return;
+        }
+        if app.key_rm_confirm {
+            let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
+            if popup.width > 0 && popup.height > 0 {
+                let key_y = popup.y + popup.height - 2;
+                two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
+            }
+            return;
+        }
+        // 册体:钥匙清单行命中(渲染每把 4 行,命中按条给整块)
+        let n = app.key_len();
+        if n == 0 {
+            return;
+        }
+        push_sheet_rows(inner, n, kind.row_lines(), hits);
+        return;
+    }
     if kind == crate::screens::catalog::CatalogKind::Tag {
         if app.tag_flow.phase != crate::screens::catalog::RegPhase::Idle {
             return;

@@ -372,6 +372,26 @@ pub struct App {
     /// 取回链接本体的建议命令是否已收进日志(#56,键 `g`):命令可见可取用,
     /// 但面板**不执行**它(ADR-0009 §1:get 一律只给建议命令)。
     pub sub_get_logged: bool,
+    /// 钥匙册(#57,ADR-0009):两段式登记流(复用骨架件 `crate::screens::RegisterFlow`;
+    /// 本体只经 stdin 进,预审与落账各喂一次)。机密纪律最严的一本:投影无本体
+    /// 槽也不印指纹,get 一律只给建议命令。
+    pub key_flow: crate::screens::RegisterFlow,
+    /// 钥匙登记表单:名字 / 主机 / 若干条作用域 / 轮换日 + **钥匙本体喂入框(掩码)**。
+    /// `body` 是 `SecretBody`——在途内存、Debug 不打印内容、随流程 drop。
+    pub key_form: crate::screens::KeyForm,
+    /// 钥匙编目册投影(`nw key ls` 回音定型后落在这里;None = 还没读到)。
+    pub key_ls: Option<crate::engine::KeyLsData>,
+    /// ls 在途(不拿上一轮投影冒充本次)。
+    pub key_ls_loading: bool,
+    /// 钥匙册选中行(↑/↓ 与鼠标点行同源)。
+    pub key_sel: usize,
+    /// 删除确认浮层(ADR-0009 §2:上游 rm 没有 `--yes`,面板加一道图形确认)。
+    pub key_rm_confirm: bool,
+    /// 最近一次 `key rm` 回音(证据五字段原样呈现)。
+    pub key_rm_result: Option<EngineOutput>,
+    /// 取回钥匙本体的建议命令是否已收进日志(#57,键 `g`):命令可见可取用,
+    /// 但面板**不执行**它(ADR-0009 §1:get 一律只给建议命令)。
+    pub key_get_logged: bool,
     /// 配方域建议命令的只读选中态(#39,键 `c`):命令可见可取用,
     /// 但面板**不执行**它(ADR-0003:执行权留给操作者)。选中行/切域即复位。
     pub rc_bake_sel: bool,
@@ -526,6 +546,14 @@ impl App {
             sub_rm_confirm: false,
             sub_rm_result: None,
             sub_get_logged: false,
+            key_flow: crate::screens::RegisterFlow::new(),
+            key_form: crate::screens::new_key_form(),
+            key_ls: None,
+            key_ls_loading: false,
+            key_sel: 0,
+            key_rm_confirm: false,
+            key_rm_result: None,
+            key_get_logged: false,
             fed_queue: Vec::new(),
             rc_bake_sel: false,
             rc_filter: String::new(),
@@ -649,6 +677,17 @@ impl App {
                 }
                 _ => {}
             },
+            // 钥匙册(#57):ls 只读在途;register 落账段点亮写互斥(预审段不点亮;
+            // 本体经 stdin 喂入,见 `spawn_engine_fed`)。
+            Some("key") => match args.get(1).map(String::as_str) {
+                Some("ls") => {
+                    self.key_ls_loading = true;
+                }
+                Some("register") if args.iter().any(|a| a == "--yes") => {
+                    self.assembling = true;
+                }
+                _ => {}
+            },
             // recheck(#40)在途:清掉上一轮结论,不拿旧结论冒充本次
             Some("source") if args.get(1).map(String::as_str) == Some("recheck") => {
                 self.hl_loading = true;
@@ -725,6 +764,9 @@ impl App {
                     Screen::Vps if self.catalog_kind == catalog::CatalogKind::Tag => {
                         self.tag_sel = i.min(self.tag_len().saturating_sub(1));
                     }
+                    Screen::Vps if self.catalog_kind == catalog::CatalogKind::Key => {
+                        self.key_sel = i.min(self.key_len().saturating_sub(1));
+                    }
                     Screen::Vps => self.vps_sel = i.min(self.vps_len().saturating_sub(1)),
                     Screen::Settings => {}
                 }
@@ -792,6 +834,9 @@ impl App {
                 if self.catalog_kind == catalog::CatalogKind::Tag {
                     let n = self.tag_len();
                     (&mut self.tag_sel, n)
+                } else if self.catalog_kind == catalog::CatalogKind::Key {
+                    let n = self.key_len();
+                    (&mut self.key_sel, n)
                 } else {
                     let n = self.vps_len();
                     (&mut self.vps_sel, n)
@@ -850,6 +895,13 @@ impl App {
             // 编目册登记返航与 Esc 完全同路(骨架件同一语义);在途链接本体
             // 随表单 drop(ADR-0009 §3:面板侧不留副本)。
             self.cancel_sub_register();
+        } else if self.key_rm_confirm {
+            self.key_rm_confirm = false;
+            self.push_log("删除已取消:keys.json 一个字节都没动");
+        } else if self.key_flow.phase != catalog::RegPhase::Idle {
+            // 编目册登记返航与 Esc 完全同路(骨架件同一语义);在途钥匙本体
+            // 随表单 drop(ADR-0009 §3:面板侧不留副本)。
+            self.cancel_key_register();
         }
     }
 
@@ -997,6 +1049,9 @@ impl App {
             // 订阅册回音(#56):ls 只读 / register 两段式(本体经 stdin)/ rm。
             // 只认真实 argv(精确的无参 `subscription` 探针仍归能力回音路)。
             "subscription" if Capability::from_probe(&out.args).is_none() => self.on_sub_echo(out),
+            // 钥匙册回音(#57):ls 只读 / register 两段式(本体经 stdin)/ rm。
+            // 只认真实 argv(精确的无参 `key` 探针仍归能力回音路)。
+            "key" if Capability::from_probe(&out.args).is_none() => self.on_key_echo(out),
             // 外部源漂移复核回音(#40):只读,只认真实 argv(带 --root 或
             // --name);精确的无参探针仍归下面的能力回音路。
             "source"
@@ -1093,6 +1148,16 @@ impl App {
         }
         if self.sub_flow.phase != catalog::RegPhase::Idle {
             self.on_key_sub_flow(k);
+            return;
+        }
+        // 钥匙册浮层(#57):同一个骨架件。删除确认是独立一道图形确认
+        // (ADR-0009 §2),登记流里没有 rm 那一步,所以两道浮层平级即可。
+        if self.key_rm_confirm {
+            self.on_key_key_rm_confirm(k);
+            return;
+        }
+        if self.key_flow.phase != catalog::RegPhase::Idle {
+            self.on_key_key_flow(k);
             return;
         }
         // 登记两段式(#30 #31):输入 → 预审 → 确认 → 落账 → 结果,
@@ -1850,6 +1915,29 @@ impl App {
             }
             return;
         }
+        if self.catalog_kind == catalog::CatalogKind::Key {
+            match k.code {
+                KeyCode::Char('r') if !self.assembling => self.start_key_register(),
+                // 取回钥匙本体:只给建议命令,面板不代跑 get(ADR-0009 §1)
+                KeyCode::Char('g') => self.log_key_get_suggest(),
+                KeyCode::Char('d') => self.start_key_rm(),
+                KeyCode::Down => {
+                    let n = self.key_len();
+                    if n > 0 {
+                        self.key_sel = (self.key_sel + 1) % n;
+                    }
+                }
+                KeyCode::Up => {
+                    let n = self.key_len();
+                    if n > 0 {
+                        self.key_sel = (self.key_sel + n - 1) % n;
+                    }
+                }
+                KeyCode::Char('l') => self.run_key_ls(),
+                _ => {}
+            }
+            return;
+        }
         if self.catalog_kind == catalog::CatalogKind::Tag {
             match k.code {
                 KeyCode::Char('r') if !self.assembling => self.start_tag_add(),
@@ -2191,6 +2279,7 @@ impl App {
             k.file(),
             match k {
                 catalog::CatalogKind::Tag => "按 l 反查全部标签(只读)",
+                catalog::CatalogKind::Key => "按 l 重读钥匙编目(只读,无本体槽、不印指纹)",
                 catalog::CatalogKind::Subscription => "按 l 重读订阅编目(只读,含到期三态)",
                 catalog::CatalogKind::Vps => "按 l 重读机器编目(只读)",
             }
@@ -2210,6 +2299,7 @@ impl App {
                 .and_then(|e| e.data_as::<crate::engine::TagLsData>())
                 .map(|d| d.sheet()),
             catalog::CatalogKind::Subscription => self.sub_ls.as_ref().map(|d| d.sheet()),
+            catalog::CatalogKind::Key => self.key_ls.as_ref().map(|d| d.sheet()),
         }
     }
 
@@ -2238,6 +2328,7 @@ impl App {
                 None => "全部标签".to_string(),
             },
             catalog::CatalogKind::Subscription => "全部订阅".to_string(),
+            catalog::CatalogKind::Key => "全部钥匙".to_string(),
         }
     }
 
@@ -2247,6 +2338,7 @@ impl App {
             catalog::CatalogKind::Vps => self.vps_sel,
             catalog::CatalogKind::Tag => self.tag_sel,
             catalog::CatalogKind::Subscription => self.sub_sel,
+            catalog::CatalogKind::Key => self.key_sel,
         }
     }
 
@@ -2945,6 +3037,354 @@ impl App {
                     None => {
                         let h = self
                             .sub_rm_result
+                            .as_ref()
+                            .map(|o| o.headline())
+                            .unwrap_or_default();
+                        self.push_log(format!("删除结果不可用:{h}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- 编目册屏·钥匙册(spec #50 工单 #57,ADR-0009;机密纪律最严的一本) ----
+
+    /// 钥匙册的行数(ls 投影条数;没读到 = 0)。
+    pub fn key_len(&self) -> usize {
+        self.key_ls.as_ref().map(|d| d.keys.len()).unwrap_or(0)
+    }
+
+    /// 选中钥匙的名字(删除确认 / 取回建议命令同源)。
+    pub fn selected_key_name(&self) -> Option<String> {
+        let d = self.key_ls.as_ref()?;
+        d.keys
+            .get(self.key_sel.min(d.keys.len().saturating_sub(1)))
+            .map(|k| k.name.clone())
+    }
+
+    /// 钥匙册入口门(#29 能力门 + #27 数据仓根,与 vps / tag / subscription 册同两道)。
+    pub fn key_entry_enabled(&self) -> bool {
+        self.data_root_cause().is_none() && self.capabilities.enabled(Capability::Key)
+    }
+
+    /// 入口不可用时的一句指路(与册体提示同源)。
+    pub fn key_gate_hint(&self) -> String {
+        match self.data_root_cause() {
+            Some(_) => self.data_root_gate_msg(),
+            None => capability::GATE_HINT.to_string(),
+        }
+    }
+
+    /// 取回钥匙本体的**建议命令**(ADR-0009 §1:面板不代跑 `key get`)。纯函数层产
+    /// argv + 展示串(`engine::commands::key_get_suggest`,与 bake / recipe new /
+    /// subscription get 同源同层);`App` 只在这里读它,**没有任何路径会把它下发**
+    /// ——队列里永远不会出现 `key get`。
+    pub fn key_get_suggest(&self) -> Option<crate::engine::commands::Suggest> {
+        let name = self.selected_key_name()?;
+        let root = self.usable_data_root()?;
+        Some(crate::engine::commands::key_get_suggest(&name, &root))
+    }
+
+    /// 把取回钥匙的建议命令收进日志(键 `g`):命令文案可取用,执行权留给操作者。
+    /// **只收命令不收本体**——这条命令本身不含钥匙,面板也从不代跑它。
+    pub fn log_key_get_suggest(&mut self) {
+        match self.key_get_suggest() {
+            Some(s) => {
+                self.push_log(format!("取回钥匙(面板不代跑,自己执行):{}", s.display));
+                self.push_log("get 是上游唯一回显本体的出口:别把它贴回面板(不进日志/配置/快照)。");
+                self.key_get_logged = true;
+            }
+            None => self.push_log(format!("取回钥匙未给出:{}", self.key_gate_hint())),
+        }
+    }
+
+    /// 读一次钥匙编目册(只读;编目不存在 = 空数组 rc 0,合法空态)。投影**没有
+    /// 本体槽、也不印指纹**。
+    pub fn run_key_ls(&mut self) {
+        if !self.key_entry_enabled() {
+            self.push_log(format!("钥匙册未读:{}", self.key_gate_hint()));
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("钥匙册未读:{}", self.data_root_gate_msg()));
+            return;
+        };
+        self.key_ls_loading = true;
+        self.queue.push(commands::key_ls(&root));
+        self.push_log("key ls 已入队(只读,不写任何文件)");
+    }
+
+    /// 发起钥匙登记:先过两道门 + 写互斥,再进表单态(含掩码喂入框)。
+    pub fn start_key_register(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:登记与装配互斥,稍后再试");
+            return;
+        }
+        if !self.key_entry_enabled() {
+            self.push_log(format!("登记入口不可用:{}", self.key_gate_hint()));
+            return;
+        }
+        self.key_rm_confirm = false;
+        self.key_flow.begin();
+        self.key_form = crate::screens::new_key_form();
+        self.push_log(
+            "登记钥匙:填名字/主机/作用域/轮换日,在钥匙框贴一次本体,Enter 预审,Esc/q 返航",
+        );
+    }
+
+    /// 钥匙登记流程键位(表单 / 等回音 / 确认 / 落账在途 / 结果)。
+    fn on_key_key_flow(&mut self, k: KeyEvent) {
+        match self.key_flow.phase {
+            catalog::RegPhase::Form => match catalog::on_key_key_form(&mut self.key_form, k) {
+                catalog::FormAction::Submit => self.dispatch_key_register(),
+                catalog::FormAction::Cancel => self.cancel_key_register(),
+                catalog::FormAction::Edited => {}
+            },
+            catalog::RegPhase::PreAudit | catalog::RegPhase::Commit => {
+                if matches!(k.code, KeyCode::Esc) {
+                    self.cancel_key_register();
+                }
+            }
+            catalog::RegPhase::Review => match k.code {
+                KeyCode::Enter => self.dispatch_key_commit(),
+                KeyCode::Esc => self.cancel_key_register(),
+                _ => {}
+            },
+            catalog::RegPhase::Done => {
+                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.cancel_key_register();
+                }
+            }
+            catalog::RegPhase::Idle => {}
+        }
+    }
+
+    /// 下发预审(两段式第一段):不带 `--yes`,文件不落;**钥匙本体经 stdin 喂入
+    /// 这一次**(喂入是一次性的,落账那一下要再喂一次)。
+    pub fn dispatch_key_register(&mut self) {
+        if !self.key_entry_enabled() {
+            self.push_log(format!("登记不下发:{}", self.key_gate_hint()));
+            self.cancel_key_register();
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("登记不下发:{}", self.data_root_gate_msg()));
+            self.cancel_key_register();
+            return;
+        };
+        let spec = match catalog::spec_from_key_form(&self.key_form) {
+            Ok(s) => s,
+            Err(bad) => {
+                // 面板侧就拒(空名字 / 轮换日形状不对 / 本体没喂入),留表单可改,
+                // 不喂给引擎跑一趟。
+                self.push_log(format!("登记被拒:{},留表单可改", bad.join(";")));
+                return;
+            }
+        };
+        self.key_flow.preaudit_sent();
+        let fed = spec.preaudit(&root);
+        let n = self.key_form.body.len();
+        // 本体在面板侧的唯一副本在表单里(在途内存):预审这一下**克隆**一份喂出去,
+        // 表单里那份留到落账那一下再喂一次(两段式各喂一次,喂入是一次性的)。
+        self.fed_queue.push((fed, self.key_form.body.clone()));
+        self.push_log(format!(
+            "登记预审已入队:key register --name {}(不带 --yes,文件不落;已喂入 {n} 字节)",
+            spec.name
+        ));
+    }
+
+    /// 落账(两段式第二段):图形确认后才可能到达——全流程唯一能产生 `--yes` 的
+    /// 转换。重过三道闸(入口 / 数据仓根 / 预审结论),全过才下发并点亮写互斥;
+    /// 任何一道不过都不下发写命令。**本体再喂一次 stdin**。
+    pub fn dispatch_key_commit(&mut self) {
+        if self.key_flow.phase != catalog::RegPhase::Review || !self.key_can_commit() {
+            self.push_log("落账未下发:预审未通过(三道闸有 fail 或退出码非 0)");
+            return;
+        }
+        if !self.key_entry_enabled() {
+            self.push_log(format!("落账未下发:{}", self.key_gate_hint()));
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("落账未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        let Ok(spec) = catalog::spec_from_key_form(&self.key_form) else {
+            self.push_log("落账未下发:表单已不可定型(返航后从表单重来)");
+            return;
+        };
+        self.key_flow.commit_sent();
+        self.assembling = true;
+        let fed = spec.commit(&root);
+        let n = self.key_form.body.len();
+        self.fed_queue.push((fed, self.key_form.body.clone()));
+        self.push_log(format!(
+            "登记落账已入队:key register --name {} --yes(--root {};已再喂入 {n} 字节)",
+            spec.name, root
+        ));
+    }
+
+    /// 钥匙落账闸(呈现口径):预审通过 = rc 0 且三道闸无 fail 且 data 可定型。
+    pub fn key_can_commit(&self) -> bool {
+        let Some(out) = self.key_flow.result.as_ref() else {
+            return false;
+        };
+        catalog::preaudit_passed(out, catalog::KeySpec::audit(out).as_ref())
+    }
+
+    /// 返航:任一态 Esc 同义,状态清空不留半条记录(在途本体随表单一起 drop)。
+    pub fn cancel_key_register(&mut self) {
+        self.key_flow.abandon();
+        self.key_form = crate::screens::new_key_form();
+        self.push_log("登记返航(在途钥匙本体已 drop,面板侧不留副本)");
+    }
+
+    /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
+    fn start_key_rm(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:删除与装配互斥,稍后再试");
+            return;
+        }
+        if !self.key_entry_enabled() {
+            self.push_log(format!("删除未下发:{}", self.key_gate_hint()));
+            return;
+        }
+        let Some(name) = self.selected_key_name() else {
+            self.push_log("删除未下发:没有选中的钥匙(↑/↓ 先选一行)");
+            return;
+        };
+        self.key_rm_confirm = true;
+        self.push_log(format!("删除确认:{name}(Enter 确认,Esc/q 取消)"));
+    }
+
+    fn on_key_key_rm_confirm(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => self.dispatch_key_rm(),
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
+            _ => {}
+        }
+    }
+
+    /// 下发删除:argv 与在 shell 里敲的逐字相同(面板只决定何时递出去)。
+    fn dispatch_key_rm(&mut self) {
+        let Some(name) = self.selected_key_name() else {
+            self.key_rm_confirm = false;
+            self.push_log("删除未下发:没有选中的钥匙");
+            return;
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("删除未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        self.key_rm_confirm = false;
+        self.key_rm_result = None;
+        self.queue.push(commands::key_rm(&name, &root));
+        self.push_log(format!("删除已入队:key rm {name} --root {root}"));
+    }
+
+    /// 钥匙册选中行钳回可见范围内(刷新后旧下标可能越界)。
+    fn clamp_key_sel(&mut self) {
+        let n = self.key_len();
+        if n == 0 {
+            self.key_sel = 0;
+        } else {
+            self.key_sel = self.key_sel.min(n - 1);
+        }
+    }
+
+    /// 钥匙册回音路由(#57):ls 只读 / register 两段式(本体经 stdin)/ rm。
+    fn on_key_echo(&mut self, out: EngineOutput) {
+        match out.args.get(1).map(String::as_str) {
+            Some("ls") => {
+                self.key_ls_loading = false;
+                match out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::KeyLsData>())
+                {
+                    Some(d) => {
+                        let n = d.keys.len();
+                        self.key_ls = Some(d);
+                        self.clamp_key_sel();
+                        self.key_get_logged = false;
+                        self.push_log(format!("钥匙册已刷新:{n} 条(只读,无本体槽、不印指纹)"));
+                    }
+                    None => self.push_log(format!("key ls 结果不可用:{}", out.headline())),
+                }
+            }
+            Some("register") => {
+                let is_commit = out.args.iter().any(|a| a == "--yes");
+                if is_commit {
+                    let echo_ok = out.ok;
+                    match self.key_flow.commit_back(out) {
+                        Some(true) => {
+                            self.assembling = false;
+                            self.push_log(
+                                "登记落账完成:keys.json 已写入数据仓根(一次 git 变更)".to_string(),
+                            );
+                            self.run_key_ls();
+                        }
+                        Some(false) => {
+                            self.assembling = false;
+                            let h = self
+                                .key_flow
+                                .result
+                                .as_ref()
+                                .map(|o| o.headline())
+                                .unwrap_or_default();
+                            self.push_log(format!("登记落账失败:{h}"));
+                        }
+                        None => {
+                            // 在途返航收不回引擎的写(与 vps / subscription 同一收敛行为)
+                            self.assembling = false;
+                            if echo_ok {
+                                self.run_key_ls();
+                                self.push_log(
+                                    "登记写盘可能已完成:钥匙册已刷新,keys.json 走 PR + 家长审复核"
+                                        .to_string(),
+                                );
+                            } else {
+                                self.push_log("登记落账回音已丢弃(流程已返航,写未成功)");
+                            }
+                        }
+                    }
+                } else if self.key_flow.preaudit_back(out) {
+                    let h = self
+                        .key_flow
+                        .result
+                        .as_ref()
+                        .map(|o| o.headline())
+                        .unwrap_or_default();
+                    self.push_log(format!("登记预审完成:{h}"));
+                } else {
+                    self.push_log("登记预审回音已丢弃(流程已返航)");
+                }
+            }
+            Some("rm") => {
+                let typed = out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::KeyRmData>());
+                self.key_rm_result = Some(out);
+                match typed {
+                    Some(d) if d.removed => {
+                        self.push_log(format!(
+                            "已删除钥匙 {}:剩余 {} 条(一次 git 变更,走 PR + 家长审)",
+                            d.name, d.remaining
+                        ));
+                        self.run_key_ls();
+                    }
+                    Some(d) => {
+                        // 删不存在的名:rc 3 + 证据五字段 + 文件一个字节都不动
+                        self.push_log(format!(
+                            "没删成:{} 不在编目里(action {}),keys.json 一个字节都没动",
+                            d.name, d.action
+                        ));
+                    }
+                    None => {
+                        let h = self
+                            .key_rm_result
                             .as_ref()
                             .map(|o| o.headline())
                             .unwrap_or_default();
