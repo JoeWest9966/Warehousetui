@@ -1122,6 +1122,19 @@ impl App {
         .map(|_| ())
     }
 
+    /// 配方域**新建骨架**建议命令是否给得出(#58):与 bake 同三条前提——
+    /// 选中行是配方(骨架名跟着它起)、数据仓根已设(`--out-dir` 指它,
+    /// 不拿当前目录兜底)、引擎有 `recipe new` 能力(#29 探测门的结论)。
+    pub fn recipe_new_suggest_gate(&self) -> Result<(), crate::engine::commands::RecipeNewGate> {
+        let name = self.selected_recipe().map(|r| r.name.as_str());
+        crate::engine::commands::recipe_new_suggest(
+            name,
+            self.usable_data_root().as_deref(),
+            self.capabilities.enabled(Capability::RecipeNew),
+        )
+        .map(|_| ())
+    }
+
     /// 配方域建议命令切换只读选中态(#39):键盘 `c` 与鼠标点键位行「取用」段
     /// 走同一条路。三前提不齐时**不翻状态、不入队**,只留一句与呈现层
     /// 同源的指路(门不放行时命中区同样不产出,键盘/鼠标同源)。
@@ -2525,6 +2538,68 @@ mod tests {
             "取用说清执行权归属:{:?}",
             app.log[0]
         );
+    }
+
+    #[test]
+    fn 建议命令_recipe_new_三前提各有可区分门_互不冒充() {
+        // 齐备:门放行(面板仍只读呈现,不执行)
+        let mut app = bake_app();
+        app.capabilities
+            .record(Capability::RecipeNew, capability::Probe::Available);
+        app.data_root = Some("/tmp".into());
+        assert!(app.recipe_new_suggest_gate().is_ok(), "三前提齐备门放行");
+        // 选中行不是配方(配方域为空)
+        let mut app = bake_app();
+        app.ls = Some(serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#).unwrap());
+        assert_eq!(
+            app.recipe_new_suggest_gate(),
+            Err(commands::RecipeNewGate::NotARecipe)
+        );
+        // 未设数据仓根
+        let mut app = bake_app();
+        app.data_root = None;
+        assert_eq!(
+            app.recipe_new_suggest_gate(),
+            Err(commands::RecipeNewGate::NoDataRoot)
+        );
+        // 引擎没有 recipe new 能力
+        let mut app = bake_app();
+        app.capabilities
+            .record(Capability::RecipeNew, capability::Probe::Unavailable);
+        assert_eq!(
+            app.recipe_new_suggest_gate(),
+            Err(commands::RecipeNewGate::NoCapability)
+        );
+    }
+
+    #[test]
+    fn 建议命令_recipe_new_面板没有任何入队路径_只读呈现() {
+        // ADR-0003:面板只呈现与编排,执行权留给操作者。recipe new 与 bake
+        // 同源同层——同一个纯函数层算 argv 与展示串,但 App 没有任何路径
+        // 会把它下发(没有键位、没有命中区、没有队列入口)。
+        let mut app = bake_app();
+        app.capabilities
+            .record(Capability::RecipeNew, capability::Probe::Available);
+        app.data_root = Some("/tmp".into());
+        // 配方域键面全按一遍(含 bake 的 c 与五域导航/搜索)
+        for code in ['h', 'l', 'j', 'k', '/', 'c', 'r', 'n', 'y'] {
+            app.update(Message::Key(key(code)));
+        }
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Enter, KeyCode::Esc] {
+            app.update(Message::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        assert!(
+            app.queue.is_empty(),
+            "recipe new 永不下发:队列一个都不该有:{:?}",
+            app.queue
+        );
+        // 铁律的另一半:建议命令本身不带任何写旗标
+        let s =
+            crate::engine::commands::recipe_new_suggest(Some("research-desk"), Some("/tmp"), true)
+                .expect("三前提齐备");
+        for a in &s.argv {
+            assert!(!a.contains("--yes"), "建议命令永不带确认闸:{a}");
+        }
     }
 
     #[test]

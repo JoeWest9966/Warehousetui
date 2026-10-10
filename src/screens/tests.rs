@@ -787,6 +787,34 @@ fn 设置屏能力清单_缺能力禁用并指路_紧凑态不截断() {
 }
 
 #[test]
+fn 设置屏能力清单_recipe_new_与烘焙同组不同项_紧凑态不截断() {
+    use crate::engine::{Capability, Probe};
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Settings;
+    for cap in Capability::ALL {
+        app.capabilities.record(cap, Probe::Available);
+    }
+    // 常畅态:六项能力一排,recipe new 与 bake 并列(同组不同项)
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    assert!(s.contains("✓配方烘焙"), "烘焙能力在场:{s}");
+    assert!(s.contains("✓配方新建"), "新建能力在场:{s}");
+    assert!(
+        !s.contains("入口禁用") && !s.contains("未决"),
+        "全部可用时不占归组行:{s}"
+    );
+    // 紧凑态 66×50(保证最小):能力行不溢出(竖向预算不变——能力仍是一行)
+    let c = crate::testutil::frame_display(&app, 66, 50);
+    for l in c.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(l) <= 66,
+            "66×50 设置行不溢出:{l}"
+        );
+    }
+    assert!(c.contains("配方新建"), "紧凑态新建能力可见:{c}");
+}
+
+#[test]
 fn 设置屏能力_无响应回未决不冒充禁用() {
     use crate::engine::{Capability, FakeRunner, Probe};
     // found=true 但探针无回答:空 stdout、无「未知子命令」——归未决
@@ -1043,6 +1071,101 @@ fn 配方域建议命令_引擎无bake能力给指路_不冒充面板故障() {
     assert!(
         s2.contains("引擎缺 recipe bake 能力"),
         "未决与禁用同走缺能力指路:{s2}"
+    );
+}
+
+// ---- #58 配方域建议命令补 recipe new:与 bake 同源同层,执行权留给操作者 ----
+
+#[test]
+fn 配方域建议命令_选中即给出recipe_new_骨架名与out_dir同源() {
+    use crate::engine::{Capability, Probe};
+    let mut app = bake_app();
+    app.capabilities
+        .record(Capability::RecipeNew, Probe::Available);
+    app.data_root = Some("/tmp".to_string());
+    // 常畅态:新建骨架命令整段在场(详情内层窄,按宽折行是真设计;
+    // 旗标一段都不少,拼回来的串与纯函数层逐字相同)
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("nw recipe new research-desk"), "命令起头:{s}");
+    assert!(s.contains("--out-dir"), "--out-dir 填数据仓根:{s}");
+    assert!(
+        crate::engine::commands::recipe_new_suggest(Some("research-desk"), Some("/tmp"), true)
+            .expect("三前提齐备")
+            .display
+            == "nw recipe new research-desk --out-dir /tmp",
+        "展示串由 argv 拼出(与屏上折行片段同一处真相)"
+    );
+    assert!(s.contains("新建配方骨架"), "标成新建骨架:{s}");
+    assert!(s.contains("执行权在你"), "执行权归属说清:{s}");
+    assert!(s.contains("面板不代跑"), "不冒充面板代跑:{s}");
+    assert!(
+        s.contains("schema nw/recipe-new.v1"),
+        "schema 照引擎原话:{s}"
+    );
+    assert!(
+        s.contains("不填 --profile") && s.contains("按配方名兜底"),
+        "派名缺省照引擎原话:{s}"
+    );
+    // bake 仍在:两条建议命令同一块区域,谁也不顶掉谁
+    assert!(
+        s.contains("nw recipe bake research-desk@1.0.0"),
+        "bake 建议命令仍在:{s}"
+    );
+    // 常畅态两档 + 紧凑态:命令按内层宽折行,旗标一段都不少,行不溢出
+    for (w, h) in [(110u16, 30u16), (90, 30), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("nw recipe new"), "{w}×{h} 新建命令在场:{f}");
+        assert!(f.contains("--out-dir"), "{w}×{h} 旗标在场:{f}");
+        for l in f.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= usize::from(w),
+                "{w}×{h} 行不溢出:{l}"
+            );
+        }
+    }
+    // 最挤的常畅态 80×30:详情内层只有 22 列,bake 的建议命令就把内层占满——
+    // 放不下就**整块**不渲染,绝不在屏上留半条命令(标题在、旗标被裁)。
+    let tight = crate::testutil::frame_display(&app, 80, 30);
+    assert!(tight.contains("nw recipe bake"), "bake 不受影响:{tight}");
+    assert!(
+        !tight.contains("nw recipe new"),
+        "放不下时整块不收,不给半条命令:{tight}"
+    );
+}
+
+#[test]
+fn 配方域建议命令_recipe_new_三种缺前提各有可区分指路_不给半条命令() {
+    use crate::engine::{Capability, Probe};
+    // 引擎没有 recipe new 能力:指路点名 recipe new,不拿 bake 的话冒充
+    let mut app = bake_app();
+    app.capabilities
+        .record(Capability::RecipeNew, Probe::Unavailable);
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("引擎缺 recipe new 能力"), "缺能力指路:{s}");
+    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    assert!(!s.contains("nw recipe new"), "缺能力不给半条命令:{s}");
+    // 未决(探测失败)同样不给命令,且与禁用同走缺能力指路
+    app.capabilities
+        .record(Capability::RecipeNew, Probe::Unknown);
+    let s3 = draw(&app, 110, 30);
+    assert!(!s3.contains("nw recipe new"), "未决不给命令:{s3}");
+    assert!(
+        s3.contains("引擎缺 recipe new 能力"),
+        "未决与禁用同走缺能力指路:{s3}"
+    );
+    // 未设数据仓根:--out-dir 指不到本地仓,同样不给半条命令
+    let mut app = bake_app();
+    app.capabilities
+        .record(Capability::RecipeNew, Probe::Available);
+    app.data_root = None;
+    let s2 = draw(&app, 110, 30);
+    assert!(s2.contains("数据仓根未设"), "未设根指路:{s2}");
+    assert!(!s2.contains("nw recipe new"), "未设根不给半条命令:{s2}");
+    assert!(!s2.contains("--out-dir"), "连旗标都不给:{s2}");
+    // 门不放行(纯函数层的三态可区分已在 commands.rs 单测钉过)
+    assert_eq!(
+        app.recipe_new_suggest_gate(),
+        Err(crate::engine::commands::RecipeNewGate::NoDataRoot)
     );
 }
 

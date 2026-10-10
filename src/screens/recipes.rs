@@ -477,6 +477,73 @@ fn bake_empty_lines(p: &crate::theme::Palette, app: &App, w: usize) -> Vec<Line<
     lines
 }
 
+/// 配方域**新建骨架**建议命令区(spec #33 / 工单 #58,ADR-0003 + ADR-0006):
+/// 紧随 bake 之后同一块地方给出 `nw recipe new …` 文案。与 bake 完全同源——
+/// argv 与展示串都出自 `commands::recipe_new_suggest` 这一个纯函数层,
+/// 旗标拼装只有一处真相;面板**永远不执行**(执行权留给操作者,
+/// `App` 没有任何路径会把它下发)。
+///
+/// 三种缺前提各有可区分指路(标题 + 说法),**绝不渲染半条命令**;
+/// 说法与 bake 的同名指路不同文——点名的旗标是 `--out-dir`,不冒充。
+///
+/// `room` 是详情内层还能给几行(末行已预留给 `c` 键位行)。竖向放不下时
+/// 从尾部收口:先收引擎口径注(整条收,不截半句),头(标题 + 命令)
+/// 放不下就整块不渲染——窗口再窄,屏上也不会出现半条命令。
+fn recipe_new_suggest_lines(
+    p: &crate::theme::Palette,
+    app: &App,
+    r: &crate::engine::RecipeRow,
+    w: usize,
+    room: usize,
+) -> Vec<Line<'static>> {
+    // 头:标题 + 命令本体(或指路标题 + 说法)。
+    let mut head = vec![Line::from(Span::styled(
+        "建议命令 · 新建配方骨架(执行权在你)",
+        p.accent(),
+    ))];
+    let mut notes: Vec<String> = Vec::new();
+    match crate::engine::commands::recipe_new_suggest(
+        Some(r.name.as_str()),
+        app.usable_data_root().as_deref(),
+        app.capabilities
+            .enabled(crate::engine::Capability::RecipeNew),
+    ) {
+        Ok(s) => {
+            for (i, ln) in wrap(&s.display, w.saturating_sub(4)).iter().enumerate() {
+                let indent = if i == 0 { "  " } else { "    " };
+                head.push(Line::from(Span::styled(format!("{indent}{ln}"), p.text())));
+            }
+            // 引擎自己的缺省与落点照原话说:面板不内置第二份真相,
+            // 也不替引擎承诺它没说的行为。
+            notes.push("面板不代跑;不填 --profile 引擎按配方名兜底(#8 布局)".to_string());
+            notes.push(
+                "骨架落 <out-dir>/recipes/<名>/recipe.yaml —— schema nw/recipe-new.v1".to_string(),
+            );
+        }
+        Err(g) => {
+            head.push(Line::from(Span::styled(
+                format!("  ⚠ {}", g.title()),
+                p.warn().bold(),
+            )));
+            notes.push(g.advice());
+        }
+    }
+    if head.len() > room {
+        return Vec::new();
+    }
+    let mut lines = head;
+    for n in &notes {
+        let wrapped = wrap(n, w.saturating_sub(2));
+        if lines.len() + wrapped.len() > room {
+            break;
+        }
+        for ln in wrapped {
+            lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+        }
+    }
+    lines
+}
+
 fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     // 过滤后的可见下标:详情取的是**看得见的那一行**(#61),不过滤时与过去
@@ -510,6 +577,11 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                             Line::from(""),
                         ];
                         v.extend(bake_suggest_lines(p, app, r, inner_w(area)));
+                        // 新建骨架建议命令(#58):紧随 bake 同一块区域,
+                        // 与 bake 同源同层(同一个纯函数层算 argv 与展示串)。
+                        // 末行预留给 `c` 键位行,放不下时该块自行收口。
+                        let room = inner_h(area).saturating_sub(1).saturating_sub(v.len());
+                        v.extend(recipe_new_suggest_lines(p, app, r, inner_w(area), room));
                         v
                     })
                     .unwrap_or_else(|| bake_empty_lines(p, app, inner_w(area))),

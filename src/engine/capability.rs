@@ -25,6 +25,13 @@ pub enum Capability {
     /// 配方烘焙(作者侧,建议命令的来源):`nw recipe bake`。
     /// 探针无参即在「恰好要一个配方」处被拒(rc 3 + `nw/bake.v1` envelope),不写任何文件。
     RecipeBake,
+    /// 配方新建·骨架(作者侧,建议命令的来源,#58):`nw recipe new`。
+    /// 与 [`Capability::RecipeBake`] 同粒度(同属 `recipe` 命令组),单独立项
+    /// 而不是复用烘焙的结论——判据仍只到「问引擎哪个命令」为止,不建本地
+    /// 能力常量表;上游若只发其一,面板自动跟上。
+    /// 探针无参即在「位置参数必须恰好一个」处被拒(rc 3 + `nw/recipe-new.v1`
+    /// envelope),无害、不写任何文件。
+    RecipeNew,
     /// 类别(上游 master 有、所配 0.1.0 无):`nw category`。
     Category,
     /// vps(上游 master 有、所配 0.1.0 无):`nw vps`。
@@ -33,10 +40,11 @@ pub enum Capability {
 
 impl Capability {
     /// 面板入口清单(设置屏按此渲染,顺序即显示顺序)。
-    pub const ALL: [Capability; 5] = [
+    pub const ALL: [Capability; 6] = [
         Capability::SourceRegister,
         Capability::SourceRecheck,
         Capability::RecipeBake,
+        Capability::RecipeNew,
         Capability::Category,
         Capability::Vps,
     ];
@@ -47,20 +55,23 @@ impl Capability {
             Capability::SourceRegister => "外部源登记",
             Capability::SourceRecheck => "外部源复核",
             Capability::RecipeBake => "配方烘焙",
+            Capability::RecipeNew => "配方新建",
             Capability::Category => "类别",
             Capability::Vps => "vps",
         }
     }
 
     /// 探针 argv:一次无害调用(不带 --yes / --repo 等会动文件的旗标)。
-    /// 实测五条探针在 0.1.0 上皆为纯读:register 无参在旗标校验处即拒,
+    /// 实测六条探针在 0.1.0 上皆为纯读:register 无参在旗标校验处即拒,
     /// recheck 只读编目,recipe bake 无参在「恰好要一个配方」处即拒,
+    /// recipe new 无参在「位置参数必须恰好一个」处即拒,
     /// 未知子命令直接回 usage。
     pub fn probe_args(self) -> Vec<String> {
         match self {
             Capability::SourceRegister => vec!["source".into(), "register".into()],
             Capability::SourceRecheck => vec!["source".into(), "recheck".into()],
             Capability::RecipeBake => vec!["recipe".into(), "bake".into()],
+            Capability::RecipeNew => vec!["recipe".into(), "new".into()],
             Capability::Category => vec!["category".into()],
             Capability::Vps => vec!["vps".into()],
         }
@@ -217,6 +228,26 @@ mod tests {
         // 别的能力的探针也不互认
         let cat: Vec<String> = vec!["category".into()];
         assert_eq!(Capability::from_probe(&cat), Some(Capability::Category));
+    }
+
+    #[test]
+    fn recipe_new_探针无参即在位置参数处被拒_无害() {
+        // 所配 0.1.0 对 `nw recipe new`(无参)的真实回放:rc 3 +
+        // nw/recipe-new.v1 envelope —— 子命令存在,且不写任何文件。
+        assert_eq!(Capability::RecipeNew.probe_args(), vec!["recipe", "new"]);
+        assert_eq!(
+            Capability::from_probe(&Capability::RecipeNew.probe_args()),
+            Some(Capability::RecipeNew),
+            "探针认得出自己"
+        );
+        // 真实的 `nw recipe new <名>` 不是探针,不误吞建议命令的结论
+        let real: Vec<String> = vec!["recipe".into(), "new".into(), "desk".into()];
+        assert_eq!(Capability::from_probe(&real), None);
+        // 与烘焙同组不同项:两个探针各问各的
+        assert_ne!(
+            Capability::RecipeNew.probe_args(),
+            Capability::RecipeBake.probe_args()
+        );
     }
 
     #[test]

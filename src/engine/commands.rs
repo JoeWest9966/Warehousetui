@@ -84,6 +84,35 @@ pub fn source_register_commit(repo: &str, kind: &str, root: &str) -> Vec<String>
     a
 }
 
+/// 三条前提缺哪一条:两种配方域建议命令(bake / new)共用这一份判定,
+/// 措辞各归各自的 gate enum——判定只有一处,说法不互相冒充。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Precondition {
+    NoDataRoot,
+    NotARecipe,
+    NoCapability,
+}
+
+/// 前提判定(纯函数,无 IO、不读环境、不碰能力账):顺序即 bake 既有的
+/// 信任顺序——先看选中行是不是配方,再看数据仓根,最后看引擎能力。
+/// 任缺一条返回缺的那一条,**绝不返回半条命令**。
+fn precondition<'a>(
+    recipe: Option<&'a str>,
+    data_root: Option<&'a str>,
+    capable: bool,
+) -> Result<(&'a str, &'a str), Precondition> {
+    let Some(name) = recipe else {
+        return Err(Precondition::NotARecipe);
+    };
+    let Some(root) = data_root else {
+        return Err(Precondition::NoDataRoot);
+    };
+    if !capable {
+        return Err(Precondition::NoCapability);
+    }
+    Ok((name, root))
+}
+
 /// 配方域**建议命令**(spec #33 / 工单 #39,ADR-0003):选中一个配方时,
 /// 面板给出可复制的 `nw recipe bake …` 命令文案,**执行权留给操作者**——
 /// 本模块只算命令,永远不把它下发(`App` 没有任何路径会调它)。
@@ -132,12 +161,24 @@ impl BakeGate {
             }
         }
     }
+
+    /// 与 [`Precondition`] 的映射:判定只有一处(见 [`precondition`]),
+    /// 说法仍是 bake 自己那一套。
+    fn of(p: Precondition) -> Self {
+        match p {
+            Precondition::NoDataRoot => BakeGate::NoDataRoot,
+            Precondition::NotARecipe => BakeGate::NotARecipe,
+            Precondition::NoCapability => BakeGate::NoCapability,
+        }
+    }
 }
 
 /// 算出的建议命令:argv(下发形态,面板**不**下发)与给人看的展示串。
+/// bake(#39)与 recipe new(#58)两条建议命令共用这一个形状——argv 与
+/// 展示串同源,`display` 永远是 `"nw " + argv.join(" ")`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BakeSuggest {
-    /// 完整 argv(含二进制名之后的所有元素),与 [`recipe_bake`] 同源。
+    /// 完整 argv(含二进制名之后的所有元素),与 [`recipe_bake`] / [`recipe_new`] 同源。
     pub argv: Vec<String>,
     /// 操作者可见的命令文案(`nw ` 起头,可直接复制)。
     pub display: String,
@@ -186,17 +227,103 @@ pub fn recipe_bake_suggest(
     data_root: Option<&str>,
     bake_capable: bool,
 ) -> Result<BakeSuggest, BakeGate> {
-    let Some((name, version)) = recipe else {
-        return Err(BakeGate::NotARecipe);
-    };
-    let Some(repo) = data_root else {
-        return Err(BakeGate::NoDataRoot);
-    };
-    if !bake_capable {
-        return Err(BakeGate::NoCapability);
-    }
+    let (name, repo) =
+        precondition(recipe.map(|(n, _)| n), data_root, bake_capable).map_err(BakeGate::of)?;
+    let version = recipe.and_then(|(_, v)| v);
     let out = bake_out_default(name);
     let argv = recipe_bake(name, version, &out, repo);
+    Ok(BakeSuggest {
+        display: format!("nw {}", argv.join(" ")),
+        argv,
+    })
+}
+
+/// 配方域**新建骨架**建议命令(spec #33 / 工单 #58,ADR-0003 + ADR-0006):
+/// 选中一个配方时,面板在 bake 之外一并给出可复制的 `nw recipe new …`
+/// 命令文案,**执行权留给操作者**——与 bake 同源同层(同一个纯函数层产出
+/// argv 与展示串),本模块只算命令,永远不把它下发(`App` 没有任何路径会调它)。
+///
+/// 三种缺前提各有可区分的指路,**绝不渲染半条命令**:没设数据仓根、
+/// 选中行不是配方、引擎没有 `recipe new` 能力(#29 能力探测门的结论)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecipeNewGate {
+    /// 数据仓根未设——骨架要写进数据仓,`--out-dir` 指哪儿都不对。
+    NoDataRoot,
+    /// 当前没有选中的配方(配方域为空,或选中行不是配方):骨架名跟着它起。
+    NotARecipe,
+    /// 引擎没有 `recipe new` 能力(缺的是引擎能力,不是面板坏了)。
+    NoCapability,
+}
+
+impl RecipeNewGate {
+    /// 指路标题:三态各说各话。
+    pub fn title(self) -> &'static str {
+        match self {
+            RecipeNewGate::NoDataRoot => "数据仓根未设",
+            RecipeNewGate::NotARecipe => "没有选中的配方",
+            RecipeNewGate::NoCapability => "引擎缺 recipe new 能力",
+        }
+    }
+
+    /// 指路人话:每态一条,带各自的事实与下一步;与 [`BakeGate`] 同形
+    /// 不同文(标题可能同题,说法绝不互相冒充)。
+    pub fn advice(self) -> String {
+        match self {
+            RecipeNewGate::NoDataRoot => {
+ "五域读不到数据仓,recipe new 的 --out-dir 指不到本地仓。去设置屏按 d 录入数据仓根;面板不拿当前目录兜底。"
+                    .into()
+            }
+            RecipeNewGate::NotARecipe => {
+                "配方域为空或未选中配方——先在配方域选中一条(↑/↓ 或鼠标点行),骨架名跟着它起。".into()
+            }
+            RecipeNewGate::NoCapability => {
+                "缺的是引擎能力,不是面板坏了;升级所配 nw 后 recipe new 的建议命令自动给出。"
+                    .into()
+            }
+        }
+    }
+
+    fn of(p: Precondition) -> Self {
+        match p {
+            Precondition::NoDataRoot => RecipeNewGate::NoDataRoot,
+            Precondition::NotARecipe => RecipeNewGate::NotARecipe,
+            Precondition::NoCapability => RecipeNewGate::NoCapability,
+        }
+    }
+}
+
+/// 新建配方骨架:写 `<out-dir>/recipes/<名>/recipe.yaml`,不碰 git。
+///
+/// `profile` 非空时才带 `--profile`——上游缺省 "" = 按配方名兜底
+/// (#8 布局),面板不替引擎猜一个派名。`--out-dir` 与 bake 的 `--repo`
+/// 同一纪律:显式指数据仓根,不让引擎拿当前目录兜底。
+/// 形状实测自引擎 usage 行(所配 0.1.0):
+/// `nw recipe new <名> [--profile <名>] [--out-dir <目录>]`。
+pub fn recipe_new(name: &str, profile: Option<&str>, out_dir: &str) -> Vec<String> {
+    let mut a = vec!["recipe".into(), "new".into(), name.to_string()];
+    if let Some(p) = profile.filter(|p| !p.is_empty()) {
+        a.push("--profile".into());
+        a.push(p.to_string());
+    }
+    a.push("--out-dir".into());
+    a.push(out_dir.to_string());
+    a
+}
+
+/// 由「选中配方 + 数据仓根 + 引擎能力」算出新建骨架的建议命令。
+///
+/// 纯函数:无 IO、不读环境、不碰能力账——`new_capable` 由调用方从
+/// 能力探测门(#29)取来。任一前提不成立就走对应的 [`RecipeNewGate`],
+/// **绝不返回半条命令**。
+pub fn recipe_new_suggest(
+    recipe: Option<&str>,
+    data_root: Option<&str>,
+    new_capable: bool,
+) -> Result<BakeSuggest, RecipeNewGate> {
+    let (name, out_dir) =
+        precondition(recipe, data_root, new_capable).map_err(RecipeNewGate::of)?;
+    // 派名面板不知道,也不猜:不填 --profile,由引擎按配方名兜底(#8 布局)
+    let argv = recipe_new(name, None, out_dir);
     Ok(BakeSuggest {
         display: format!("nw {}", argv.join(" ")),
         argv,
@@ -382,6 +509,114 @@ mod tests {
             BakeGate::NoDataRoot,
             BakeGate::NotARecipe,
             BakeGate::NoCapability,
+        ] {
+            let advice = gate.advice();
+            assert!(
+                !advice.contains("  "),
+                "{} 的说法中段不许有一长串空格:{advice:?}",
+                gate.title()
+            );
+        }
+    }
+
+    #[test]
+    fn 建议命令_recipe_new_位置参数恰好一个_旗标与数据仓根同源() {
+        // 形状实测自引擎 usage 行(所配 0.1.0):
+        // nw recipe new <名> [--profile <名>] [--out-dir <目录>]
+        assert_eq!(
+            recipe_new("research-desk", None, "/data/repo"),
+            vec!["recipe", "new", "research-desk", "--out-dir", "/data/repo"]
+        );
+        // 派名非空才给 --profile:上游缺省 = 按配方名兜底(#8 布局),面板不替引擎猜
+        assert_eq!(
+            recipe_new("desk", Some("desk"), "/data/repo"),
+            vec![
+                "recipe",
+                "new",
+                "desk",
+                "--profile",
+                "desk",
+                "--out-dir",
+                "/data/repo"
+            ]
+        );
+        assert_eq!(
+            recipe_new("desk", Some(""), "/data/repo"),
+            recipe_new("desk", None, "/data/repo"),
+            "空派名等于没给"
+        );
+    }
+
+    #[test]
+    fn 建议命令_recipe_new_三前提齐备_argv与展示串同源且无写旗标() {
+        let ok = recipe_new_suggest(Some("research-desk"), Some("/data/repo"), true)
+            .expect("三前提齐备必须给得出命令");
+        assert_eq!(
+            ok.display,
+            "nw recipe new research-desk --out-dir /data/repo"
+        );
+        assert_eq!(
+            ok.display,
+            format!("nw {}", ok.argv.join(" ")),
+            "展示串由 argv 拼出"
+        );
+        for a in &ok.argv {
+            assert!(
+                !a.contains("--yes") && !a.contains("--json"),
+                "建议命令永不带写旗标/no-op 旗标:{a}"
+            );
+        }
+    }
+
+    #[test]
+    fn 建议命令_recipe_new_三种缺前提各有可区分指路_不给半条命令() {
+        assert_eq!(
+            recipe_new_suggest(None, Some("/data/repo"), true),
+            Err(RecipeNewGate::NotARecipe)
+        );
+        assert_eq!(
+            recipe_new_suggest(Some("desk"), None, true),
+            Err(RecipeNewGate::NoDataRoot)
+        );
+        assert_eq!(
+            recipe_new_suggest(Some("desk"), Some("/data/repo"), false),
+            Err(RecipeNewGate::NoCapability)
+        );
+        // 三种指路两两不同,互不冒充;且与 bake 的同名指路不同文(不冒充)
+        let gates = [
+            RecipeNewGate::NoDataRoot,
+            RecipeNewGate::NotARecipe,
+            RecipeNewGate::NoCapability,
+        ];
+        for (i, a) in gates.iter().enumerate() {
+            for b in &gates[i + 1..] {
+                assert_ne!(a.title(), b.title(), "标题两两不同");
+                assert_ne!(a.advice(), b.advice(), "说法两两不同");
+            }
+        }
+        assert_ne!(
+            RecipeNewGate::NoDataRoot.advice(),
+            BakeGate::NoDataRoot.advice(),
+            "同为未设根,new 的说法要点名 --out-dir,不拿 bake 的话冒充"
+        );
+        assert_ne!(
+            RecipeNewGate::NoCapability.advice(),
+            BakeGate::NoCapability.advice(),
+            "缺能力要说是缺哪一个"
+        );
+        assert!(RecipeNewGate::NoCapability.advice().contains("recipe new"));
+        assert!(RecipeNewGate::NoDataRoot.advice().contains("--out-dir"));
+        assert!(RecipeNewGate::NoDataRoot
+            .advice()
+            .contains("不拿当前目录兜底"));
+    }
+
+    #[test]
+    fn 建议命令_recipe_new_指路人话不带连续空格_换行残留不入屏() {
+        for gate in [
+            RecipeNewGate::NoDataRoot,
+            RecipeNewGate::NotARecipe,
+            RecipeNewGate::NoCapability,
         ] {
             let advice = gate.advice();
             assert!(
