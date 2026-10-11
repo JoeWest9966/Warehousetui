@@ -1111,7 +1111,7 @@ fn render_reg_review(frame: &mut Frame, area: Rect, app: &App) {
             // 不按旧形状解析、不 panic(spec #28/#30 交汇)。
             let headline = out.map(|o| o.headline().to_string()).unwrap_or_default();
             for ln in wrap(
-                &format!("  预审结果不可定型:{}", headline),
+                &format!("  预审结果不可定型:{headline}"),
                 inner_w.saturating_sub(2),
             )
             .into_iter()

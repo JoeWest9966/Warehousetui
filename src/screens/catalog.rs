@@ -44,8 +44,8 @@ use crossterm::event::KeyCode;
 use crate::app::{App, DataRootCause};
 use crate::engine::{
     capability, capability::Capability, CatalogEntryView, CatalogGate, CatalogRef, CatalogSheet,
-    EngineOutput, KeyRegisterData, State, SubRegisterData, SubStatusCounts, TagAddData, VpsLsData,
-    VpsRegisterData,
+    EngineOutput, KeyRegisterData, State, SubRegisterData, SubStatusCounts, TagAddData, TagLsData,
+    VpsLsData, VpsRegisterData,
 };
 use crate::input::{self, InputAction};
 use crate::layout::{popup_rect, REG_INPUT_H, REG_INPUT_W};
@@ -292,6 +292,350 @@ impl CatalogKind {
             CatalogKind::Key => CatalogKind::Vps,
         }
     }
+
+    // ---- 册级查表(工单 #66:按册差异只剩数据,不再有分支) ----
+    //
+    // 下面这一族把「这一本的登记流槽 / 删除确认旗 / 册体条数 / 选中槽 /
+    // 落账闸 / 投影数据源 / 空册文案 / 附述行 / 边界表述 / 键位行 / 浮层 /
+    // 册内键位表」收成 `CatalogKind` 的成员。**调用方不再写第四份
+    // `if kind == …`**:命中区(`layout::catalog_hits`)、册内键位路由
+    // (`App::key_catalog`)、渲染(`render_catalog` / `catalog_keys`)与
+    // `App` 的册级访问器各只剩一处公共代码路径,四本册走同一条。
+    //
+    // 加一条只在一本册上成立的关切 = 在这里加一个成员(那一本给真值,
+    // 其余三本给 `false` / 空 / `None`),不是往调用方再插一个分支——
+    // 第五本册子来时同样只改这一处。测试
+    // `只属一两本的关切_按册各按一次_表外一本都不多发` 钉住这条口径。
+
+    /// 这一本的登记流槽(两段式 / 无确认闸两种形态,四本各一份)。
+    pub fn flow(self, app: &App) -> &RegisterFlow {
+        match self {
+            CatalogKind::Vps => &app.vps_flow,
+            CatalogKind::Tag => &app.tag_flow,
+            CatalogKind::Subscription => &app.sub_flow,
+            CatalogKind::Key => &app.key_flow,
+        }
+    }
+
+    /// 这一本的删除确认弹层是否打开(ADR-0009 §2:面板加一道图形确认,
+    /// 不改引擎语义;四本各一面旗)。
+    pub fn rm_confirm(self, app: &App) -> bool {
+        match self {
+            CatalogKind::Vps => app.vps_rm_confirm,
+            CatalogKind::Tag => app.tag_rm_confirm,
+            CatalogKind::Subscription => app.sub_rm_confirm,
+            CatalogKind::Key => app.key_rm_confirm,
+        }
+    }
+
+    /// 这一本册体的条数(没读到 = 0;与 [`Self::sel`] 同一张表)。
+    pub fn len(self, app: &App) -> usize {
+        match self {
+            CatalogKind::Vps => app.vps_len(),
+            CatalogKind::Tag => app.tag_len(),
+            CatalogKind::Subscription => app.sub_len(),
+            CatalogKind::Key => app.key_len(),
+        }
+    }
+
+    /// 这一本的选中行(↑/↓ 与鼠标点行同源;四本各一个槽,换册不串味)。
+    pub fn sel(self, app: &App) -> usize {
+        match self {
+            CatalogKind::Vps => app.vps_sel,
+            CatalogKind::Tag => app.tag_sel,
+            CatalogKind::Subscription => app.sub_sel,
+            CatalogKind::Key => app.key_sel,
+        }
+    }
+
+    /// 这一本的选中槽(可写侧;键位 ↑/↓、鼠标点行、滚轮移选中都走这一口)。
+    pub fn sel_mut(self, app: &mut App) -> &mut usize {
+        match self {
+            CatalogKind::Vps => &mut app.vps_sel,
+            CatalogKind::Tag => &mut app.tag_sel,
+            CatalogKind::Subscription => &mut app.sub_sel,
+            CatalogKind::Key => &mut app.key_sel,
+        }
+    }
+
+    /// 这一本的登记确认态是否放行落账。**标签册恒 `false`**:上游
+    /// `tag add` 没有确认闸(追加合并、幂等),ADR-0009 §2 不许面板自己造
+    /// 一道——所以标签册的确认屏没有「Enter 落账」段可点,这一条就是那道闸。
+    pub fn can_commit(self, app: &App) -> bool {
+        match self {
+            CatalogKind::Vps => app.vps_can_commit(),
+            CatalogKind::Tag => false,
+            CatalogKind::Subscription => app.sub_can_commit(),
+            CatalogKind::Key => app.key_can_commit(),
+        }
+    }
+
+    /// 反查回音的失败态(带参问错了名字 = rc 3 / 回音不可定型)。
+    /// `None` = 没有失败态。**只标签册有这一态**:机器册的 `vps ls` 没有
+    /// 位置参数,失败时只留日志(51 §6.11:两种语义不都画成空列表)。
+    /// 「只有一本册成立」是一条按册关切,所以它落在查表成员上(#66):
+    /// 其余三本恒 `None`,调用方不再写 `if kind != Tag`。
+    pub fn ls_error(self, app: &App) -> Option<&EngineOutput> {
+        if self != CatalogKind::Tag {
+            return None;
+        }
+        let out = app.tag_ls_echo.as_ref()?;
+        let typed = out.envelope.as_ref().and_then(|e| e.data_as::<TagLsData>());
+        (typed.is_none() || !out.ok).then_some(out)
+    }
+
+    /// 册体首行的口径词:机器册给册名,标签册把「列全部 / 只列一个」
+    /// 这档差别显式画出来(51 §6.11:两种语义不都画成空列表)。
+    pub fn scope_label(self, app: &App) -> String {
+        match self {
+            CatalogKind::Vps => "机器".to_string(),
+            CatalogKind::Tag => match app.tag_lookup.as_deref() {
+                Some(name) => format!("反查 {name}"),
+                None => "全部标签".to_string(),
+            },
+            CatalogKind::Subscription => "全部订阅".to_string(),
+            CatalogKind::Key => "全部钥匙".to_string(),
+        }
+    }
+
+    /// 换到这一本时,日志里那一句「接下来按 l 做什么」(各本只读调用的
+    /// 口径不同:标签册是反查、钥匙册明示无本体槽、订阅册含到期三态)。
+    pub fn next_hint(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "按 l 重读机器编目(只读)",
+            CatalogKind::Tag => "按 l 反查全部标签(只读)",
+            CatalogKind::Subscription => "按 l 重读订阅编目(只读,含到期三态)",
+            CatalogKind::Key => "按 l 重读钥匙编目(只读,无本体槽、不印指纹)",
+        }
+    }
+
+    /// 这一本的投影(四本各自的数据源汇到同一个 [`CatalogSheet`])。
+    ///
+    /// **这是全模块唯一一处「四本各读哪个状态」的匹配**:四本的数据源
+    /// 形状本就不同(`Option<VpsLsData>` / 回音 envelope / `Option<SubLsData>`
+    /// / `Option<KeyLsData>`),没法再拆成更小的查表——那就让这一处匹配
+    /// 长在 [`CatalogKind`] 上,调用方(`App::catalog_sheet` 及渲染)只写
+    /// `kind.sheet(app)`,不再各自 `match self.catalog_kind`。
+    pub fn sheet(self, app: &App) -> Option<CatalogSheet> {
+        match self {
+            CatalogKind::Vps => app.vps_ls.as_ref().map(|d| d.sheet()),
+            CatalogKind::Tag => app
+                .tag_ls_echo
+                .as_ref()
+                .filter(|o| o.ok)
+                .and_then(|o| o.envelope.as_ref())
+                .and_then(|e| e.data_as::<TagLsData>())
+                .map(|d| d.sheet()),
+            CatalogKind::Subscription => app.sub_ls.as_ref().map(|d| d.sheet()),
+            CatalogKind::Key => app.key_ls.as_ref().map(|d| d.sheet()),
+        }
+    }
+
+    /// 册体「还没读到」的一句话(合法空态之前的第三态:一次 ls 都没成功过)。
+    /// 四本各一句——按册查表,渲染不再 `match kind` 四回。
+    pub fn unread_line(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "  编目册还没读到:按 r 登记,或先刷新(回概览按 r 重读五域)。",
+            CatalogKind::Tag => "  还没反查过:按 l 列全部标签(只读),按 r 挂第一个标签。",
+            CatalogKind::Subscription => "  订阅册还没读到:按 l 重读(只读),按 r 登记第一条订阅。",
+            CatalogKind::Key => "  钥匙册还没读到:按 l 重读(只读),按 r 登记第一把钥匙。",
+        }
+    }
+
+    /// 册体「合法空态」的两行:`(标题, 下一步)`。引擎给了空数组 = 册子
+    /// 存在而里面没有条目(文件不存在也是这一态),与「还没读到」分开说
+    /// (三态不共用一个空列表)。
+    pub fn empty_lines(self) -> [&'static str; 2] {
+        match self {
+            CatalogKind::Vps => [
+                "  编目里还没有机器(合法空态:vps.json 不存在 = 空册)。",
+                "  按 r 登记第一台(两段式:预审摊开五道闸 → 图形确认才落账)。",
+            ],
+            CatalogKind::Tag => [
+                "  编目里还没有标签(合法空态:tags.json 不存在 = 空册)。",
+                "  按 r 挂第一个标签(追加合并、幂等、无确认闸,Enter 即下发)。",
+            ],
+            CatalogKind::Subscription => [
+                "  编目里还没有订阅(合法空态:subscriptions.json 不存在 = 空册)。",
+                "  按 r 登记第一条(两段式:链接本体只经 stdin 进,Enter 预审摊开四道闸)。",
+            ],
+            CatalogKind::Key => [
+                "  编目里还没有钥匙(合法空态:keys.json 不存在 = 空册)。",
+                "  按 r 登记第一把(两段式:钥匙本体只经 stdin 进,Enter 预审摊开三道闸)。",
+            ],
+        }
+    }
+
+    /// 册体清单之外、**只属于某一本**的附述行(订阅册的到期三态汇总与
+    /// 取回链接建议;钥匙册的取回钥匙建议)。机器册与标签册没有这一族
+    /// 关切,给空——所以渲染侧不再有 `if kind == Subscription` /
+    /// `if kind == Key` 两段。
+    pub fn extra_lines(self, app: &App, w: usize, p: &Palette) -> Vec<Line<'static>> {
+        match self {
+            CatalogKind::Subscription => {
+                let mut out = Vec::new();
+                if let Some(s) = self.sheet(app) {
+                    if !s.entries.is_empty() {
+                        out.extend(sub_summary_lines(&sub_status_counts(&s), w, p));
+                    }
+                }
+                out.extend(sub_get_lines(app, w, p));
+                out
+            }
+            CatalogKind::Key => key_get_lines(app, w, p),
+            CatalogKind::Vps | CatalogKind::Tag => Vec::new(),
+        }
+    }
+
+    /// 这一本的边界表述(ADR-0009 §5:编目条目绝不进配方 / 锁定集 /
+    /// bundle / 装配命令)。**机器册没有这一句**(vps 条目不进派这条纪律
+    /// 由装配屏那边守),给 `None` = 不画行——渲染侧不再 `match kind`。
+    pub fn boundary(self) -> Option<&'static str> {
+        match self {
+            CatalogKind::Vps => None,
+            CatalogKind::Tag => Some(TAG_BOUNDARY),
+            CatalogKind::Subscription => Some(SUB_BOUNDARY),
+            CatalogKind::Key => Some(KEY_BOUNDARY),
+        }
+    }
+
+    /// 空册时的册内键位行(与鼠标命中区同文案同序;四本各一句)。
+    pub fn keys_empty(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "  r 登记机器 · Esc/q 返航 ",
+            CatalogKind::Tag => "  l 反查全部 · r 挂标签 · m 换册 · Esc/q 返航 ",
+            CatalogKind::Subscription => "  r 登记订阅 · l 重读 · m 换册 · Esc/q 返航 ",
+            CatalogKind::Key => "  r 登记钥匙 · l 重读 · m 换册 · Esc/q 返航 ",
+        }
+    }
+
+    /// 册体有条目时的册内键位行(常态)。
+    pub fn keys_body(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 ",
+            CatalogKind::Tag => "  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册 ",
+            CatalogKind::Subscription => {
+                "  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 "
+            }
+            CatalogKind::Key => "  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
+        }
+    }
+
+    /// 这一本此刻该画哪个浮层;`None` = 画册体。
+    ///
+    /// **两种浮层同时在场时谁盖谁,也是查表数据不是调用方的 if**:机器册
+    /// 让登记表单在上,其余三本让 rm 确认在上——因为标签册的 rm 确认
+    /// 嵌套在表单流里(表单 Enter 才出现),`on_key` 的受理次序是更里层
+    /// 的先收;订阅 / 钥匙册同形。这一条的次序与 `on_key` 逐字对齐,
+    /// 否则会出现「键被 A 收、屏上画的是 B」。
+    pub fn overlay(self, app: &App) -> Option<OverlayForm> {
+        let order = match self {
+            CatalogKind::Vps => [OverlayForm::Register, OverlayForm::RmConfirm],
+            CatalogKind::Tag | CatalogKind::Subscription | CatalogKind::Key => {
+                [OverlayForm::RmConfirm, OverlayForm::Register]
+            }
+        };
+        order.into_iter().find(|f| self.overlay_on(*f, app))
+    }
+
+    /// 这个形态的浮层,这一本此刻在不在场(与形态无关,四本同一口径)。
+    fn overlay_on(self, form: OverlayForm, app: &App) -> bool {
+        match form {
+            OverlayForm::Register => self.flow(app).phase != RegPhase::Idle,
+            OverlayForm::RmConfirm => self.rm_confirm(app),
+        }
+    }
+
+    /// 画这个形态的浮层(四本各一套画法,骨架同一件:同一个
+    /// [`popup_rect`] 基准、同一套阶段,差别全在呈现)。
+    pub fn draw_overlay(self, form: OverlayForm, frame: &mut Frame, area: Rect, app: &App) {
+        match (self, form) {
+            (CatalogKind::Vps, OverlayForm::Register) => render_register_overlay(frame, area, app),
+            (CatalogKind::Vps, OverlayForm::RmConfirm) => render_rm_confirm(frame, area, app),
+            (CatalogKind::Tag, OverlayForm::Register) => render_tag_overlay(frame, area, app),
+            (CatalogKind::Tag, OverlayForm::RmConfirm) => render_tag_rm_confirm(frame, area, app),
+            (CatalogKind::Subscription, OverlayForm::Register) => {
+                render_sub_overlay(frame, area, app)
+            }
+            (CatalogKind::Subscription, OverlayForm::RmConfirm) => {
+                render_sub_rm_confirm(frame, area, app)
+            }
+            (CatalogKind::Key, OverlayForm::Register) => render_key_overlay(frame, area, app),
+            (CatalogKind::Key, OverlayForm::RmConfirm) => render_key_rm_confirm(frame, area, app),
+        }
+    }
+
+    /// 册内一个键落在这一本上触发什么(#66:按册差异查表化)。
+    ///
+    /// **四本册走同一条键位路径**:`key_catalog` 只有一处查表 + 一处
+    /// 落实,不再有四份逐字重复的 `match k.code`。按册差异全在这张表里
+    /// ——同一个键在不同册上可以落到不同动作(`l` = 重读 / 列全部;
+    /// `g` = 订阅/钥匙册的取回命令建议;`Enter` = 只有标签册反查选中的
+    /// 这一条),也可以这一本根本没有这个键(机器册没有 `g`、没有
+    /// `Enter` 反查),表里就不写那一行 = 这个键在这一本上无事可做。
+    ///
+    /// `r` 的写互斥也在这张表上:装配在途时机器册 / 订阅册 / 钥匙册的
+    /// `r` 行不成立(与既有的 `if !self.assembling` 守卫同一口径),
+    /// 落空即「这个键此刻无事可做」。第五本册子来时只加行,不改调用方。
+    pub fn action(self, app: &App, k: KeyCode) -> Option<CatalogAction> {
+        use CatalogAction::{Act, Move};
+        match (self, k) {
+            // ↑/↓ 选行:四本同一口(不是按册差异,但同表驱动,四本走一条路)
+            (_, KeyCode::Down) => Some(Move(true)),
+            (_, KeyCode::Up) => Some(Move(false)),
+            // r 登记 / 挂标签:两段式(带确认闸)与无确认闸两种形态,各本自己的方法
+            (CatalogKind::Vps, KeyCode::Char('r')) if !app.assembling => {
+                Some(Act(App::start_vps_register))
+            }
+            (CatalogKind::Tag, KeyCode::Char('r')) if !app.assembling => {
+                Some(Act(App::start_tag_add))
+            }
+            (CatalogKind::Subscription, KeyCode::Char('r')) if !app.assembling => {
+                Some(Act(App::start_sub_register))
+            }
+            (CatalogKind::Key, KeyCode::Char('r')) if !app.assembling => {
+                Some(Act(App::start_key_register))
+            }
+            // d 删除:机器 / 订阅 / 钥匙三本进 rm 确认弹层;标签册的删除
+            // 嵌套在表单流里(摘引用 / 删整个标签两态),是另一条路
+            (CatalogKind::Vps, KeyCode::Char('d')) => Some(Act(App::start_vps_rm)),
+            (CatalogKind::Tag, KeyCode::Char('d')) => Some(Act(App::start_tag_rm)),
+            (CatalogKind::Subscription, KeyCode::Char('d')) => Some(Act(App::start_sub_rm)),
+            (CatalogKind::Key, KeyCode::Char('d')) => Some(Act(App::start_key_rm)),
+            // l 重读册体 / 列全部标签:四本各一次只读调用,argv 同形
+            (CatalogKind::Vps, KeyCode::Char('l')) => Some(Act(App::run_vps_ls)),
+            (CatalogKind::Tag, KeyCode::Char('l')) => Some(Act(App::run_tag_ls_all)),
+            (CatalogKind::Subscription, KeyCode::Char('l')) => Some(Act(App::run_sub_ls)),
+            (CatalogKind::Key, KeyCode::Char('l')) => Some(Act(App::run_key_ls)),
+            // g 取回本体的建议命令:只订阅册与钥匙册有(投影里有本体槽的
+            // 两本;ADR-0009 §1 面板不代跑 get)。机器册 / 标签册没有这一行
+            (CatalogKind::Subscription, KeyCode::Char('g')) => Some(Act(App::log_sub_get_suggest)),
+            (CatalogKind::Key, KeyCode::Char('g')) => Some(Act(App::log_key_get_suggest)),
+            // Enter 反查选中的这一条:只标签册有(机器册的 `vps ls` 没有
+            // 位置参数;订阅 / 钥匙册的条目不在 TAG_REF_KINDS 里)
+            (CatalogKind::Tag, KeyCode::Enter) => Some(Act(App::tag_lookup_selected)),
+            _ => None,
+        }
+    }
+}
+
+/// 册内浮层的两种形态(登记流 / rm 确认;弹层优先级高于册体)。
+/// 渲染与命中区都只认这两个形态,不认「哪一本」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OverlayForm {
+    /// 两段式登记流(表单 / 预审在途 / 摊开闸结论 / 落账在途 / 结论)。
+    Register,
+    /// 删除前的图形确认(ADR-0009 §2:面板加一道,不改引擎语义)。
+    RmConfirm,
+}
+
+/// 册内键位触发的动作(#66 查表表的取值)。`Act` 直接带这一本的落实方法
+/// ——按册差异就是「哪个方法」,这是数据,不是调用方的一个分支。
+pub enum CatalogAction {
+    /// ↑/↓ 移选中(`true` = 向下;到界绕回,见 `App::catalog_move`)。
+    Move(bool),
+    /// 这一本对这一键的落实(登记 / 删除 / 重读 / 取回命令 / 反查)。
+    Act(fn(&mut App)),
 }
 
 /// 一本册子的条目明细画法:名字行右侧的弱化后缀(机器册给端口,标签册
@@ -1259,59 +1603,13 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
                 p.dim(),
             )));
         } else {
-            match app.catalog_sheet() {
-                None => lines.push(Line::from(Span::styled(
-                    match kind {
-                        CatalogKind::Vps => {
-                            "  编目册还没读到:按 r 登记,或先刷新(回概览按 r 重读五域)。"
-                        }
-                        CatalogKind::Tag => {
-                            "  还没反查过:按 l 列全部标签(只读),按 r 挂第一个标签。"
-                        }
-                        CatalogKind::Subscription => {
-                            "  订阅册还没读到:按 l 重读(只读),按 r 登记第一条订阅。"
-                        }
-                        CatalogKind::Key => {
-                            "  钥匙册还没读到:按 l 重读(只读),按 r 登记第一把钥匙。"
-                        }
-                    },
-                    p.dim(),
-                ))),
+            match kind.sheet(app) {
+                None => lines.push(Line::from(Span::styled(kind.unread_line(), p.dim()))),
                 Some(s) if s.entries.is_empty() => {
-                    lines.push(Line::from(Span::styled(
-                        match kind {
-                            CatalogKind::Vps => {
-                                "  编目里还没有机器(合法空态:vps.json 不存在 = 空册)。"
-                            }
-                            CatalogKind::Tag => {
-                                "  编目里还没有标签(合法空态:tags.json 不存在 = 空册)。"
-                            }
-                            CatalogKind::Subscription => {
-                                "  编目里还没有订阅(合法空态:subscriptions.json 不存在 = 空册)。"
-                            }
-                            CatalogKind::Key => {
-                                "  编目里还没有钥匙(合法空态:keys.json 不存在 = 空册)。"
-                            }
-                        },
-                        p.text(),
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        match kind {
-                            CatalogKind::Vps => {
-                                "  按 r 登记第一台(两段式:预审摊开五道闸 → 图形确认才落账)。"
-                            }
-                            CatalogKind::Tag => {
-                                "  按 r 挂第一个标签(追加合并、幂等、无确认闸,Enter 即下发)。"
-                            }
-                            CatalogKind::Subscription => {
-                                "  按 r 登记第一条(两段式:链接本体只经 stdin 进,Enter 预审摊开四道闸)。"
-                            }
-                            CatalogKind::Key => {
-                                "  按 r 登记第一把(两段式:钥匙本体只经 stdin 进,Enter 预审摊开三道闸)。"
-                            }
-                        },
-                        p.dim(),
-                    )));
+                    // 合法空态两态可区分:标题(正文色)+ 下一步(弱化)
+                    let [title, next] = kind.empty_lines();
+                    lines.push(Line::from(Span::styled(title, p.text())));
+                    lines.push(Line::from(Span::styled(next, p.dim())));
                 }
                 Some(s) => lines.extend(catalog_sheet_lines(
                     &s,
@@ -1322,73 +1620,26 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
                 )),
             }
         }
-        // 订阅册(工单 #56):到期三态汇总一行 + 取回链接的建议命令(面板不代跑
-        // get,ADR-0009 §1)。**投影里没有链接槽**,册体任何一行都不出现本体。
-        if kind == CatalogKind::Subscription {
-            if let Some(s) = app.catalog_sheet() {
-                if !s.entries.is_empty() {
-                    lines.extend(sub_summary_lines(&sub_status_counts(&s), w, p));
-                }
-            }
-            lines.extend(sub_get_lines(app, w, p));
-        }
-        // 钥匙册(工单 #57):取回钥匙本体的建议命令(面板不代跑 get,ADR-0009 §1)。
-        // **投影里没有本体槽、也不印指纹**,册体任何一行都不出现本体。
-        if kind == CatalogKind::Key {
-            lines.extend(key_get_lines(app, w, p));
-        }
-        // 边界表述(ADR-0009 §5):编目条目绝不进配方 / 锁定集 / bundle / 装配
-        // 命令,面板侧不提供任何把它烤进去的入口(各本一句,同一条纪律)。
-        match kind {
-            CatalogKind::Tag => {
-                lines.push(Line::from(Span::styled(clip(TAG_BOUNDARY, w), p.dim())))
-            }
-            CatalogKind::Subscription => {
-                lines.push(Line::from(Span::styled(clip(SUB_BOUNDARY, w), p.dim())))
-            }
-            CatalogKind::Key => {
-                lines.push(Line::from(Span::styled(clip(KEY_BOUNDARY, w), p.dim())))
-            }
-            CatalogKind::Vps => {}
+        // 只属于某一本的附述行(订阅册的到期三态汇总 + 取回链接建议;
+        // 钥匙册的取回钥匙建议)。机器册 / 标签册没有这一族关切,
+        // `CatalogKind::extra_lines` 给空——渲染侧不再有两段 `if kind ==`。
+        // ADR-0009 §1:面板不代跑 get;两本的投影都没有本体槽。
+        lines.extend(kind.extra_lines(app, w, p));
+        // 边界表述(ADR-0009 §5):编目条目绝不进配方 / 锁定集 / bundle /
+        // 装配命令,面板侧不提供任何把它烤进去的入口(各本一句,同一条
+        // 纪律;机器册没有这一句)。
+        if let Some(b) = kind.boundary() {
+            lines.push(Line::from(Span::styled(clip(b, w), p.dim())));
         }
     }
     let _ = cause_line(app);
     lines.push(Line::from(Span::styled(catalog_keys(app), p.dim())));
     frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
 
-    // 浮层:登记 / 删除确认(弹层优先级高于册体;四本各一套,骨架同一件)
-    if kind == CatalogKind::Subscription {
-        // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先。
-        if app.sub_rm_confirm {
-            render_sub_rm_confirm(frame, area, app);
-        } else if app.sub_flow.phase != RegPhase::Idle {
-            render_sub_overlay(frame, area, app);
-        }
-        return;
-    }
-    if kind == CatalogKind::Key {
-        // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先(同订阅册)。
-        if app.key_rm_confirm {
-            render_key_rm_confirm(frame, area, app);
-        } else if app.key_flow.phase != RegPhase::Idle {
-            render_key_overlay(frame, area, app);
-        }
-        return;
-    }
-    if kind == CatalogKind::Tag {
-        // rm 确认嵌套在表单流里(表单 Enter 才出现),弹层优先级高于表单
-        // (同 `on_key` 的受理次序:更里层的浮层先收键)。
-        if app.tag_rm_confirm {
-            render_tag_rm_confirm(frame, area, app);
-        } else if app.tag_flow.phase != RegPhase::Idle {
-            render_tag_overlay(frame, area, app);
-        }
-        return;
-    }
-    if app.vps_flow.phase != RegPhase::Idle {
-        render_register_overlay(frame, area, app);
-    } else if app.vps_rm_confirm {
-        render_rm_confirm(frame, area, app);
+    // 浮层:登记 / 删除确认(弹层优先级高于册体;四本各一套画法,骨架同一件)。
+    // 画哪个、谁盖谁都在 `CatalogKind::overlay` 这张表上,本函数不再分册。
+    if let Some(form) = kind.overlay(app) {
+        kind.draw_overlay(form, frame, area, app);
     }
 }
 
@@ -1411,42 +1662,21 @@ fn cause_line(app: &App) -> String {
 
 /// 编目册键位行(与鼠标命中区同文案同序)。
 /// 册级键位行**按 kind 查表**(四本册各一组;在途浮层与空册各换一句,
-/// 三态形状相同)。新增第五本册只加一行——册级状态不再复制四份 if-else
-/// (双轴评审发现 9:Mysterious Name,catalog_keys 曾用四条 if)。
+/// 三态形状相同)。新增第五本册只加两个成员——册级状态不再复制四份
+/// if-else(双轴评审发现 9:Mysterious Name,catalog_keys 曾用四条 if)。
+///
+/// 「在途」与「空册」两个判定也走查表成员(`flow` / `rm_confirm` /
+/// `len`),与命中区 `layout::catalog_hits` 用的是同一口——键位行画的和
+/// 命中区算的从此不可能各说各话(#66)。
 fn catalog_keys(app: &App) -> &'static str {
     const IN_FLOW: &str = "  Enter 确认 · Esc/q 返航 ";
-    let (in_flow, empty, empty_line, line) = match app.catalog_kind {
-        CatalogKind::Vps => (
-            app.vps_flow.phase != RegPhase::Idle || app.vps_rm_confirm,
-            app.vps_len() == 0,
-            "  r 登记机器 · Esc/q 返航 ",
-            "  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 ",
-        ),
-        CatalogKind::Tag => (
-            app.tag_flow.phase != RegPhase::Idle || app.tag_rm_confirm,
-            app.tag_len() == 0,
-            "  l 反查全部 · r 挂标签 · m 换册 · Esc/q 返航 ",
-            "  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册 ",
-        ),
-        CatalogKind::Subscription => (
-            app.sub_flow.phase != RegPhase::Idle || app.sub_rm_confirm,
-            app.sub_len() == 0,
-            "  r 登记订阅 · l 重读 · m 换册 · Esc/q 返航 ",
-            "  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
-        ),
-        CatalogKind::Key => (
-            app.key_flow.phase != RegPhase::Idle || app.key_rm_confirm,
-            app.key_len() == 0,
-            "  r 登记钥匙 · l 重读 · m 换册 · Esc/q 返航 ",
-            "  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
-        ),
-    };
-    if in_flow {
+    let kind = app.catalog_kind;
+    if kind.flow(app).phase != RegPhase::Idle || kind.rm_confirm(app) {
         IN_FLOW
-    } else if empty {
-        empty_line
+    } else if kind.len(app) == 0 {
+        kind.keys_empty()
     } else {
-        line
+        kind.keys_body()
     }
 }
 
@@ -5337,5 +5567,590 @@ mod tests {
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(s.contains("入口禁用"), "{s}");
         assert!(s.contains("缺的是引擎能力"), "{s}");
+    }
+
+    // ---- 工单 #66:四本册整帧 golden(逐字节) ----
+    //
+    // 本票是**纯重构**:操作者感知不到任何变化。上面四条
+    // `*_屏_常畅与紧凑两档都渲染不溢出` 只钉「在场」(contains),钉不住
+    // 「没变」;这一族把整帧显示内容逐字节钉住,按册各一份、常畅(80×30)与
+    // 紧凑(66×50)两档各一份——按册分叉收敛成查表成员之后,任何一本的
+    // 文案 / 行序 / 行数 / 折列漂了一个字节,这里就红。
+    //
+    // 期望值取自**本票之前**的第 8 轮 tip `bb19d70`(同一夹具、同一尺寸),
+    // 并经人工逐行核对。修订纪律同 `ui::tests::golden_常畅态_80x30_整帧逐字节`:
+    // 若既有渲染面发生真实回归而改期望,必须与该回归同一次提交并说明——
+    // 不许为过测试回填。
+
+    /// 四本册各就绪一个 app(夹具 / splash / 只读 ls 回音全部钉死),
+    /// 整帧 golden 与「四本册走同一条键位路径」共用。
+    ///
+    /// 场景钉死到不随机器与测试次序漂:数据仓根显式钉成临时目录(否则
+    /// golden 字节与键位测试跟着跑测试那台机器的配置漂,建议命令里带
+    /// `--root <根>`)、NW_HOME 显式钉成 `/nw`(顶栏那一行;别的测试会经
+    /// `apply_nw_home` 写进程环境,不钉就随执行次序漂)。理由同
+    /// `ui::tests::golden_常畅态_80x30_整帧逐字节` 的头注:环境噪声不算回归。
+    fn book_apps() -> Vec<(&'static str, crate::app::App)> {
+        let vps = {
+            let ls = r#"{"catalogPath":"/r/vps.json","machines":[{"name":"gate","ips":[{"label":"home","addr":"10.0.0.1"}],"port":22,"logins":[{"user":"root","ref":"$DEPLOY_KEY"}],"note":"门口"},{"name":"bare","ips":[],"port":0,"logins":[]}]}"#;
+            let mut app = crate::app::App::with_runner(std::sync::Arc::new(
+                crate::engine::FakeRunner::new(&[("vps ls", 0, ls)]),
+            ));
+            app.splash = false;
+            app.screen = crate::app::Screen::Vps;
+            app.capabilities.record(
+                crate::engine::Capability::Vps,
+                crate::engine::Probe::Available,
+            );
+            app.vps_ls = Some(serde_json::from_str(ls).unwrap());
+            app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+            app.nw_home = "/nw".into(); // 顶栏 NW_HOME 也钉死(别的测试会写进程环境)
+            app
+        };
+        let mut tag = tag_app(&[("tag ls", 0, TAG_LS_ALL)]);
+        tag.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        tag.nw_home = "/nw".into();
+        tap(&mut tag, KeyCode::Char('l'));
+        feed(&mut tag);
+        let (mut sub, _r) = sub_app(&[("subscription ls", 0, SUB_LS_ALL)]);
+        sub.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        sub.nw_home = "/nw".into();
+        tap(&mut sub, KeyCode::Char('l'));
+        feed(&mut sub);
+        let (mut key, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        key.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        key.nw_home = "/nw".into();
+        tap(&mut key, KeyCode::Char('l'));
+        feed(&mut key);
+        vec![("机器", vps), ("标签", tag), ("订阅", sub), ("钥匙", key)]
+    }
+
+    /// 按册名取一本就绪的册(四本册同一套就绪口径)。
+    fn book(name: &str) -> crate::app::App {
+        book_apps()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, a)| a)
+            .expect("四本册之一")
+    }
+
+    /// 整帧逐字节比对(got 与 want 一上一下,漂一个字节就红)。
+    fn assert_book_frame(app: &crate::app::App, w: u16, h: u16, want: &str) {
+        assert_eq!(
+            crate::testutil::frame_display(app, w, h),
+            want,
+            "{w}×{h} 整帧渲染发生变化(见本族测试头注的修订纪律)"
+        );
+    }
+    /// 机器册 80×30 整帧 golden(本票之前逐字节)。
+    const VPS_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
+│  ▸ 概览  ││  当前册 机器 · 机器 · 编目 /r/vps.json                           │
+│  ⚙ 装配  ││  ▸ bare  端口 0                                                  │
+│  ✚ 健康  ││    地址 ——                                                       │
+│  ▤ 配方  ││    登录 ——                                                       │
+│▸ ▩ 编目  ││    备注 ——                                                       │
+│  ✦ 设置  ││    gate  端口 22                                                 │
+│          ││    地址 home=10.0.0.1                                            │
+│          ││    登录 root→$DEPLOY_KEY                                         │
+│          ││    备注 门口                                                     │
+│          ││  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航                       │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+    /// 机器册 66×50 整帧 golden(本票之前逐字节)。
+    const VPS_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
+  ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
+┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
+│  当前册 机器 · 机器 · 编目 /r/vps.json                         │
+│  ▸ bare  端口 0                                                │
+│    地址 ——                                                     │
+│    登录 ——                                                     │
+│    备注 ——                                                     │
+│    gate  端口 22                                               │
+│    地址 home=10.0.0.1                                          │
+│    登录 root→$DEPLOY_KEY                                       │
+│    备注 门口                                                   │
+│  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航                     │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
+    /// 标签册 80×30 整帧 golden(本票之前逐字节)。
+    const TAG_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
+│  ▸ 概览  ││  当前册 标签 · 反查 /tmp · 编目 /r/tags.json                     │
+│  ⚙ 装配  ││  ▸ bare                                                          │
+│  ✚ 健康  ││    引用 ——                                                       │
+│  ▤ 配方  ││    pi                                                            │
+│▸ ▩ 编目  ││    引用 skill/o/r/deep-research · vps/gate                       │
+│  ✦ 设置  ││  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)      │
+│          ││  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册      │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+    /// 标签册 66×50 整帧 golden(本票之前逐字节)。
+    const TAG_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
+  ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
+┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
+│  当前册 标签 · 反查 /tmp · 编目 /r/tags.json                   │
+│  ▸ bare                                                        │
+│    引用 ——                                                     │
+│    pi                                                          │
+│    引用 skill/o/r/deep-research · vps/gate                     │
+│  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)    │
+│  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册    │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
+    /// 订阅册 80×30 整帧 golden(本票之前逐字节)。
+    const SUB_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
+│  ▸ 概览  ││  当前册 订阅 · 全部订阅 · 编目 /r/subscriptions.json             │
+│  ⚙ 装配  ││  ▸ airport  应用 Mihomo                                          │
+│  ✚ 健康  ││    到期 2099-03-01  ✓ active  剩 26000 天                        │
+│  ▤ 配方  ││    forever  应用 Surge                                           │
+│▸ ▩ 编目  ││    到期 永不过期  ✓ active  剩余 ——                              │
+│  ✦ 设置  ││    gone  应用 Mihomo                                             │
+│          ││    到期 2020-01-01  ✗ expired  剩 -2000 天                       │
+│          ││    soon  应用 Clash                                              │
+│          ││    到期 2099-03-04  警 expiring  剩 3 天                         │
+│          ││  汇总 2 active · 1 expiring · 1 expired                          │
+│          ││  三态按 UTC 在读取时算、永不写进文件;只标记不治理(过期不改退出   │
+│          ││  取回链接(面板不代跑,按 g 收进日志):                             │
+│          ││nw subscription get --name airport --root /tmp | jq -r .data.url  │
+│          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
+│          ││  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发重   │
+│          ││  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册     │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+    /// 订阅册 66×50 整帧 golden(本票之前逐字节)。
+    const SUB_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
+  ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
+┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
+│  当前册 订阅 · 全部订阅 · 编目 /r/subscriptions.json           │
+│  ▸ airport  应用 Mihomo                                        │
+│    到期 2099-03-01  ✓ active  剩 26000 天                      │
+│    forever  应用 Surge                                         │
+│    到期 永不过期  ✓ active  剩余 ——                            │
+│    gone  应用 Mihomo                                           │
+│    到期 2020-01-01  ✗ expired  剩 -2000 天                     │
+│    soon  应用 Clash                                            │
+│    到期 2099-03-04  警 expiring  剩 3 天                       │
+│  汇总 2 active · 1 expiring · 1 expired                        │
+│  三态按 UTC 在读取时算、永不写进文件;只标记不治理(过期不改退   │
+│  取回链接(面板不代跑,按 g 收进日志):                           │
+│nw subscription get --name airport --root /tmp | jq -r .data.u  │
+│  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
+│  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发   │
+│  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册   │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
+    /// 钥匙册 80×30 整帧 golden(本票之前逐字节)。
+    const KEY_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
+│  ▸ 概览  ││  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                      │
+│  ⚙ 装配  ││  ▸ ci  kind github-key                                           │
+│  ✚ 健康  ││    主机 ghe.internal                                             │
+│  ▤ 配方  ││    作用域 未声明(0 条)                                           │
+│▸ ▩ 编目  ││    轮换日 2025-11-02                                             │
+│  ✦ 设置  ││    deploy  kind github-key                                       │
+│          ││    主机 github.com                                               │
+│          ││    作用域 2 条                                                   │
+│          ││    轮换日 2026-01-15                                             │
+│          ││  取回钥匙(面板不代跑,按 g 收进日志):                             │
+│          ││nw key get --name ci --root /tmp | jq -r .data.key                │
+│          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
+│          ││  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供烤  │
+│          ││  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册     │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+    /// 钥匙册 66×50 整帧 golden(本票之前逐字节)。
+    const KEY_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
+  ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
+┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
+│  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                    │
+│  ▸ ci  kind github-key                                         │
+│    主机 ghe.internal                                           │
+│    作用域 未声明(0 条)                                         │
+│    轮换日 2025-11-02                                           │
+│    deploy  kind github-key                                     │
+│    主机 github.com                                             │
+│    作用域 2 条                                                 │
+│    轮换日 2026-01-15                                           │
+│  取回钥匙(面板不代跑,按 g 收进日志):                           │
+│nw key get --name ci --root /tmp | jq -r .data.key              │
+│  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
+│  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供  │
+│  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册   │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
+
+    /// 机器册整帧 golden:常畅 80×30 与紧凑 66×50 两档都逐字节不变
+    /// (#66 验收第 1 条:纯重构,零用户可见变化)。
+    #[test]
+    fn 机器册整帧golden_两档逐字节不变() {
+        let app = book("机器");
+        assert_book_frame(&app, 80, 30, VPS_80X30);
+        assert_book_frame(&app, 66, 50, VPS_66X50);
+    }
+
+    /// 标签册整帧 golden:常畅 80×30 与紧凑 66×50 两档都逐字节不变
+    /// (#66 验收第 1 条:纯重构,零用户可见变化)。
+    #[test]
+    fn 标签册整帧golden_两档逐字节不变() {
+        let app = book("标签");
+        assert_book_frame(&app, 80, 30, TAG_80X30);
+        assert_book_frame(&app, 66, 50, TAG_66X50);
+    }
+
+    /// 订阅册整帧 golden:常畅 80×30 与紧凑 66×50 两档都逐字节不变
+    /// (#66 验收第 1 条:纯重构,零用户可见变化)。
+    #[test]
+    fn 订阅册整帧golden_两档逐字节不变() {
+        let app = book("订阅");
+        assert_book_frame(&app, 80, 30, SUB_80X30);
+        assert_book_frame(&app, 66, 50, SUB_66X50);
+    }
+
+    /// 钥匙册整帧 golden:常畅 80×30 与紧凑 66×50 两档都逐字节不变
+    /// (#66 验收第 1 条:纯重构,零用户可见变化)。
+    #[test]
+    fn 钥匙册整帧golden_两档逐字节不变() {
+        let app = book("钥匙");
+        assert_book_frame(&app, 80, 30, KEY_80X30);
+        assert_book_frame(&app, 66, 50, KEY_66X50);
+    }
+
+    /// 四本册走同一条键位路径(#66 验收第 4 条):对四本册各驱动一次**相同**
+    /// 的键序列(`l` 重读 → `↓` → `↑`),断言回音形状同形——
+    /// ① 每本都只下发一条只读 argv,形状都是 `<组> ls --root <根>`;
+    /// ② 每本都只多一行日志,都带「已入队」+「只读」+「不写任何文件」;
+    /// ③ 选中行增量相同(`↓` = +1、`↑` = −1,与行数无关);
+    /// ④ 帧上「当前是哪一本」与册内键位行都在,两档都不溢宽。
+    ///
+    /// 收敛之前这四段是四份逐字重复的分叉(每本一条 `if kind ==`),改一本
+    /// 漏三本是常态;收敛之后四本册同一条代码路径。谁再把某一本单独拆出去
+    /// (在调用方插一个 `if kind ==`),这条就红。
+    #[test]
+    fn 四本册同一键序列_回音与日志同形() {
+        for (label, mut app) in book_apps() {
+            let root = app.usable_data_root().unwrap_or_default();
+            let group = match label {
+                "机器" => "vps",
+                "标签" => "tag",
+                "订阅" => "subscription",
+                _ => "key",
+            };
+            let log_before = app.log.len();
+            // ① l:一条只读 argv,形状同形
+            tap(&mut app, KeyCode::Char('l'));
+            let argv = app.queue.last().cloned().unwrap_or_default();
+            assert_eq!(argv.len(), 4, "{label}册 ls 的 argv 四段");
+            assert_eq!(argv[0], group, "{label}册 ls 打到自己的组");
+            assert_eq!(argv[1], "ls", "{label}册 ls 是只读子命令");
+            assert_eq!(argv[2], "--root", "{label}册 ls 只认 --root(不猜目录)");
+            assert_eq!(argv[3], root, "{label}册 ls 的根是就绪的数据仓根");
+            // ② 一行日志,同一形状(四本措辞各有各的限定词,形状不变)
+            assert_eq!(app.log.len(), log_before + 1, "{label}册 l 只留一行日志");
+            let line = app.log.first().cloned().unwrap_or_default(); // 最新一行在前
+            assert!(line.contains("ls 已入队"), "{label}册日志说清入队:{line}");
+            assert!(line.contains("只读"), "{label}册日志说清只读:{line}");
+            assert!(
+                line.contains("不写任何文件"),
+                "{label}册日志说清不写:{line}"
+            );
+            feed(&mut app);
+            // ③ ↑/↓ 选中增量与行数无关(到界绕回是另一条口径,这里只测增量)
+            let sel0 = app.catalog_sel();
+            tap(&mut app, KeyCode::Down);
+            assert_eq!(app.catalog_sel(), sel0 + 1, "{label}册 ↓ 下移一行");
+            tap(&mut app, KeyCode::Up);
+            assert_eq!(app.catalog_sel(), sel0, "{label}册 ↑ 上移一行");
+            // ④ 帧上两样都在:当前是哪一本 + 册内键位行
+            for (w, h) in [(80u16, 30u16), (66, 50)] {
+                let f = crate::testutil::frame_display(&app, w, h);
+                assert!(
+                    f.contains(&format!("当前册 {label}")),
+                    "{label}册 {w}×{h} 报出当前册"
+                );
+                assert!(
+                    f.lines()
+                        .any(|ln| ln.contains("Esc/q 返航") || ln.contains("m 换册")),
+                    "{label}册 {w}×{h} 键位行在场:{f}"
+                );
+                for ln in f.lines() {
+                    assert!(
+                        unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                        "{label}册 {w}×{h} 有行超宽:{ln}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 「一条只在一本册上成立的关切,落在查表成员上即生效」(#66 验收第 5 条)。
+    ///
+    /// 钉两件真事,不靠口头约定:`g`(取回本体的建议命令)只属于订阅册与
+    /// 钥匙册——投影里有本体槽的两本(ADR-0009 §1 面板不代跑 get);
+    /// `Enter`(反查选中的这一条)只属于标签册——`vps ls` 没有位置参数,
+    /// 订阅 / 钥匙册的条目也不在 `TAG_REF_KINDS` 里。对四本册各按一次:
+    /// 有这一关切的那本给出各人话的一行日志、**不下发任何命令**(建议命令
+    /// 只给文案);没有这一关切的两本**一个字节都不多打**——不长日志、不
+    /// 入队、册体与选中都不动。谁把这一条挪出查表成员、或往调用方插一个
+    /// `if kind ==`,这条测试就红。
+    #[test]
+    fn 只属一两本的关切_按册各按一次_表外一本都不多发() {
+        for (label, mut app) in book_apps() {
+            let log_before = app.log.len();
+            let sheet_before = app.catalog_len();
+            let sel_before = app.catalog_sel();
+            // g:只有订阅册 / 钥匙册有这一条关切
+            tap(&mut app, KeyCode::Char('g'));
+            let has_g = matches!(label, "订阅" | "钥匙");
+            if has_g {
+                // 两行:建议命令 + 「get 是上游唯一回显本体的出口」那句纪律注
+                assert_eq!(app.log.len(), log_before + 2, "{label}册 g 留两行");
+                // 日志最新在前:先入队的是建议命令那一行,纪律注压在它上面
+                let line = app.log.get(1).cloned().unwrap_or_default();
+                assert!(
+                    line.starts_with(if label == "订阅" {
+                        "取回链接"
+                    } else {
+                        "取回钥匙"
+                    }),
+                    "{label}册 g 给的是自己那一本的取回建议:{line}"
+                );
+                assert!(
+                    app.log[0].contains("上游唯一回显本体的出口"),
+                    "{label}册 g 同时留一句纪律注:{s}",
+                    s = app.log[0]
+                );
+            } else {
+                assert_eq!(
+                    app.log.len(),
+                    log_before,
+                    "{label}册没有 g 这一关切:一字不多打"
+                );
+            }
+            assert!(app.queue.is_empty(), "{label}册 g 只给命令文案,不下发");
+            // g 是纯读关切:册体与选中一个字节都不动(四本同一口径)
+            assert_eq!(app.catalog_len(), sheet_before, "{label}册 g 不改册体");
+            assert_eq!(app.catalog_sel(), sel_before, "{label}册 g 不改选中");
+            // Enter:只有标签册有反查这一条关切
+            tap(&mut app, KeyCode::Enter);
+            if label == "标签" {
+                let argv = app.queue.last().cloned().unwrap_or_default();
+                assert_eq!(argv[0], "tag", "标签册 Enter 走 tag 组");
+                assert_eq!(argv[1], "ls", "标签册 Enter 是只读反查");
+                assert_eq!(argv[2], "bare", "反查选中的这一条(排序后首行)");
+                assert_eq!(argv[3], "--root", "反查只认 --root");
+                assert_eq!(
+                    app.log.len(),
+                    log_before + 1,
+                    "标签册 Enter 只留一行入队日志"
+                );
+                // 在途清空上一轮结论是 #54 既定语义(不拿旧结论冒充本次),
+                // 不是这两键「改了册体内容」——回音到达才重新摊开。
+                assert_eq!(app.catalog_len(), 0, "反查在途不拿上一轮结论冒充本次");
+            } else {
+                assert!(
+                    app.queue.is_empty(),
+                    "{label}册没有 Enter 反查:一个字节都不多打"
+                );
+                assert_eq!(
+                    app.log.len(),
+                    log_before + 2 * usize::from(has_g),
+                    "{label}册 Enter 无声"
+                );
+                assert_eq!(app.catalog_len(), sheet_before, "{label}册册体原样");
+                assert_eq!(app.catalog_sel(), sel_before, "{label}册选中原样");
+            }
+        }
     }
 }

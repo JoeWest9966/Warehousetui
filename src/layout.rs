@@ -213,100 +213,20 @@ fn screen_hits(content: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect,
 /// 编目册屏命中区(#53 / #54 / #56 / #57):清单整块产行命中(点行 = 选中,
 /// 同 ↑/↓);登记浮层与删除确认弹层只产键位行两段(渲染 `catalog::render_catalog`
 /// 同一个 `popup_rect` 基准,弹层优先级高于册体)。屏虽叫 `Vps`,命中区
-/// 服务屏内四本册(机器 / 标签 / 订阅 / 钥匙),按 `app.catalog_kind` 分叉。
+/// 服务屏内四本册(机器 / 标签 / 订阅 / 钥匙)。
+///
+/// **四本册走同一条代码路径**(工单 #66):按册差异全部收在
+/// [`CatalogKind`](crate::screens::catalog::CatalogKind) 的查表成员上
+/// (`flow` / `can_commit` / `rm_confirm` / `len` / `row_lines`),本函数
+/// 没有第四份 `if kind == …`。加第五本册子只改查表,此处不动。
 fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     let kind = app.catalog_kind;
-    // 订阅册浮层:rm 确认弹层的键位行两段可点(其余态同手填浮层惰性)
-    if kind == crate::screens::catalog::CatalogKind::Subscription {
-        // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
-        if app.sub_flow.phase != crate::screens::catalog::RegPhase::Idle {
-            if app.sub_flow.phase == crate::screens::catalog::RegPhase::Review
-                && app.sub_can_commit()
-            {
-                let popup = popup_rect(
-                    inner,
-                    crate::screens::catalog::REG_W,
-                    crate::screens::catalog::REG_H,
-                );
-                if popup.width > 0 && popup.height > 0 {
-                    let key_y = popup.y + popup.height - 2;
-                    two_key_segments(popup, key_y, REG_KEY_REVIEW_COMMIT, RITUAL_KEY_RETURN, hits);
-                }
-            }
-            return;
-        }
-        if app.sub_rm_confirm {
-            let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
-            if popup.width > 0 && popup.height > 0 {
-                let key_y = popup.y + popup.height - 2;
-                two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
-            }
-            return;
-        }
-        // 册体:订阅清单行命中(渲染每台 2 行,命中按条给整块)
-        let n = app.sub_len();
-        if n == 0 {
-            return;
-        }
-        push_sheet_rows(inner, n, kind.row_lines(), hits);
-        return;
-    }
-    if kind == crate::screens::catalog::CatalogKind::Key {
-        // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
-        if app.key_flow.phase != crate::screens::catalog::RegPhase::Idle {
-            if app.key_flow.phase == crate::screens::catalog::RegPhase::Review
-                && app.key_can_commit()
-            {
-                let popup = popup_rect(
-                    inner,
-                    crate::screens::catalog::REG_W,
-                    crate::screens::catalog::REG_H,
-                );
-                if popup.width > 0 && popup.height > 0 {
-                    let key_y = popup.y + popup.height - 2;
-                    two_key_segments(popup, key_y, REG_KEY_REVIEW_COMMIT, RITUAL_KEY_RETURN, hits);
-                }
-            }
-            return;
-        }
-        if app.key_rm_confirm {
-            let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
-            if popup.width > 0 && popup.height > 0 {
-                let key_y = popup.y + popup.height - 2;
-                two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
-            }
-            return;
-        }
-        // 册体:钥匙清单行命中(渲染每把 4 行,命中按条给整块)
-        let n = app.key_len();
-        if n == 0 {
-            return;
-        }
-        push_sheet_rows(inner, n, kind.row_lines(), hits);
-        return;
-    }
-    if kind == crate::screens::catalog::CatalogKind::Tag {
-        if app.tag_flow.phase != crate::screens::catalog::RegPhase::Idle {
-            return;
-        }
-        if app.tag_rm_confirm {
-            let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
-            if popup.width > 0 && popup.height > 0 {
-                let key_y = popup.y + popup.height - 2;
-                two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
-            }
-            return;
-        }
-        let n = app.tag_len();
-        if n == 0 {
-            return;
-        }
-        push_sheet_rows(inner, n, kind.row_lines(), hits);
-        return;
-    }
-    if app.vps_flow.phase != crate::screens::catalog::RegPhase::Idle {
-        // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
-        if app.vps_flow.phase == crate::screens::catalog::RegPhase::Review && app.vps_can_commit() {
+    // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)。
+    // 标签册的确认态没有「Enter 落账」段(`CatalogKind::can_commit` 恒 false,
+    // 上游 tag add 无确认闸),所以同一处条件对它自然不产段。
+    if kind.flow(app).phase != crate::screens::catalog::RegPhase::Idle {
+        if kind.flow(app).phase == crate::screens::catalog::RegPhase::Review && kind.can_commit(app)
+        {
             let popup = popup_rect(
                 inner,
                 crate::screens::catalog::REG_W,
@@ -319,7 +239,7 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         }
         return;
     }
-    if app.vps_rm_confirm {
+    if kind.rm_confirm(app) {
         let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
         if popup.width > 0 && popup.height > 0 {
             let key_y = popup.y + popup.height - 2;
@@ -327,8 +247,8 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         }
         return;
     }
-    // 册体:机器清单行命中(渲染每台 4 行,命中按台给整块)
-    let n = app.vps_len();
+    // 册体:清单行命中(渲染每条目占 `row_lines` 行,命中按条给整块)
+    let n = kind.len(app);
     if n == 0 {
         return;
     }
@@ -1164,8 +1084,7 @@ mod tests {
             .expect("命中行在渲染中在场");
         assert!(
             rendered.contains("web-search"),
-            "命中行 = 渲染清单首行:{}",
-            rendered
+            "命中行 = 渲染清单首行:{rendered}"
         );
         assert!(
             hits.iter()
