@@ -1795,15 +1795,24 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
         // 并且**绝不画成空列表**——「这次没读到」与「一条标签引用都没有」是
         // 两件事,话不许互相冒充(spec #65 铁律 4)。册体与选中行原样在场:
         // 反查从头到尾不写 `vps_sel`,读不到也不该把册体收走。
-        if let VpsReverse::Unreadable { reason, .. } = &app.vps_reverse {
-            lines.push(Line::from(Span::styled(
-                format!("  ⚠ 反查没结果:{}", clip(reason, w.saturating_sub(12))),
-                p.warn().bold(),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  标签册这次没读到,不是「一条标签引用都没有」;册体与选中行原样不动。",
-                p.dim(),
-            )));
+        //
+        // **只在机器册画**(`kind == CatalogKind::Vps`):反查上浮是机器册独有
+        // 的动作,换册(`cycle_catalog_kind`)会把 `vps_reverse` 清回 Idle,所以
+        // 今天别三本册上这条指路本来就画不出来。但把不变量写在**用它的这一处**
+        // 本地,而不是靠调用方在远处复位:将来哪条路径换了册却忘了清
+        // `vps_reverse`,画出来的会是机器册的指路摊在标签 / 订阅 / 钥匙册上——
+        // 一态冒充另一态。
+        if kind == CatalogKind::Vps {
+            if let VpsReverse::Unreadable { reason, .. } = &app.vps_reverse {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ 反查没结果:{}", clip(reason, w.saturating_sub(12))),
+                    p.warn().bold(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  标签册这次没读到,不是「一条标签引用都没有」;册体与选中行原样不动。",
+                    p.dim(),
+                )));
+            }
         }
         // 反查回音的终态(#54):问错了名字(rc 3)/ 合法空态 / 有内容,
         // 三者互不冒充——都画成「空列表」会丢掉「这个名字不存在」的信息
