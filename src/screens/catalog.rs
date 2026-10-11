@@ -6731,6 +6731,31 @@ mod tests {
 
     // ---- 工单 #70 的两处「要当场钉住」的边界 ----
 
+    /// 规格验收 7 的第三面:在途时**换册**(`m`)把在途清成 Idle,迟到的
+    /// `tag ls` 回音于是不收敛任何状态。它问的那台机器已经不在场,面板不替
+    /// 一个走了的问题留一个幽灵结果——「迟到回音不收敛」这条纪律因此不只
+    /// 返航一条路,换册 / 切屏同样算。
+    #[test]
+    fn 反查_在途时换册_迟到回音不收敛任何状态() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app); // 在途
+        assert_eq!(app.queue.len(), 1, "确有一次只读调用在队里");
+        tap(&mut app, KeyCode::Char('m')); // 翻到标签册
+        assert_eq!(
+            app.catalog_kind,
+            CatalogKind::Tag,
+            "换册成功(在途不是写闸,挡不住换册)"
+        );
+        assert!(!app.vps_reverse_open(), "换册即收在途");
+        // 迟到的 tag ls 回音落地:标签册照常读进来,但反查浮层不开
+        feed(&mut app);
+        assert!(!app.vps_reverse_open(), "迟到回音不重开浮层");
+        assert_eq!(app.tag_len(), 4, "标签册照常呈现(只读回音没被丢)");
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("什么标签引用了这一条"), "屏上没有反查浮层:{s}");
+    }
+
     /// 规格验收 12 / #62 立过的双向对齐(帮助不写幽灵键、README 不漏键):
     /// 机器册的 `Enter`(反查上浮)在 `HELP_ROWS` 里挂在机器册那一行、说明写
     /// 的是「什么标签引用了这一条」,在 README 的编目键位列里也在场。这一条
