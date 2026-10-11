@@ -807,6 +807,11 @@ impl App {
             // 点正文键位行的「换册」段(#67):与键盘 `m` 完全同路——四本编目册
             // 按 CatalogKind::next() 轮转。鼠标只是叠加,不新增语义。
             Target::SwitchBook => self.cycle_catalog_kind(),
+            // 点正文键位行的「中止」段(#71):与键盘 `x` 完全同路——进程级真止在途
+            // nw up 子进程,回选择器态,stderr 日志一行不清(不宣布成功也不假装失败)。
+            // 命中区只在真有 up 在途(as_running)时由 assemble_hits 产出,故此臂
+            // 到达即确有进程可止;滚轮分支不受理它(滚过中止段不点火)。
+            Target::Abort => self.abort_assembling(),
         }
     }
 
@@ -4167,6 +4172,151 @@ mod tests {
         app.update(Message::Key(key('x')));
         assert_eq!(runner.abort_count(), 0, "没有 up 在途:一枪都不放");
         assert!(app.assembling, "登记落账的互斥不被装配中止键关掉");
+    }
+
+    // ---- #71 中止键 x 的正文动作段:点「中止」段 = 按 x 进程级真止 ----
+
+    /// 点装配屏正文键位行的「中止」段 = 按 `x`(#71,补 #59 欠下的鼠标命中):
+    /// 在途 `nw up` 子进程进程级真止(`FakeRunner::abort_count()` +1),面板回
+    /// 锁定集选择器态;stderr 日志一行不清——那是操作者判断「停在哪一步」的
+    /// 唯一依据,面板不宣布成功也不假装失败。与键盘 `x` 完全同一路
+    /// (`abort_assembling`),鼠标只是叠加、零键盘回归,不新增语义。
+    #[test]
+    fn 点中止段_等于按x_进程级真止_日志一行不清() {
+        let (runner, mut app) = up_inflight_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        // 在途互斥不变:点中止前再按 Enter 不开发射仪式(忙时不排队)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.as_confirm, "在途时不接第二次发射(互斥语义不变)");
+        let abort = hit_target(&app, |t| *t == Target::Abort);
+        click(&mut app, abort);
+        assert_eq!(
+            runner.abort_count(),
+            1,
+            "点中止段确有一次到达运行器(进程级那一枪,与按 x 同路)"
+        );
+        assert!(!app.assembling, "装配态灯灭");
+        assert!(!app.as_running, "在途标记收敛");
+        assert!(!app.as_confirm, "回选择器态(不是确认态)");
+        assert_eq!(
+            app.as_log,
+            vec!["铺骨架…".to_string(), "落组件…".to_string()],
+            "中止不清空既有 stderr 日志:那是判断停在哪一步的唯一依据"
+        );
+        assert_eq!(app.as_log_offset, 1, "滚轮偏移也不动");
+        assert!(app.as_result.is_none(), "不拿半个结果冒充结论");
+        // 人话:不宣布成功也不假装失败,只指路
+        let said = app.log.join("\n");
+        assert!(said.contains("装配已中止"), "留证据:{said}");
+        assert!(
+            said.contains("不宣布成功也不假装失败"),
+            "中止后状态不归面板裁决:{said}"
+        );
+        assert!(
+            said.contains("重跑同一条装配命令即可收敛") && said.contains("doctor"),
+            "收敛路由:重跑同一条命令 + 健康屏 doctor 复核:{said}"
+        );
+    }
+
+    /// 「中止」段常畅(80×30)与紧凑(66×50)两档都点得中;段文案由渲染与命中
+    /// 共用同一份字符串(`assemble::assemble_key_parts`),点哪打哪——命中行在
+    /// 整帧里必能找着「x 中止」(ADR-0005 渲染与命中同源,#67 接缝的同一形状;
+    /// 规格故事 52:换终端不断命中)。
+    #[test]
+    fn 中止段_常畅与紧凑两档都点得中_且段文案在屏上在场() {
+        for (w, h) in [(80u16, 30u16), (66, 50u16)] {
+            let (runner, mut app) = up_inflight_app();
+            app.size = Rect::new(0, 0, w, h);
+            app.splash = false; // 命中区不看 splash、渲染看:留着它 frame_display 只画 logo(同既有鼠标测试纪律)
+            let abort = hit_target(&app, |t| *t == Target::Abort);
+            let frame = crate::testutil::frame_display(&app, w, h);
+            let row = frame
+                .split('\n')
+                .nth(abort.y as usize)
+                .expect("命中行在渲染中在场");
+            assert!(row.contains("x 中止"), "{w}×{h} 键位行应画着中止段:{row}");
+            click(&mut app, abort);
+            assert_eq!(runner.abort_count(), 1, "{w}×{h} 点中止段进程级真止");
+            assert!(!app.as_running, "{w}×{h} 在途标记收敛");
+        }
+    }
+
+    /// 「中止」段只在真有 `up` 在途(`as_running`)时画得出、点得中(#71 票面 +
+    /// 规格故事 47):不在场时不画也不给命中——点到一个当前不存在的动作,比点不到
+    /// 更糟。在途标记一收敛,命中区与整帧的中止提示一并消失(块标题也不再带 `x`,
+    /// 话术单源在键位行上)。
+    #[test]
+    fn 中止段_只在up在途在场_闲置不画不命中() {
+        let (_r, mut app) = up_inflight_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.splash = false; // 命中区不看 splash、渲染看:留着它 frame_display 只画 logo
+                            // 真有 up 在途:画得出、点得中
+        let abort = hit_target(&app, |t| *t == Target::Abort);
+        let frame = crate::testutil::frame_display(&app, 80, 30);
+        let row = frame
+            .split('\n')
+            .nth(abort.y as usize)
+            .expect("命中行在渲染中在场");
+        assert!(row.contains("x 中止"), "up 在途:中止段画在键位行:{row}");
+        // 在途标记收敛(仍 assembling = 运行视图在场,但没有 up 在途):段不画、
+        // 命中区也没有、整帧再无中止提示
+        app.as_running = false;
+        assert!(
+            hitmap(app.size, &app, size_class(app.size))
+                .iter()
+                .all(|(_, t)| *t != Target::Abort),
+            "非 up 在途:中止段不产命中区(点不到一个当前不存在的动作)"
+        );
+        let frame = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            !frame.contains("x 中止"),
+            "非 up 在途:整帧无中止提示(块标题不再带 x,话术单源在键位行):{frame}"
+        );
+    }
+
+    /// 「中止」与「Esc 返航」是两个可点段、话术不互冒充(#71 票面 + 规格故事
+    /// 46/48):发射前(仪式浮层)可点的是「Esc 返航」——命令还没下发,点什么
+    /// 都什么都没发生(不碰运行器);发射后(运行视图)可点的是「x 中止」——在途
+    /// 子进程进程级真止。两个状态各产各的命中区,不共屏、不共话术。
+    #[test]
+    fn 中止与返航两段可点_话术不互冒充() {
+        // 发射前:仪式浮层只产「Enter 发射 / Esc 返航」两段,没有「中止」段
+        let (runner, mut app) = up_inflight_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.assembling = false; // 仪式在发射前:命令还没下发
+        app.as_running = false;
+        app.as_confirm = true;
+        let hits = hitmap(app.size, &app, size_class(app.size));
+        assert!(
+            hits.iter().any(|(_, t)| *t == Target::DismissPopup),
+            "发射前:「Esc 返航」段可点"
+        );
+        assert!(
+            hits.iter().all(|(_, t)| *t != Target::Abort),
+            "发射前:没有「中止」段(命令还没下发,没有进程可止)"
+        );
+        let back = hit_target(&app, |t| *t == Target::DismissPopup);
+        click(&mut app, back);
+        assert_eq!(runner.abort_count(), 0, "点返航 = 取消仪式,什么都没发生");
+        assert!(!app.as_confirm, "返航关仪式");
+        // 发射后:运行视图只产「x 中止」段,没有「返航」段(浮层没开)
+        let (runner2, mut app2) = up_inflight_app();
+        app2.size = Rect::new(0, 0, 80, 30);
+        let hits2 = hitmap(app2.size, &app2, size_class(app2.size));
+        assert!(
+            hits2.iter().any(|(_, t)| *t == Target::Abort),
+            "发射后:「x 中止」段可点"
+        );
+        assert!(
+            hits2.iter().all(|(_, t)| *t != Target::DismissPopup),
+            "发射后:没有「返航」段(浮层没开,返航归发射前)"
+        );
+        let abort = hit_target(&app2, |t| *t == Target::Abort);
+        click(&mut app2, abort);
+        assert_eq!(runner2.abort_count(), 1, "点中止 = 进程级真止");
     }
 
     // ---- #9 NW_HOME 手填输入(App 行为缝) ----
