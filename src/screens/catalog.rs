@@ -7595,6 +7595,35 @@ mod tests {
         }
     }
 
+    /// `catalog_filter: [String; 4]` 与 `CatalogKind::idx()` 的耦合钉在这儿
+    /// (#65 评审第 9 条):第五本册子若只给 `idx()` 加了第 5 个下标、却忘了把
+    /// 数组放宽成 5,`catalog_filter()[idx]` 就是一次**运行期索引 panic**,不是
+    /// 编译错误——编译期一处都不红,单测跑到那一本才炸。这条按换册环(`next()`)
+    /// 把每一本都走一遍,断言每本的 `idx()` 都落在那只数组的长度里;顺带钉各本
+    /// 占的槽两两不同(重槽 = 两本册子共用一个过滤词,规格故事 24「按册各留一份」
+    /// 就破了)。走环而不写死四本清单,是为了第五本真来时这条自己会长。
+    #[test]
+    fn 每本册的idx都落进过滤词数组_且各本不重槽() {
+        let slots =
+            crate::app::App::with_runner(std::sync::Arc::new(crate::engine::FakeRunner::new(&[])))
+                .catalog_filter
+                .len();
+        let mut seen: Vec<usize> = Vec::new();
+        let mut k = CatalogKind::Vps;
+        for _ in 0..slots {
+            let i = k.idx();
+            assert!(
+                i < slots,
+                "{} 册的 idx()={i} 超出过滤词数组长度 {slots}:加第五本册子时要把 `catalog_filter: [String; N]` 一起放宽",
+                k.label()
+            );
+            assert!(!seen.contains(&i), "{} 册与别的册重槽(idx={i})", k.label());
+            seen.push(i);
+            k = k.next();
+        }
+        assert_eq!(seen.len(), slots, "换册环一圈走过的册数 = 数组长度");
+    }
+
     // ---- #69 册内过滤:四本册都能 `/` 过滤,纯本地筛选(与 #61 五域同源同形) ----
     //
     // 全部走在公开缝上:`App::update(Message::Key/Mouse)` 驱动、经 FakeRunner
