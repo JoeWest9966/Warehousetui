@@ -6731,6 +6731,45 @@ mod tests {
 
     // ---- 工单 #70 的两处「要当场钉住」的边界 ----
 
+    /// 规格验收 12 / #62 立过的双向对齐(帮助不写幽灵键、README 不漏键):
+    /// 机器册的 `Enter`(反查上浮)在 `HELP_ROWS` 里挂在机器册那一行、说明写
+    /// 的是「什么标签引用了这一条」,在 README 的编目键位列里也在场。这一条
+    /// 不新造对照机制,只是把 #70 这一个键接进既有的双向对齐——免得反查上浮
+    /// 落成「屏上有个键,两处文档都没有」。顺带把那一行派发下去:实现里真有
+    /// 一条真实分支,不是幽灵键。
+    #[test]
+    fn 反查键_帮助浮层与readme都对齐_派发确有一次只读调用() {
+        use crate::ui::HELP_ROWS;
+        let row = HELP_ROWS
+            .iter()
+            .find(|r| r.book == Some(CatalogKind::Vps) && r.code == KeyCode::Enter)
+            .expect("机器册的 Enter(反查上浮)应在帮助对照表里");
+        assert!(
+            row.desc.contains("什么标签引用了"),
+            "说明写的是反查上浮这一件事:{}",
+            row.desc
+        );
+        let readme = include_str!("../../README.md");
+        let line = readme
+            .lines()
+            .find(|l| l.starts_with("| 编目 "))
+            .expect("README 六屏表应有编目一行");
+        assert!(line.contains("`Enter`"), "编目键位列应有 Enter:{line}");
+        assert!(line.contains("反查"), "并说清它是反查:{line}");
+        // 帮助那一行派发下去:实现里真有一条只读分支
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        app.update(crate::app::Message::Key(KeyEvent::new(
+            row.code,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.queue.len(),
+            1,
+            "帮助列的 Enter 派发下去确有一次只读 tag ls"
+        );
+    }
+
     /// 反查触发段**只机器册有命中**。`TAG_REF_KINDS` 的已知集合是
     /// `skill` / `extension` / `vps`,四本册里只有机器册的条目可打标签;
     /// 订阅册与钥匙册的条目不在其内,放一个注定只返回「没有」的动作是噪声
