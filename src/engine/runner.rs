@@ -518,6 +518,12 @@ pub struct FakeRunner {
     /// 记录「收到过几次中止」(#59):只记次数。FakeRunner 没有真进程可杀,
     /// 用计数表达「中止到过运行器」,让面板侧的中止路可测。
     aborts: AtomicUsize,
+    /// 记录每次调用收到的 argv(#69:守「过滤词一个字节都不进任何一条下发
+    /// 的 argv」这条硬验收)。**只记 argv、绝不记 stdin 本体**——argv 按设计
+    /// 就是可见的(机密只从 stdin 进,见 `spawn_with_stdin`),记它不碰「面板侧
+    /// 不留副本」铁律(那条只针对 stdin 本体)。测试靠它直接对 FakeRunner 断言
+    /// 「回放期间没有任何一条 argv 含过滤词」。
+    argvs: Mutex<Vec<Vec<String>>>,
 }
 
 impl FakeRunner {
@@ -540,6 +546,7 @@ impl FakeRunner {
                 .collect(),
             stdin_feeds: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
+            argvs: Mutex::new(Vec::new()),
         }
     }
 
@@ -565,6 +572,7 @@ impl FakeRunner {
                 .collect(),
             stdin_feeds: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
+            argvs: Mutex::new(Vec::new()),
         }
     }
 
@@ -577,6 +585,13 @@ impl FakeRunner {
     /// 只记次数——面板的「中止确有一次到达运行器」由此可守。
     pub fn abort_count(&self) -> usize {
         self.aborts.load(Ordering::SeqCst)
+    }
+
+    /// 测试探针(#69):这条 FakeRunner 累计收到过的**每一次 argv**(按收到顺序)。
+    /// 只记 argv、绝不记 stdin 本体(铁律只针对本体)。测试靠它直接断言「回放
+    /// 期间没有任何一条下发的 argv 含过滤词」——过滤是纯本地筛选,不打命令。
+    pub fn call_argvs(&self) -> Vec<Vec<String>> {
+        self.argvs.lock().unwrap().clone()
     }
 
     fn match_for(&self, args: &[String]) -> EngineOutput {
@@ -602,6 +617,7 @@ impl CommandRunner for FakeRunner {
     }
 
     fn run(&self, args: &[String]) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>> {
+        self.argvs.lock().unwrap().push(args.to_vec());
         let mut out = self.match_for(args);
         out.args = args.to_vec();
         Box::pin(async move { out })
@@ -614,6 +630,7 @@ impl CommandRunner for FakeRunner {
     ) -> Pin<Box<dyn Future<Output = EngineOutput> + Send + '_>> {
         // 记「收到过」即弃:内容绝不进任何结构(只计数,铁律面板侧不留副本)。
         self.stdin_feeds.fetch_add(1, Ordering::SeqCst);
+        self.argvs.lock().unwrap().push(args.to_vec());
         drop(stdin);
         let mut out = self.match_for(args);
         out.args = args.to_vec();
@@ -621,6 +638,7 @@ impl CommandRunner for FakeRunner {
     }
 
     fn spawn(&self, args: Vec<String>, tx: mpsc::UnboundedSender<EngineEvent>) {
+        self.argvs.lock().unwrap().push(args.clone());
         let mut out = self.match_for(&args);
         out.args = args;
         let _ = tx.send(EngineEvent::Finished(Box::new(out)));
@@ -633,6 +651,7 @@ impl CommandRunner for FakeRunner {
         tx: mpsc::UnboundedSender<EngineEvent>,
     ) {
         self.stdin_feeds.fetch_add(1, Ordering::SeqCst);
+        self.argvs.lock().unwrap().push(args.clone());
         drop(stdin); // 记「收到过」即弃:内容绝不进任何结构
         let mut out = self.match_for(&args);
         out.args = args;

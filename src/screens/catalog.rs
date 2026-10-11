@@ -293,6 +293,19 @@ impl CatalogKind {
         }
     }
 
+    /// 这一本在「按册各留一份」状态数组里的下标(#69 册内过滤:编目过滤词是
+    /// `[String; 4]`,换册时每本各留各的词,靠这个下标取自己那一份;
+    /// 规格故事 24:机器册筛「gate」、切到钥匙册筛「deploy」,回头机器册
+    /// 还在「gate」上)。四本固定 0/1/2/3,与枚举声明序一致。
+    pub fn idx(self) -> usize {
+        match self {
+            CatalogKind::Vps => 0,
+            CatalogKind::Tag => 1,
+            CatalogKind::Subscription => 2,
+            CatalogKind::Key => 3,
+        }
+    }
+
     // ---- 册级查表(工单 #66:按册差异只剩数据,不再有分支) ----
     //
     // 下面这一族把「这一本的登记流槽 / 删除确认旗 / 册体条数 / 选中槽 /
@@ -431,6 +444,65 @@ impl CatalogKind {
         }
     }
 
+    /// 这一本的一条条目**参与过滤的字段**(#69,与 #61 五域 `domain_row_fields`
+    /// 同一族口径):按册取该行在列表与明细里出现过的文本。**只收引擎真给了的
+    /// 字段**,缺字段 / 占位符「——」一律不入匹配面——不猜、不拿「——」冒充
+    /// 可检索内容(规格 §3「每册一份可匹配字段」)。机器 = 名/地址/登录/备注;
+    /// 标签 = 名/引用;订阅 = 名/应用/到期日;钥匙 = 名/主机/作用域/轮换日。
+    /// 落在查表成员上(#66 模式):调用方(`App::catalog_visible`)只写
+    /// `kind.match_fields(e)`,不再有四份按册匹配分支。
+    pub fn match_fields(self, e: &CatalogEntryView) -> Vec<String> {
+        let mut v = vec![e.name.clone()];
+        match self {
+            CatalogKind::Vps => {
+                for a in &e.addrs {
+                    v.push(a.label.clone());
+                    v.push(a.addr.clone());
+                }
+                for l in &e.logins {
+                    v.push(l.user.clone());
+                    v.push(l.key_ref.clone());
+                }
+                if let Some(n) = e.note.as_deref().filter(|s| !s.is_empty()) {
+                    v.push(n.to_string());
+                }
+            }
+            CatalogKind::Tag => {
+                for r in &e.refs {
+                    v.push(r.label());
+                }
+            }
+            CatalogKind::Subscription => {
+                if let Some(c) = e.client.as_deref().filter(|s| !s.is_empty()) {
+                    v.push(c.to_string());
+                }
+                if let Some(x) = e
+                    .expires
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    v.push(x.to_string());
+                }
+            }
+            CatalogKind::Key => {
+                if let Some(h) = e.host.as_deref().filter(|s| !s.is_empty()) {
+                    v.push(h.to_string());
+                }
+                v.extend(e.scopes.iter().cloned());
+                if let Some(r) = e
+                    .rotated_at
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    v.push(r.to_string());
+                }
+            }
+        }
+        v
+    }
+
     /// 册体「还没读到」的一句话(合法空态之前的第三态:一次 ls 都没成功过)。
     /// 四本各一句——按册查表,渲染不再 `match kind` 四回。
     pub fn unread_line(self) -> &'static str {
@@ -523,9 +595,16 @@ impl CatalogKind {
     /// 按「只机器册 + 有选中行」现拼(提示段与可点段在一处汇合,渲染与命中
     /// 共用同一份清单);写进这张静态表就会在订阅 / 钥匙册上也画出一个点不动
     /// 的段,也会在空册上问一台不存在的机器。
+    ///
+    /// #69 合入后再收窄第三处:`Esc 返航` → `Esc`。#69 的 `/ 过滤`、#70 的
+    /// `Enter 反查`、#67 的 `m 换册` 三个可点段在机器册键位行同场,且三段的
+    /// 点击命中都在 80×30 / 66×50 两档钉死;不把这段提示再收一档,紧凑态下
+    /// `/ 过滤` 会被整段裁掉、点不到(#69 的过滤行为就不完整)。册体上 `Esc`
+    /// 只做「清当前册过滤词」(见 `key_catalog`),裸 `Esc` 足够提示这个键、语义
+    /// 也不虚,故只留键名、去掉「返航」二字。
     pub fn keys_body(self) -> &'static [&'static str] {
         match self {
-            CatalogKind::Vps => &["  ↑/↓ 选", "r 登记", "d 删除", "Esc 返航"],
+            CatalogKind::Vps => &["  ↑/↓ 选", "r 登记", "d 删除", "Esc"],
             CatalogKind::Tag => &["  ↑/↓ 选", "Enter 反查", "l 全部", "r 挂标签", "d 摘/删"],
             CatalogKind::Subscription => {
                 &["  ↑/↓ 选订阅", "r 登记", "g 取回命令", "d 删除", "l 重读"]
@@ -1641,7 +1720,7 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = catalog_body_lines(app, w);
     let _ = cause_line(app);
-    lines.push(key_line(&catalog_key_parts(app), p));
+    lines.push(key_line(inner, &catalog_key_parts(app), p));
     frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
 
     // 浮层:登记 / 删除确认(弹层优先级高于册体;骨架同一件)。
@@ -1696,17 +1775,30 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
     } else if app.data_root_cause().is_some() {
         lines.extend(data_root_signpost(app));
     } else {
+        // 册内过滤态(#69):标题显「命中/总数」——被过滤空在标题层就与册体
+        // 真空 / 还没读到可区分(规格故事 19)。不过滤时 count 段为空,与过滤前
+        // 逐字节相同(面板永不重排引擎输出,故事 18/30)。
+        let filtering = !app.catalog_filter().trim().is_empty();
+        let count = if filtering {
+            format!(" · 命中 {}/{}", app.catalog_visible().len(), kind.len(app))
+        } else {
+            String::new()
+        };
+        // 过滤态多出 count 段,路径按同一总预算再让一截,整行不因过滤而溢宽。
+        let path_budget =
+            w.saturating_sub(20 + unicode_width::UnicodeWidthStr::width(count.as_str()));
         lines.push(Line::from(Span::styled(
             format!(
-                "  当前册 {} · {} · 编目 {}",
+                "  当前册 {} · {} · 编目 {}{}",
                 kind.label(),
                 app.catalog_scope_label(),
                 clip(
                     &app.catalog_sheet()
                         .map(|s| s.catalog_path)
                         .unwrap_or_else(|| "—".into()),
-                    w.saturating_sub(20)
-                )
+                    path_budget
+                ),
+                count
             ),
             p.dim(),
         )));
@@ -1736,13 +1828,26 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
                     lines.push(Line::from(Span::styled(title, p.text())));
                     lines.push(Line::from(Span::styled(next, p.dim())));
                 }
-                Some(s) => lines.extend(catalog_sheet_lines(
-                    &s,
-                    w,
-                    app.catalog_sel(),
-                    p,
-                    kind.detail(),
-                )),
+                Some(s) => {
+                    // 册内过滤(#69):只画「看得见的那一行」——下标经
+                    // `catalog_visible` 映射回原始投影。无关键词时 vis = 0..n
+                    // 全量同序,与过滤前逐字节相同。
+                    let vis = app.catalog_visible();
+                    if vis.is_empty() {
+                        // 关键词把条目全筛掉了:与「册体本来是空的」两态可
+                        // 区分,给改词 / 清过滤的下一步,绝不共用一个空列表。
+                        lines.extend(filter_empty_lines(app, s.entries.len(), p));
+                    } else {
+                        lines.extend(catalog_sheet_lines(
+                            &s,
+                            &vis,
+                            w,
+                            app.catalog_sel(),
+                            p,
+                            kind.detail(),
+                        ));
+                    }
+                }
             }
         }
         // 只属于某一本的附述行(订阅册的到期三态汇总 + 取回链接建议;
@@ -1777,6 +1882,11 @@ pub(crate) const CATALOG_SWITCH: &str = "m 换册";
 /// 只返回「没有」,是噪声(spec #65 §4:触发点只有一处)。
 pub(crate) const CATALOG_REVERSE: &str = "Enter 反查";
 
+/// 键位行「过滤」可点文案(#69):点它 = 按 `/` 进册内过滤输入态。与
+/// [`CATALOG_SWITCH`] 同一份接缝——渲染画这个串、命中测这个串的宽,
+/// 段可点(accent 高亮),与键盘 `/` 同路(点哪打哪)。
+pub(crate) const CATALOG_FILTER: &str = "/ 过滤";
+
 /// 编目册键位行的**段清单**(#67 通用接缝的第一个用户):提示段只画不点
 /// (`None`),末段「换册」可点(`Some(SwitchBook)`)。渲染与命中测试共用这
 /// 同一份清单——段文案与段宽一处真相。
@@ -1808,6 +1918,11 @@ pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::l
         parts.push((CATALOG_REVERSE, Some(Target::VpsReverse)));
     }
     parts.push((CATALOG_SWITCH, Some(Target::SwitchBook)));
+    // 册内过滤入口(#69):有条目可筛时才给这一段(空册没东西可筛,给了反而
+    // 误导)。点它 = 按 `/`,与键盘同一路;空册键位行(`keys_empty`)不带它。
+    if kind.len(app) > 0 {
+        parts.push((CATALOG_FILTER, Some(Target::CatalogFilter)));
+    }
     parts
 }
 
@@ -1815,18 +1930,35 @@ pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::l
 /// (`None`)dim;段间用 [`CATALOG_KEY_GAP`] 连接。与命中侧
 /// [`crate::layout::key_line_segments`] 同一份 `parts` + 同一个 gap——屏上画的
 /// 和点得的逐字同源。
-fn key_line(parts: &[(&str, Option<crate::layout::Target>)], p: &Palette) -> Line<'static> {
+/// 编目册键位行的**渲染**(#67/#69):段清单 `parts` 由
+/// [`catalog_key_parts`] 一处产出,渲染与命中测试共用。
+///
+/// #69 修一处「渲染与命中不同源」的隐患:键位行若直接铺全部段、靠终端
+/// 裁尾,会在「段放不下」时画出一截点不到的残段(如紧凑态标签册的 `· / `),
+/// 而命中侧 [`crate::layout::key_line_segments`] 早就是「放不下整段收口、
+/// 这一段及后续既不画也不给命中」。两边口径一旦分叉,就破了 ADR-0005「渲染
+/// 与命中同源」。故渲染也走同一份 [`crate::layout::key_line_segments`]:
+/// 放得下的段才画、放不下的段(如紧凑态够不着 `/ 过滤` 的标签 / 订阅 / 钥匙册)
+/// 两厢都不出现——屏上没有的段,鼠标也点不到,点哪打哪。
+fn key_line(
+    inner: Rect,
+    parts: &[(&str, Option<crate::layout::Target>)],
+    p: &Palette,
+) -> Line<'static> {
+    // 与命中侧同一 anchor(`inner`)、同一 gap:逐字同源。y 只进命中矩形,
+    // 渲染不取矩形,传 0 即可。
+    let segs = crate::layout::key_line_segments(inner, 0, parts, CATALOG_KEY_GAP);
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, (text, target)) in parts.iter().enumerate() {
+    for (i, seg) in segs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(CATALOG_KEY_GAP, p.dim()));
         }
-        let style = if target.is_some() {
+        let style = if seg.target.is_some() {
             p.accent().bold()
         } else {
             p.dim()
         };
-        spans.push(Span::styled((*text).to_string(), style));
+        spans.push(Span::styled(seg.text.clone(), style));
     }
     Line::from(spans)
 }
@@ -1835,16 +1967,25 @@ fn key_line(parts: &[(&str, Option<crate::layout::Target>)], p: &Palette) -> Lin
 /// 缺字段显式「——」,不自造、不补全;ref 原样呈现(指针不是密钥),
 /// 摘要不印 ref 与 addr。后三本册子只换 `CatalogSheet` 的数据源与
 /// [`EntryDetail`](条目明细画法),不换列表件。
+///
+/// #69 册内过滤:`vis` 是「看得见的那一行」在原始投影里的下标(
+/// [`App::catalog_visible`] 的产出),本件只画 `vis` 指到的那些条目、按
+/// `vis` 的顺序;选中高亮按**可见位置** `pos == sel`。无关键词时 `vis` =
+/// `0..n` 全量同序,画出来的与过滤前逐字节相同(面板永不重排引擎输出)。
 pub fn catalog_sheet_lines(
     sheet: &CatalogSheet,
+    vis: &[usize],
     width: usize,
     sel: usize,
     p: &Palette,
     detail: EntryDetail,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    for (i, e) in sheet.entries.iter().enumerate() {
-        let on = i == sel;
+    for (pos, &i) in vis.iter().enumerate() {
+        let Some(e) = sheet.entries.get(i) else {
+            continue;
+        };
+        let on = pos == sel;
         let (suffix, rows) = detail(e, width.saturating_sub(12), p);
         let mut head = vec![Span::raw(format!(
             "  {} {}",
@@ -1859,6 +2000,26 @@ pub fn catalog_sheet_lines(
         out.extend(rows);
     }
     out
+}
+
+/// 册内过滤把条目全筛掉了的指路(#69,照 `recipes::ListEmptyCause` 的范式:
+/// 一个概念一个拼写,与「册体本来是空的」「还没读到」三态两两可区分,绝不
+/// 共用一个空列表)。标题(warn 色,与合法空态的正文色区分)+ 两句下一步:
+/// 事实(「q」在 total 条里没命中)+ 出路(改词 / 清过滤)。`total` 是册体
+/// 原始条数(分母),让操作者知道是「被筛掉了」而不是「本来就没有」。
+fn filter_empty_lines(app: &App, total: usize, p: &Palette) -> Vec<Line<'static>> {
+    let q = app.catalog_filter().trim();
+    vec![
+        Line::from(Span::styled(
+            format!("  {}册无命中", app.catalog_kind.label()),
+            p.warn(),
+        )),
+        Line::from(Span::styled(
+            format!("  「{q}」在 {total} 条里没有命中。"),
+            p.dim(),
+        )),
+        Line::from(Span::styled("  按 / 改词 · Esc 清空过滤", p.dim())),
+    ]
 }
 
 /// 机器册的条目明细:名字行后缀给端口,之下给 地址 / 登录 / 备注
@@ -4046,8 +4207,10 @@ pub fn selected_name(sheet: &VpsLsData, sel: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crate::app::Screen;
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use ratatui::Terminal;
 
     /// 常畅态 / 紧凑态两档都成立(#53 验收):不引新断点、不缩放字号,
@@ -4196,7 +4359,14 @@ mod tests {
             crate::theme::ThemeKind::Warehouse,
             crate::term::ColorCap::Truecolor,
         );
-        let lines = catalog_sheet_lines(&sheet, 60, 0, &p, vps_detail_rows);
+        let lines = catalog_sheet_lines(
+            &sheet,
+            &(0..sheet.entries.len()).collect::<Vec<_>>(),
+            60,
+            0,
+            &p,
+            vps_detail_rows,
+        );
         let text: String = lines
             .iter()
             .map(|l| {
@@ -4585,16 +4755,23 @@ mod tests {
             crate::term::ColorCap::Truecolor,
         );
         let text = |detail: EntryDetail| -> String {
-            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            catalog_sheet_lines(
+                &sheet,
+                &(0..sheet.entries.len()).collect::<Vec<_>>(),
+                60,
+                0,
+                &p,
+                detail,
+            )
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         // 同一份投影,两个画法:机器册给端口/地址/登录/备注,标签册给引用
         let vps = text(vps_detail_rows);
@@ -5182,16 +5359,23 @@ mod tests {
             crate::term::ColorCap::Truecolor,
         );
         let text = |detail: EntryDetail| -> String {
-            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            catalog_sheet_lines(
+                &sheet,
+                &(0..sheet.entries.len()).collect::<Vec<_>>(),
+                60,
+                0,
+                &p,
+                detail,
+            )
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         let sub = text(sub_detail_rows);
         assert!(sub.contains("应用 Mihomo"), "订阅册:{sub}");
@@ -5706,16 +5890,23 @@ mod tests {
             crate::term::ColorCap::Truecolor,
         );
         let text = |detail: EntryDetail| -> String {
-            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            catalog_sheet_lines(
+                &sheet,
+                &(0..sheet.entries.len()).collect::<Vec<_>>(),
+                60,
+                0,
+                &p,
+                detail,
+            )
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         let key = text(key_detail_rows);
         assert!(key.contains("kind github-key"), "钥匙册:{key}");
@@ -5970,7 +6161,7 @@ mod tests {
 │          ││    地址 home=10.0.0.1                                            │
 │          ││    登录 root→$DEPLOY_KEY                                         │
 │          ││    备注 门口                                                     │
-│          ││  ↑/↓ 选 · r 登记 · d 删除 · Esc 返航 · Enter 反查 · m 换册       │
+│          ││  ↑/↓ 选 · r 登记 · d 删除 · Esc · Enter 反查 · m 换册 · / 过滤   │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -6002,7 +6193,7 @@ mod tests {
 │    地址 home=10.0.0.1                                          │
 │    登录 root→$DEPLOY_KEY                                       │
 │    备注 门口                                                   │
-│  ↑/↓ 选 · r 登记 · d 删除 · Esc 返航 · Enter 反查 · m 换册     │
+│  ↑/↓ 选 · r 登记 · d 删除 · Esc · Enter 反查 · m 换册 · / 过滤 │
 │                                                                │
 │                                                                │
 │                                                                │
@@ -6485,5 +6676,526 @@ mod tests {
                 assert_eq!(app.catalog_sel(), sel_before, "{label}册选中原样");
             }
         }
+    }
+
+    // ---- #69 册内过滤:四本册都能 `/` 过滤,纯本地筛选(与 #61 五域同源同形) ----
+    //
+    // 全部走在公开缝上:`App::update(Message::Key/Mouse)` 驱动、经 FakeRunner
+    // 回放,断言落在 frame_display 帧、可观察状态后果(catalog_visible /
+    // catalog_sel / selected_*_name / catalog_filter)、命中区(FakeRunner 的
+    // call_argvs 探针)上——不断言私有签名或字段名。每本册用 book_apps() 的
+    // 就绪态,vps 另用直接灌 vps_ls 的 vps_book 便于自造条数。
+
+    /// 建一本就绪的机器册:machines 是 VpsLsData 的 machines JSON 数组。
+    /// 直接灌 vps_ls(不下发命令),FakeRunner 只为 `/ 过滤` 后的 `l` 刷新备用。
+    fn vps_book(machines: &str) -> crate::app::App {
+        let ls = format!(r#"{{"catalogPath":"/r/vps.json","machines":{machines}}}"#);
+        let mut app = crate::app::App::with_runner(std::sync::Arc::new(
+            crate::engine::FakeRunner::new(&[("vps ls", 0, ls.as_str())]),
+        ));
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
+        app
+    }
+
+    /// 进过滤输入态、敲词、收词(走真实键路,与 #61 filter_type 同一条)。连敲多
+    /// 词先 Esc 清掉上一轮(过滤词按册各留一份,这里只清当前这本;不在输入态时
+    /// Esc 才走清词路,与 #61 口径一致)。
+    fn 过滤敲词(app: &mut crate::app::App, q: &str) {
+        if !app.catalog_filter().is_empty() {
+            tap(app, KeyCode::Esc);
+        }
+        tap(app, KeyCode::Char('/'));
+        for c in q.chars() {
+            tap(app, KeyCode::Char(c));
+        }
+        tap(app, KeyCode::Enter);
+    }
+
+    /// 左键点中某命中目标(坐标取自布局模型,点哪拿哪;与渲染同源)。
+    fn 点中(
+        app: &mut crate::app::App,
+        w: u16,
+        h: u16,
+        pred: impl Fn(&crate::layout::Target) -> bool,
+    ) {
+        app.size = Rect::new(0, 0, w, h);
+        let r = crate::layout::hitmap(app.size, app, crate::layout::size_class(app.size))
+            .into_iter()
+            .find(|(_, t)| pred(t))
+            .map(|(r, _)| r)
+            .expect("该目标应有命中区");
+        app.update(crate::app::Message::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.x + r.width / 2,
+            row: r.y + r.height / 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    /// 喂一条 vps ls 回音(走 on_vps_echo → catalog_clamp,即 `l` 刷新的收敛路径;
+    /// FakeRunner 每次回放同一 fixture,故自造回音面来验「刷新后选中钳回可见行数」)。
+    fn feed_vps_echo(app: &mut crate::app::App, machines: &str) {
+        let data = format!(r#"{{"catalogPath":"/r/vps.json","machines":{machines}}}"#);
+        let env = format!(
+            r#"{{"schema":"nw/vps-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{data}}}"#
+        );
+        let out = crate::engine::EngineOutput {
+            args: vec!["vps".into(), "ls".into(), "--root".into(), "/tmp".into()],
+            exit_code: crate::engine::ExitCode::from_number(0),
+            ok: true,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(&env).ok(),
+            raw_stdout: env,
+            parse_error: None,
+        };
+        app.update(crate::app::Message::Engine(
+            crate::engine::EngineEvent::Finished(Box::new(out)),
+        ));
+    }
+
+    /// 规格验收 1 / 故事 18:过滤收窄后再放宽,册体回到与过滤前**逐字节同序**
+    /// (无关键词时 vis = 0..n 全量同序,面板永不重排引擎输出)。
+    #[test]
+    fn 过滤收窄再放宽_册体回到逐字节同序() {
+        let mut app = book("机器");
+        let before = crate::testutil::frame_display(&app, 80, 30);
+        过滤敲词(&mut app, "gate");
+        let narrowed = crate::testutil::frame_display(&app, 80, 30);
+        assert_ne!(
+            narrowed, before,
+            "收窄后册体确实变了(bare 被滤掉、标题多命中数)"
+        );
+        assert!(narrowed.contains("命中 1/2"), "收窄显命中/总数:{narrowed}");
+        assert!(!narrowed.contains("bare"), "收窄后 bare 不在场:{narrowed}");
+        // Esc 清词放宽:册体回到与过滤前逐字节同序
+        tap(&mut app, KeyCode::Esc);
+        let after = crate::testutil::frame_display(&app, 80, 30);
+        assert_eq!(after, before, "清空过滤后册体与过滤前逐字节同序");
+    }
+
+    /// 规格验收 5 / 故事 20-21:过滤空与「册体本来是空的」两态可区分,各有不同
+    /// 文案与下一步,互不冒充(绝不共用一个空列表)。
+    #[test]
+    fn 过滤空与册体本来空_两态可区分_互不冒充() {
+        // 册体本来空:0 台机器
+        let empty = vps_book("[]");
+        let f_empty = crate::testutil::frame_display(&empty, 80, 30);
+        assert!(
+            f_empty.contains("编目里还没有机器"),
+            "册体真空的措辞:{f_empty}"
+        );
+        assert!(
+            !f_empty.contains("无命中"),
+            "册体真空不冒充过滤空:{f_empty}"
+        );
+        // 过滤空:有条目但被全筛掉
+        let mut filtered = book("机器");
+        过滤敲词(&mut filtered, "不存在的关键词");
+        let f_filtered = crate::testutil::frame_display(&filtered, 80, 30);
+        assert!(f_filtered.contains("无命中"), "过滤空的措辞:{f_filtered}");
+        assert!(f_filtered.contains("没有命中"), "过滤空给事实:{f_filtered}");
+        assert!(
+            f_filtered.contains("按 / 改词"),
+            "过滤空给改词出路:{f_filtered}"
+        );
+        assert!(
+            f_filtered.contains("Esc 清空过滤"),
+            "过滤空给清滤出路:{f_filtered}"
+        );
+        assert!(
+            !f_filtered.contains("编目里还没有"),
+            "过滤空不冒充册体真空:{f_filtered}"
+        );
+    }
+
+    /// 规格验收 3 / 故事 16:大小写不敏感匹配。
+    #[test]
+    fn 过滤大小写不敏感() {
+        let mut app = book("机器"); // gate / bare
+        过滤敲词(&mut app, "GATE");
+        assert_eq!(app.catalog_visible().len(), 1, "全大写关键词命中小写名");
+        assert_eq!(app.selected_vps_name().as_deref(), Some("gate"));
+        过滤敲词(&mut app, "GaTe");
+        assert_eq!(app.catalog_visible().len(), 1, "混合大小写同样命中");
+    }
+
+    /// 规格验收 3 / 故事 17:占位符「——」与引擎未给出的字段不参与匹配——bare
+    /// 没有 ips/logins/note,明细画「——」,但按「——」过滤不该命中它。
+    #[test]
+    fn 占位符与缺字段不参与匹配() {
+        let mut app = book("机器"); // gate(有字段) / bare(全缺 → 明细画 ——)
+        过滤敲词(&mut app, "——");
+        assert_eq!(
+            app.catalog_visible().len(),
+            0,
+            "「——」不冒充可检索内容:bare 的缺字段不入匹配面"
+        );
+        assert!(app.selected_vps_name().is_none(), "无可见行");
+    }
+
+    /// 规格验收 4 / 故事 15(硬验收):过滤全程 FakeRunner 收到的 argv 里**不含
+    /// 关键词**。过滤是纯本地筛选,不打新命令;唯一那条 `l` 只读 argv 也不含词。
+    #[test]
+    fn 过滤全程_下发argv不含过滤词() {
+        let ls = r#"{"catalogPath":"/r/vps.json","machines":[{"name":"gate","ips":[],"port":0,"logins":[]},{"name":"bare","ips":[],"port":0,"logins":[]}]}"#;
+        let runner = std::sync::Arc::new(crate::engine::FakeRunner::new(&[("vps ls", 0, ls)]));
+        let mut app = crate::app::App::with_runner(runner.clone());
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        // 真刷新一次:入队并回放,让 FakeRunner 记到一条 argv
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        let before = runner.call_argvs().len();
+        assert_eq!(before, 1, "刷新只打过一条只读 argv");
+        // 过滤敲词(纯本地):不应再打任何命令
+        过滤敲词(&mut app, "gate");
+        let argvs = runner.call_argvs();
+        assert_eq!(argvs.len(), before, "过滤是纯本地,不打新命令");
+        for a in &argvs {
+            assert!(
+                !a.iter().any(|s| s.contains("gate")),
+                "没有任何一条下发 argv 含过滤词:{a:?}"
+            );
+        }
+    }
+
+    /// 规格验收 6 / 故事 22:Esc 清词并让选中回顶。
+    #[test]
+    fn 逃逸键清词并让选中回顶() {
+        let machines = r#"[{"name":"gate-a","ips":[],"port":0,"logins":[]},{"name":"gate-b","ips":[],"port":0,"logins":[]},{"name":"gate-c","ips":[],"port":0,"logins":[]}]"#;
+        let mut app = vps_book(machines);
+        过滤敲词(&mut app, "gate");
+        assert_eq!(app.catalog_visible().len(), 3, "三条都含 gate");
+        tap(&mut app, KeyCode::Down);
+        tap(&mut app, KeyCode::Down);
+        assert_eq!(app.catalog_sel(), 2, "选中挪到第 3 个可见行");
+        tap(&mut app, KeyCode::Esc); // 清词 + 回顶
+        assert_eq!(app.catalog_filter(), "", "Esc 清空过滤词");
+        assert_eq!(app.catalog_sel(), 0, "Esc 让选中回顶");
+        assert_eq!(app.catalog_visible().len(), 3, "清词后回到全量");
+    }
+
+    /// 规格验收 6 / 故事 23:切屏退输入态但留词。输入态里唯一能绕开吞键守卫的
+    /// 是鼠标点导航——点它切屏并退输入态,过滤词留着;切回编目屏词还在、仍生效。
+    #[test]
+    fn 输入态里点导航切屏_退输入态留词() {
+        let mut app = book("机器");
+        tap(&mut app, KeyCode::Char('/'));
+        for c in "gate".chars() {
+            tap(&mut app, KeyCode::Char(c));
+        }
+        assert!(app.catalog_filter_on, "在输入态");
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::NavTo(Screen::Overview))
+        });
+        assert_eq!(app.screen, Screen::Overview, "点导航切到概览");
+        assert!(!app.catalog_filter_on, "切屏退输入态");
+        assert_eq!(app.catalog_filter(), "gate", "过滤词留着");
+        // 切回编目屏:词还在、仍生效(gate 命中 1)
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::NavTo(Screen::Vps))
+        });
+        assert_eq!(app.screen, Screen::Vps);
+        assert_eq!(app.catalog_filter(), "gate", "切回编目屏过滤词还在");
+        assert_eq!(app.catalog_visible().len(), 1, "过滤词仍生效");
+    }
+
+    /// 规格验收 6 / 故事 23(键路):收词退输入态后,壳级切屏(j/k)不碰过滤词,
+    /// 绕回编目屏词仍生效——与 #61 五域同一条后果链。
+    #[test]
+    fn 切屏留词_绕回编目仍生效() {
+        let mut app = book("机器");
+        过滤敲词(&mut app, "gate");
+        assert!(!app.catalog_filter_on, "收词后已退输入态");
+        tap(&mut app, KeyCode::Char('j')); // Vps → Settings
+        assert_ne!(app.screen, Screen::Vps, "切走");
+        assert!(!app.catalog_filter_on, "切屏后退输入态");
+        tap(&mut app, KeyCode::Char('k')); // Settings → Vps
+        assert_eq!(app.screen, Screen::Vps, "绕回编目屏");
+        assert_eq!(app.catalog_filter(), "gate", "过滤词没被切屏清掉");
+        assert_eq!(app.catalog_visible().len(), 1, "过滤词仍生效");
+    }
+
+    /// 规格验收 6 / 故事 24:换册(m)过滤词按册各留各的——机器册筛「gate」、切到
+    /// 钥匙册筛「deploy」、回头机器册还在「gate」上。
+    #[test]
+    fn 换册各留各的词() {
+        let mut app = book("机器"); // [gate, bare]
+                                    // 同一本 app 再装钥匙册数据(机器册已在场)
+        let key_ls = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"ghe.internal","scopes":[],"rotatedAt":"2025-11-02"},{"name":"deploy","kind":"github-key","host":"github.com","scopes":["repo"],"rotatedAt":"2026-01-15"}]}}"#;
+        let key_echo = crate::engine::EngineOutput {
+            args: vec!["key".into(), "ls".into(), "--root".into(), "/tmp".into()],
+            exit_code: crate::engine::ExitCode::from_number(0),
+            ok: true,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(key_ls).ok(),
+            raw_stdout: key_ls.to_string(),
+            parse_error: None,
+        };
+        app.update(crate::app::Message::Engine(
+            crate::engine::EngineEvent::Finished(Box::new(key_echo)),
+        ));
+        app.capabilities.record(
+            crate::engine::Capability::Key,
+            crate::engine::Probe::Available,
+        );
+        // 机器册筛 gate
+        过滤敲词(&mut app, "gate");
+        assert_eq!(app.catalog_filter(), "gate");
+        assert_eq!(app.catalog_visible().len(), 1);
+        // 切到钥匙册(Vps→Tag→Sub→Key)
+        for _ in 0..3 {
+            tap(&mut app, KeyCode::Char('m'));
+        }
+        assert_eq!(app.catalog_kind, CatalogKind::Key, "切到钥匙册");
+        assert_eq!(app.catalog_filter(), "", "钥匙册各留各的词:起初空");
+        // 钥匙册筛 deploy
+        过滤敲词(&mut app, "deploy");
+        assert_eq!(app.catalog_filter(), "deploy");
+        assert_eq!(app.catalog_visible().len(), 1, "deploy 命中 1 把钥匙");
+        // 切回机器册:`next()` 的环在 Key → Vps 处合上,所以从钥匙册回机器册
+        // 只要**一次** `m`(Vps→Tag→Sub→Key 三步、Key→Vps 一步,环不是对称的)。
+        tap(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.catalog_kind, CatalogKind::Vps, "切回机器册");
+        assert_eq!(app.catalog_filter(), "gate", "回头机器册还在 gate 上");
+        assert_eq!(app.catalog_visible().len(), 1, "gate 过滤仍生效");
+    }
+
+    /// 规格验收 6 / 故事 25:刷新(l)后选中钳回可见行数内(不越界、不指向看不见的行)。
+    #[test]
+    fn 刷新后_选中钳回可见行数内() {
+        let machines = r#"[{"name":"gate-a","ips":[],"port":0,"logins":[]},{"name":"gate-b","ips":[],"port":0,"logins":[]},{"name":"gate-c","ips":[],"port":0,"logins":[]}]"#;
+        let mut app = vps_book(machines);
+        过滤敲词(&mut app, "gate");
+        assert_eq!(app.catalog_visible().len(), 3);
+        tap(&mut app, KeyCode::Down);
+        tap(&mut app, KeyCode::Down);
+        assert_eq!(app.catalog_sel(), 2, "选中在可见位 2");
+        // 刷新回音只剩 gate-a 含 gate(其余换名):可见数塌到 1,选中必须钳回 0
+        feed_vps_echo(
+            &mut app,
+            r#"[{"name":"gate-a","ips":[],"port":0,"logins":[]},{"name":"solo","ips":[],"port":0,"logins":[]}]"#,
+        );
+        assert_eq!(app.catalog_visible().len(), 1, "刷新后只剩 gate-a 含 gate");
+        assert_eq!(app.catalog_sel(), 0, "选中钳回可见行数内");
+    }
+
+    /// 规格验收 7 / 故事 27:过滤态下删除作用于「看得见的那一行」——滤到只剩
+    /// gate(原始下标 1),按 d 起的删除确认点名 gate,不是被滤掉的 bare。
+    #[test]
+    fn 过滤态下_删除作用于看得见的那一行() {
+        let mut app = book("机器"); // 排序后 [bare(0), gate(1)]
+        过滤敲词(&mut app, "gate");
+        assert_eq!(app.catalog_visible(), vec![1], "只剩 gate(原始下标 1)可见");
+        tap(&mut app, KeyCode::Char('d'));
+        assert!(app.vps_rm_confirm, "d 起删除确认");
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate"),
+            "删除确认点名看得见的 gate,不是被滤掉的 bare"
+        );
+        let f = crate::testutil::frame_display(&app, 80, 30);
+        assert!(f.contains("gate"), "删除确认框点名 gate:{f}");
+    }
+
+    /// 规格验收 7 / 故事 26:过滤态下鼠标点行与键盘同一本账——点可见第 i 行 =
+    /// 选中可见第 i 行(下标经 catalog_visible 映射回原始数组)。
+    #[test]
+    fn 过滤态下_鼠标点行作用于看得见的那一行() {
+        let machines = r#"[{"name":"aaa","ips":[],"port":0,"logins":[]},{"name":"gate-x","ips":[],"port":0,"logins":[]},{"name":"gate-y","ips":[],"port":0,"logins":[]}]"#;
+        let mut app = vps_book(machines); // 排序后 [aaa(0), gate-x(1), gate-y(2)]
+        过滤敲词(&mut app, "gate"); // 可见 [1, 2]
+        assert_eq!(app.catalog_visible(), vec![1, 2]);
+        // 点可见第 1 行 = 原始下标 1 的 gate-x(不是原始下标 0 的 aaa)
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::SelectRow(0))
+        });
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate-x"),
+            "点可见第 1 行"
+        );
+        // 点可见第 2 行 = 原始下标 2 的 gate-y
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::SelectRow(1))
+        });
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate-y"),
+            "点可见第 2 行"
+        );
+        // 键盘从第 2 行按 ↑ 也回可见第 1 行(键鼠同一本账)
+        tap(&mut app, KeyCode::Up);
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate-x"),
+            "↑ 与点行同一本账"
+        );
+    }
+
+    /// 规格验收 8 / 故事 28:过滤态是输入态——期间动作键(m 换册 / d 删除 /
+    /// r 登记 / j 切屏)不生效,只当字符进过滤缓冲;与 #61 五域同一形态。
+    #[test]
+    fn 过滤态是输入态_期间动作键不生效() {
+        let mut app = book("机器");
+        tap(&mut app, KeyCode::Char('/')); // 进输入态
+        assert!(app.catalog_filter_on);
+        for c in ['m', 'd', 'r', 'j'] {
+            tap(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.catalog_kind, CatalogKind::Vps, "输入态里 m 不换册");
+        assert!(!app.vps_rm_confirm, "输入态里 d 不起删除确认");
+        assert_eq!(app.screen, Screen::Vps, "输入态里 j 不切屏(壳级键也被吞)");
+        assert_eq!(app.catalog_filter(), "mdrj", "动作键在输入态只进过滤缓冲");
+    }
+
+    /// 规格验收 9 / 故事 29:过滤入口有鼠标命中,点中 = 按 `/`。机器册键位行够短,
+    /// `/ 过滤` 段在常畅(80×30)与紧凑(66×50)两档都放得下、都点得中。
+    #[test]
+    fn 过滤入口段_点中等于按斜杠_机器册两档可点() {
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let mut app = book("机器");
+            app.size = Rect::new(0, 0, w, h);
+            let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+            assert!(
+                hits.iter()
+                    .any(|(_, t)| *t == crate::layout::Target::CatalogFilter),
+                "{w}×{h} 过滤段应有命中区"
+            );
+            assert!(
+                crate::testutil::frame_display(&app, w, h).contains("/ 过滤"),
+                "{w}×{h} 屏上也该画出这一段(点哪打哪)"
+            );
+            点中(&mut app, w, h, |t| {
+                *t == crate::layout::Target::CatalogFilter
+            });
+            assert!(app.catalog_filter_on, "{w}×{h} 点过滤段 = 进输入态(同按 /)");
+        }
+    }
+
+    /// ADR-0005「渲染与命中同源」:#69 修掉一处隐患——键位行段放不下时,渲染
+    /// 若靠终端裁尾会画出点不到的残段,而命中侧早就是「放不下整段收口」。这里
+    /// 钉住:够宽的终端四本册都画得出、点得中;常畅/紧凑两档下标签/订阅/钥匙册
+    /// 键位行够长、`/ 过滤` 放不下,于是屏上不画、命中区也不产(两厢一致,
+    /// 不出现「屏上写着 / 却点不到」)。键盘 `/` 四本册始终可用(见输入态测试)。
+    #[test]
+    fn 过滤段渲染与命中同源_放不下则两厢都不出现() {
+        // 够宽(110×30):四本册都放得下 `/ 过滤`,画得出也点得中
+        for name in ["机器", "标签", "订阅", "钥匙"] {
+            let mut app = book(name);
+            app.size = Rect::new(0, 0, 110, 30);
+            let f = crate::testutil::frame_display(&app, 110, 30);
+            assert!(f.contains("/ 过滤"), "{name} 110×30 屏上应画出 / 过滤:{f}");
+            let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+            assert!(
+                hits.iter()
+                    .any(|(_, t)| *t == crate::layout::Target::CatalogFilter),
+                "{name} 110×30 应有过滤命中区"
+            );
+            点中(&mut app, 110, 30, |t| {
+                *t == crate::layout::Target::CatalogFilter
+            });
+            assert!(app.catalog_filter_on, "{name} 110×30 点中 = 进输入态");
+        }
+        // 常畅/紧凑两档:键位行较长的三本册放不下,屏上不画残段、命中区也不产
+        for name in ["标签", "订阅", "钥匙"] {
+            for (w, h) in [(80u16, 30u16), (66, 50)] {
+                let app = book(name);
+                let f = crate::testutil::frame_display(&app, w, h);
+                assert!(
+                    !f.contains("/ 过滤"),
+                    "{name} {w}×{h} 放不下 / 过滤,屏上不该画出:{f}"
+                );
+                let hits = crate::layout::hitmap(
+                    Rect::new(0, 0, w, h),
+                    &app,
+                    crate::layout::size_class(Rect::new(0, 0, w, h)),
+                );
+                assert!(
+                    hits.iter()
+                        .all(|(_, t)| *t != crate::layout::Target::CatalogFilter),
+                    "{name} {w}×{h} 放不下,过滤命中区也不该产(渲染与命中同源)"
+                );
+            }
+        }
+    }
+
+    /// 规格验收 10:过滤态在两档(80×30 / 66×50)整帧渲染不溢宽;过滤空态同。
+    #[test]
+    fn 过滤态两档渲染不溢宽() {
+        let mut app = book("机器");
+        过滤敲词(&mut app, "gate");
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let f = crate::testutil::frame_display(&app, w, h);
+            assert!(f.contains("命中 1/2"), "{w}×{h} 标题显命中/总数:{f}");
+            for ln in f.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 有行超宽:{ln}"
+                );
+            }
+        }
+        // 过滤空态两档也不溢宽
+        过滤敲词(&mut app, "zzz-不存在");
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let f = crate::testutil::frame_display(&app, w, h);
+            assert!(f.contains("无命中"), "{w}×{h} 过滤空态在场:{f}");
+            for ln in f.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 过滤空态有行超宽:{ln}"
+                );
+            }
+        }
+    }
+
+    /// 规格验收 1 / 故事 10-13:每册按各自的可匹配字段过滤(机器 名/地址/登录/
+    /// 备注;标签 名/引用;订阅 名/应用/到期日;钥匙 名/主机/作用域/轮换日)。
+    #[test]
+    fn 四本册各自按可匹配字段过滤() {
+        // 机器册:地址 / 登录 / 备注
+        let mut vps = book("机器"); // gate(10.0.0.1, root→$DEPLOY_KEY, 门口) / bare
+        过滤敲词(&mut vps, "10.0.0.1"); // 地址
+        assert_eq!(vps.catalog_visible().len(), 1, "机器册按地址过滤");
+        过滤敲词(&mut vps, "$DEPLOY_KEY"); // 登录 key_ref
+        assert_eq!(vps.catalog_visible().len(), 1, "机器册按登录过滤");
+        过滤敲词(&mut vps, "门口"); // 备注
+        assert_eq!(vps.catalog_visible().len(), 1, "机器册按备注过滤");
+        assert_eq!(vps.selected_vps_name().as_deref(), Some("gate"));
+        // 标签册:引用
+        let mut tag = book("标签"); // pi(引用 deep-research / vps/gate) / bare
+        过滤敲词(&mut tag, "deep-research");
+        assert_eq!(tag.catalog_visible().len(), 1, "标签册按引用 id 过滤");
+        过滤敲词(&mut tag, "vps/gate");
+        assert_eq!(tag.catalog_visible().len(), 1, "标签册按引用 kind/id 过滤");
+        // 订阅册:应用 / 到期日
+        let mut sub = book("订阅"); // airport/soon(Mihomo/Clash, 2099) ...
+        过滤敲词(&mut sub, "Mihomo");
+        assert_eq!(
+            sub.catalog_visible().len(),
+            2,
+            "订阅册按应用过滤(airport+gone)"
+        );
+        过滤敲词(&mut sub, "2099");
+        assert_eq!(sub.catalog_visible().len(), 2, "订阅册按到期日过滤");
+        // 钥匙册:主机 / 作用域 / 轮换日
+        let mut key = book("钥匙"); // ci(ghe.internal) / deploy(github.com, [repo], 2026-01-15)
+        过滤敲词(&mut key, "github.com");
+        assert_eq!(key.catalog_visible().len(), 1, "钥匙册按主机过滤");
+        过滤敲词(&mut key, "repo");
+        assert_eq!(key.catalog_visible().len(), 1, "钥匙册按作用域过滤");
+        过滤敲词(&mut key, "2026-01");
+        assert_eq!(key.catalog_visible().len(), 1, "钥匙册按轮换日过滤");
     }
 }

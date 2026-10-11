@@ -53,6 +53,9 @@ pub enum Target {
     /// ——订阅 / 钥匙册的条目不在 `TAG_REF_KINDS` 里,放一个注定只返回「没有」
     /// 的动作是噪声(spec #65 §4:触发点只有一处)。
     VpsReverse,
+    /// 点正文键位行的「过滤」段 = 按 `/` 进册内过滤输入态(#69:与键盘 `/`
+    /// 同一路,鼠标只是叠加;段上文案由渲染与命中共用,点哪打哪)。
+    CatalogFilter,
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -279,7 +282,10 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         return;
     }
     // 册体:清单行命中(渲染每条目占 `row_lines` 行,命中按条给整块)
-    let n = kind.len(app);
+    // #69:只给「看得见的那一行」产命中——行数取可见行数(经过滤后的),
+    // 不过滤时 = 册体条数,与过去逐字等价;点第 i 个可见行 = 选中第 i 个
+    // 可见行(`on_mouse` 的 SelectRow 经 catalog_visible 映射回原始投影)。
+    let n = app.catalog_visible().len();
     push_sheet_rows(inner, n, kind.row_lines(), hits);
 
     // 正文键位行的可点动作段(#67):段清单由 `catalog::catalog_key_parts` 一处

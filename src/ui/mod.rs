@@ -416,6 +416,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('m'),
     },
     HelpRow {
+        key: "/",
+        desc: "编目:册内过滤(本地筛选,键入即筛;Esc 清词)",
+        screen: Some(Screen::Vps),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('/'),
+    },
+    HelpRow {
         key: "g",
         desc: "编目:取回链接的命令(订阅册,只给建议)",
         screen: Some(Screen::Vps),

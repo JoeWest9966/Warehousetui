@@ -414,6 +414,17 @@ pub struct App {
     /// 过滤词输入态(#61,键 `/`):与 NW_HOME / 数据仓根手填同一级输入态,
     /// 键入即筛。只在配方屏在场时吞键(切屏即退输入态,过滤词保留)。
     pub rc_filter_on: bool,
+    /// 编目册册内过滤词(#69),**按册各留一份**:`[String; 4]` 以
+    /// [`CatalogKind::idx`](crate::screens::CatalogKind::idx) 为下标,换册时每本
+    /// 各留各的词(规格故事 24:机器册筛「gate」、切到钥匙册筛「deploy」,回头
+    /// 机器册还在「gate」上)。与 #61 五域 `rc_filter` 同源——**纯本地筛选**,
+    /// 只作用于面板已拿到的投影,不新增引擎调用、不改数据来源、不把关键词
+    /// 带进任何一条 argv。空串 = 不过滤(与过滤前逐字节相同)。
+    pub catalog_filter: [String; 4],
+    /// 编目册过滤输入态(#69,键 `/`):与 `rc_filter_on` 同一级顶层输入态
+    /// (优先于册内键位,但只在编目屏在场时吞键)。键入即筛;`Enter` 收词退
+    /// 输入态、`Esc` 清词。切屏即退输入态但留词(后果链与 #61 一字不差)。
+    pub catalog_filter_on: bool,
 
     /// 最近动作流水,概览屏右下「最近日志」。
     pub log: Vec<String>,
@@ -573,6 +584,8 @@ impl App {
             rc_bake_sel: false,
             rc_filter: String::new(),
             rc_filter_on: false,
+            catalog_filter: [String::new(), String::new(), String::new(), String::new()],
+            catalog_filter_on: false,
             log: vec!["驾驶舱已就绪".into()],
             queue: Vec::new(),
             pending_editor: false,
@@ -763,6 +776,7 @@ impl App {
             Target::NavTo(s) => {
                 self.screen = s;
                 self.rc_filter_on = false; // 点导航切屏同样退过滤输入态(#61)
+                self.catalog_filter_on = false; // 编目册过滤同理(#69)
             }
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
@@ -817,6 +831,9 @@ impl App {
             // 有条目(= 选中了一行)时由 catalog_hits 产出,故到达即确有一台机器
             // 可问;滚轮分支不受理它(滚过反查段不发起调用)。
             Target::VpsReverse => self.vps_reverse_lookup(),
+            // 点正文键位行的「过滤」段(#69):与键盘 `/` 完全同路——进册内过滤
+            // 输入态。鼠标只是叠加,不新增语义。
+            Target::CatalogFilter => self.catalog_filter_on = true,
         }
     }
 
@@ -1185,6 +1202,14 @@ impl App {
         // 但只在本屏在场时吞键——切屏即退输入态,过滤词保留可预期。
         if self.rc_filter_on && self.screen == Screen::Recipes {
             self.on_key_rc_filter(k);
+            return;
+        }
+        // 编目册册内过滤输入态(#69):与 `rc_filter_on` 同一级顶层输入态
+        // (优先于册内键位,但只在编目屏在场时吞键——切屏即退输入态,过滤词
+        // 按册保留)。插在 vps_flow / rm_confirm 守卫**之前**:它是顶层浮层,
+        // 与 `rc_filter` 同级,不与登记两段式混。
+        if self.catalog_filter_on && self.screen == Screen::Vps {
+            self.on_key_catalog_filter(k);
             return;
         }
         // 编目册登记两段式(#53):与外部源登记同级的浮层优先级,
@@ -1657,6 +1682,45 @@ impl App {
         }
     }
 
+    /// 编目册册内过滤输入态(#69,与 `on_key_rc_filter` 同一形态、同一后果链):
+    /// 键入分发归通用态机 [`input::on_key`](与两份手填 / 五域过滤同一条路),
+    /// 本函数只接过滤这一条的后果链。**纯本地**:改的只有当前册的过滤词一个
+    /// 字符串,不入队、不下发任何引擎命令、不把关键词写进别处。`Enter` 收词
+    /// 退输入态;`Esc/q` 取消并清空过滤词(两种退出都可预期);每改一个词选中
+    /// 回顶。按册各留一份:清的只是当前这一本的词。
+    fn on_key_catalog_filter(&mut self, k: KeyEvent) {
+        let action = input::on_key(self.catalog_filter_mut(), k);
+        match action {
+            InputAction::Submit => {
+                self.catalog_filter_on = false;
+                *self.catalog_kind.sel_mut(self) = 0;
+                let n = self.catalog_visible().len();
+                self.push_log(format!(
+                    "过滤词「{}」:{}册 {} 条命中(本地筛选,未入队)",
+                    self.catalog_filter().trim(),
+                    self.catalog_kind.label(),
+                    n
+                ));
+            }
+            InputAction::Cancel => {
+                self.clear_catalog_filter();
+                self.push_log("已清空过滤词:回到编目全量".to_string());
+            }
+            InputAction::Edited => {
+                *self.catalog_kind.sel_mut(self) = 0;
+            }
+            InputAction::Ignored => {}
+        }
+    }
+
+    /// 清空当前册过滤词并让选中回顶(#69):输入态 Cancel / Esc 共用一条后果链
+    /// (与 `clear_rc_filter` 同形状)。**只清当前这一本**——换册各留各的词。
+    fn clear_catalog_filter(&mut self) {
+        self.catalog_filter_mut().clear();
+        self.catalog_filter_on = false;
+        *self.catalog_kind.sel_mut(self) = 0;
+    }
+
     /// 数据仓根手填键位:与 NW_HOME 手填同一条通用态机
     /// ([`input::on_key`]),本函数只接数据仓根的后果链。
     fn on_key_data_input(&mut self, k: KeyEvent) {
@@ -1941,10 +2005,12 @@ impl App {
 
     /// 选中机器的名字(删除确认与键位行同源)。
     pub fn selected_vps_name(&self) -> Option<String> {
-        let d = self.vps_ls.as_ref()?;
-        d.machines
-            .get(self.vps_sel.min(d.machines.len().saturating_sub(1)))
-            .map(|m| m.name.clone())
+        // #69:登记 / 删除 / 反查都作用于「看得见的那一行」——下标经过滤后的
+        // 可见列表映射回原始投影。不过滤时 vis = 0..n,与过去的 `machines[sel]`
+        // 等价(投影按名排序,册体与选中同一口径)。
+        let sheet = self.catalog_sheet()?;
+        let i = *self.catalog_visible().get(self.vps_sel)?;
+        sheet.entries.get(i).map(|e| e.name.clone())
     }
 
     /// vps 入口门(#29 能力门 + #27 数据仓根,与外部源登记同两道、互不冒充):
@@ -1963,10 +2029,27 @@ impl App {
 
     /// 编目册屏键位:`m` 换册(机器 / 标签 / 订阅 / 钥匙);各册 r 登记 /
     /// ↑/↓ 选 / d 删除 / l 重读;订阅与钥匙册 `g` 只给取回建议命令、
-    /// 标签册 `Enter` 反查选中的这一条(#54 / #56 / #57)。
+    /// 标签册 `Enter` 反查选中的这一条(#54 / #56 / #57);`/` 册内过滤(#69)。
     fn key_catalog(&mut self, k: KeyEvent) {
         if let KeyCode::Char('m') = k.code {
             self.cycle_catalog_kind();
+            return;
+        }
+        // 册内过滤入口(#69):`/` 进过滤输入态(点正文「过滤」段同路,见
+        // `on_mouse` 的 `Target::CatalogFilter`)。与 #61 五域 `/` 同形:输入态
+        // 优先于册内动作键,键入即筛。
+        if let KeyCode::Char('/') = k.code {
+            self.catalog_filter_on = true;
+            return;
+        }
+        // Esc 一键回全量(#69):不在输入态时,按 Esc 清当前册过滤词并让选中回顶
+        // (输入态下 Esc 归 `on_key_catalog_filter` 的 Cancel,同一后果链)。
+        // 无过滤词时 Esc 什么都不做(与 #61 五域同口径)。
+        if let KeyCode::Esc = k.code {
+            if !self.catalog_filter().is_empty() {
+                self.clear_catalog_filter();
+                self.push_log("已清空过滤词:回到编目全量".to_string());
+            }
             return;
         }
         // 册内动作键(#66):**四本册同一处查表 + 同一处落实**。按册差异全在
@@ -2307,11 +2390,48 @@ impl App {
         self.catalog_kind.sel(self)
     }
 
+    /// 当前这一本的过滤词(#69,按册各留一份):取 `catalog_filter[idx]`。
+    /// 换册时每本各留各的词,靠 [`CatalogKind::idx`](crate::screens::CatalogKind::idx)
+    /// 取自己那一份——调用方不写 `match kind`。
+    pub fn catalog_filter(&self) -> &str {
+        &self.catalog_filter[self.catalog_kind.idx()]
+    }
+
+    /// 当前这一本过滤词的可写侧(输入态 [`Self::on_key_catalog_filter`] 键入用)。
+    fn catalog_filter_mut(&mut self) -> &mut String {
+        &mut self.catalog_filter[self.catalog_kind.idx()]
+    }
+
+    /// 当前这一本**可见行**在原始投影里的下标(#69 册内过滤,与 #61 五域
+    /// `rc_visible` 同一族口径,全册单一「看得见的那一行」真相源):无关键词时
+    /// 就是 `0..n` 全量同序(与过滤前逐字节相同,面板永不重排引擎输出);有关键词时
+    /// 按册在该行字段上做大小写不敏感包含匹配。只筛面板已拿到的投影——不新增
+    /// 引擎调用、不改数据来源、不把关键词带进任何命令。
+    pub fn catalog_visible(&self) -> Vec<usize> {
+        let Some(sheet) = self.catalog_sheet() else {
+            return Vec::new();
+        };
+        let q = self.catalog_filter().trim().to_lowercase();
+        (0..sheet.entries.len())
+            .filter(|&i| {
+                q.is_empty()
+                    || self
+                        .catalog_kind
+                        .match_fields(&sheet.entries[i])
+                        .iter()
+                        .any(|f| f.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
     /// 册级选中态的**单一查表**:当前是哪一本,就借出它自己的选中槽与行数
     /// (键位 ↑/↓、鼠标点行、滚轮移选中都走这一口,换册不串味)。
+    /// 行数取**可见行数**(#69:`catalog_sel` 是「看得见的那一行」在可见列表里
+    /// 的位置,↑/↓ / 点行 / 钳位都建立在 `catalog_sel ∈ [0, 可见行数)` 上;
+    /// 不过滤时可见行数 = 册体条数,与过去逐字等价)。
     /// 只读侧的同源口径是 [`App::catalog_sel`] / [`App::catalog_len`]。
     fn catalog_sel_mut(&mut self) -> (&mut usize, usize) {
-        let n = self.catalog_len();
+        let n = self.catalog_visible().len();
         (self.catalog_kind.sel_mut(self), n)
     }
 
@@ -2348,11 +2468,10 @@ impl App {
 
     /// 选中标签的名字(反查这一条 / 摘引用删标签同源)。
     pub fn selected_tag_name(&self) -> Option<String> {
+        // #69:同 `selected_vps_name`——经过滤后的可见列表映射回原始投影。
         let sheet = self.catalog_sheet()?;
-        sheet
-            .entries
-            .get(self.tag_sel.min(sheet.entries.len().saturating_sub(1)))
-            .map(|e| e.name.clone())
+        let i = *self.catalog_visible().get(self.tag_sel)?;
+        sheet.entries.get(i).map(|e| e.name.clone())
     }
 
     /// 标签册入口门(#29 能力门 + #27 数据仓根,与 vps 册同两道、互不冒充)。
@@ -2790,10 +2909,10 @@ impl App {
 
     /// 选中订阅的名字(删除确认 / 取回建议命令同源)。
     pub fn selected_sub_name(&self) -> Option<String> {
-        let d = self.sub_ls.as_ref()?;
-        d.subscriptions
-            .get(self.sub_sel.min(d.subscriptions.len().saturating_sub(1)))
-            .map(|s| s.name.clone())
+        // #69:同 `selected_vps_name`——经过滤后的可见列表映射回原始投影。
+        let sheet = self.catalog_sheet()?;
+        let i = *self.catalog_visible().get(self.sub_sel)?;
+        sheet.entries.get(i).map(|e| e.name.clone())
     }
 
     /// 订阅册入口门(#29 能力门 + #27 数据仓根,与 vps / tag 册同两道、互不冒充)。
@@ -3143,10 +3262,10 @@ impl App {
 
     /// 选中钥匙的名字(删除确认 / 取回建议命令同源)。
     pub fn selected_key_name(&self) -> Option<String> {
-        let d = self.key_ls.as_ref()?;
-        d.keys
-            .get(self.key_sel.min(d.keys.len().saturating_sub(1)))
-            .map(|k| k.name.clone())
+        // #69:同 `selected_vps_name`——经过滤后的可见列表映射回原始投影。
+        let sheet = self.catalog_sheet()?;
+        let i = *self.catalog_visible().get(self.key_sel)?;
+        sheet.entries.get(i).map(|e| e.name.clone())
     }
 
     /// 钥匙册入口门(#29 能力门 + #27 数据仓根,与 vps / tag / subscription 册同两道)。
@@ -3662,12 +3781,14 @@ impl App {
         let i = (self.screen.index() + 1) % Screen::ALL.len();
         self.screen = Screen::ALL[i];
         self.rc_filter_on = false; // 切屏退过滤输入态(#61),过滤词留着回屏还在
+        self.catalog_filter_on = false; // 编目册过滤同理(#69):退输入态、留词
     }
 
     pub fn prev_screen(&mut self) {
         let i = (self.screen.index() + Screen::ALL.len() - 1) % Screen::ALL.len();
         self.screen = Screen::ALL[i];
         self.rc_filter_on = false;
+        self.catalog_filter_on = false;
     }
 
     pub fn cycle_theme(&mut self) {
@@ -6825,6 +6946,8 @@ mod tests {
         data_input: bool,
         rc_filter_on: bool,
         rc_filter: String,
+        catalog_filter_on: bool,
+        catalog_filter: [String; 4],
         pending_editor: bool,
         mouse_enabled: bool,
         nw_home: String,
@@ -6851,6 +6974,8 @@ mod tests {
             data_input: a.data_input,
             rc_filter_on: a.rc_filter_on,
             rc_filter: a.rc_filter.clone(),
+            catalog_filter_on: a.catalog_filter_on,
+            catalog_filter: a.catalog_filter.clone(),
             pending_editor: a.pending_editor,
             mouse_enabled: a.mouse_enabled,
             nw_home: a.nw_home.clone(),
