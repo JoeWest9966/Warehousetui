@@ -812,6 +812,11 @@ impl App {
             // 命中区只在真有 up 在途(as_running)时由 assemble_hits 产出,故此臂
             // 到达即确有进程可止;滚轮分支不受理它(滚过中止段不点火)。
             Target::Abort => self.abort_assembling(),
+            // 点正文键位行的「Enter 反查」段(#70):与机器册选中行上按 `Enter`
+            // 完全同路——只读地问「什么标签引用了这一条」。段只在机器册、且册体
+            // 有条目(= 选中了一行)时由 catalog_hits 产出,故到达即确有一台机器
+            // 可问;滚轮分支不受理它(滚过反查段不发起调用)。
+            Target::VpsReverse => self.vps_reverse_lookup(),
         }
     }
 
@@ -910,6 +915,12 @@ impl App {
         } else if self.as_confirm {
             self.as_confirm = false;
             self.push_log("发射取消");
+        } else if self.vps_reverse_open() {
+            // 反查上浮结果浮层返航(#70):只收状态,册体一行不改、机器册原选中行
+            // 原样在场——反查从头到尾不写 `vps_sel`(它在途时册体键位被吞、回音
+            // 落地只按当前册钳位),所以「回到原选中行」不需要一次恢复动作,只
+            // 需要不在返航时顺手改它。Esc 与点任意处走这一条同路(语义不漂移)。
+            self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
@@ -1149,6 +1160,16 @@ impl App {
         }
         if self.as_confirm {
             self.on_key_confirm(k);
+            return;
+        }
+        // 反查上浮结果浮层(#70):与帮助浮层同级的**顶层浮层**——它在场时吞键,
+        // 只有 Esc 返航;册体键位(↑/↓ / r / d / l / Enter / m)一个都不受理,
+        // 机器册原选中行因此原样不动(规格故事 37:返航后回到原选中行)。
+        // 与 `dismiss_popup` 同路:鼠标点任意处与键盘 Esc 一个后果。
+        if self.vps_reverse_open() {
+            if matches!(k.code, KeyCode::Esc) {
+                self.dismiss_popup();
+            }
             return;
         }
         // 浮层优先级:帮助浮层 > 发射确认 > 手填输入(NW_HOME / 数据仓根) > 指路屏/常屏(见 spec #9)

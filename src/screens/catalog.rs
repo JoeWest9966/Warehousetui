@@ -512,9 +512,20 @@ impl CatalogKind {
     }
 
     /// 册体有条目时的册内键位行**段清单**(常态)。
+    ///
+    /// 机器册这一段在 #70 收窄过两处,好让「Enter 反查」可点段在 66×50 的
+    /// 紧凑态也放得下(#67 的纪律:放不下就不画也不给命中,而规格故事 52 要求
+    /// 新命中区两档都算得对):`↑/↓ 选机器` → `↑/↓ 选`(选哪一本 HUD 已说),
+    /// `Esc/q 返航` → `Esc 返航`(**`q` 在册体上是退出面板,不是返航**——旧文案
+    /// 把两个语义混成一句;浮层里的 `Esc/q 返航` 仍两键都认,那句不动)。
+    ///
+    /// 「Enter 反查」**不写在这里**:它是可点动作段,由 `catalog_key_parts`
+    /// 按「只机器册 + 有选中行」现拼(提示段与可点段在一处汇合,渲染与命中
+    /// 共用同一份清单);写进这张静态表就会在订阅 / 钥匙册上也画出一个点不动
+    /// 的段,也会在空册上问一台不存在的机器。
     pub fn keys_body(self) -> &'static [&'static str] {
         match self {
-            CatalogKind::Vps => &["  ↑/↓ 选机器", "r 登记", "d 删除", "Esc/q 返航"],
+            CatalogKind::Vps => &["  ↑/↓ 选", "r 登记", "d 删除", "Esc 返航"],
             CatalogKind::Tag => &["  ↑/↓ 选", "Enter 反查", "l 全部", "r 挂标签", "d 摘/删"],
             CatalogKind::Subscription => {
                 &["  ↑/↓ 选订阅", "r 登记", "g 取回命令", "d 删除", "l 重读"]
@@ -1757,6 +1768,15 @@ pub(crate) const CATALOG_KEY_GAP: &str = " · ";
 /// 串、命中测这个串的宽,同一份字符串;段可点(accent 高亮),与键盘 `m` 同路。
 pub(crate) const CATALOG_SWITCH: &str = "m 换册";
 
+/// 键位行「Enter 反查」可点文案(#70):点它 = 机器册选中行上按 `Enter`
+/// (`App::vps_reverse_lookup`)。渲染画这个串、命中测这个串的宽,同一份
+/// 字符串——点哪打哪(ADR-0005)。
+///
+/// **只机器册给这一段**:`TAG_REF_KINDS` 的已知集合是 `skill` / `extension`
+/// / `vps`,四本册里只有机器册的条目可打标签;订阅 / 钥匙册放这个动作注定
+/// 只返回「没有」,是噪声(spec #65 §4:触发点只有一处)。
+pub(crate) const CATALOG_REVERSE: &str = "Enter 反查";
+
 /// 编目册键位行的**段清单**(#67 通用接缝的第一个用户):提示段只画不点
 /// (`None`),末段「换册」可点(`Some(SwitchBook)`)。渲染与命中测试共用这
 /// 同一份清单——段文案与段宽一处真相。
@@ -1781,6 +1801,12 @@ pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::l
         kind.keys_body()
     };
     let mut parts: Vec<(&'static str, Option<Target>)> = hint.iter().map(|s| (*s, None)).collect();
+    // 反查上浮触发段(#70):只机器册、且册体有条目(= 选中了一行)才给。
+    // 判据与 `keys_body` / `keys_empty` 的分岔同一个——空册没有「选中的这一
+    // 条」可问,面板不空手问,也不画一个点下去只得到一行指路的段。
+    if kind == CatalogKind::Vps && kind.len(app) > 0 {
+        parts.push((CATALOG_REVERSE, Some(Target::VpsReverse)));
+    }
     parts.push((CATALOG_SWITCH, Some(Target::SwitchBook)));
     parts
 }
@@ -2246,7 +2272,23 @@ fn render_rm_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// 反查上浮结果浮层的矩形(#70):**渲染与命中区共用这一处几何**(ADR-0005:
+/// 反查命中标签的**引用一行**(`kind/id` 逐条,空数组 = 「——」):与标签册
+/// 明细的 [`CatalogEntryView::ref_line`](crate::engine::CatalogEntryView::ref_line)
+/// 同一拼法——面板不为浮层另造一种引用文案(一处真相)。
+///
+/// **只印指针,不印机密本体**:标签引用恒是 `<kind>/<条目>` 形式的指针,
+/// 密钥本体只经 stdin 进、投影里根本没有(ADR-0009 §1)。
+fn tag_hit_ref_line(refs: &[crate::engine::CatalogRef]) -> String {
+    if refs.is_empty() {
+        return "——".to_string();
+    }
+    refs.iter()
+        .map(|r| r.label())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// 反查上浮结果浮层的矩形(#70):**渲染与命中区共用这一处几何**(ADR-0005):
 /// 一处真相,点哪打哪)。高按命中数现算——标题 1 行 + 命中标签 N 行 + 收口
 /// 1 行 + 上下边框 2 行;「一条都没有」是固定 3 行内容。`None` = 没有可画
 /// 的浮层(在途 / 闲置 / 读不到都不画薄浮层;读不到走既有指路)。
@@ -2291,10 +2333,7 @@ fn render_vps_reverse_popup(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled(clip(&t.name, 18), p.accent().bold()),
                     Span::raw("  "),
                     Span::styled(
-                        clip(
-                            &crate::engine::CatalogRef::line(&t.refs),
-                            inner_w.saturating_sub(24),
-                        ),
+                        clip(&tag_hit_ref_line(&t.refs), inner_w.saturating_sub(24)),
                         p.dim(),
                     ),
                 ]));
@@ -4033,8 +4072,9 @@ mod tests {
             let s = crate::testutil::frame_display(&app, w, h);
             assert!(s.contains("编目"), "{w}×{h} 册体应在场");
             assert!(s.contains("gate"), "{w}×{h} 机器名应在场");
-            // 键位行钉在册体末行(两档同文案)
-            assert!(s.contains("选机器"), "{w}×{h} 键位行应在场:{s}");
+            // 键位行钉在册体末行(两档同文案);#70 起机器册这一行还带可点的
+            // 「Enter 反查」段(只机器册有,见 `catalog_key_parts`)
+            assert!(s.contains("Enter 反查"), "{w}×{h} 键位行应在场:{s}");
             // 不溢出:每行显示宽不超终端宽
             for ln in s.lines() {
                 assert!(
@@ -5930,7 +5970,7 @@ mod tests {
 │          ││    地址 home=10.0.0.1                                            │
 │          ││    登录 root→$DEPLOY_KEY                                         │
 │          ││    备注 门口                                                     │
-│          ││  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册              │
+│          ││  ↑/↓ 选 · r 登记 · d 删除 · Esc 返航 · Enter 反查 · m 换册       │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -5962,7 +6002,7 @@ mod tests {
 │    地址 home=10.0.0.1                                          │
 │    登录 root→$DEPLOY_KEY                                       │
 │    备注 门口                                                   │
-│  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册            │
+│  ↑/↓ 选 · r 登记 · d 删除 · Esc 返航 · Enter 反查 · m 换册     │
 │                                                                │
 │                                                                │
 │                                                                │

@@ -47,6 +47,12 @@ pub enum Target {
     /// 也不给命中;与发射前浮层里的「Esc 返航」(`DismissPopup`)是两个语义,
     /// 不共屏、不共话术。
     Abort,
+    /// 点编目屏正文键位行的「Enter 反查」段 = 机器册选中行上按 `Enter`
+    /// (#70:反查上浮的鼠标触发,与键盘 `App::vps_reverse_lookup` 完全同路)。
+    /// **只机器册、且册体有条目(= 选中了一行)才由 `catalog_hits` 产出这一段**
+    /// ——订阅 / 钥匙册的条目不在 `TAG_REF_KINDS` 里,放一个注定只返回「没有」
+    /// 的动作是噪声(spec #65 §4:触发点只有一处)。
+    VpsReverse,
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -231,6 +237,21 @@ fn screen_hits(content: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect,
 /// 没有第四份 `if kind == …`。加第五本册子只改查表,此处不动。
 fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     let kind = app.catalog_kind;
+    // 反查上浮结果浮层(#70):**本屏弹层优先级最高的一层**——它在场时整块
+    // 正文只有一个「点任意处返航」命中区,底层清单行与键位行(含「换册」
+    // 「Enter 反查」两段)一段都不产:浮层吞点击、不穿透底层
+    // (spec #65 故事 37 / 50)。
+    //
+    // 命中区取**整块正文**而不是浮层矩形:规格钉的是「`Esc` 或任意处点击
+    // 关闭」(spec #65 §7),点浮层外的空白也算返航;只给浮层矩形会变成
+    // 「点外面没反应」,与规格原文相反。整块正文即浮层自己的命中区,底层
+    // 不另产——「只有浮层自己的命中」这条弹层纪律不变。
+    if app.vps_reverse_open() {
+        if inner.width > 0 && inner.height > 0 {
+            hits.push((inner, Target::DismissPopup));
+        }
+        return;
+    }
     // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)。
     // 标签册的确认态没有「Enter 落账」段(`CatalogKind::can_commit` 恒 false,
     // 上游 tag add 无确认闸),所以同一处条件对它自然不产段。
