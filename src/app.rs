@@ -5553,6 +5553,14 @@ mod tests {
         );
     }
 
+    /// 点顶栏 / HUD 行零状态变化(#16 钉住:HUD 是提示栏,永远不可点)。
+    ///
+    /// 快照字段刻意带上**编目册本轮新增的三个状态**(#65 评审第 10 条):
+    /// `catalog_kind` / `catalog_filter_on` / `vps_reverse`。它们在结构上今天
+    /// 不可能被这一下改到(`area_pad` 先把 HUD 整行从命中区切掉,任何 `*_hits`
+    /// 都在切过的区域上跑),但正因为切得干净,旧的快照元组**结构上就看不见
+    /// 编目屏上的回归**——而这正是本轮长出三个可点正文段的地方。带上这三个
+    /// 字段,将来看不见的回归才会真的红。
     #[test]
     fn 点空白不改状态_顶栏与hud行() {
         let mut app = mouse_ls_app();
@@ -5567,6 +5575,9 @@ mod tests {
             app.queue.len(),
             app.as_confirm,
             app.help,
+            app.catalog_kind,
+            app.catalog_filter_on,
+            app.vps_reverse.clone(),
         );
         // 顶栏(y=0)与 HUD(y=29)都不在命中区内(#16 钉住)
         app.update(Message::Mouse(mouse_at(
@@ -5589,6 +5600,9 @@ mod tests {
                 app.queue.len(),
                 app.as_confirm,
                 app.help,
+                app.catalog_kind,
+                app.catalog_filter_on,
+                app.vps_reverse.clone(),
             ),
             before,
             "点空白零变化"
