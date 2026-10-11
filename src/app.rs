@@ -1329,9 +1329,11 @@ impl App {
             KeyCode::Char('h') => self.screen = Screen::Health,
             KeyCode::Char('l') => self.screen = Screen::Recipes,
             // #68:「家」直达第六屏(编目)。键取 `v`(屏枚举 `Screen::Vps` 首字母),
-            // 与既有 `a/h/l` 跳屏同构;屏上指令栏、HUD/帮助、README 三处同写 `v`
-            // (屏上看到的与我按下的是一回事,故事 5)。纯导航零引擎调用——册体到编目
-            // 屏按 `l` 才读,门禁也按册各自给,不在指令栏做禁用态。
+            // 与既有 `a/h/l` 跳屏同构;屏上指令栏、帮助、README 三处同写 `v`
+            // (屏上看到的与我按下的是一回事,故事 5)。HUD 不写它——HUD 是壳级
+            // 提示栏,只有 j/k 切屏 / Enter 确认 / t 主题 / ? 帮助 / q 退出。
+            // 纯导航零引擎调用——册体到编目屏按 `l` 才读,门禁也按册各自给,
+            // 不在指令栏做禁用态。
             KeyCode::Char('v') => self.screen = Screen::Vps,
             KeyCode::Down | KeyCode::Char('n') => {
                 if n > 0 {
@@ -5269,7 +5271,8 @@ mod tests {
 
     /// 键盘路:概览按 `v` 一键到第六屏(编目),且纯导航零引擎调用、不写流水。
     /// 键位选 `v`(屏枚举 `Screen::Vps` 首字母)与既有 `a`/`h`/`l` 跳屏同构,
-    /// 全仓无 `Char('v')` 冲突;HUD/帮助/README 三处同写 `v`(屏上=按下,#68 故事 5)。
+    /// 全仓无 `Char('v')` 冲突;指令栏 / 帮助 / README 三处同写 `v`
+    /// (屏上=按下,#68 故事 5)。HUD 不写它:壳级提示栏只写 j/k、Enter、t、?、q。
     #[test]
     fn 概览_按v跳到编目屏_零引擎调用() {
         let mut app = fake_app();
