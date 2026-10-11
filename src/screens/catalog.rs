@@ -293,6 +293,19 @@ impl CatalogKind {
         }
     }
 
+    /// 这一本在「按册各留一份」状态数组里的下标(#69 册内过滤:编目过滤词是
+    /// `[String; 4]`,换册时每本各留各的词,靠这个下标取自己那一份;
+    /// 规格故事 24:机器册筛「gate」、切到钥匙册筛「deploy」,回头机器册
+    /// 还在「gate」上)。四本固定 0/1/2/3,与枚举声明序一致。
+    pub fn idx(self) -> usize {
+        match self {
+            CatalogKind::Vps => 0,
+            CatalogKind::Tag => 1,
+            CatalogKind::Subscription => 2,
+            CatalogKind::Key => 3,
+        }
+    }
+
     // ---- 册级查表(工单 #66:按册差异只剩数据,不再有分支) ----
     //
     // 下面这一族把「这一本的登记流槽 / 删除确认旗 / 册体条数 / 选中槽 /
@@ -429,6 +442,65 @@ impl CatalogKind {
             CatalogKind::Subscription => app.sub_ls.as_ref().map(|d| d.sheet()),
             CatalogKind::Key => app.key_ls.as_ref().map(|d| d.sheet()),
         }
+    }
+
+    /// 这一本的一条条目**参与过滤的字段**(#69,与 #61 五域 `domain_row_fields`
+    /// 同一族口径):按册取该行在列表与明细里出现过的文本。**只收引擎真给了的
+    /// 字段**,缺字段 / 占位符「——」一律不入匹配面——不猜、不拿「——」冒充
+    /// 可检索内容(规格 §3「每册一份可匹配字段」)。机器 = 名/地址/登录/备注;
+    /// 标签 = 名/引用;订阅 = 名/应用/到期日;钥匙 = 名/主机/作用域/轮换日。
+    /// 落在查表成员上(#66 模式):调用方(`App::catalog_visible`)只写
+    /// `kind.match_fields(e)`,不再有四份按册匹配分支。
+    pub fn match_fields(self, e: &CatalogEntryView) -> Vec<String> {
+        let mut v = vec![e.name.clone()];
+        match self {
+            CatalogKind::Vps => {
+                for a in &e.addrs {
+                    v.push(a.label.clone());
+                    v.push(a.addr.clone());
+                }
+                for l in &e.logins {
+                    v.push(l.user.clone());
+                    v.push(l.key_ref.clone());
+                }
+                if let Some(n) = e.note.as_deref().filter(|s| !s.is_empty()) {
+                    v.push(n.to_string());
+                }
+            }
+            CatalogKind::Tag => {
+                for r in &e.refs {
+                    v.push(r.label());
+                }
+            }
+            CatalogKind::Subscription => {
+                if let Some(c) = e.client.as_deref().filter(|s| !s.is_empty()) {
+                    v.push(c.to_string());
+                }
+                if let Some(x) = e
+                    .expires
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    v.push(x.to_string());
+                }
+            }
+            CatalogKind::Key => {
+                if let Some(h) = e.host.as_deref().filter(|s| !s.is_empty()) {
+                    v.push(h.to_string());
+                }
+                v.extend(e.scopes.iter().cloned());
+                if let Some(r) = e
+                    .rotated_at
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    v.push(r.to_string());
+                }
+            }
+        }
+        v
     }
 
     /// 册体「还没读到」的一句话(合法空态之前的第三态:一次 ls 都没成功过)。
@@ -1609,17 +1681,30 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
     } else if app.data_root_cause().is_some() {
         lines.extend(data_root_signpost(app));
     } else {
+        // 册内过滤态(#69):标题显「命中/总数」——被过滤空在标题层就与册体
+        // 真空 / 还没读到可区分(规格故事 19)。不过滤时 count 段为空,与过滤前
+        // 逐字节相同(面板永不重排引擎输出,故事 18/30)。
+        let filtering = !app.catalog_filter().trim().is_empty();
+        let count = if filtering {
+            format!(" · 命中 {}/{}", app.catalog_visible().len(), kind.len(app))
+        } else {
+            String::new()
+        };
+        // 过滤态多出 count 段,路径按同一总预算再让一截,整行不因过滤而溢宽。
+        let path_budget =
+            w.saturating_sub(20 + unicode_width::UnicodeWidthStr::width(count.as_str()));
         lines.push(Line::from(Span::styled(
             format!(
-                "  当前册 {} · {} · 编目 {}",
+                "  当前册 {} · {} · 编目 {}{}",
                 kind.label(),
                 app.catalog_scope_label(),
                 clip(
                     &app.catalog_sheet()
                         .map(|s| s.catalog_path)
                         .unwrap_or_else(|| "—".into()),
-                    w.saturating_sub(20)
-                )
+                    path_budget
+                ),
+                count
             ),
             p.dim(),
         )));
@@ -1649,13 +1734,26 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
                     lines.push(Line::from(Span::styled(title, p.text())));
                     lines.push(Line::from(Span::styled(next, p.dim())));
                 }
-                Some(s) => lines.extend(catalog_sheet_lines(
-                    &s,
-                    w,
-                    app.catalog_sel(),
-                    p,
-                    kind.detail(),
-                )),
+                Some(s) => {
+                    // 册内过滤(#69):只画「看得见的那一行」——下标经
+                    // `catalog_visible` 映射回原始投影。无关键词时 vis = 0..n
+                    // 全量同序,与过滤前逐字节相同。
+                    let vis = app.catalog_visible();
+                    if vis.is_empty() {
+                        // 关键词把条目全筛掉了:与「册体本来是空的」两态可
+                        // 区分,给改词 / 清过滤的下一步,绝不共用一个空列表。
+                        lines.extend(filter_empty_lines(app, s.entries.len(), p));
+                    } else {
+                        lines.extend(catalog_sheet_lines(
+                            &s,
+                            &vis,
+                            w,
+                            app.catalog_sel(),
+                            p,
+                            kind.detail(),
+                        ));
+                    }
+                }
             }
         }
         // 只属于某一本的附述行(订阅册的到期三态汇总 + 取回链接建议;
@@ -1680,6 +1778,11 @@ pub(crate) const CATALOG_KEY_GAP: &str = " · ";
 /// 键位行末段的「换册」可点文案(#67):点它 = 按 `m` 轮转四本册。渲染画这个
 /// 串、命中测这个串的宽,同一份字符串;段可点(accent 高亮),与键盘 `m` 同路。
 pub(crate) const CATALOG_SWITCH: &str = "m 换册";
+
+/// 键位行「过滤」可点文案(#69):点它 = 按 `/` 进册内过滤输入态。与
+/// [`CATALOG_SWITCH`] 同一份接缝——渲染画这个串、命中测这个串的宽,
+/// 段可点(accent 高亮),与键盘 `/` 同路(点哪打哪)。
+pub(crate) const CATALOG_FILTER: &str = "/ 过滤";
 
 /// 编目册键位行的**段清单**(#67 通用接缝的第一个用户):提示段只画不点
 /// (`None`),末段「换册」可点(`Some(SwitchBook)`)。渲染与命中测试共用这
@@ -1706,6 +1809,11 @@ pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::l
     };
     let mut parts: Vec<(&'static str, Option<Target>)> = hint.iter().map(|s| (*s, None)).collect();
     parts.push((CATALOG_SWITCH, Some(Target::SwitchBook)));
+    // 册内过滤入口(#69):有条目可筛时才给这一段(空册没东西可筛,给了反而
+    // 误导)。点它 = 按 `/`,与键盘同一路;空册键位行(`keys_empty`)不带它。
+    if kind.len(app) > 0 {
+        parts.push((CATALOG_FILTER, Some(Target::CatalogFilter)));
+    }
     parts
 }
 
@@ -1733,16 +1841,25 @@ fn key_line(parts: &[(&str, Option<crate::layout::Target>)], p: &Palette) -> Lin
 /// 缺字段显式「——」,不自造、不补全;ref 原样呈现(指针不是密钥),
 /// 摘要不印 ref 与 addr。后三本册子只换 `CatalogSheet` 的数据源与
 /// [`EntryDetail`](条目明细画法),不换列表件。
+///
+/// #69 册内过滤:`vis` 是「看得见的那一行」在原始投影里的下标(
+/// [`App::catalog_visible`] 的产出),本件只画 `vis` 指到的那些条目、按
+/// `vis` 的顺序;选中高亮按**可见位置** `pos == sel`。无关键词时 `vis` =
+/// `0..n` 全量同序,画出来的与过滤前逐字节相同(面板永不重排引擎输出)。
 pub fn catalog_sheet_lines(
     sheet: &CatalogSheet,
+    vis: &[usize],
     width: usize,
     sel: usize,
     p: &Palette,
     detail: EntryDetail,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    for (i, e) in sheet.entries.iter().enumerate() {
-        let on = i == sel;
+    for (pos, &i) in vis.iter().enumerate() {
+        let Some(e) = sheet.entries.get(i) else {
+            continue;
+        };
+        let on = pos == sel;
         let (suffix, rows) = detail(e, width.saturating_sub(12), p);
         let mut head = vec![Span::raw(format!(
             "  {} {}",
@@ -1757,6 +1874,26 @@ pub fn catalog_sheet_lines(
         out.extend(rows);
     }
     out
+}
+
+/// 册内过滤把条目全筛掉了的指路(#69,照 `recipes::ListEmptyCause` 的范式:
+/// 一个概念一个拼写,与「册体本来是空的」「还没读到」三态两两可区分,绝不
+/// 共用一个空列表)。标题(warn 色,与合法空态的正文色区分)+ 两句下一步:
+/// 事实(「q」在 total 条里没命中)+ 出路(改词 / 清过滤)。`total` 是册体
+/// 原始条数(分母),让操作者知道是「被筛掉了」而不是「本来就没有」。
+fn filter_empty_lines(app: &App, total: usize, p: &Palette) -> Vec<Line<'static>> {
+    let q = app.catalog_filter().trim();
+    vec![
+        Line::from(Span::styled(
+            format!("  {}册无命中", app.catalog_kind.label()),
+            p.warn(),
+        )),
+        Line::from(Span::styled(
+            format!("  「{q}」在 {total} 条里没有命中。"),
+            p.dim(),
+        )),
+        Line::from(Span::styled("  按 / 改词 · Esc 清空过滤", p.dim())),
+    ]
 }
 
 /// 机器册的条目明细:名字行后缀给端口,之下给 地址 / 登录 / 备注
@@ -3991,7 +4128,14 @@ mod tests {
             crate::theme::ThemeKind::Warehouse,
             crate::term::ColorCap::Truecolor,
         );
-        let lines = catalog_sheet_lines(&sheet, 60, 0, &p, vps_detail_rows);
+        let lines = catalog_sheet_lines(
+            &sheet,
+            &(0..sheet.entries.len()).collect::<Vec<_>>(),
+            60,
+            0,
+            &p,
+            vps_detail_rows,
+        );
         let text: String = lines
             .iter()
             .map(|l| {
@@ -4380,16 +4524,23 @@ mod tests {
             crate::term::ColorCap::Truecolor,
         );
         let text = |detail: EntryDetail| -> String {
-            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            catalog_sheet_lines(
+                &sheet,
+                &(0..sheet.entries.len()).collect::<Vec<_>>(),
+                60,
+                0,
+                &p,
+                detail,
+            )
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         // 同一份投影,两个画法:机器册给端口/地址/登录/备注,标签册给引用
         let vps = text(vps_detail_rows);
@@ -4977,16 +5128,23 @@ mod tests {
             crate::term::ColorCap::Truecolor,
         );
         let text = |detail: EntryDetail| -> String {
-            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            catalog_sheet_lines(
+                &sheet,
+                &(0..sheet.entries.len()).collect::<Vec<_>>(),
+                60,
+                0,
+                &p,
+                detail,
+            )
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         let sub = text(sub_detail_rows);
         assert!(sub.contains("应用 Mihomo"), "订阅册:{sub}");
@@ -5501,16 +5659,23 @@ mod tests {
             crate::term::ColorCap::Truecolor,
         );
         let text = |detail: EntryDetail| -> String {
-            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            catalog_sheet_lines(
+                &sheet,
+                &(0..sheet.entries.len()).collect::<Vec<_>>(),
+                60,
+                0,
+                &p,
+                detail,
+            )
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         let key = text(key_detail_rows);
         assert!(key.contains("kind github-key"), "钥匙册:{key}");
@@ -5703,7 +5868,7 @@ mod tests {
 │          ││    地址 home=10.0.0.1                                            │
 │          ││    登录 root→$DEPLOY_KEY                                         │
 │          ││    备注 门口                                                     │
-│          ││  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册              │
+│          ││  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册 · / 过滤     │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -5735,7 +5900,7 @@ mod tests {
 │    地址 home=10.0.0.1                                          │
 │    登录 root→$DEPLOY_KEY                                       │
 │    备注 门口                                                   │
-│  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册            │
+│  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册 · / 过滤   │
 │                                                                │
 │                                                                │
 │                                                                │
@@ -5782,7 +5947,7 @@ mod tests {
 │  ▤ 配方  ││    pi                                                            │
 │▸ ▩ 编目  ││    引用 skill/o/r/deep-research · vps/gate                       │
 │  ✦ 设置  ││  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)      │
-│          ││  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册      │
+│          ││  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册 · /  │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -5814,7 +5979,7 @@ mod tests {
 │    pi                                                          │
 │    引用 skill/o/r/deep-research · vps/gate                     │
 │  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)    │
-│  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册    │
+│  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册 · /│
 │                                                                │
 │                                                                │
 │                                                                │
@@ -5873,7 +6038,7 @@ mod tests {
 │          ││nw subscription get --name airport --root /tmp | jq -r .data.url  │
 │          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
 │          ││  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发重   │
-│          ││  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册     │
+│          ││  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 · / │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -5905,7 +6070,7 @@ mod tests {
 │nw subscription get --name airport --root /tmp | jq -r .data.u  │
 │  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
 │  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发   │
-│  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册   │
+│  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 · │
 │                                                                │
 │                                                                │
 │                                                                │
@@ -5953,7 +6118,7 @@ mod tests {
 │          ││nw key get --name ci --root /tmp | jq -r .data.key                │
 │          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
 │          ││  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供烤  │
-│          ││  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册     │
+│          ││  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 · / │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -5985,7 +6150,7 @@ mod tests {
 │nw key get --name ci --root /tmp | jq -r .data.key              │
 │  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
 │  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供  │
-│  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册   │
+│  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 · │
 │                                                                │
 │                                                                │
 │                                                                │
