@@ -1269,6 +1269,11 @@ impl App {
             KeyCode::Char('a') => self.screen = Screen::Assemble,
             KeyCode::Char('h') => self.screen = Screen::Health,
             KeyCode::Char('l') => self.screen = Screen::Recipes,
+            // #68:「家」直达第六屏(编目)。键取 `v`(屏枚举 `Screen::Vps` 首字母),
+            // 与既有 `a/h/l` 跳屏同构;屏上指令栏、HUD/帮助、README 三处同写 `v`
+            // (屏上看到的与我按下的是一回事,故事 5)。纯导航零引擎调用——册体到编目
+            // 屏按 `l` 才读,门禁也按册各自给,不在指令栏做禁用态。
+            KeyCode::Char('v') => self.screen = Screen::Vps,
             KeyCode::Down | KeyCode::Char('n') => {
                 if n > 0 {
                     self.ov_sel = (self.ov_sel + 1) % n;
@@ -4854,6 +4859,92 @@ mod tests {
             tab.y,
         )));
         assert_eq!(app.screen, Screen::Recipes, "右键不分派");
+    }
+
+    // ---- #68 概览指令栏第五条「浏览编目」:一键到第六屏,点它也等于按键 ----
+
+    /// 在整帧真显示里定位某子串的终端 (列, 行)(列按显示宽累计,与命中区
+    /// 同一把尺;frame_display 已跳过宽字续格,故字节偏移≠列,须累宽)。
+    fn locate_col_row(app: &App, w: u16, h: u16, needle: &str) -> (u16, u16) {
+        use unicode_width::UnicodeWidthChar;
+        let frame = crate::testutil::frame_display(app, w, h);
+        for (y, line) in frame.split('\n').enumerate() {
+            if let Some(byte) = line.find(needle) {
+                let col: u16 = line[..byte]
+                    .chars()
+                    .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+                    .sum();
+                return (col, y as u16);
+            }
+        }
+        panic!("整帧里找不到「{needle}」({w}×{h})");
+    }
+
+    /// 键盘路:概览按 `v` 一键到第六屏(编目),且纯导航零引擎调用、不写流水。
+    /// 键位选 `v`(屏枚举 `Screen::Vps` 首字母)与既有 `a`/`h`/`l` 跳屏同构,
+    /// 全仓无 `Char('v')` 冲突;HUD/帮助/README 三处同写 `v`(屏上=按下,#68 故事 5)。
+    #[test]
+    fn 概览_按v跳到编目屏_零引擎调用() {
+        let mut app = fake_app();
+        app.screen = Screen::Overview;
+        let (q, log) = (app.queue.len(), app.log.len());
+        app.update(Message::Key(key('v')));
+        assert_eq!(app.screen, Screen::Vps, "v 一键到第六屏(编目,屏内 m 换册)");
+        assert_eq!(app.queue.len(), q, "切屏零引擎调用:队列不长");
+        assert_eq!(app.log.len(), log, "纯导航不写流水");
+    }
+
+    /// 点路 == 键路:点帧上「浏览编目」所在行列 = 按 `v`,两档都中、都零调用。
+    /// 坐标取自整帧真显示(点哪打哪),不硬编码矩形——紧凑态 Tab 行让首行、
+    /// 竖导航列还正文,几何两支都由渲染同源算出(ADR-0005)。
+    #[test]
+    fn 概览_点浏览编目等于按v_常畅与紧凑两档都中_且不发调用() {
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let mut by_key = mouse_ls_app();
+            by_key.screen = Screen::Overview;
+            by_key.update(Message::Key(key('v')));
+
+            let mut by_click = mouse_ls_app();
+            by_click.screen = Screen::Overview;
+            by_click.splash = false;
+            by_click.size = Rect::new(0, 0, w, h);
+            let (col, row) = locate_col_row(&by_click, w, h, "浏览编目");
+            let q = by_click.queue.len();
+            by_click.update(Message::Mouse(mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                row,
+            )));
+            assert_eq!(
+                by_click.screen,
+                Screen::Vps,
+                "{w}×{h} 点指令栏第五条到编目屏"
+            );
+            assert_eq!(
+                by_click.screen, by_key.screen,
+                "{w}×{h} 点它 = 按 v(同一后果)"
+            );
+            assert_eq!(by_click.queue.len(), q, "{w}×{h} 点它零引擎调用");
+        }
+    }
+
+    /// 入口常驻可点:指令栏是动线不是能力表——数据仓根未设也不在指令栏做
+    /// 禁用态(#68 明确不做 gate);按册的能力门在编目屏内各自指路,语义不变。
+    #[test]
+    fn 概览_浏览编目入口常驻可点_不设数据仓根也到第六屏() {
+        let mut app = mouse_ls_app();
+        app.screen = Screen::Overview;
+        app.data_root = None; // 未设数据仓根
+        app.splash = false;
+        app.size = Rect::new(0, 0, 66, 50);
+        let (col, row) = locate_col_row(&app, 66, 50, "浏览编目");
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            row,
+        )));
+        assert_eq!(app.screen, Screen::Vps, "入口常驻可点:坏根也不禁用指令栏");
+        assert!(app.queue.is_empty(), "切屏零引擎调用(门禁在编目屏内按册给)");
     }
 
     #[test]

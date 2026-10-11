@@ -57,6 +57,52 @@ fn 概览屏渲染派表与计数卡() {
     assert!(s.contains("recipes"), "四域计数卡");
 }
 
+/// #68 概览指令栏加第五条「浏览编目 (v)」的整帧 golden:指令框从 6 长到 7
+/// (边框 2 + 5 条),余高由「最近日志」的 `Min` 吸收——其余部件(警示带/派表/
+/// 计数卡)排布与高度不变,只多这一行。常畅(110×30 / 80×30)与紧凑(66×50)
+/// 两档都放得下这条入口且无行超宽;键位 `v` 与 HUD/帮助同写(故事 5/6/7)。
+/// 紧凑态内层仅 18 列,19 宽的指令行沿用 #22 既定裁法把 `)` 裁掉(同 `h/l/r`),
+/// 不放宽指令框、不引限高、不居中。
+#[test]
+fn 概览指令栏第五条_浏览编目带v键_两档不溢出() {
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    app.splash = false; // frame_display 走整帧壳:splash 在场会画 logo,先交棒
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(
+            f.contains("浏览编目"),
+            "{w}×{h} 指令栏应有第五条「浏览编目」:{f}"
+        );
+        // 四条原有指令不丢(顺序在第五条之前)
+        for label in ["跑一次体检", "发起装配", "浏览配方", "刷新 ls"] {
+            assert!(f.contains(label), "{w}×{h} 原指令 {label} 不丢:{f}");
+        }
+        // 常畅态键位提示 (v) 完整;紧凑态 (v) 被裁到「(v」,与 h/l/r 同裁法
+        if h == 30 {
+            assert!(f.contains("(v)"), "{w}×{h} 常畅态键位 (v) 完整可见:{f}");
+        }
+        // 其余部件排布与高度不变:警示带 / 派表 / 计数卡 / 最近日志都在场
+        assert!(f.contains("警示带"), "{w}×{h} 警示带在场:{f}");
+        assert!(
+            f.contains("desk") && f.contains("漂移"),
+            "{w}×{h} 派表在场:{f}"
+        );
+        assert!(f.contains("recipes"), "{w}×{h} 计数卡在场:{f}");
+        assert!(
+            f.contains("最近日志"),
+            "{w}×{h} 最近日志区在场(未被挤掉):{f}"
+        );
+        // 两档纪律:无行超宽
+        for ln in f.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                "{w}×{h} 有行超宽:{ln}"
+            );
+        }
+    }
+}
+
 #[test]
 fn 概览空态有入坑指南() {
     let mut app = fake_app();

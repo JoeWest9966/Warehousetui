@@ -251,8 +251,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Down,
     },
     HelpRow {
-        key: "a / h / l",
-        desc: "概览:跳 装配 / 健康 / 配方",
+        key: "a / h / l / v",
+        desc: "概览:跳 装配 / 健康 / 配方 / 编目",
         screen: Some(Screen::Overview),
         domain: None,
         mode: None,
@@ -713,10 +713,10 @@ mod tests {
 │  ▤ 配方  │││✗  desk       9f8e       2026-10-01  漂移  ││   发起装配…   (a) ││
 │  ▩ 编目  │││●  lab        a1b2       —           ok    ││   浏览配方     (l)││
 │  ✦ 设置  │││                                           ││   刷新 ls      (r)││
+│          │││                                           ││   浏览编目     (v)││
 │          │││                                           │└───────────────────┘│
 │          │││                                           │┌ 最近日志 ─────────┐│
 │          │││                                           ││驾驶舱已就绪       ││
-│          │││                                           ││                   ││
 │          │││                                           ││                   ││
 │          │││                                           ││                   ││
 │          │││                                           ││                   ││

@@ -27,9 +27,11 @@ pub fn render_overview(frame: &mut Frame, area: Rect, app: &App) {
     let cols =
         Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).split(rows[1]);
     render_profiles(frame, cols[0], app);
-    // 右栏:指令框固定 6 行(边框 2 + 4 条指令),余高全给「最近日志」——
+    // 右栏:指令框固定 7 行(边框 2 + 5 条指令),余高全给「最近日志」——
     // 纵向富余由 Min 吸收、可视行随高度长(不引限高、不居中,票 #22)。
-    let right = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).split(cols[1]);
+    // #68 加第五条「浏览编目 (v)」:框从 6 长到 7,只多这一行,其余部件
+    // (警示带/派表/计数卡)高度不变,少的那一行由最近日志的 Min 吸收。
+    let right = Layout::vertical([Constraint::Length(7), Constraint::Min(3)]).split(cols[1]);
     render_commands(frame, right[0], app);
     render_recent_log(frame, right[1], app);
 
@@ -177,6 +179,10 @@ fn render_profiles(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_commands(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
+    // 指令栏是「家」的动线,不是能力表(#68):每条常驻可点、无禁用态。第五条
+    // 「浏览编目 (v)」一键到第六屏(编目),键位 `v` 与 HUD/帮助/README 同写;
+    // 点它也等于按 `v`(命中区见 `layout::overview_hits`,与这里同一组 Layout)。
+    // 四条既有跳屏键 `h/a/l` 之后接 `v`(屏枚举 `Screen::Vps` 首字母,全仓无冲突)。
     let items = vec![
         Line::from(vec![
             Span::styled(" ▸ 跑一次体检 ", p.accent()),
@@ -193,6 +199,10 @@ fn render_commands(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("   刷新 ls    ", p.accent()),
             Span::styled("  (r)", p.dim()),
+        ]),
+        Line::from(vec![
+            Span::styled("   浏览编目   ", p.accent()),
+            Span::styled("  (v)", p.dim()),
         ]),
     ];
     frame.render_widget(
