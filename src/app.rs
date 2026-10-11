@@ -799,6 +799,9 @@ impl App {
             // 配方域建议命令取用(#39):与键盘 `c` 完全同路——只读选中态,
             // 面板不执行这条命令(ADR-0003:执行权留给操作者)。
             Target::ToggleSuggest => self.toggle_bake_suggest(),
+            // 点正文键位行的「换册」段(#67):与键盘 `m` 完全同路——四本编目册
+            // 按 CatalogKind::next() 轮转。鼠标只是叠加,不新增语义。
+            Target::SwitchBook => self.cycle_catalog_kind(),
         }
     }
 
@@ -5039,6 +5042,81 @@ mod tests {
         wheel(&mut app, row, MouseEventKind::ScrollDown);
         assert_eq!(app.sub_sel, 2, "订阅册滚轮动 sub_sel");
         assert_eq!(app.vps_sel, 0, "订阅册滚轮不误写 vps_sel");
+    }
+
+    // ---- #67 正文键位行命中接缝:点「换册」段 = 按 m ----
+
+    /// 点正文键位行的「换册」段 = 按 `m`:四本册按 `CatalogKind::next()` 既有
+    /// 顺序轮转(鼠标只是叠加,不新增语义,#67 承载的规格订正:可点动作段画在
+    /// **正文里**,不画在 HUD)。段文案由渲染与命中共用同一份字符串——点哪打哪。
+    #[test]
+    fn 点换册段_等于按m_四本册按既有顺序轮转() {
+        let mut app = catalog_four_books_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        let mut by_click = vec![app.catalog_kind];
+        for _ in 0..4 {
+            let sw = hit_target(&app, |t| *t == Target::SwitchBook);
+            click(&mut app, sw);
+            by_click.push(app.catalog_kind);
+        }
+        // 与连按四次 m 同一条轮转链(Vps → Tag → Subscription → Key → Vps)
+        let mut keyed = catalog_four_books_app();
+        keyed.size = Rect::new(0, 0, 80, 30);
+        let mut by_key = vec![keyed.catalog_kind];
+        for _ in 0..4 {
+            keyed.update(Message::Key(key('m')));
+            by_key.push(keyed.catalog_kind);
+        }
+        assert_eq!(by_click, by_key, "点换册段与按 m 逐帧同源");
+        assert_eq!(
+            by_click,
+            vec![
+                catalog::CatalogKind::Vps,
+                catalog::CatalogKind::Tag,
+                catalog::CatalogKind::Subscription,
+                catalog::CatalogKind::Key,
+                catalog::CatalogKind::Vps,
+            ],
+            "四本册按 next() 既有顺序轮转,不另造一套"
+        );
+    }
+
+    /// 「换册」段常畅(80×30)与紧凑(66×50)两档都点得中;段文案在屏上逐字在场
+    /// (渲染与命中共用同一份字符串量宽,点哪打哪)。
+    #[test]
+    fn 换册段_常畅与紧凑两档都点得中_且段文案在屏上在场() {
+        for (w, h) in [(80u16, 30u16), (66, 50u16)] {
+            let mut app = catalog_four_books_app();
+            app.size = Rect::new(0, 0, w, h);
+            let sw = hit_target(&app, |t| *t == Target::SwitchBook);
+            // 段文案与命中共用:渲染行里必能找着这段字符串,且它的起始列 = 命中矩形 x
+            let frame = crate::testutil::frame_display(&app, w, h);
+            let row = frame
+                .split('\n')
+                .nth(sw.y as usize)
+                .expect("命中行在渲染中在场");
+            assert!(row.contains("m 换册"), "{w}×{h} 键位行应画着换册段:{row}");
+            click(&mut app, sw);
+            assert_eq!(
+                app.catalog_kind,
+                catalog::CatalogKind::Tag,
+                "{w}×{h} 点换册段切到下一本"
+            );
+        }
+    }
+
+    /// 浮层打开时点底层不换册(spec #65 故事 50:浮层吞底层点击,弹层优先级);
+    /// 删除确认弹层在场时「换册」段不产命中区。
+    #[test]
+    fn 换册段_删除确认弹层打开时_点底层不换册() {
+        let mut app = catalog_four_books_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.vps_rm_confirm = true;
+        let hits = hitmap(app.size, &app, size_class(app.size));
+        assert!(
+            hits.iter().all(|(_, t)| *t != Target::SwitchBook),
+            "删除确认弹层打开:换册段不产命中区(弹层优先级,底层不穿透)"
+        );
     }
 
     #[test]

@@ -1213,6 +1213,71 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     let w = inner.width.saturating_sub(2) as usize;
 
+    let mut lines = catalog_body_lines(app, w);
+    let _ = cause_line(app);
+    lines.push(key_line(&catalog_key_parts(app), p));
+    frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
+
+    // 浮层:登记 / 删除确认(弹层优先级高于册体;四本各一套,骨架同一件)
+    if kind == CatalogKind::Subscription {
+        // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先。
+        if app.sub_rm_confirm {
+            render_sub_rm_confirm(frame, area, app);
+        } else if app.sub_flow.phase != RegPhase::Idle {
+            render_sub_overlay(frame, area, app);
+        }
+        return;
+    }
+    if kind == CatalogKind::Key {
+        // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先(同订阅册)。
+        if app.key_rm_confirm {
+            render_key_rm_confirm(frame, area, app);
+        } else if app.key_flow.phase != RegPhase::Idle {
+            render_key_overlay(frame, area, app);
+        }
+        return;
+    }
+    if kind == CatalogKind::Tag {
+        // rm 确认嵌套在表单流里(表单 Enter 才出现),弹层优先级高于表单
+        // (同 `on_key` 的受理次序:更里层的浮层先收键)。
+        if app.tag_rm_confirm {
+            render_tag_rm_confirm(frame, area, app);
+        } else if app.tag_flow.phase != RegPhase::Idle {
+            render_tag_overlay(frame, area, app);
+        }
+        return;
+    }
+    if app.vps_flow.phase != RegPhase::Idle {
+        render_register_overlay(frame, area, app);
+    } else if app.vps_rm_confirm {
+        render_rm_confirm(frame, area, app);
+    }
+}
+
+/// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
+/// 烤进锁定集等于每次改标签重烤一次派——面板不提供任何这样的入口。
+const TAG_BOUNDARY: &str = "  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)";
+
+/// 数据仓根三态的一行说明(能力可用而根不可用时给人话;根就绪时给空)。
+fn cause_line(app: &App) -> String {
+    match app.data_root_cause() {
+        Some(DataRootCause::Unset) => {
+            "  数据仓根未设:去设置屏按 d 录入(面板不拿当前目录兜底)。".into()
+        }
+        Some(DataRootCause::Unavailable) => {
+            "  数据仓根不可用:目录不存在或不可读,去设置屏按 d 重设。".into()
+        }
+        _ => String::new(),
+    }
+}
+
+/// 编目册**正文行**(键位行之前的一切:标题 + 册体 + 各册附加行)。
+/// #67 抽出供渲染与命中测试共用:键位行的行号 = `inner.y + 本函数行数`,
+/// 一处真相——可点的「换册」段落在键位行上,渲染画的那一行与命中测的
+/// 那一行由同一份行数算出,点哪打哪(ADR-0005 渲染与命中同源)。
+pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
+    let p = &app.palette;
+    let kind = app.catalog_kind;
     let mut lines: Vec<Line> = Vec::new();
     // 引擎没有这一本的能力:入口禁用并指路(既有门控语义不变,面板不自造替代品)
     if !app.capabilities.enabled(kind.capability()) {
@@ -1352,102 +1417,83 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
             CatalogKind::Vps => {}
         }
     }
-    let _ = cause_line(app);
-    lines.push(Line::from(Span::styled(catalog_keys(app), p.dim())));
-    frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
-
-    // 浮层:登记 / 删除确认(弹层优先级高于册体;四本各一套,骨架同一件)
-    if kind == CatalogKind::Subscription {
-        // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先。
-        if app.sub_rm_confirm {
-            render_sub_rm_confirm(frame, area, app);
-        } else if app.sub_flow.phase != RegPhase::Idle {
-            render_sub_overlay(frame, area, app);
-        }
-        return;
-    }
-    if kind == CatalogKind::Key {
-        // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先(同订阅册)。
-        if app.key_rm_confirm {
-            render_key_rm_confirm(frame, area, app);
-        } else if app.key_flow.phase != RegPhase::Idle {
-            render_key_overlay(frame, area, app);
-        }
-        return;
-    }
-    if kind == CatalogKind::Tag {
-        // rm 确认嵌套在表单流里(表单 Enter 才出现),弹层优先级高于表单
-        // (同 `on_key` 的受理次序:更里层的浮层先收键)。
-        if app.tag_rm_confirm {
-            render_tag_rm_confirm(frame, area, app);
-        } else if app.tag_flow.phase != RegPhase::Idle {
-            render_tag_overlay(frame, area, app);
-        }
-        return;
-    }
-    if app.vps_flow.phase != RegPhase::Idle {
-        render_register_overlay(frame, area, app);
-    } else if app.vps_rm_confirm {
-        render_rm_confirm(frame, area, app);
-    }
+    lines
 }
 
-/// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
-/// 烤进锁定集等于每次改标签重烤一次派——面板不提供任何这样的入口。
-const TAG_BOUNDARY: &str = "  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)";
+/// 键位行可点段之间(以及段内各项之间)的分隔串:渲染与命中共用同一份,
+/// 段宽按 `unicode_width` 量——一处真相,点哪打哪。
+pub(crate) const CATALOG_KEY_GAP: &str = " · ";
 
-/// 数据仓根三态的一行说明(能力可用而根不可用时给人话;根就绪时给空)。
-fn cause_line(app: &App) -> String {
-    match app.data_root_cause() {
-        Some(DataRootCause::Unset) => {
-            "  数据仓根未设:去设置屏按 d 录入(面板不拿当前目录兜底)。".into()
-        }
-        Some(DataRootCause::Unavailable) => {
-            "  数据仓根不可用:目录不存在或不可读,去设置屏按 d 重设。".into()
-        }
-        _ => String::new(),
-    }
-}
+/// 键位行末段的「换册」可点文案(#67):点它 = 按 `m` 轮转四本册。渲染画这个
+/// 串、命中测这个串的宽,同一份字符串;段可点(accent 高亮),与键盘 `m` 同路。
+pub(crate) const CATALOG_SWITCH: &str = "m 换册";
 
-/// 编目册键位行(与鼠标命中区同文案同序)。
-/// 册级键位行**按 kind 查表**(四本册各一组;在途浮层与空册各换一句,
-/// 三态形状相同)。新增第五本册只加一行——册级状态不再复制四份 if-else
-/// (双轴评审发现 9:Mysterious Name,catalog_keys 曾用四条 if)。
-fn catalog_keys(app: &App) -> &'static str {
-    const IN_FLOW: &str = "  Enter 确认 · Esc/q 返航 ";
-    let (in_flow, empty, empty_line, line) = match app.catalog_kind {
+/// 编目册键位行的**段清单**(#67 通用接缝的第一个用户):提示段只画不点
+/// (`None`),末段「换册」可点(`Some(SwitchBook)`)。渲染与命中测试共用这
+/// 同一份清单——段文案与段宽一处真相。册级键位行按 kind 查表(四本册各一组;
+/// 在途浮层与空册各换一句),新增第五本册只加一行(双轴评审发现 9)。
+///
+/// **规格订正(#67 承载)**:可点动作段画在**正文里**,不画在 HUD——命中区模型
+/// 历来把顶栏与 HUD 整行切在外面(spec #15/#16)。在途浮层/删除确认态换册键被
+/// 浮层受理(`m` 到不了 `key_catalog`),键位行只留浮层提示、不画可点段。
+pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::layout::Target>)> {
+    use crate::layout::Target;
+    let (in_flow, empty) = match app.catalog_kind {
         CatalogKind::Vps => (
             app.vps_flow.phase != RegPhase::Idle || app.vps_rm_confirm,
             app.vps_len() == 0,
-            "  r 登记机器 · Esc/q 返航 ",
-            "  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 ",
         ),
         CatalogKind::Tag => (
             app.tag_flow.phase != RegPhase::Idle || app.tag_rm_confirm,
             app.tag_len() == 0,
-            "  l 反查全部 · r 挂标签 · m 换册 · Esc/q 返航 ",
-            "  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册 ",
         ),
         CatalogKind::Subscription => (
             app.sub_flow.phase != RegPhase::Idle || app.sub_rm_confirm,
             app.sub_len() == 0,
-            "  r 登记订阅 · l 重读 · m 换册 · Esc/q 返航 ",
-            "  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
         ),
         CatalogKind::Key => (
             app.key_flow.phase != RegPhase::Idle || app.key_rm_confirm,
             app.key_len() == 0,
-            "  r 登记钥匙 · l 重读 · m 换册 · Esc/q 返航 ",
-            "  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
         ),
     };
     if in_flow {
-        IN_FLOW
-    } else if empty {
-        empty_line
-    } else {
-        line
+        return vec![("  Enter 确认", None), ("Esc/q 返航", None)];
     }
+    let hint: &[&str] = match (app.catalog_kind, empty) {
+        (CatalogKind::Vps, false) => &["  ↑/↓ 选机器", "r 登记", "d 删除", "Esc/q 返航"],
+        (CatalogKind::Vps, true) => &["  r 登记机器", "Esc/q 返航"],
+        (CatalogKind::Tag, false) => &["  ↑/↓ 选", "Enter 反查", "l 全部", "r 挂标签", "d 摘/删"],
+        (CatalogKind::Tag, true) => &["  l 反查全部", "r 挂标签", "Esc/q 返航"],
+        (CatalogKind::Subscription, false) => {
+            &["  ↑/↓ 选订阅", "r 登记", "g 取回命令", "d 删除", "l 重读"]
+        }
+        (CatalogKind::Subscription, true) => &["  r 登记订阅", "l 重读", "Esc/q 返航"],
+        (CatalogKind::Key, false) => &["  ↑/↓ 选钥匙", "r 登记", "g 取回命令", "d 删除", "l 重读"],
+        (CatalogKind::Key, true) => &["  r 登记钥匙", "l 重读", "Esc/q 返航"],
+    };
+    let mut parts: Vec<(&'static str, Option<Target>)> = hint.iter().map(|s| (*s, None)).collect();
+    parts.push((CATALOG_SWITCH, Some(Target::SwitchBook)));
+    parts
+}
+
+/// 把段清单画成一行 `Line`(渲染侧):可点段(`Some`)accent 高亮、提示段
+/// (`None`)dim;段间用 [`CATALOG_KEY_GAP`] 连接。与命中侧
+/// [`crate::layout::key_line_segments`] 同一份 `parts` + 同一个 gap——屏上画的
+/// 和点得的逐字同源。
+fn key_line(parts: &[(&str, Option<crate::layout::Target>)], p: &Palette) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (text, target)) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(CATALOG_KEY_GAP, p.dim()));
+        }
+        let style = if target.is_some() {
+            p.accent().bold()
+        } else {
+            p.dim()
+        };
+        spans.push(Span::styled((*text).to_string(), style));
+    }
+    Line::from(spans)
 }
 
 /// **编目册列表件**(#53 骨架第二件):按投影字段渲染,遵循确定性排序。
