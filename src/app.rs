@@ -350,9 +350,12 @@ pub struct App {
     pub tag_ls_echo: Option<EngineOutput>,
     /// 反查在途(不拿上一轮结论冒充本次)。
     pub tag_ls_loading: bool,
-    /// 最近一次反查问的是哪一条(由回音 argv 推导:`None` = 列全部)。
-    /// 只为把「列全部 / 只列一个」这档差别显式画出来——操作者看得见自己
-    /// 问的是什么,不靠记性。
+    /// 最近一次反查问的是哪一条(**由下发时记下**:`run_tag_ls` 的入参,
+    /// `None` = 列全部)。只为把「列全部 / 只列一个」这档差别显式画出来——
+    /// 操作者看得见自己问的是什么,不靠记性。回音路由
+    /// ([`App::on_tag_echo`])只把它读回来,不再从 argv 重新推导:argv 里
+    /// `--root` 的值长得跟标签名一样,推导就会把「列全部」冒充成「反查
+    /// 一个叫 <根> 的标签」。
     pub tag_lookup: Option<String>,
     /// 反查上浮状态(#70):机器册上一个键问「什么标签引用了这一条」。
     /// **独立小状态,不并入 `assembling` 写互斥**(反查只读);三态两两可
@@ -2738,12 +2741,15 @@ impl App {
         match out.args.get(1).map(String::as_str) {
             Some("ls") => {
                 self.tag_ls_loading = false;
-                let asked = out
-                    .args
-                    .iter()
-                    .skip(2)
-                    .find(|a| !a.starts_with("--"))
-                    .cloned();
+                // 问的是哪一条,读**下发时**记下的 [`App::tag_lookup`]
+                // (`run_tag_ls` 的入参,`None` = 列全部),不从回音 argv 重新推导。
+                // 早先这里写的是 `args.iter().skip(2).find(非 -- 开头)`,它会把
+                // `--root` 的**值**当成标签名:机器册反查(#70)发的正是不带参的
+                // `tag ls --root <根>`,于是「列全部标签」被冒充成「反查一个叫
+                // `/tmp` 的标签」——册头(`当前册 标签 · 反查 /tmp`)与日志
+                // (`反查完成(标签 /tmp:4 条,只读)`)两处都跟着错。一种状态冒充
+                // 另一种,正是铁律不许的事;记在下发处,回音只读回来。
+                let asked = self.tag_lookup.clone();
                 // 反查上浮在途(#70):机器册问「什么标签引用了这一条」——回音落地
                 // 时按在途记住的那台机器,从这次 fresh 标签册里就地按 `<kind>/<条目>`
                 // 精确匹配推导。**只在在途时收敛**:操作者已返航(Idle)/ 已看到
@@ -2775,9 +2781,6 @@ impl App {
                                 crate::screens::catalog::tags_referring(&d.sheet(), "vps", m);
                             (m.clone(), hits)
                         });
-                        if asked.is_some() {
-                            self.tag_lookup = asked.clone();
-                        }
                         self.tag_ls_echo = Some(out);
                         self.catalog_clamp();
                         // 有 N 条 / 一条都没有:都是 rc 0 合法回音,只是命中数不同

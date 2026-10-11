@@ -6855,6 +6855,51 @@ mod tests {
         assert_eq!(app.catalog_filter(), "", "第二次 Esc 清词");
     }
 
+    /// 回归(#65 评审第 3 条):机器册反查(#70)发的是**不带参**的
+    /// `tag ls --root <根>`,所以切到标签册时册头必须说「列全部标签」。
+    /// 早先回音路由从 argv 重新推导「问的是哪一条」
+    /// (`skip(2).find(非 -- 开头)`),它把 `--root` 的**值**当成了标签名:
+    /// 册头写「当前册 标签 · 反查 /tmp」、日志写「反查完成(标签 /tmp:4 条,
+    /// 只读)」——「列全部标签」被冒充成「反查一个叫 /tmp 的标签」,一种
+    /// 状态冒充另一种。下面两条把册头与日志两处都钉住:带的只能是
+    /// `run_tag_ls` 下发时记下的那个入参(`None` = 列全部)。
+    #[test]
+    fn 反查后切到标签册_册头与日志都说全部标签_不把数据仓根当标签名() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "反查结论先在场");
+        tap(&mut app, KeyCode::Esc); // 先收浮层(它在场时吞册体键)
+        tap(&mut app, KeyCode::Char('m')); // 机器册 → 标签册
+        let root = app.usable_data_root().unwrap_or_default();
+        assert_eq!(
+            app.catalog_scope_label(),
+            "全部标签",
+            "不带参反查 = 列全部:册头别把数据仓根 {root} 当成标签名"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            s.contains("当前册 标签 · 全部标签 ·"),
+            "帧上册头同口径(下面两帧 golden 就钉在这一行):{s}"
+        );
+        assert!(
+            !s.contains(&format!("反查 {root}")),
+            "册头不出现「反查 <数据仓根>」:{s}"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查完成(全部标签:")),
+            "日志同口径:列全部,不是一个叫 {root} 的标签:{:?}",
+            app.log.first()
+        );
+        assert!(
+            app.log
+                .iter()
+                .all(|l| !l.contains(&format!("标签 {root}:"))),
+            "日志不把数据仓根 {root} 当成标签名:{:?}",
+            app.log.first()
+        );
+    }
+
     // ---- 工单 #66:四本册整帧 golden(逐字节) ----
     //
     // 本票是**纯重构**:操作者感知不到任何变化。上面四条
@@ -7013,7 +7058,7 @@ mod tests {
     /// 标签册 80×30 整帧 golden(本票之前逐字节)。
     const TAG_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
-│  ▸ 概览  ││  当前册 标签 · 反查 /tmp · 编目 /r/tags.json                     │
+│  ▸ 概览  ││  当前册 标签 · 全部标签 · 编目 /r/tags.json                      │
 │  ⚙ 装配  ││  ▸ bare                                                          │
 │  ✚ 健康  ││    引用 ——                                                       │
 │  ▤ 配方  ││    pi                                                            │
@@ -7045,7 +7090,7 @@ mod tests {
     const TAG_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
 ┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
-│  当前册 标签 · 反查 /tmp · 编目 /r/tags.json                   │
+│  当前册 标签 · 全部标签 · 编目 /r/tags.json                    │
 │  ▸ bare                                                        │
 │    引用 ——                                                     │
 │    pi                                                          │
