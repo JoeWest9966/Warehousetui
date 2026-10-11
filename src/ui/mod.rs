@@ -439,6 +439,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
     },
     HelpRow {
         key: "Enter",
+        desc: "编目:反查什么标签引用了选中的这台机器(只读)",
+        screen: Some(Screen::Vps),
+        domain: None,
+        mode: None,
+        book: Some(crate::screens::CatalogKind::Vps),
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Enter,
+    },
+    HelpRow {
+        key: "Enter",
         desc: "编目:反查选中的这一条标签(只读)",
         screen: Some(Screen::Vps),
         domain: None,
@@ -559,6 +570,7 @@ pub(crate) const MOUSE_LINES: &[&str] = &[
     "滚轮移选中;装配 stderr 日志可回看",
     "发射仪式「发射/返航」两段可点;浮层吞点击不穿透",
     "装配运行中「x 中止」段可点 = 按 x 进程级真止",
+    "编目册键位行可点段:换册 / 过滤 / 反查(点它 = 按对应键)",
     "捕获默认开的代价:复制要按 Shift",
     "逃逸:--no-mouse / 设置屏 m 关(重启生效)",
 ];

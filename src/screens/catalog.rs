@@ -584,9 +584,27 @@ impl CatalogKind {
     }
 
     /// 册体有条目时的册内键位行**段清单**(常态)。
+    ///
+    /// 机器册这一段在 #70 收窄过两处,好让「Enter 反查」可点段在 66×50 的
+    /// 紧凑态也放得下(#67 的纪律:放不下就不画也不给命中,而规格故事 52 要求
+    /// 新命中区两档都算得对):`↑/↓ 选机器` → `↑/↓ 选`(选哪一本 HUD 已说),
+    /// `Esc/q 返航` → `Esc 返航`(**`q` 在册体上是退出面板,不是返航**——旧文案
+    /// 把两个语义混成一句;浮层里的 `Esc/q 返航` 仍两键都认,那句不动)。
+    ///
+    /// 「Enter 反查」**不写在这里**:它是可点动作段,由 `catalog_key_parts`
+    /// 按「只机器册 + 有选中行」现拼(提示段与可点段在一处汇合,渲染与命中
+    /// 共用同一份清单);写进这张静态表就会在订阅 / 钥匙册上也画出一个点不动
+    /// 的段,也会在空册上问一台不存在的机器。
+    ///
+    /// #69 合入后再收窄第三处:`Esc 返航` → `Esc`。#69 的 `/ 过滤`、#70 的
+    /// `Enter 反查`、#67 的 `m 换册` 三个可点段在机器册键位行同场,且三段的
+    /// 点击命中都在 80×30 / 66×50 两档钉死;不把这段提示再收一档,紧凑态下
+    /// `/ 过滤` 会被整段裁掉、点不到(#69 的过滤行为就不完整)。册体上 `Esc`
+    /// 只做「清当前册过滤词」(见 `key_catalog`),裸 `Esc` 足够提示这个键、语义
+    /// 也不虚,故只留键名、去掉「返航」二字。
     pub fn keys_body(self) -> &'static [&'static str] {
         match self {
-            CatalogKind::Vps => &["  ↑/↓ 选机器", "r 登记", "d 删除", "Esc/q 返航"],
+            CatalogKind::Vps => &["  ↑/↓ 选", "r 登记", "d 删除", "Esc"],
             CatalogKind::Tag => &["  ↑/↓ 选", "Enter 反查", "l 全部", "r 挂标签", "d 摘/删"],
             CatalogKind::Subscription => {
                 &["  ↑/↓ 选订阅", "r 登记", "g 取回命令", "d 删除", "l 重读"]
@@ -685,11 +703,80 @@ impl CatalogKind {
             // 两本;ADR-0009 §1 面板不代跑 get)。机器册 / 标签册没有这一行
             (CatalogKind::Subscription, KeyCode::Char('g')) => Some(Act(App::log_sub_get_suggest)),
             (CatalogKind::Key, KeyCode::Char('g')) => Some(Act(App::log_key_get_suggest)),
-            // Enter 反查选中的这一条:只标签册有(机器册的 `vps ls` 没有
-            // 位置参数;订阅 / 钥匙册的条目不在 TAG_REF_KINDS 里)
+            // Enter 反查选中的这一条:标签册反查选中的那条标签(#54 旧态);
+            // 机器册反查「什么标签引用了这一条」(#70 上浮——只机器册的条目可打
+            // 标签,见 TAG_REF_KINDS;订阅 / 钥匙册的条目不在其内,不提供)。
+            (CatalogKind::Vps, KeyCode::Enter) => Some(Act(App::vps_reverse_lookup)),
             (CatalogKind::Tag, KeyCode::Enter) => Some(Act(App::tag_lookup_selected)),
             _ => None,
         }
+    }
+}
+
+/// 反查上浮**命中一条标签**(#70):标签名 + 它引用的 `<kind>/<条目>` 清单
+/// (原样,指针不是密钥;结果呈现只印这些,绝不印机密本体)。
+///
+/// 只由纯函数 [`tags_referring`] 产出——匹配口径集中在这一处,不散进
+/// 渲染 / 回音路由里,好被单测钉住。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagHit {
+    pub name: String,
+    pub refs: Vec<crate::engine::CatalogRef>,
+}
+
+/// 反查上浮的**匹配纯函数**(#70:本轮最该被钉住的口径,spec #65 故事 41 /
+/// 验收第 5 条)。一台机器被哪些标签引用?按 `<kind>/<条目>` **精确匹配**
+/// (kind 与条目两侧都原样比对),**绝不做子串包含**——否则一台叫 `gate` 的
+/// 机器会和一条引用 `skill/gate` 的标签互相串味。
+///
+/// 输入是**标签册的投影**(`nw tag ls` 无参全列落进 `tag_ls_echo` 后的
+/// [`CatalogSheet`]:每条目是一个标签,`refs` 是它引用的 `<kind>/<条目>`
+/// 清单)。`kind` 取自 [`crate::engine::commands::TAG_REF_KINDS`],机器册
+/// 条目恒 `vps`。输出保持引擎的确定性排序(面板不重排)。
+pub fn tags_referring(sheet: &CatalogSheet, kind: &str, id: &str) -> Vec<TagHit> {
+    sheet
+        .entries
+        .iter()
+        .filter(|e| e.refs.iter().any(|r| r.kind == kind && r.id == id))
+        .map(|e| TagHit {
+            name: e.name.clone(),
+            refs: e.refs.clone(),
+        })
+        .collect()
+}
+
+/// 反查上浮状态(#70):机器册上一个键(Enter)或点键位段,问「什么标签引用了
+/// 这一条」。**独立小状态,不并入 `assembling` 全局写互斥**(反查是只读,
+/// 不占写闸);在途不拿上一轮结论冒充本次,迟到回音不收敛任何状态(操作者
+/// 已返航 = Idle 时,回音落地不重开浮层)。
+///
+/// **三态两两可区分**(spec #65 故事 33 / 铁律 4:不共用一个空列表):
+/// [`Hits`](VpsReverse::Hits) 有 N 条 / [`Empty`](VpsReverse::Empty) 一条都
+/// 没有 / [`Unreadable`](VpsReverse::Unreadable) 读不到(rc≠0 / 契约守卫 /
+/// 数据仓根 / 能力)。「读不到」不进结果浮层——它走既有指路(日志),只
+/// [`Hits`](VpsReverse::Hits) / [`Empty`](VpsReverse::Empty) 画薄浮层。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum VpsReverse {
+    /// 闲置:没有反查在场。
+    #[default]
+    Idle,
+    /// 在途:已下发只读 `nw tag ls`(无参全列),等回音。此刻**不呈现任何
+    /// 结论**(`tag_ls_echo` 已被清空),屏上只有机器册本体。
+    InFlight { machine: String },
+    /// 有 N 条标签命中(列标签名 + 各自引用)。
+    Hits { machine: String, tags: Vec<TagHit> },
+    /// 一条标签引用都没有(明说 + 给「去挂第一个标签」的下一步)。
+    Empty { machine: String },
+    /// 读不到(rc≠0 / 契约守卫合成「需升级 nw」):带一句人话理由,走既有
+    /// 指路(日志),**不画成空列表**。
+    Unreadable { machine: String, reason: String },
+}
+
+impl VpsReverse {
+    /// 结果浮层在不在场(只有 有 N 条 / 一条都没有 两态画浮层;在途 / 闲置 /
+    /// 读不到 都不画)。渲染与命中区共用这一判据——点哪打哪(ADR-0005)。
+    pub fn is_open(&self) -> bool {
+        matches!(self, VpsReverse::Hits { .. } | VpsReverse::Empty { .. })
     }
 }
 
@@ -1641,6 +1728,13 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(form) = kind.overlay(app) {
         kind.draw_overlay(form, frame, area, app);
     }
+    // 反查上浮结果浮层(#70):机器册上一个键问「什么标签引用了这一条」的结论
+    // (有 N 条 / 一条都没有两态)。薄浮层,不是新屏、不是新册;几何与命中区
+    // 共用 `vps_reverse_popup_rect`。换册已把状态清成 Idle,所以这本就画在
+    // 机器册上。
+    if app.vps_reverse_open() {
+        render_vps_reverse_popup(frame, area, app);
+    }
 }
 
 /// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
@@ -1708,6 +1802,23 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
             ),
             p.dim(),
         )));
+        // 反查上浮的第三态「读不到」(#70 规格验收 3 / 故事 34):rc≠0 或契约
+        // 守卫合成「需升级 nw」。机器册这一本没有带参反查态(`catalog_ls_error`
+        // 恒 None),若不在这里给一句人话,操作者按了 Enter 屏上一个字都不变,
+        // 只会当成「面板没反应」。走既有指路的同一套措辞(不新造一套话),
+        // 并且**绝不画成空列表**——「这次没读到」与「一条标签引用都没有」是
+        // 两件事,话不许互相冒充(spec #65 铁律 4)。册体与选中行原样在场:
+        // 反查从头到尾不写 `vps_sel`,读不到也不该把册体收走。
+        if let VpsReverse::Unreadable { reason, .. } = &app.vps_reverse {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ 反查没结果:{}", clip(reason, w.saturating_sub(12))),
+                p.warn().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  标签册这次没读到,不是「一条标签引用都没有」;册体与选中行原样不动。",
+                p.dim(),
+            )));
+        }
         // 反查回音的终态(#54):问错了名字(rc 3)/ 合法空态 / 有内容,
         // 三者互不冒充——都画成「空列表」会丢掉「这个名字不存在」的信息
         // (51 §6.11)。机器册没有带参反查这一态,`catalog_ls_error` 恒 None。
@@ -1779,6 +1890,15 @@ pub(crate) const CATALOG_KEY_GAP: &str = " · ";
 /// 串、命中测这个串的宽,同一份字符串;段可点(accent 高亮),与键盘 `m` 同路。
 pub(crate) const CATALOG_SWITCH: &str = "m 换册";
 
+/// 键位行「Enter 反查」可点文案(#70):点它 = 机器册选中行上按 `Enter`
+/// (`App::vps_reverse_lookup`)。渲染画这个串、命中测这个串的宽,同一份
+/// 字符串——点哪打哪(ADR-0005)。
+///
+/// **只机器册给这一段**:`TAG_REF_KINDS` 的已知集合是 `skill` / `extension`
+/// / `vps`,四本册里只有机器册的条目可打标签;订阅 / 钥匙册放这个动作注定
+/// 只返回「没有」,是噪声(spec #65 §4:触发点只有一处)。
+pub(crate) const CATALOG_REVERSE: &str = "Enter 反查";
+
 /// 键位行「过滤」可点文案(#69):点它 = 按 `/` 进册内过滤输入态。与
 /// [`CATALOG_SWITCH`] 同一份接缝——渲染画这个串、命中测这个串的宽,
 /// 段可点(accent 高亮),与键盘 `/` 同路(点哪打哪)。
@@ -1808,6 +1928,12 @@ pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::l
         kind.keys_body()
     };
     let mut parts: Vec<(&'static str, Option<Target>)> = hint.iter().map(|s| (*s, None)).collect();
+    // 反查上浮触发段(#70):只机器册、且册体有条目(= 选中了一行)才给。
+    // 判据与 `keys_body` / `keys_empty` 的分岔同一个——空册没有「选中的这一
+    // 条」可问,面板不空手问,也不画一个点下去只得到一行指路的段。
+    if kind == CatalogKind::Vps && kind.len(app) > 0 {
+        parts.push((CATALOG_REVERSE, Some(Target::VpsReverse)));
+    }
     parts.push((CATALOG_SWITCH, Some(Target::SwitchBook)));
     // 册内过滤入口(#69):有条目可筛时才给这一段(空册没东西可筛,给了反而
     // 误导)。点它 = 按 `/`,与键盘同一路;空册键位行(`keys_empty`)不带它。
@@ -2324,7 +2450,103 @@ fn render_rm_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// 到期三态 → **结果四态**(不新造一套状态词):`active` = Pass、
+/// 反查命中标签的**引用一行**(`kind/id` 逐条,空数组 = 「——」):与标签册
+/// 明细的 [`CatalogEntryView::ref_line`](crate::engine::CatalogEntryView::ref_line)
+/// 同一拼法——面板不为浮层另造一种引用文案(一处真相)。
+///
+/// **只印指针,不印机密本体**:标签引用恒是 `<kind>/<条目>` 形式的指针,
+/// 密钥本体只经 stdin 进、投影里根本没有(ADR-0009 §1)。
+fn tag_hit_ref_line(refs: &[crate::engine::CatalogRef]) -> String {
+    if refs.is_empty() {
+        return "——".to_string();
+    }
+    refs.iter()
+        .map(|r| r.label())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// 反查上浮结果浮层的矩形(#70):**渲染与命中区共用这一处几何**(ADR-0005):
+/// 一处真相,点哪打哪)。高按命中数现算——标题 1 行 + 命中标签 N 行 + 收口
+/// 1 行 + 上下边框 2 行;「一条都没有」是固定 3 行内容。`None` = 没有可画
+/// 的浮层(在途 / 闲置 / 读不到都不画薄浮层;读不到走既有指路)。
+pub(crate) fn vps_reverse_popup_rect(area: Rect, app: &App) -> Option<Rect> {
+    let content = match &app.vps_reverse {
+        VpsReverse::Hits { tags, .. } => tags.len() + 2, // 标题 + N 标签 + 收口
+        VpsReverse::Empty { .. } => 3,                   // 标题 + 下一步 + 收口
+        _ => return None,
+    };
+    let h = u16::try_from(content).unwrap_or(u16::MAX).saturating_add(2); // +上下边框
+    let popup = popup_rect(area, REVERSE_W, h);
+    (popup.width > 0 && popup.height > 0).then_some(popup)
+}
+
+/// 反查上浮结果浮层(#70):一层薄浮层(不是新屏、不是新册),几何与命中区
+/// 同一个 [`vps_reverse_popup_rect`]。三态里画得出的两态在这里:
+/// [`Hits`](VpsReverse::Hits) 列标签名 + 各自引用;
+/// [`Empty`](VpsReverse::Empty) 明说「没有标签引用这一条」+ 给「去挂第一个
+/// 标签」的下一步。第三态「读不到」不进这里——它走既有指路(日志),**绝不
+/// 画成空列表**。
+///
+/// **只印引用(`kind/id` 指针),不印任何机密本体**——与面板其余部分同纪律
+/// (ADR-0009 §1:指针不是密钥;反查看不到、也不该看到密钥本体)。`Esc` 或
+/// 任意点击关闭(命中区见 `layout::catalog_hits`),回到机器册原选中行。
+fn render_vps_reverse_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(popup) = vps_reverse_popup_rect(area, app) else {
+        return;
+    };
+    let p = &app.palette;
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    match &app.vps_reverse {
+        VpsReverse::Hits { machine, tags } => {
+            lines.push(Line::from(Span::styled(
+                format!("  {} 个标签引用了 {machine}", tags.len()),
+                p.text().bold(),
+            )));
+            for t in tags {
+                lines.push(Line::from(vec![
+                    Span::raw("  ▸ "),
+                    Span::styled(clip(&t.name, 18), p.accent().bold()),
+                    Span::raw("  "),
+                    Span::styled(
+                        clip(&tag_hit_ref_line(&t.refs), inner_w.saturating_sub(24)),
+                        p.dim(),
+                    ),
+                ]));
+            }
+        }
+        VpsReverse::Empty { machine } => {
+            lines.push(Line::from(Span::styled(
+                format!("  没有标签引用 {machine}"),
+                p.text().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  下一步:在机器册按 r 挂第一个标签(追加合并、幂等、无确认闸)。",
+                p.dim(),
+            )));
+        }
+        _ => return,
+    }
+    lines.push(Line::from(Span::styled("  Esc 或点击任意处关闭", p.dim())));
+    let budget = popup.height.saturating_sub(2) as usize;
+    lines.truncate(budget);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(
+                        " 反查 · 什么标签引用了这一条 ",
+                        p.accent().bold(),
+                    )),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
 /// `expiring` = Warn、`expired` = Fail;回音缺 `status` 字段 = 第四态 Skip
 /// (「没这道标记」,显式「——」不猜)。三态本身仍是引擎的原词
 /// (active / expiring / expired,上游 `status.go` 的三个取值),面板只做
@@ -3983,6 +4205,12 @@ pub fn new_tag_form(mode: TagFormMode) -> TagForm {
 pub const REG_W: u16 = 80;
 pub const REG_H: u16 = 17;
 
+/// 反查上浮结果浮层的宽(#70):一层**薄浮层**(不是新屏、不是新册),与
+/// 登记浮层同一个 [`popup_rect`] 基准;高按命中数现算(见
+/// [`vps_reverse_popup_rect`]),渲染与命中共用这一处几何——点哪打哪
+/// (ADR-0005)。
+pub const REVERSE_W: u16 = 56;
+
 /// 编目册的删除确认键位行几何(渲染与命中共用)。
 pub fn rm_confirm_rect(area: Rect) -> Rect {
     popup_rect(area, REG_INPUT_W, REG_INPUT_H)
@@ -4024,8 +4252,9 @@ mod tests {
             let s = crate::testutil::frame_display(&app, w, h);
             assert!(s.contains("编目"), "{w}×{h} 册体应在场");
             assert!(s.contains("gate"), "{w}×{h} 机器名应在场");
-            // 键位行钉在册体末行(两档同文案)
-            assert!(s.contains("选机器"), "{w}×{h} 键位行应在场:{s}");
+            // 键位行钉在册体末行(两档同文案);#70 起机器册这一行还带可点的
+            // 「Enter 反查」段(只机器册有,见 `catalog_key_parts`)
+            assert!(s.contains("Enter 反查"), "{w}×{h} 键位行应在场:{s}");
             // 不溢出:每行显示宽不超终端宽
             for ln in s.lines() {
                 assert!(
@@ -5802,6 +6031,830 @@ mod tests {
         assert!(s.contains("缺的是引擎能力"), "{s}");
     }
 
+    // ---- 工单 #70:反查上浮(机器册上一个键问「什么标签引用了这一条」) ----
+
+    /// 反查匹配**纯函数**的口径(#70 验收第 5 条,spec #65 故事 41):同时存在
+    /// 一台叫 `gate` 的机器与一条引用 `skill/gate` 的标签(名字也叫 gate)时,
+    /// 反查机器只返回 `vps/gate` 那条引用——kind 与条目两侧都**精确比对**,
+    /// 一条 `skill/gate` 不会因为条目名撞车被算进来;`vps/gateway` 也不会因
+    /// 子串包含被算进来。这一个函数就是本轮最该被钉住的口径。
+    #[test]
+    fn 反查匹配纯函数_gate机器不串skill_gate_只认vps_gate精确() {
+        // 标签册投影:web 引用 vps/gate(真命中);gate 引用 skill/gate(条目撞车,
+        // kind 不同,不命中);edge 引用 vps/gateway(子串,不命中)。
+        let data: crate::engine::TagLsData = serde_json::from_str(
+            r#"{"catalogPath":"/r/tags.json","tags":[
+                {"name":"web","refs":[{"kind":"vps","id":"gate"}]},
+                {"name":"gate","refs":[{"kind":"skill","id":"gate"}]},
+                {"name":"edge","refs":[{"kind":"vps","id":"gateway"}]}
+            ]}"#,
+        )
+        .unwrap();
+        let sheet = data.sheet();
+        let hits = crate::screens::catalog::tags_referring(&sheet, "vps", "gate");
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["web"],
+            "只有真正引用 vps/gate 的 web 命中;skill/gate 与 vps/gateway 都不算"
+        );
+        assert_eq!(
+            hits[0].refs,
+            vec![crate::engine::CatalogRef {
+                kind: "vps".into(),
+                id: "gate".into()
+            }],
+            "命中标签带上各自引用(原样,指针不是密钥)"
+        );
+    }
+
+    /// 反查匹配纯函数:一台机器可被多个标签引用,全部返回且保持引擎的确定性
+    /// 排序(面板不重排);一个都不引时给空(由调用方画成「一条都没有」)。
+    #[test]
+    fn 反查匹配纯函数_多标签命中保序_零命中给空() {
+        let data: crate::engine::TagLsData = serde_json::from_str(
+            r#"{"catalogPath":"/r/tags.json","tags":[
+                {"name":"prod","refs":[{"kind":"vps","id":"gate"}]},
+                {"name":"bare","refs":[]},
+                {"name":"edge","refs":[{"kind":"vps","id":"gate"},{"kind":"vps","id":"bare"}]}
+            ]}"#,
+        )
+        .unwrap();
+        let sheet = data.sheet();
+        let hits = crate::screens::catalog::tags_referring(&sheet, "vps", "gate");
+        assert_eq!(
+            hits.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            vec!["edge", "prod"],
+            "两个引用 vps/gate 的标签都命中,保持投影(确定性排序后)的顺序"
+        );
+        assert!(
+            crate::screens::catalog::tags_referring(&sheet, "vps", "ghost").is_empty(),
+            "没有标签引用 ghost:零命中给空(调用方画成「一条都没有」)"
+        );
+    }
+
+    // ---- 工单 #70:反查上浮的行为测试(公开缝:update(Key/Mouse) 驱动) ----
+    //
+    // 全部走在公开缝上:`App::update(Message::Key / Message::Mouse)` 驱动一个
+    // `FakeRunner`,断言落在 `frame_display` 帧、`app.log` 人话行、选中下标、
+    // `hitmap()` 命中目标与 `FakeRunner::call_argvs()` / `abort_count()` 探针上
+    // ——不断言私有函数签名、不断言内部字段名。上面的 `反查匹配纯函数_*` 钉纯
+    // 函数口径,这一族钉「一个键问下去之后操作者看见什么、引擎收到什么」。
+
+    /// 反查上浮的**三标签夹具**(#70 规格验收 1):prod / edge / pi 三条都
+    /// 引用 `vps/gate`(各自引用原样在场);另放一条**名字也叫 gate** 的标签,
+    /// 它引用的是 `skill/gate`——条目名撞车,反查机器时不该被算进来(纯函数
+    /// 那一族已钉口径,这里在帧上复核)。prod 多带一条 `skill/dr` 引用,用来
+    /// 钉「命中标签的**各自**引用原样上场,不只印名字」。
+    const TAG_LS_GATE3: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[{"name":"prod","refs":[{"kind":"vps","id":"gate"},{"kind":"skill","id":"dr"}]},{"name":"edge","refs":[{"kind":"vps","id":"gate"}]},{"name":"pi","refs":[{"kind":"vps","id":"gate"}]},{"name":"gate","refs":[{"kind":"skill","id":"gate"}]}]}}"#;
+
+    /// 反查上浮的**机器册夹具**(#70):gate 带一条登录指针 `$DEPLOY_KEY`
+    /// (用来钉「结果不印机密本体」——投影里就只有指针,面板也不该多印),
+    /// 另留一台 bare(零标签,给「一条都没有」那一态)。
+    const REVERSE_MACHINES: &str = r#"[{"name":"gate","ips":[{"label":"home","addr":"10.0.0.1"}],"port":22,"logins":[{"user":"root","ref":"$DEPLOY_KEY"}],"note":"门口"},{"name":"bare","ips":[],"port":0,"logins":[]}]"#;
+
+    /// 标签册 **rc 3** 回音(#70 规格验收 3 / 故事 34:读不到,不是空结果)。
+    /// 刻意让 `data` 仍是**可定型**的形状(`TagLsData` 拆得出来)——这正是
+    /// 最容易蒙混过关的那一种:只凭「拆不拆得出型」判定,就会把「这次没读到」
+    /// 画成「一条标签引用都没有」,两态互相冒充(spec #65 铁律 4)。
+    const TAG_LS_RC3: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"tags.json 读不到:数据仓根下没有这个文件","hint":"先 nw tag add <标签> --ref <kind>/<条目> 挂一个","details":{"catalogPath":"/r/tags.json"}}],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[]}}"#;
+
+    /// 契约守卫合成「需升级 nw」的回音(#70 读不到第三态):schema 面板不认识,
+    /// `data_as` 拆不出型——绝不按旧形状降级解析,也不画成空列表。
+    const TAG_LS_GUARD: &str = r#"{"schema":"nw/tag-ls.v9","nw":"9.9.9","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[]}}"#;
+
+    /// 建一本就绪的机器册(#70 反查上浮的行为夹具)。`machines` 是 VpsLsData
+    /// 的 machines JSON 数组;`rules` 是 FakeRunner 的回放规则——反查只读走
+    /// `tag ls` 无参全列,把标签册夹具喂在这里;`root` = 数据仓根(`None` =
+    /// 未设);`tag_cap` = 标签组能力可不可用。后两个参数让**门禁两态**可分别
+    /// 自造:门禁顺序钉死「先根、再能力、最后才发那一次只读调用」,任缺一条
+    /// 给各自指路且**一次引擎调用都不发**。
+    ///
+    /// 返回 runner 是为了探针:`call_argvs()` 是「发没发命令」唯一可观察的
+    /// 证据(FakeRunner 只记 argv、绝不存 stdin 本体,守「面板侧不留副本」铁律)。
+    fn reverse_app(
+        machines: &str,
+        rules: &[(&str, i32, &str)],
+        root: Option<&str>,
+        tag_cap: bool,
+    ) -> (std::sync::Arc<crate::engine::FakeRunner>, crate::app::App) {
+        let ls = format!(r#"{{"catalogPath":"/r/vps.json","machines":{machines}}}"#);
+        let mut all: Vec<(&str, i32, &str)> = vec![("vps ls", 0, ls.as_str())];
+        all.extend_from_slice(rules);
+        let runner = std::sync::Arc::new(crate::engine::FakeRunner::new(&all));
+        let mut app = crate::app::App::with_runner(runner.clone());
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        if tag_cap {
+            app.capabilities.record(
+                crate::engine::Capability::Tag,
+                crate::engine::Probe::Available,
+            );
+        }
+        app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
+        app.data_root = root.map(str::to_string);
+        (runner, app)
+    }
+
+    /// 反查上浮两门俱开的就绪机器册(上面各族的行为夹具都走这一档)。
+    fn reverse_ready(
+        machines: &str,
+        rules: &[(&str, i32, &str)],
+    ) -> (std::sync::Arc<crate::engine::FakeRunner>, crate::app::App) {
+        // 数据仓根钉成临时目录:门禁第一道(根)因此确确过得去,第二道(能力)
+        // 由 `tag_cap` 另造。不钉就会随跑测试那台机器的配置漂,门禁测不准。
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        reverse_app(machines, rules, Some(&root), true)
+    }
+
+    /// 反查上浮在机器册选中行上的键盘触发(规格故事 31):Enter 问「什么标签
+    /// 引用了这一条」。抽出来是因为四族测试都要走这一下,而这一下必须与
+    /// 鼠标触发完全同路(见 `反查触发段_有鼠标命中_点它等于按键`)。
+    fn 反查这台(app: &mut crate::app::App) {
+        tap(app, KeyCode::Enter);
+    }
+
+    /// 直接灌一条 `tag ls` 回音(不经 FakeRunner):用来造「迟到的第二条回音」
+    /// ——它确确实实是一次引擎回音(带 argv、带回音信封),只是落在操作者
+    /// 已返航之后。`data` 是 TagLsData 的 data 面 JSON,`rc` 是退出码。
+    fn feed_tag_echo(app: &mut crate::app::App, data: &str, rc: i32) {
+        let env = format!(
+            r#"{{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":{ok},"errors":[],"warnings":[],"data":{data}}}"#,
+            ok = rc == 0
+        );
+        let out = crate::engine::EngineOutput {
+            args: vec![
+                "tag".into(),
+                "ls".into(),
+                "--root".into(),
+                std::env::temp_dir().to_string_lossy().to_string(),
+            ],
+            exit_code: crate::engine::ExitCode::from_number(rc),
+            ok: rc == 0,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(&env).ok(),
+            raw_stdout: env,
+            parse_error: None,
+        };
+        app.update(crate::app::Message::Engine(
+            crate::engine::EngineEvent::Finished(Box::new(out)),
+        ));
+    }
+
+    /// 规格验收 1 / 故事 32:一台挂了 3 个标签的机器,三个标签名与各自引用
+    /// **都在帧上**;条目名撞车的 `skill/gate` 不混进来。
+    #[test]
+    fn 反查_三个标签与各自引用都在帧上() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 投影按名排序:首行 bare,第二行才是 gate
+        assert_eq!(app.catalog_sel(), 1, "选中 gate");
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        for name in ["prod", "edge", "pi"] {
+            assert!(s.contains(name), "标签 {name} 应在浮层里:{s}");
+        }
+        assert!(s.contains("3 个标签引用了 gate"), "命中条数明说:{s}");
+        assert!(s.contains("skill/dr"), "prod 的另一条引用原样在场:{s}");
+        assert!(s.contains("Esc 或点击任意处关闭"), "收口给返航路:{s}");
+        // 在途的那一次只读调用确有一次到达运行器,形状与 nw tag ls 契约一致
+        assert_eq!(
+            _r.call_argvs(),
+            vec![vec![
+                "tag".to_string(),
+                "ls".to_string(),
+                "--root".to_string(),
+                std::env::temp_dir().to_string_lossy().to_string()
+            ]],
+            "反查复用既有的 tag ls 无参全列(不新增调用形状)"
+        );
+    }
+
+    /// 规格验收 2 / 故事 33:一台没有标签的机器,**明说**「没有标签引用这一
+    /// 条」并给「去挂第一个标签」的下一步——与「有 N 条」两态可区分,绝不
+    /// 共用一个空列表。
+    #[test]
+    fn 反查_一条标签都没有_明说并给下一步() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        assert_eq!(app.catalog_sel(), 0, "投影按名排序:首行 bare");
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("没有标签引用 bare"), "明说一条都没有:{s}");
+        assert!(s.contains("挂第一个标签"), "给下一步:{s}");
+        assert!(!s.contains("个标签引用了"), "不是有 N 条那一态:{s}");
+    }
+
+    /// 规格验收 5 / 故事 41 的**帧上层**:同时存在一台叫 `gate` 的机器与一条
+    /// 叫 `gate` 的技能标签时,反查机器只摊开引用 `vps/gate` 的那几条——帧上
+    /// 出现 `skill/gate` 就是匹配退化成了子串包含(纯函数那一族钉口径,这一
+    /// 条钉「口径真的走到了屏上」)。
+    #[test]
+    fn 反查_机器与技能同名_帧上只有vps_gate的引用() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 投影按名排序:首行 bare,第二行才是 gate
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("3 个标签引用了 gate"), "只数出三条:{s}");
+        assert!(
+            !s.contains("skill/gate"),
+            "引用 skill/gate 的那条标签不上屏(同名不串味):{s}"
+        );
+        assert!(!s.contains("4 个标签"), "不是四条:同名的那条没被算进来:{s}");
+    }
+
+    /// 规格验收 3 / 故事 34:标签册回 rc 3,**走指路、不画成空列表**。
+    /// rc 3 的 `data` 仍是可定型形状——只看「拆不拆得出型」就会把它当成
+    /// 合法空册,于是「这次没读到」冒充「一条标签引用都没有」。帧上因此既
+    /// 没有「没有标签引用」那套话,也没有「挂第一个标签」的下一步;指路
+    /// 落在日志行里(人话原文 + 说清不是空结果)。
+    #[test]
+    fn 反查_标签册回rc3_走指路不画成空列表() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 3, TAG_LS_RC3)]);
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            s.contains("反查没结果"),
+            "帧上给指路,不是一片空白(按了 Enter 屏上没动静 = 当成面板没反应):{s}"
+        );
+        assert!(
+            s.contains("不是「一条标签引用都没有」"),
+            "说清读不到与没打过标签是两件事:{s}"
+        );
+        assert!(
+            !s.contains("没有标签引用"),
+            "rc 3 是读不到,绝不是「一条都没有」:{s}"
+        );
+        assert!(
+            !s.contains("挂第一个标签"),
+            "读不到不给挂标签的下一步(那会把没读到骗成没打过标签):{s}"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查没结果")),
+            "指路同时落在日志人话里:{:?}",
+            app.log
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("tags.json 读不到")),
+            "引擎的原文证据在场,不替它改写:{:?}",
+            app.log
+        );
+    }
+
+    /// 规格验收 3 的另一半:契约守卫合成「需升级 nw」(schema 面板不认识)
+    /// 同样走指路,不画成空列表。这一路 `data_as` 拆不出型,与 rc 3 那一
+    /// 路形状不同,但落到操作者眼里必须是同一件事:**没读到**。
+    #[test]
+    fn 反查_契约守卫需升级nw_走指路不画成空列表() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GUARD)]);
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("反查没结果"), "帧上给指路,不画成空列表:{s}");
+        assert!(!s.contains("没有标签引用"), "读不到不是空列表:{s}");
+        assert!(
+            app.log.iter().any(|l| l.contains("反查没结果")),
+            "指路落在日志人话里:{:?}",
+            app.log
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("需升级 nw")),
+            "说清是两端 schema 没对齐,不是数据没了:{:?}",
+            app.log
+        );
+    }
+
+    /// 规格验收 4 / 故事 40:数据仓根**未设**时给数据仓根指路(帧上 + 日志),
+    /// 且**一次引擎调用都没发**。夹具里明明摆着能答对的 `tag ls` 回放规则,
+    /// 所以「没发」不是夹具答不上,是面板自己没收口。
+    #[test]
+    fn 反查门禁_数据仓根未设_指路且零引擎调用() {
+        let (runner, mut app) =
+            reverse_app(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)], None, true);
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "根未设:一条 argv 都不发(探针是空的):{:?}",
+            runner.call_argvs()
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查未下发")),
+            "日志给指路:{:?}",
+            app.log
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("数据仓根未设"), "帧上也给人话:{s}");
+        assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
+    }
+
+    /// 规格验收 4 / 故事 39:标签组能力不可用时给能力指路(缺的是引擎能力,
+    /// 不是面板坏了),同样**零引擎调用**。数据仓根这一道是过的——所以这一
+    /// 条钉的是第二道门真的在管事,不是被第一道顺手挡掉的。
+    #[test]
+    fn 反查门禁_标签组能力不可用_指路且零引擎调用() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            Some(&root),
+            false,
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "能力不可用:一条 argv 都不发:{:?}",
+            runner.call_argvs()
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("缺的是引擎能力")),
+            "说清缺的是引擎能力,不是面板坏了:{:?}",
+            app.log
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
+    }
+
+    /// 规格验收 4 的**门禁顺序**:根未设与能力不可用同时在场时,**根那句赢**
+    /// (与面板其余入口同一信任序:先根、再能力),并且仍然是零引擎调用。
+    /// 两条指路措辞互不冒充——操作者该先去设根,而不是先被告知去升级 nw。
+    #[test]
+    fn 反查门禁_根与能力双缺_根那句赢且零调用() {
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            None,
+            false,
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "两道门都不过:更是一条都不发:{:?}",
+            runner.call_argvs()
+        );
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("反查未下发"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(line.contains("五域读不到数据仓"), "根那句赢:{line}");
+        assert!(
+            !line.contains("缺的是引擎能力"),
+            "不让能力那句抢在前面(两条指路互不冒充):{line}"
+        );
+        assert!(
+            !line.contains("升级所配 nw"),
+            "能力那句的下一步也不出现:{line}"
+        );
+    }
+
+    /// 规格验收 6 / 故事 38:反查**只在机器册**提供。订阅册与钥匙册的条目
+    /// 不在 `TAG_REF_KINDS` 里,在那里放这个键注定只返回「没有」——所以同一
+    /// 个 `Enter` 在这两本上**无事可做**:不开浮层、不入在途、不排队一条
+    /// `tag ls`。这里把两道门都开到过得去(根设了、tag 能力记成可用), 钉的
+    /// 就是「没有这一行」而不是「门挡掉了」。
+    #[test]
+    fn 反查边界_订阅册与钥匙册上同一个键不做反查() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        for (name, mk) in [
+            (
+                "订阅",
+                sub_app
+                    as fn(
+                        &[(&str, i32, &str)],
+                    )
+                        -> (crate::app::App, std::sync::Arc<crate::engine::FakeRunner>),
+            ),
+            ("钥匙", key_app),
+        ] {
+            let (mut app, runner) = mk(&[]);
+            app.data_root = Some(root.clone());
+            app.capabilities.record(
+                crate::engine::Capability::Tag,
+                crate::engine::Probe::Available,
+            );
+            tap(&mut app, KeyCode::Char('l')); // 先把册体读出来(有行可选)
+            feed(&mut app);
+            let before = runner.call_argvs();
+            tap(&mut app, KeyCode::Down);
+            tap(&mut app, KeyCode::Enter);
+            assert!(!app.vps_reverse_open(), "{name}册上 Enter 不开反查浮层");
+            assert_eq!(
+                runner.call_argvs(),
+                before,
+                "{name}册上 Enter 不下发任何命令(连 tag ls 都不排)"
+            );
+        }
+    }
+
+    /// 规格验收 8 / 故事 42:反查**复用既有的只读调用形状**——队里那一条
+    /// argv 逐字节就是 `nw tag ls --root <根>`(无参全列)。不新增调用形状、
+    /// 不新增写路径,`tags.json` 因此一个字节都不会被碰。
+    #[test]
+    fn 反查_复用既有只读调用_队里argv逐字节是tag_ls_root() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        assert_eq!(
+            app.queue.last().cloned(),
+            Some(vec![
+                "tag".to_string(),
+                "ls".to_string(),
+                "--root".to_string(),
+                root.clone()
+            ]),
+            "无参全列 + 只认 --root:与既有的 nw tag ls 逐字节同形"
+        );
+        assert!(
+            app.queue
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("tag")
+                    || a.get(1) == Some(&"ls".to_string())),
+            "反查这一路只有只读的 ls,没有任何写路径:{:?}",
+            app.queue
+        );
+    }
+
+    /// 规格验收 9 / 故事 43:反查结果**不印密钥引用、不印机密本体**。机器册
+    /// 帧上本来就有 `$DEPLOY_KEY` 这个指针(那是登录槽的 ref,指针不是密钥),
+    /// 所以断言要更严:浮层里只准出现 `<kind>/<条目>` 形式的标签引用,不准
+    /// 出现任何 `$` 引用、任何形如地址/端口的本体。
+    #[test]
+    fn 反查结果_不印密钥引用不印机密本体() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        // 浮层那一块(取「反查 · 什么标签引用了这一条」到收口行之间)
+        let popup: String = s
+            .lines()
+            .skip_while(|l| !l.contains("反查 · 什么标签引用了这一条"))
+            .take_while(|l| !l.contains("Esc 或点击任意处关闭"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(popup.contains("prod"), "浮层确凿在场:{popup}");
+        assert!(!popup.contains('$'), "浮层不印任何 $ 引用:{popup}");
+        assert!(!popup.contains("10.0.0.1"), "浮层不印地址本体:{popup}");
+        assert!(!popup.contains(":22"), "浮层不印端口:{popup}");
+        assert!(!popup.contains("门口"), "浮层不印备注:{popup}");
+        assert!(!popup.contains("root"), "浮层不印登录名:{popup}");
+    }
+
+    /// 规格验收 11:反查是**只读**,不并入 `assembling` 全局写互斥。按下去
+    /// 之后 `assembling` 必须还是灭的——否则在途的一次反查会把登记 / 装配
+    /// 一路全挡住(那是写闸,不是读闸)。
+    #[test]
+    fn 反查_是只读_不点亮assembling写互斥() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        assert!(!app.assembling, "起初没有写在途");
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        assert!(!app.assembling, "反查在途不点亮写互斥(只读,不占写闸)");
+        assert_eq!(app.queue.len(), 1, "确有一次只读调用排队");
+        feed(&mut app);
+        assert!(!app.assembling, "反查落地也不点亮写互斥");
+        // 反证:写互斥亮着(装配在途)时反查照样问得动。若把反查并进
+        // `assembling`,这一下就会被互斥语挡掉,队里一条都不多。
+        tap(&mut app, KeyCode::Esc); // 先返航,否则结果浮层吞键
+        app.assembling = true;
+        反查这台(&mut app);
+        assert_eq!(app.queue.len(), 1, "装配在途也问得动(只读不占写闸)");
+    }
+
+    /// 规格验收 7 / 故事 36:反查**在途期间不拿上一轮结论冒充本次**。第一轮
+    /// 问 bare 得到「一条都没有」,返航后换一台机器再问——在途那一刻屏上既
+    /// 没有第一轮的结论,也没有本轮的回音(还没到)。`run_tag_ls` 因此把上一
+    /// 轮的回音清空:留着它,「在途」就会长得像「有结果」。
+    #[test]
+    fn 反查_在途不拿上一轮结论冒充本次() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        反查这台(&mut app); // 第一轮:bare
+        feed(&mut app);
+        let a = crate::testutil::frame_display(&app, 80, 30);
+        assert!(a.contains("没有标签引用 bare"), "第一轮落地:{a}");
+        tap(&mut app, KeyCode::Esc); // 返航回机器册(选中行不动)
+        tap(&mut app, KeyCode::Down); // 换一台机器问
+        反查这台(&mut app); // 第二轮:在途
+        let b = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!b.contains("没有标签引用 bare"), "在途不摆上一轮的结论:{b}");
+        assert!(
+            !b.contains("个标签引用了"),
+            "在途也不摆本轮(回音还没到):{b}"
+        );
+    }
+
+    /// 规格验收 7 的另一半:操作者已返航(Idle)之后,**迟到的回音不收敛任何
+    /// 状态、不重开浮层**。这一条回音确确实实是一次引擎回音,只是落在操作
+    /// 者已经看完走了之后——幽灵重开一个旧结果比不开更糟。
+    #[test]
+    fn 反查_迟到回音不重开浮层() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "先落地");
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.vps_reverse_open(), "返航");
+        // 迟到的第二条 tag ls 回音:同一台机器、另一份标签册
+        feed_tag_echo(
+            &mut app,
+            r#"{"catalogPath":"/r/tags.json","tags":[{"name":"late","refs":[{"kind":"vps","id":"gate"}]}]}"#,
+            0,
+        );
+        assert!(
+            !app.vps_reverse_open(),
+            "迟到回音不重开浮层(已返航 = 这一轮已经结束)"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("个标签引用了"), "迟到回音不上屏:{s}");
+        assert!(!s.contains("late"), "迟到回音里的标签名也不上屏:{s}");
+    }
+
+    /// 规格验收 10 / 故事 44:反查触发段**有鼠标命中**,且点它 = 在机器册
+    /// 选中行上按 `Enter`(两条路给同一件事:同一条 argv、同一次在途)。
+    /// 段文案由渲染与命中共用(`catalog_key_parts` 一处产出),点哪打哪。
+    #[test]
+    fn 反查触发段_有鼠标命中_点它等于按键() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 选中 gate
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("Enter 反查"), "段在键位行上画着:{s}");
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::VpsReverse)
+        });
+        assert_eq!(
+            app.queue.last().cloned(),
+            Some(vec![
+                "tag".to_string(),
+                "ls".to_string(),
+                "--root".to_string(),
+                std::env::temp_dir().to_string_lossy().to_string()
+            ]),
+            "点段与按 Enter 下同一条只读 argv"
+        );
+        // 与键盘那条路逐字节同路
+        let (_r2, mut app2) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app2, KeyCode::Down);
+        反查这台(&mut app2);
+        assert_eq!(app.queue, app2.queue, "鼠标与键盘两条路一条 argv");
+    }
+
+    /// 规格验收 10 / 故事 37:结果浮层 `Esc` 或**任意处点击**都关,且关掉
+    /// 之后回到机器册**原选中行**。反查从头到尾不写 `vps_sel`,所以「回到
+    /// 原选中行」不需要一次恢复动作,只需要不在返航时顺手改它——这条钉的
+    /// 正是「没顺手改」。
+    #[test]
+    fn 反查浮层_键盘与任意点击都关_回到机器册原选中行() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        let sel = app.catalog_sel();
+        assert_eq!(sel, 1, "选中 gate");
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "浮层在场");
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.vps_reverse_open(), "Esc 返航");
+        assert_eq!(app.catalog_sel(), sel, "Esc 后选中行原样");
+        // 再开一次:点浮层外的空白也算返航(规格 §7:任意处点击关闭)
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "再开一次");
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::DismissPopup)
+        });
+        assert!(!app.vps_reverse_open(), "点任意处返航");
+        assert_eq!(app.catalog_sel(), sel, "点任意处后选中行仍原样");
+    }
+
+    /// 规格验收 10 的弹层纪律 / 故事 50:浮层打开时**底层不产命中**——清单
+    /// 行与键位行三个可点段(反查 / 换册 / 过滤)一段都不给,点击不穿透。
+    /// 命中的整个正文只有一个「点任意处返航」。
+    #[test]
+    fn 反查浮层_弹层优先级_底层清单行与键位段都不产命中() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open());
+        app.size = Rect::new(0, 0, 80, 30);
+        let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+        assert!(
+            hits.iter()
+                .any(|(_, t)| matches!(t, crate::layout::Target::DismissPopup)),
+            "浮层自己给一个「点任意处返航」:{hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .all(|(_, t)| !matches!(t, crate::layout::Target::SelectRow(_))),
+            "底层清单行不产命中(点不到被浮层盖住的那一行)"
+        );
+        assert!(
+            hits.iter().all(|(_, t)| !matches!(
+                t,
+                crate::layout::Target::VpsReverse
+                    | crate::layout::Target::SwitchBook
+                    | crate::layout::Target::CatalogFilter
+            )),
+            "键位行三个可点段都不产命中"
+        );
+    }
+
+    /// #69 与 #70 合用(规格故事 27):过滤收窄到一台机器之后,反查点的是
+    /// **看得见的那一台**——被滤掉的 bare 不该被问到,浮层点名的必须是 gate。
+    /// 选中 / 鼠标 / 反查全部经过可见下标映射回原始投影,同一口径。
+    #[test]
+    fn 反查与册内过滤合用_浮层点名看得见的那一台() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        过滤敲词(&mut app, "gate"); // 只留 gate(bare 被滤掉)
+        assert_eq!(app.catalog_visible().len(), 1, "收窄到一台");
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("3 个标签引用了 gate"), "点名看得见的那一台:{s}");
+        assert!(!s.contains("没有标签引用"), "滤掉的 bare 不被问到:{s}");
+    }
+
+    /// 两档响应式(#70 验收的常畅 / 紧凑):80×30 与 66×50(外加 100×40)下,
+    /// 触发段与结果浮层都画得出来,且**没有一行超宽**。紧凑态放不下整段时
+    /// 渲染与命中同源收口(屏上没有的段,鼠标也点不到)。浮层盖住键位行是
+    /// 弹层纪律,所以「关着看段、开着看浮层」分两次量。
+    #[test]
+    fn 反查浮层与触发段_常畅与紧凑两档都渲染不溢出() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        for (w, h) in [(80u16, 30u16), (66, 50), (100, 40)] {
+            // 关着:触发段在键位行上,且没有浮层
+            let closed = crate::testutil::frame_display(&app, w, h);
+            assert!(
+                closed.contains("Enter 反查"),
+                "{w}×{h} 触发段应在场:{closed}"
+            );
+            assert!(
+                !closed.contains("什么标签引用了这一条"),
+                "{w}×{h} 没问就不起浮层:{closed}"
+            );
+            for ln in closed.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 关着也有行超宽:{ln}"
+                );
+            }
+            // 开着:结果浮层在场(它盖住键位行是弹层纪律,不是漏画)
+            反查这台(&mut app);
+            feed(&mut app);
+            let open = crate::testutil::frame_display(&app, w, h);
+            assert!(
+                open.contains("3 个标签引用了 gate"),
+                "{w}×{h} 结果浮层应在场:{open}"
+            );
+            assert!(
+                open.contains("Esc 或点击任意处关闭"),
+                "{w}×{h} 收口行应在场:{open}"
+            );
+            for ln in open.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 开着也有行超宽:{ln}"
+                );
+            }
+            tap(&mut app, KeyCode::Esc);
+        }
+    }
+
+    // ---- 工单 #70 的两处「要当场钉住」的边界 ----
+
+    /// 规格验收 7 的第三面:在途时**换册**(`m`)把在途清成 Idle,迟到的
+    /// `tag ls` 回音于是不收敛任何状态。它问的那台机器已经不在场,面板不替
+    /// 一个走了的问题留一个幽灵结果——「迟到回音不收敛」这条纪律因此不只
+    /// 返航一条路,换册 / 切屏同样算。
+    #[test]
+    fn 反查_在途时换册_迟到回音不收敛任何状态() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app); // 在途
+        assert_eq!(app.queue.len(), 1, "确有一次只读调用在队里");
+        tap(&mut app, KeyCode::Char('m')); // 翻到标签册
+        assert_eq!(
+            app.catalog_kind,
+            CatalogKind::Tag,
+            "换册成功(在途不是写闸,挡不住换册)"
+        );
+        assert!(!app.vps_reverse_open(), "换册即收在途");
+        // 迟到的 tag ls 回音落地:标签册照常读进来,但反查浮层不开
+        feed(&mut app);
+        assert!(!app.vps_reverse_open(), "迟到回音不重开浮层");
+        assert_eq!(app.tag_len(), 4, "标签册照常呈现(只读回音没被丢)");
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("什么标签引用了这一条"), "屏上没有反查浮层:{s}");
+    }
+
+    /// 规格验收 12 / #62 立过的双向对齐(帮助不写幽灵键、README 不漏键):
+    /// 机器册的 `Enter`(反查上浮)在 `HELP_ROWS` 里挂在机器册那一行、说明写
+    /// 的是「什么标签引用了这一条」,在 README 的编目键位列里也在场。这一条
+    /// 不新造对照机制,只是把 #70 这一个键接进既有的双向对齐——免得反查上浮
+    /// 落成「屏上有个键,两处文档都没有」。顺带把那一行派发下去:实现里真有
+    /// 一条真实分支,不是幽灵键。
+    #[test]
+    fn 反查键_帮助浮层与readme都对齐_派发确有一次只读调用() {
+        use crate::ui::HELP_ROWS;
+        let row = HELP_ROWS
+            .iter()
+            .find(|r| r.book == Some(CatalogKind::Vps) && r.code == KeyCode::Enter)
+            .expect("机器册的 Enter(反查上浮)应在帮助对照表里");
+        assert!(
+            row.desc.contains("什么标签引用了"),
+            "说明写的是反查上浮这一件事:{}",
+            row.desc
+        );
+        let readme = include_str!("../../README.md");
+        let line = readme
+            .lines()
+            .find(|l| l.starts_with("| 编目 "))
+            .expect("README 六屏表应有编目一行");
+        assert!(line.contains("`Enter`"), "编目键位列应有 Enter:{line}");
+        assert!(line.contains("反查"), "并说清它是反查:{line}");
+        // 帮助那一行派发下去:实现里真有一条只读分支
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        app.update(crate::app::Message::Key(KeyEvent::new(
+            row.code,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.queue.len(),
+            1,
+            "帮助列的 Enter 派发下去确有一次只读 tag ls"
+        );
+    }
+
+    /// 反查触发段**只机器册有命中**。`TAG_REF_KINDS` 的已知集合是
+    /// `skill` / `extension` / `vps`,四本册里只有机器册的条目可打标签;
+    /// 订阅册与钥匙册的条目不在其内,放一个注定只返回「没有」的动作是噪声
+    /// (spec #65 §4:触发点只有一处)。标签册的 `Enter` 是另一件事(#54 反查
+    /// 选中的那条标签),它的键位行也写着「Enter 反查」四个字,但那是**只画
+    /// 不点的提示段**,不给命中——所以这一条只认命中区,不认帧上有没有那四
+    /// 个字(认字就会把标签册的提示段误判成触发段)。
+    #[test]
+    fn 反查触发段_只机器册给命中_另三本连段都不给() {
+        for (name, kind) in [
+            ("机器", CatalogKind::Vps),
+            ("标签", CatalogKind::Tag),
+            ("订阅", CatalogKind::Subscription),
+            ("钥匙", CatalogKind::Key),
+        ] {
+            let mut app = book(name);
+            assert_eq!(app.catalog_kind, kind, "{name}册");
+            app.size = Rect::new(0, 0, 80, 30);
+            let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+            let has = hits
+                .iter()
+                .any(|(_, t)| matches!(t, crate::layout::Target::VpsReverse));
+            assert_eq!(
+                has,
+                kind == CatalogKind::Vps,
+                "{name}册:反查触发段的有无={has}"
+            );
+        }
+    }
+
+    /// 反查结果浮层与编目过滤输入态**同时在场**时,`Esc` 归谁?答案:浮层是
+    /// 更上一层(与帮助 / 发射确认同级的顶层浮层),所以 **Esc 先收浮层**,
+    /// 过滤输入态与刚敲的过滤词原样留着。反过来会让操作者卡在一个二选一里:
+    /// 要么还被浮层蒙着就丢了刚敲的词,要么为了清词先手动关浮层。
+    /// 这条把次序钉住,免得以后有人把浮层守卫挪到过滤守卫后面去。
+    #[test]
+    fn 反查浮层与过滤输入态同时在场_先收浮层_过滤词不丢() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 选中 gate
+        tap(&mut app, KeyCode::Char('/')); // 进过滤输入态
+        tap(&mut app, KeyCode::Char('g'));
+        tap(&mut app, KeyCode::Char('a')); // 过滤词「ga」(只留 gate)
+        assert!(app.catalog_filter_on, "输入态在场");
+        // 输入态下点键位行的反查段:可点段不收输入态管(输入态只管键入)
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::VpsReverse)
+        });
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "浮层开起来了");
+        assert!(app.catalog_filter_on, "过滤输入态还在");
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.vps_reverse_open(), "Esc 先收浮层(更上一层先收)");
+        assert!(app.catalog_filter_on, "过滤输入态不退:它不在这一层");
+        assert_eq!(app.catalog_filter(), "ga", "刚敲的过滤词不丢");
+        // 再按一次 Esc 才归输入态那一层(清词 + 退输入态)
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.catalog_filter_on, "第二次 Esc 才退输入态");
+        assert_eq!(app.catalog_filter(), "", "第二次 Esc 清词");
+    }
+
     // ---- 工单 #66:四本册整帧 golden(逐字节) ----
     //
     // 本票是**纯重构**:操作者感知不到任何变化。上面四条
@@ -5887,7 +6940,7 @@ mod tests {
 │          ││    地址 home=10.0.0.1                                            │
 │          ││    登录 root→$DEPLOY_KEY                                         │
 │          ││    备注 门口                                                     │
-│          ││  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册 · / 过滤     │
+│          ││  ↑/↓ 选 · r 登记 · d 删除 · Esc · Enter 反查 · m 换册 · / 过滤   │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -5919,7 +6972,7 @@ mod tests {
 │    地址 home=10.0.0.1                                          │
 │    登录 root→$DEPLOY_KEY                                       │
 │    备注 门口                                                   │
-│  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册 · / 过滤   │
+│  ↑/↓ 选 · r 登记 · d 删除 · Esc · Enter 反查 · m 换册 · / 过滤 │
 │                                                                │
 │                                                                │
 │                                                                │
@@ -6311,11 +7364,12 @@ mod tests {
     ///
     /// 钉两件真事,不靠口头约定:`g`(取回本体的建议命令)只属于订阅册与
     /// 钥匙册——投影里有本体槽的两本(ADR-0009 §1 面板不代跑 get);
-    /// `Enter`(反查选中的这一条)只属于标签册——`vps ls` 没有位置参数,
-    /// 订阅 / 钥匙册的条目也不在 `TAG_REF_KINDS` 里。对四本册各按一次:
-    /// 有这一关切的那本给出各人话的一行日志、**不下发任何命令**(建议命令
-    /// 只给文案);没有这一关切的两本**一个字节都不多打**——不长日志、不
-    /// 入队、册体与选中都不动。谁把这一条挪出查表成员、或往调用方插一个
+    /// `Enter`(反查)属于标签册与机器册——标签册带参反查选中的那条(#54)、
+    /// 机器册无参列全部再本地精确匹配「什么标签引用了这一条」(#70;`vps`
+    /// 在 `TAG_REF_KINDS` 里,机器条目可打标签)。订阅 / 钥匙册的条目不在
+    /// `TAG_REF_KINDS` 里,没有这一关切。对四本册各按一次:有这一关切的给
+    /// 各人话的一行(标签册入队 / 机器册门禁指路),没有的这一关切的两本
+    /// **一个字节都不多打**。谁把这一条挪出查表成员、或往调用方插一个
     /// `if kind ==`,这条测试就红。
     #[test]
     fn 只属一两本的关切_按册各按一次_表外一本都不多发() {
@@ -6355,7 +7409,10 @@ mod tests {
             // g 是纯读关切:册体与选中一个字节都不动(四本同一口径)
             assert_eq!(app.catalog_len(), sheet_before, "{label}册 g 不改册体");
             assert_eq!(app.catalog_sel(), sel_before, "{label}册 g 不改选中");
-            // Enter:只有标签册有反查这一条关切
+            // Enter 反查:标签册(#54 旧态)与机器册(#70 上浮)都有这一关切,
+            // 但两本读法不同——标签册带参反查选中的那条,机器册无参列全部再
+            // 本地按 `<kind>/<条目>` 精确匹配。订阅 / 钥匙册的条目不在
+            // TAG_REF_KINDS 里,没有这一关切(表外一本都不多发)。
             tap(&mut app, KeyCode::Enter);
             if label == "标签" {
                 let argv = app.queue.last().cloned().unwrap_or_default();
@@ -6371,6 +7428,19 @@ mod tests {
                 // 在途清空上一轮结论是 #54 既定语义(不拿旧结论冒充本次),
                 // 不是这两键「改了册体内容」——回音到达才重新摊开。
                 assert_eq!(app.catalog_len(), 0, "反查在途不拿上一轮结论冒充本次");
+            } else if label == "机器" {
+                // 机器册反查(#70 上浮):本夹具只记了 vps 能力、没记 tag 能力,
+                // 所以门禁在「标签组能力」这道上指路——**一次引擎调用都不发**,
+                // 只留一行人话。门禁顺序与 zero-call 由 #70 专测钉,这里只证
+                // 「这一本确有 Enter 关切」(不再是 #66 时的「Enter 无声」)。
+                assert!(app.queue.is_empty(), "机器册反查门不过:零引擎调用");
+                assert_eq!(
+                    app.log.len(),
+                    log_before + 1,
+                    "机器册 Enter 反查门不过留一行指路"
+                );
+                assert_eq!(app.catalog_len(), sheet_before, "机器册反查门不过不改册体");
+                assert_eq!(app.catalog_sel(), sel_before, "机器册反查门不过不改选中");
             } else {
                 assert!(
                     app.queue.is_empty(),

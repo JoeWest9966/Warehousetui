@@ -354,6 +354,10 @@ pub struct App {
     /// 只为把「列全部 / 只列一个」这档差别显式画出来——操作者看得见自己
     /// 问的是什么,不靠记性。
     pub tag_lookup: Option<String>,
+    /// 反查上浮状态(#70):机器册上一个键问「什么标签引用了这一条」。
+    /// **独立小状态,不并入 `assembling` 写互斥**(反查只读);三态两两可
+    /// 区分,见 [`crate::screens::catalog::VpsReverse`]。
+    pub vps_reverse: crate::screens::catalog::VpsReverse,
     /// 标签册选中行(↑/↓ 与鼠标点行同源)。
     pub tag_sel: usize,
     /// 摘引用 / 删标签确认浮层(ADR-0009 §2:上游 rm 没有 `--yes`,面板加
@@ -556,6 +560,7 @@ impl App {
             tag_ls_echo: None,
             tag_ls_loading: false,
             tag_lookup: None,
+            vps_reverse: crate::screens::catalog::VpsReverse::Idle,
             tag_sel: 0,
             tag_rm_confirm: false,
             tag_rm_result: None,
@@ -821,6 +826,11 @@ impl App {
             // 命中区只在真有 up 在途(as_running)时由 assemble_hits 产出,故此臂
             // 到达即确有进程可止;滚轮分支不受理它(滚过中止段不点火)。
             Target::Abort => self.abort_assembling(),
+            // 点正文键位行的「Enter 反查」段(#70):与机器册选中行上按 `Enter`
+            // 完全同路——只读地问「什么标签引用了这一条」。段只在机器册、且册体
+            // 有条目(= 选中了一行)时由 catalog_hits 产出,故到达即确有一台机器
+            // 可问;滚轮分支不受理它(滚过反查段不发起调用)。
+            Target::VpsReverse => self.vps_reverse_lookup(),
             // 点正文键位行的「过滤」段(#69):与键盘 `/` 完全同路——进册内过滤
             // 输入态。鼠标只是叠加,不新增语义。
             Target::CatalogFilter => self.catalog_filter_on = true,
@@ -922,6 +932,12 @@ impl App {
         } else if self.as_confirm {
             self.as_confirm = false;
             self.push_log("发射取消");
+        } else if self.vps_reverse_open() {
+            // 反查上浮结果浮层返航(#70):只收状态,册体一行不改、机器册原选中行
+            // 原样在场——反查从头到尾不写 `vps_sel`(它在途时册体键位被吞、回音
+            // 落地只按当前册钳位),所以「回到原选中行」不需要一次恢复动作,只
+            // 需要不在返航时顺手改它。Esc 与点任意处走这一条同路(语义不漂移)。
+            self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
@@ -1161,6 +1177,16 @@ impl App {
         }
         if self.as_confirm {
             self.on_key_confirm(k);
+            return;
+        }
+        // 反查上浮结果浮层(#70):与帮助浮层同级的**顶层浮层**——它在场时吞键,
+        // 只有 Esc 返航;册体键位(↑/↓ / r / d / l / Enter / m)一个都不受理,
+        // 机器册原选中行因此原样不动(规格故事 37:返航后回到原选中行)。
+        // 与 `dismiss_popup` 同路:鼠标点任意处与键盘 Esc 一个后果。
+        if self.vps_reverse_open() {
+            if matches!(k.code, KeyCode::Esc) {
+                self.dismiss_popup();
+            }
             return;
         }
         // 浮层优先级:帮助浮层 > 发射确认 > 手填输入(NW_HOME / 数据仓根) > 指路屏/常屏(见 spec #9)
@@ -2320,6 +2346,10 @@ impl App {
     /// 四本各有自己的账,回来还在(不重跑、不轮询)。
     pub fn cycle_catalog_kind(&mut self) {
         self.catalog_kind = self.catalog_kind.next();
+        // 换册即离开机器册语境(#70):反查上浮是机器册独有的只读动作,换册
+        // 取消任何在途 / 在场的反查——不把机器册的结论顺带到别的册上,也不
+        // 在换册这种「别的动作」后顺手收敛一次回音。
+        self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
         let k = self.catalog_kind;
         self.push_log(format!(
             "换册:{}册({});{}",
@@ -2502,6 +2532,46 @@ impl App {
         self.run_tag_ls(Some(&name));
     }
 
+    /// 反查上浮(#70 主入口,只读):机器册选中行上一个键(Enter)或点键位段,
+    /// 问「什么标签引用了这一条」。**门禁顺序与面板信任序一致**:先看
+    /// 数据仓根设没设、再看标签组能力可不可用,最后才发那一次只读
+    /// `nw tag ls`(无参全列);任缺一条给对应指路,**不发命令、不发在途**
+    /// (`tag_entry_enabled` 内部就是「先根后能力」,`tag_gate_hint` 按同序
+    /// 给各自的指路,互不冒充)。
+    ///
+    /// 反查是只读,**不并入 `assembling` 全局写互斥**;在途是独立小状态
+    /// (`vps_reverse`),不拿上一轮结论冒充本次。读法复用既有
+    /// [`run_tag_ls`](App::run_tag_ls) 落进标签册既有的 `tag_ls_echo`,再
+    /// 本地按 `<kind>/<条目>` 精确匹配推导——**不新增调用形状、不新增写
+    /// 路径、不动 `tags.json` 一个字节**。
+    pub fn vps_reverse_lookup(&mut self) {
+        // 门禁①+②:先数据仓根、再标签组能力(任一缺给各自指路,零引擎调用)。
+        if !self.tag_entry_enabled() {
+            self.push_log(format!("反查未下发:{}", self.tag_gate_hint()));
+            return;
+        }
+        let Some(_root) = self.usable_data_root() else {
+            self.push_log(format!("反查未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        // 选中行:机器册没选中(空册)不下发——面板不空手问,也不把「没选」
+        // 画成一次反查。
+        let Some(machine) = self.selected_vps_name() else {
+            self.push_log("反查未下发:没有选中的机器(↑/↓ 先选一行)");
+            return;
+        };
+        // 在途:清空上一轮结论(`run_tag_ls` 会把 `tag_ls_echo` 置 None),独立
+        // 小状态记住这次问的是哪台机器;回音落地时按它推导。
+        self.vps_reverse = crate::screens::catalog::VpsReverse::InFlight { machine };
+        self.run_tag_ls(None);
+    }
+
+    /// 反查结果浮层在不在场(只有 有 N 条 / 一条都没有 两态画;渲染 / 命中 /
+    /// 键位吞键共用这一判据)。
+    pub fn vps_reverse_open(&self) -> bool {
+        self.vps_reverse.is_open()
+    }
+
     /// 发起挂标签:进表单态(Enter 即下发——上游没有 `--yes`,面板不自己
     /// 造一道确认,ADR-0009 §2)。
     pub fn start_tag_add(&mut self) {
@@ -2674,18 +2744,54 @@ impl App {
                     .skip(2)
                     .find(|a| !a.starts_with("--"))
                     .cloned();
+                // 反查上浮在途(#70):机器册问「什么标签引用了这一条」——回音落地
+                // 时按在途记住的那台机器,从这次 fresh 标签册里就地按 `<kind>/<条目>`
+                // 精确匹配推导。**只在在途时收敛**:操作者已返航(Idle)/ 已看到
+                // 结论(Hits/Empty)时,迟到回音不重开、不覆盖;换册 / 切屏已把在途
+                // 清成 Idle,所以这里天然只对机器册生效。
+                let machine = match &self.vps_reverse {
+                    crate::screens::catalog::VpsReverse::InFlight { machine } => {
+                        Some(machine.clone())
+                    }
+                    _ => None,
+                };
+                // 「读到了」的判据(#70):**rc 0 且拆得出 TagLsData**。rc≠0 的
+                // 回音 `data` 仍可能是可定型形状,只凭「拆不拆得出型」判定就会把
+                // 「这次没读到」冒充成「一条标签引用都没有」——两态互相冒充,正是
+                // spec #65 铁律 4 钉死不许发生的事。契约守卫合成「需升级 nw」
+                // 由 `data_as` 的 None 分支接住(schema 不认识就拆不出型,绝不按旧
+                // 形状降级解析),rc 这一路单独立判。
                 match out
-                    .envelope
-                    .as_ref()
+                    .ok
+                    .then_some(out.envelope.as_ref())
+                    .flatten()
                     .and_then(|e| e.data_as::<crate::engine::TagLsData>())
                 {
                     Some(d) => {
                         let n = d.tags.len();
+                        // 先算收敛结论(借用 d),再 move out 进 tag_ls_echo。
+                        let converged = machine.as_ref().map(|m| {
+                            let hits =
+                                crate::screens::catalog::tags_referring(&d.sheet(), "vps", m);
+                            (m.clone(), hits)
+                        });
                         if asked.is_some() {
                             self.tag_lookup = asked.clone();
                         }
                         self.tag_ls_echo = Some(out);
                         self.catalog_clamp();
+                        // 有 N 条 / 一条都没有:都是 rc 0 合法回音,只是命中数不同
+                        // ——两态可区分,不共用一个空列表。
+                        if let Some((m, hits)) = converged {
+                            self.vps_reverse = if hits.is_empty() {
+                                crate::screens::catalog::VpsReverse::Empty { machine: m }
+                            } else {
+                                crate::screens::catalog::VpsReverse::Hits {
+                                    machine: m,
+                                    tags: hits,
+                                }
+                            };
+                        }
                         let scope = match asked.as_deref() {
                             Some(name) => format!("标签 {name}:{n} 条"),
                             None => format!("全部标签:{n} 条"),
@@ -2694,9 +2800,16 @@ impl App {
                     }
                     None => {
                         // 带参问错了名字(rc 3)/ 回音不可定型:留证据,册体
-                        // 不画空列表(51 §6.11)
+                        // 不画空列表(51 §6.11)。反查上浮在途时这一态 = 「读不到」:
+                        // 转 Unreadable 走既有指路(日志),**绝不画成空列表**。
                         let h = out.headline().to_string();
                         self.tag_ls_echo = Some(out);
+                        if let Some(m) = machine {
+                            self.vps_reverse = crate::screens::catalog::VpsReverse::Unreadable {
+                                machine: m,
+                                reason: h.clone(),
+                            };
+                        }
                         self.push_log(format!("反查没结果:{h}"));
                     }
                 }
