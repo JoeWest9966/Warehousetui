@@ -312,7 +312,7 @@ impl CatalogKind {
     // 落账闸 / 投影数据源 / 空册文案 / 附述行 / 边界表述 / 键位行 / 浮层 /
     // 册内键位表」收成 `CatalogKind` 的成员。**调用方不再写第四份
     // `if kind == …`**:命中区(`layout::catalog_hits`)、册内键位路由
-    // (`App::key_catalog`)、渲染(`render_catalog` / `catalog_keys`)与
+    // (`App::key_catalog`)、渲染(`render_catalog` / `catalog_key_parts`)与
     // `App` 的册级访问器各只剩一处公共代码路径,四本册走同一条。
     //
     // 加一条只在一本册上成立的关切 = 在这里加一个成员(那一本给真值,
