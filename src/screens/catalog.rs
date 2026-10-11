@@ -6076,6 +6076,110 @@ mod tests {
         );
     }
 
+    // ---- 工单 #70:反查上浮的行为测试(公开缝:update(Key/Mouse) 驱动) ----
+    //
+    // 全部走在公开缝上:`App::update(Message::Key / Message::Mouse)` 驱动一个
+    // `FakeRunner`,断言落在 `frame_display` 帧、`app.log` 人话行、选中下标、
+    // `hitmap()` 命中目标与 `FakeRunner::call_argvs()` / `abort_count()` 探针上
+    // ——不断言私有函数签名、不断言内部字段名。上面的 `反查匹配纯函数_*` 钉纯
+    // 函数口径,这一族钉「一个键问下去之后操作者看见什么、引擎收到什么」。
+
+    /// 反查上浮的**三标签夹具**(#70 规格验收 1):prod / edge / pi 三条都
+    /// 引用 `vps/gate`(各自引用原样在场),另放一条 `same` 引用 `skill/dr`
+    /// ——条目名撞车,反查机器时不该被算进来(纯函数那一族已钉,这里在帧上
+    /// 复核一遍:屏上只有三条,没有第四条)。
+    const TAG_LS_GATE3: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[{"name":"prod","refs":[{"kind":"vps","id":"gate"},{"kind":"skill","id":"dr"}]},{"name":"edge","refs":[{"kind":"vps","id":"gate"}]},{"name":"pi","refs":[{"kind":"vps","id":"gate"}]},{"name":"same","refs":[{"kind":"skill","id":"gate"}]}]}}"#;
+
+    /// 反查上浮的**机器册夹具**(#70):gate 带一条登录指针 `$DEPLOY_KEY`
+    /// (用来钉「结果不印机密本体」——投影里就只有指针,面板也不该多印),
+    /// 另留一台 bare(零标签,给「一条都没有」那一态)。
+    const REVERSE_MACHINES: &str = r#"[{"name":"gate","ips":[{"label":"home","addr":"10.0.0.1"}],"port":22,"logins":[{"user":"root","ref":"$DEPLOY_KEY"}],"note":"门口"},{"name":"bare","ips":[],"port":0,"logins":[]}]"#;
+
+    /// 建一本就绪的机器册,且**反查的两道门俱开**(#70):数据仓根显式钉成
+    /// 临时目录(否则数据仓根门随跑测试那台机器的配置漂,门禁两态测不准),
+    /// tag 组能力记成可用。`rules` 是 FakeRunner 的回放规则——反查只读走
+    /// `tag ls` 无参全列,把标签册夹具喂在这里。
+    ///
+    /// 返回 runner 是为了探针:门禁不过时 `call_argvs()` 必须**空的**,这是
+    /// 「任缺一条不发命令」唯一可观察的证据(FakeRunner 只记 argv、不存 stdin
+    /// 本体,守「面板侧不留副本」铁律)。
+    fn reverse_app(
+        machines: &str,
+        rules: &[(&str, i32, &str)],
+    ) -> (std::sync::Arc<crate::engine::FakeRunner>, crate::app::App) {
+        let ls = format!(r#"{{"catalogPath":"/r/vps.json","machines":{machines}}}"#);
+        let mut all: Vec<(&str, i32, &str)> = vec![("vps ls", 0, ls.as_str())];
+        all.extend_from_slice(rules);
+        let runner = std::sync::Arc::new(crate::engine::FakeRunner::new(&all));
+        let mut app = crate::app::App::with_runner(runner.clone());
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        app.capabilities.record(
+            crate::engine::Capability::Tag,
+            crate::engine::Probe::Available,
+        );
+        app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
+        // 数据仓根钉成临时目录:门禁第一道(根)与第二道(能力)因此可分别自造
+        app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        (runner, app)
+    }
+
+    /// 反查上浮在机器册选中行上的键盘触发(规格故事 31):Enter 问「什么标签
+    /// 引用了这一条」。抽出来是因为四族测试都要走这一下,而这一下必须与
+    /// 鼠标触发完全同路(见 `点反查段_等于按Enter`)。
+    fn 反查这台(app: &mut crate::app::App) {
+        tap(app, KeyCode::Enter);
+    }
+
+    /// 规格验收 1 / 故事 32:一台挂了 3 个标签的机器,三个标签名与各自引用
+    /// **都在帧上**;条目名撞车的 `skill/gate` 不混进来。
+    #[test]
+    fn 反查_三个标签都在帧上_名字撞车那条不混进来() {
+        let (_r, mut app) = reverse_app(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 投影按名排序:首行 bare,第二行才是 gate
+        assert_eq!(app.catalog_sel(), 1, "选中 gate");
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        for name in ["prod", "edge", "pi"] {
+            assert!(s.contains(name), "标签 {name} 应在浮层里:{s}");
+        }
+        assert!(s.contains("3 个标签引用了 gate"), "命中条数明说:{s}");
+        assert!(s.contains("skill/dr"), "prod 的另一条引用原样在场:{s}");
+        assert!(s.contains("Esc 或点击任意处关闭"), "收口给返航路:{s}");
+        assert!(!s.contains("same"), "引用 skill/gate 的 same 不算命中:{s}");
+        // 在途的那一次只读调用确有一次到达运行器,形状与 nw tag ls 契约一致
+        assert_eq!(
+            _r.call_argvs(),
+            vec![vec![
+                "tag".to_string(),
+                "ls".to_string(),
+                "--root".to_string(),
+                std::env::temp_dir().to_string_lossy().to_string()
+            ]],
+            "反查复用既有的 tag ls 无参全列(不新增调用形状)"
+        );
+    }
+
+    /// 规格验收 2 / 故事 33:一台没有标签的机器,**明说**「没有标签引用这一
+    /// 条」并给「去挂第一个标签」的下一步——与「有 N 条」两态可区分,绝不
+    /// 共用一个空列表。
+    #[test]
+    fn 反查_一条标签都没有_明说并给下一步() {
+        let (_r, mut app) = reverse_app(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        assert_eq!(app.catalog_sel(), 0, "投影按名排序:首行 bare");
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("没有标签引用 bare"), "明说一条都没有:{s}");
+        assert!(s.contains("挂第一个标签"), "给下一步:{s}");
+        assert!(!s.contains("个标签引用了"), "不是有 N 条那一态:{s}");
+    }
+
     // ---- 工单 #66:四本册整帧 golden(逐字节) ----
     //
     // 本票是**纯重构**:操作者感知不到任何变化。上面四条
