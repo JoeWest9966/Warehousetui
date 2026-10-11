@@ -2755,9 +2755,16 @@ impl App {
                     }
                     _ => None,
                 };
+                // 「读到了」的判据(#70):**rc 0 且拆得出 TagLsData**。rc≠0 的
+                // 回音 `data` 仍可能是可定型形状,只凭「拆不拆得出型」判定就会把
+                // 「这次没读到」冒充成「一条标签引用都没有」——两态互相冒充,正是
+                // spec #65 铁律 4 钉死不许发生的事。契约守卫合成「需升级 nw」
+                // 由 `data_as` 的 None 分支接住(schema 不认识就拆不出型,绝不按旧
+                // 形状降级解析),rc 这一路单独立判。
                 match out
-                    .envelope
-                    .as_ref()
+                    .ok
+                    .then_some(out.envelope.as_ref())
+                    .flatten()
                     .and_then(|e| e.data_as::<crate::engine::TagLsData>())
                 {
                     Some(d) => {

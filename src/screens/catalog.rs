@@ -1802,6 +1802,23 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
             ),
             p.dim(),
         )));
+        // 反查上浮的第三态「读不到」(#70 规格验收 3 / 故事 34):rc≠0 或契约
+        // 守卫合成「需升级 nw」。机器册这一本没有带参反查态(`catalog_ls_error`
+        // 恒 None),若不在这里给一句人话,操作者按了 Enter 屏上一个字都不变,
+        // 只会当成「面板没反应」。走既有指路的同一套措辞(不新造一套话),
+        // 并且**绝不画成空列表**——「这次没读到」与「一条标签引用都没有」是
+        // 两件事,话不许互相冒充(spec #65 铁律 4)。册体与选中行原样在场:
+        // 反查从头到尾不写 `vps_sel`,读不到也不该把册体收走。
+        if let VpsReverse::Unreadable { reason, .. } = &app.vps_reverse {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ 反查没结果:{}", clip(reason, w.saturating_sub(12))),
+                p.warn().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  标签册这次没读到,不是「一条标签引用都没有」;册体与选中行原样不动。",
+                p.dim(),
+            )));
+        }
         // 反查回音的终态(#54):问错了名字(rc 3)/ 合法空态 / 有内容,
         // 三者互不冒充——都画成「空列表」会丢掉「这个名字不存在」的信息
         // (51 §6.11)。机器册没有带参反查这一态,`catalog_ls_error` 恒 None。
@@ -6095,6 +6112,16 @@ mod tests {
     /// 另留一台 bare(零标签,给「一条都没有」那一态)。
     const REVERSE_MACHINES: &str = r#"[{"name":"gate","ips":[{"label":"home","addr":"10.0.0.1"}],"port":22,"logins":[{"user":"root","ref":"$DEPLOY_KEY"}],"note":"门口"},{"name":"bare","ips":[],"port":0,"logins":[]}]"#;
 
+    /// 标签册 **rc 3** 回音(#70 规格验收 3 / 故事 34:读不到,不是空结果)。
+    /// 刻意让 `data` 仍是**可定型**的形状(`TagLsData` 拆得出来)——这正是
+    /// 最容易蒙混过关的那一种:只凭「拆不拆得出型」判定,就会把「这次没读到」
+    /// 画成「一条标签引用都没有」,两态互相冒充(spec #65 铁律 4)。
+    const TAG_LS_RC3: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"tags.json 读不到:数据仓根下没有这个文件","hint":"先 nw tag add <标签> --ref <kind>/<条目> 挂一个","details":{"catalogPath":"/r/tags.json"}}],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[]}}"#;
+
+    /// 契约守卫合成「需升级 nw」的回音(#70 读不到第三态):schema 面板不认识,
+    /// `data_as` 拆不出型——绝不按旧形状降级解析,也不画成空列表。
+    const TAG_LS_GUARD: &str = r#"{"schema":"nw/tag-ls.v9","nw":"9.9.9","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[]}}"#;
+
     /// 建一本就绪的机器册,且**反查的两道门俱开**(#70):数据仓根显式钉成
     /// 临时目录(否则数据仓根门随跑测试那台机器的配置漂,门禁两态测不准),
     /// tag 组能力记成可用。`rules` 是 FakeRunner 的回放规则——反查只读走
@@ -6178,6 +6205,68 @@ mod tests {
         assert!(s.contains("没有标签引用 bare"), "明说一条都没有:{s}");
         assert!(s.contains("挂第一个标签"), "给下一步:{s}");
         assert!(!s.contains("个标签引用了"), "不是有 N 条那一态:{s}");
+    }
+
+    /// 规格验收 3 / 故事 34:标签册回 rc 3,**走指路、不画成空列表**。
+    /// rc 3 的 `data` 仍是可定型形状——只看「拆不拆得出型」就会把它当成
+    /// 合法空册,于是「这次没读到」冒充「一条标签引用都没有」。帧上因此既
+    /// 没有「没有标签引用」那套话,也没有「挂第一个标签」的下一步;指路
+    /// 落在日志行里(人话原文 + 说清不是空结果)。
+    #[test]
+    fn 反查_标签册回rc3_走指路不画成空列表() {
+        let (_r, mut app) = reverse_app(REVERSE_MACHINES, &[("tag ls", 3, TAG_LS_RC3)]);
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            s.contains("反查没结果"),
+            "帧上给指路,不是一片空白(按了 Enter 屏上没动静 = 当成面板没反应):{s}"
+        );
+        assert!(
+            s.contains("不是「一条标签引用都没有」"),
+            "说清读不到与没打过标签是两件事:{s}"
+        );
+        assert!(
+            !s.contains("没有标签引用"),
+            "rc 3 是读不到,绝不是「一条都没有」:{s}"
+        );
+        assert!(
+            !s.contains("挂第一个标签"),
+            "读不到不给挂标签的下一步(那会把没读到骗成没打过标签):{s}"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查没结果")),
+            "指路同时落在日志人话里:{:?}",
+            app.log
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("tags.json 读不到")),
+            "引擎的原文证据在场,不替它改写:{:?}",
+            app.log
+        );
+    }
+
+    /// 规格验收 3 的另一半:契约守卫合成「需升级 nw」(schema 面板不认识)
+    /// 同样走指路,不画成空列表。这一路 `data_as` 拆不出型,与 rc 3 那一
+    /// 路形状不同,但落到操作者眼里必须是同一件事:**没读到**。
+    #[test]
+    fn 反查_契约守卫需升级nw_走指路不画成空列表() {
+        let (_r, mut app) = reverse_app(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GUARD)]);
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("反查没结果"), "帧上给指路,不画成空列表:{s}");
+        assert!(!s.contains("没有标签引用"), "读不到不是空列表:{s}");
+        assert!(
+            app.log.iter().any(|l| l.contains("反查没结果")),
+            "指路落在日志人话里:{:?}",
+            app.log
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("需升级 nw")),
+            "说清是两端 schema 没对齐,不是数据没了:{:?}",
+            app.log
+        );
     }
 
     // ---- 工单 #66:四本册整帧 golden(逐字节) ----
