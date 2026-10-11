@@ -6729,6 +6729,68 @@ mod tests {
         }
     }
 
+    // ---- 工单 #70 的两处「要当场钉住」的边界 ----
+
+    /// 反查触发段**只机器册有命中**。`TAG_REF_KINDS` 的已知集合是
+    /// `skill` / `extension` / `vps`,四本册里只有机器册的条目可打标签;
+    /// 订阅册与钥匙册的条目不在其内,放一个注定只返回「没有」的动作是噪声
+    /// (spec #65 §4:触发点只有一处)。标签册的 `Enter` 是另一件事(#54 反查
+    /// 选中的那条标签),它的键位行也写着「Enter 反查」四个字,但那是**只画
+    /// 不点的提示段**,不给命中——所以这一条只认命中区,不认帧上有没有那四
+    /// 个字(认字就会把标签册的提示段误判成触发段)。
+    #[test]
+    fn 反查触发段_只机器册给命中_另三本连段都不给() {
+        for (name, kind) in [
+            ("机器", CatalogKind::Vps),
+            ("标签", CatalogKind::Tag),
+            ("订阅", CatalogKind::Subscription),
+            ("钥匙", CatalogKind::Key),
+        ] {
+            let mut app = book(name);
+            assert_eq!(app.catalog_kind, kind, "{name}册");
+            app.size = Rect::new(0, 0, 80, 30);
+            let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+            let has = hits
+                .iter()
+                .any(|(_, t)| matches!(t, crate::layout::Target::VpsReverse));
+            assert_eq!(
+                has,
+                kind == CatalogKind::Vps,
+                "{name}册:反查触发段的有无={has}"
+            );
+        }
+    }
+
+    /// 反查结果浮层与编目过滤输入态**同时在场**时,`Esc` 归谁?答案:浮层是
+    /// 更上一层(与帮助 / 发射确认同级的顶层浮层),所以 **Esc 先收浮层**,
+    /// 过滤输入态与刚敲的过滤词原样留着。反过来会让操作者卡在一个二选一里:
+    /// 要么还被浮层蒙着就丢了刚敲的词,要么为了清词先手动关浮层。
+    /// 这条把次序钉住,免得以后有人把浮层守卫挪到过滤守卫后面去。
+    #[test]
+    fn 反查浮层与过滤输入态同时在场_先收浮层_过滤词不丢() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 选中 gate
+        tap(&mut app, KeyCode::Char('/')); // 进过滤输入态
+        tap(&mut app, KeyCode::Char('g'));
+        tap(&mut app, KeyCode::Char('a')); // 过滤词「ga」(只留 gate)
+        assert!(app.catalog_filter_on, "输入态在场");
+        // 输入态下点键位行的反查段:可点段不收输入态管(输入态只管键入)
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::VpsReverse)
+        });
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "浮层开起来了");
+        assert!(app.catalog_filter_on, "过滤输入态还在");
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.vps_reverse_open(), "Esc 先收浮层(更上一层先收)");
+        assert!(app.catalog_filter_on, "过滤输入态不退:它不在这一层");
+        assert_eq!(app.catalog_filter(), "ga", "刚敲的过滤词不丢");
+        // 再按一次 Esc 才归输入态那一层(清词 + 退输入态)
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.catalog_filter_on, "第二次 Esc 才退输入态");
+        assert_eq!(app.catalog_filter(), "", "第二次 Esc 清词");
+    }
+
     // ---- 工单 #66:四本册整帧 golden(逐字节) ----
     //
     // 本票是**纯重构**:操作者感知不到任何变化。上面四条
