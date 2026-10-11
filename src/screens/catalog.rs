@@ -6173,9 +6173,36 @@ mod tests {
 
     /// 反查上浮在机器册选中行上的键盘触发(规格故事 31):Enter 问「什么标签
     /// 引用了这一条」。抽出来是因为四族测试都要走这一下,而这一下必须与
-    /// 鼠标触发完全同路(见 `点反查段_等于按Enter`)。
+    /// 鼠标触发完全同路(见 `反查触发段_有鼠标命中_点它等于按键`)。
     fn 反查这台(app: &mut crate::app::App) {
         tap(app, KeyCode::Enter);
+    }
+
+    /// 直接灌一条 `tag ls` 回音(不经 FakeRunner):用来造「迟到的第二条回音」
+    /// ——它确确实实是一次引擎回音(带 argv、带回音信封),只是落在操作者
+    /// 已返航之后。`data` 是 TagLsData 的 data 面 JSON,`rc` 是退出码。
+    fn feed_tag_echo(app: &mut crate::app::App, data: &str, rc: i32) {
+        let env = format!(
+            r#"{{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":{ok},"errors":[],"warnings":[],"data":{data}}}"#,
+            ok = rc == 0
+        );
+        let out = crate::engine::EngineOutput {
+            args: vec![
+                "tag".into(),
+                "ls".into(),
+                "--root".into(),
+                std::env::temp_dir().to_string_lossy().to_string(),
+            ],
+            exit_code: crate::engine::ExitCode::from_number(rc),
+            ok: rc == 0,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(&env).ok(),
+            raw_stdout: env,
+            parse_error: None,
+        };
+        app.update(crate::app::Message::Engine(
+            crate::engine::EngineEvent::Finished(Box::new(out)),
+        ));
     }
 
     /// 规格验收 1 / 故事 32:一台挂了 3 个标签的机器,三个标签名与各自引用
@@ -6500,6 +6527,206 @@ mod tests {
         app.assembling = true;
         反查这台(&mut app);
         assert_eq!(app.queue.len(), 1, "装配在途也问得动(只读不占写闸)");
+    }
+
+    /// 规格验收 7 / 故事 36:反查**在途期间不拿上一轮结论冒充本次**。第一轮
+    /// 问 bare 得到「一条都没有」,返航后换一台机器再问——在途那一刻屏上既
+    /// 没有第一轮的结论,也没有本轮的回音(还没到)。`run_tag_ls` 因此把上一
+    /// 轮的回音清空:留着它,「在途」就会长得像「有结果」。
+    #[test]
+    fn 反查_在途不拿上一轮结论冒充本次() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        反查这台(&mut app); // 第一轮:bare
+        feed(&mut app);
+        let a = crate::testutil::frame_display(&app, 80, 30);
+        assert!(a.contains("没有标签引用 bare"), "第一轮落地:{a}");
+        tap(&mut app, KeyCode::Esc); // 返航回机器册(选中行不动)
+        tap(&mut app, KeyCode::Down); // 换一台机器问
+        反查这台(&mut app); // 第二轮:在途
+        let b = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!b.contains("没有标签引用 bare"), "在途不摆上一轮的结论:{b}");
+        assert!(
+            !b.contains("个标签引用了"),
+            "在途也不摆本轮(回音还没到):{b}"
+        );
+    }
+
+    /// 规格验收 7 的另一半:操作者已返航(Idle)之后,**迟到的回音不收敛任何
+    /// 状态、不重开浮层**。这一条回音确确实实是一次引擎回音,只是落在操作
+    /// 者已经看完走了之后——幽灵重开一个旧结果比不开更糟。
+    #[test]
+    fn 反查_迟到回音不重开浮层() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "先落地");
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.vps_reverse_open(), "返航");
+        // 迟到的第二条 tag ls 回音:同一台机器、另一份标签册
+        feed_tag_echo(
+            &mut app,
+            r#"{"catalogPath":"/r/tags.json","tags":[{"name":"late","refs":[{"kind":"vps","id":"gate"}]}]}"#,
+            0,
+        );
+        assert!(
+            !app.vps_reverse_open(),
+            "迟到回音不重开浮层(已返航 = 这一轮已经结束)"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("个标签引用了"), "迟到回音不上屏:{s}");
+        assert!(!s.contains("late"), "迟到回音里的标签名也不上屏:{s}");
+    }
+
+    /// 规格验收 10 / 故事 44:反查触发段**有鼠标命中**,且点它 = 在机器册
+    /// 选中行上按 `Enter`(两条路给同一件事:同一条 argv、同一次在途)。
+    /// 段文案由渲染与命中共用(`catalog_key_parts` 一处产出),点哪打哪。
+    #[test]
+    fn 反查触发段_有鼠标命中_点它等于按键() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 选中 gate
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("Enter 反查"), "段在键位行上画着:{s}");
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::VpsReverse)
+        });
+        assert_eq!(
+            app.queue.last().cloned(),
+            Some(vec![
+                "tag".to_string(),
+                "ls".to_string(),
+                "--root".to_string(),
+                std::env::temp_dir().to_string_lossy().to_string()
+            ]),
+            "点段与按 Enter 下同一条只读 argv"
+        );
+        // 与键盘那条路逐字节同路
+        let (_r2, mut app2) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app2, KeyCode::Down);
+        反查这台(&mut app2);
+        assert_eq!(app.queue, app2.queue, "鼠标与键盘两条路一条 argv");
+    }
+
+    /// 规格验收 10 / 故事 37:结果浮层 `Esc` 或**任意处点击**都关,且关掉
+    /// 之后回到机器册**原选中行**。反查从头到尾不写 `vps_sel`,所以「回到
+    /// 原选中行」不需要一次恢复动作,只需要不在返航时顺手改它——这条钉的
+    /// 正是「没顺手改」。
+    #[test]
+    fn 反查浮层_键盘与任意点击都关_回到机器册原选中行() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        let sel = app.catalog_sel();
+        assert_eq!(sel, 1, "选中 gate");
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "浮层在场");
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.vps_reverse_open(), "Esc 返航");
+        assert_eq!(app.catalog_sel(), sel, "Esc 后选中行原样");
+        // 再开一次:点浮层外的空白也算返航(规格 §7:任意处点击关闭)
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "再开一次");
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::DismissPopup)
+        });
+        assert!(!app.vps_reverse_open(), "点任意处返航");
+        assert_eq!(app.catalog_sel(), sel, "点任意处后选中行仍原样");
+    }
+
+    /// 规格验收 10 的弹层纪律 / 故事 50:浮层打开时**底层不产命中**——清单
+    /// 行与键位行三个可点段(反查 / 换册 / 过滤)一段都不给,点击不穿透。
+    /// 命中的整个正文只有一个「点任意处返航」。
+    #[test]
+    fn 反查浮层_弹层优先级_底层清单行与键位段都不产命中() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open());
+        app.size = Rect::new(0, 0, 80, 30);
+        let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+        assert!(
+            hits.iter()
+                .any(|(_, t)| matches!(t, crate::layout::Target::DismissPopup)),
+            "浮层自己给一个「点任意处返航」:{hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .all(|(_, t)| !matches!(t, crate::layout::Target::SelectRow(_))),
+            "底层清单行不产命中(点不到被浮层盖住的那一行)"
+        );
+        assert!(
+            hits.iter().all(|(_, t)| !matches!(
+                t,
+                crate::layout::Target::VpsReverse
+                    | crate::layout::Target::SwitchBook
+                    | crate::layout::Target::CatalogFilter
+            )),
+            "键位行三个可点段都不产命中"
+        );
+    }
+
+    /// #69 与 #70 合用(规格故事 27):过滤收窄到一台机器之后,反查点的是
+    /// **看得见的那一台**——被滤掉的 bare 不该被问到,浮层点名的必须是 gate。
+    /// 选中 / 鼠标 / 反查全部经过可见下标映射回原始投影,同一口径。
+    #[test]
+    fn 反查与册内过滤合用_浮层点名看得见的那一台() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        过滤敲词(&mut app, "gate"); // 只留 gate(bare 被滤掉)
+        assert_eq!(app.catalog_visible().len(), 1, "收窄到一台");
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("3 个标签引用了 gate"), "点名看得见的那一台:{s}");
+        assert!(!s.contains("没有标签引用"), "滤掉的 bare 不被问到:{s}");
+    }
+
+    /// 两档响应式(#70 验收的常畅 / 紧凑):80×30 与 66×50(外加 100×40)下,
+    /// 触发段与结果浮层都画得出来,且**没有一行超宽**。紧凑态放不下整段时
+    /// 渲染与命中同源收口(屏上没有的段,鼠标也点不到)。浮层盖住键位行是
+    /// 弹层纪律,所以「关着看段、开着看浮层」分两次量。
+    #[test]
+    fn 反查浮层与触发段_常畅与紧凑两档都渲染不溢出() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        for (w, h) in [(80u16, 30u16), (66, 50), (100, 40)] {
+            // 关着:触发段在键位行上,且没有浮层
+            let closed = crate::testutil::frame_display(&app, w, h);
+            assert!(
+                closed.contains("Enter 反查"),
+                "{w}×{h} 触发段应在场:{closed}"
+            );
+            assert!(
+                !closed.contains("什么标签引用了这一条"),
+                "{w}×{h} 没问就不起浮层:{closed}"
+            );
+            for ln in closed.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 关着也有行超宽:{ln}"
+                );
+            }
+            // 开着:结果浮层在场(它盖住键位行是弹层纪律,不是漏画)
+            反查这台(&mut app);
+            feed(&mut app);
+            let open = crate::testutil::frame_display(&app, w, h);
+            assert!(
+                open.contains("3 个标签引用了 gate"),
+                "{w}×{h} 结果浮层应在场:{open}"
+            );
+            assert!(
+                open.contains("Esc 或点击任意处关闭"),
+                "{w}×{h} 收口行应在场:{open}"
+            );
+            for ln in open.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 开着也有行超宽:{ln}"
+                );
+            }
+            tap(&mut app, KeyCode::Esc);
+        }
     }
 
     // ---- 工单 #66:四本册整帧 golden(逐字节) ----
