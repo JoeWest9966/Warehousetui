@@ -375,12 +375,26 @@ fn overview_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         ratatui::layout::Constraint::Length(4),
     ])
     .split(area);
-    let (cols, _cmd) = h_split2(rows[1], 68, 32);
+    let (cols, cmd) = h_split2(rows[1], 68, 32);
     let tbl = shrink_border(cols);
-    let Some(ls) = app.ls.as_ref() else {
-        return;
-    };
-    row_hits(tbl, 1, ls.profiles.len(), hits, Target::SelectRow);
+    if let Some(ls) = app.ls.as_ref() {
+        row_hits(tbl, 1, ls.profiles.len(), hits, Target::SelectRow);
+    }
+    // #68 指令栏第五条「浏览编目」可点:命中区 = NavTo(Vps),点它 = 按 `v`。
+    // 几何与 `render_overview`/`render_commands` 同一组 Layout(右栏 `Length(7)`
+    // 指令框)+ 同一个边框内缩,第 5 条落在内层第 5 行——不另写一份「键位行长
+    // 什么样」(ADR-0005 渲染与命中共用一份几何)。指令栏是动线不是能力表,
+    // 故常驻可点、与 ls 有无数据无关;放不下(紧凑到裁掉第 5 行)就不产命中。
+    let right = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(7),
+        ratatui::layout::Constraint::Min(3),
+    ])
+    .split(cmd);
+    let cmd_inner = shrink_border(right[0]);
+    if cmd_inner.height >= 5 {
+        let line = Rect::new(cmd_inner.x, cmd_inner.y + 4, cmd_inner.width, 1);
+        hits.push((line, Target::NavTo(Screen::Vps)));
+    }
 }
 
 /// 装配屏:装配运行中给 stderr 日志区产滚轮命中区(#21,几何与
@@ -849,9 +863,11 @@ mod tests {
         let a = area(80, 30);
         let hits = hitmap(a, &app, size_class(a));
         check(&hits, a, "80×30");
+        // 只数导航轨里的 NavTo(宽 = NAV_WIDTH);概览指令栏第五条「浏览编目」也是
+        // NavTo(Vps)(#68),但它在正文右栏、宽 ≠ 导航轨,不计入「导航六屏」。
         let nav = hits
             .iter()
-            .filter(|(_, t)| matches!(t, Target::NavTo(_)))
+            .filter(|(r, t)| matches!(t, Target::NavTo(_)) && r.width == NAV_WIDTH)
             .count();
         assert_eq!(
             nav,
@@ -926,6 +942,49 @@ mod tests {
         );
     }
 
+    /// #68:在整帧真显示里定位某子串的 (行, 列)(列按显示宽累计——frame_display
+    /// 已跳过宽字续格,字节偏移≠终端列,与命中区同一把尺)。
+    fn locate(frame: &str, needle: &str) -> (u16, u16) {
+        use unicode_width::UnicodeWidthChar;
+        for (y, line) in frame.split('\n').enumerate() {
+            if let Some(byte) = line.find(needle) {
+                let col: u16 = line[..byte]
+                    .chars()
+                    .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+                    .sum();
+                return (y as u16, col);
+            }
+        }
+        panic!("整帧里找不到「{needle}」");
+    }
+
+    /// #68 概览指令栏第五条「浏览编目」可点:命中区是 `NavTo(Vps)`,几何与渲染
+    /// 同源——点在帧上「浏览编目」所在行列必落进该命中区(点哪打哪,ADR-0005);
+    /// 常畅/紧凑两档都产、都不越界。指令栏是动线不是能力表,故与 ls 有无数据无关
+    /// (复用渲染同一组 `Layout::vertical([Length(7), Min(3)])` + 边框,不另写几何)。
+    #[test]
+    fn hitmap_概览指令栏第五条_浏览编目可点_两档同源() {
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let mut app = test_app();
+            app.screen = Screen::Overview;
+            let a = area(w, h);
+            let hits = hitmap(a, &app, size_class(a));
+            check(&hits, a, "{w}×{h}");
+            let frame = crate::testutil::frame_display(&app, w, h);
+            let (row, col) = locate(&frame, "浏览编目");
+            let hit = hits
+                .iter()
+                .find(|(r, _)| r.y == row && col >= r.x && col < r.x + r.width)
+                .map(|(_, t)| *t)
+                .unwrap_or_else(|| panic!("{w}×{h} 「浏览编目」行应有命中区"));
+            assert_eq!(
+                hit,
+                Target::NavTo(Screen::Vps),
+                "{w}×{h} 指令栏第五条 = 到编目屏"
+            );
+        }
+    }
+
     #[test]
     fn hitmap_紧凑态_66x50_也有导航与列表() {
         let mut app = test_app();
@@ -954,9 +1013,11 @@ mod tests {
         let mut app = test_app();
         let a = area(66, 50);
         let hits = hitmap(a, &app, size_class(a));
+        // 只取屏 Tab 条(y=1)的 NavTo;概览指令栏第五条「浏览编目」也是 NavTo(Vps)
+        // (#68),但它在正文右栏更低处(y≠1),不计入 Tab 条几何。
         let nav: Vec<_> = hits
             .iter()
-            .filter(|(_, t)| matches!(t, Target::NavTo(_)))
+            .filter(|(r, t)| matches!(t, Target::NavTo(_)) && r.y == 1)
             .collect();
         assert_eq!(
             nav.len(),
@@ -983,7 +1044,7 @@ mod tests {
         let hits2 = hitmap(a, &app, size_class(a));
         let x_after: u16 = hits2
             .iter()
-            .filter(|(_, t)| matches!(t, Target::NavTo(_)))
+            .filter(|(r, t)| matches!(t, Target::NavTo(_)) && r.y == 1)
             .map(|(r, _)| r.width)
             .sum();
         assert_eq!(x, x_after, "j/k 切屏不改变 Tab 条几何");
