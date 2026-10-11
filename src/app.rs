@@ -350,9 +350,12 @@ pub struct App {
     pub tag_ls_echo: Option<EngineOutput>,
     /// 反查在途(不拿上一轮结论冒充本次)。
     pub tag_ls_loading: bool,
-    /// 最近一次反查问的是哪一条(由回音 argv 推导:`None` = 列全部)。
-    /// 只为把「列全部 / 只列一个」这档差别显式画出来——操作者看得见自己
-    /// 问的是什么,不靠记性。
+    /// 最近一次反查问的是哪一条(**由下发时记下**:`run_tag_ls` 的入参,
+    /// `None` = 列全部)。只为把「列全部 / 只列一个」这档差别显式画出来——
+    /// 操作者看得见自己问的是什么,不靠记性。回音路由
+    /// ([`App::on_tag_echo`])只把它读回来,不再从 argv 重新推导:argv 里
+    /// `--root` 的值长得跟标签名一样,推导就会把「列全部」冒充成「反查
+    /// 一个叫 <根> 的标签」。
     pub tag_lookup: Option<String>,
     /// 反查上浮状态(#70):机器册上一个键问「什么标签引用了这一条」。
     /// **独立小状态,不并入 `assembling` 写互斥**(反查只读);三态两两可
@@ -1326,9 +1329,11 @@ impl App {
             KeyCode::Char('h') => self.screen = Screen::Health,
             KeyCode::Char('l') => self.screen = Screen::Recipes,
             // #68:「家」直达第六屏(编目)。键取 `v`(屏枚举 `Screen::Vps` 首字母),
-            // 与既有 `a/h/l` 跳屏同构;屏上指令栏、HUD/帮助、README 三处同写 `v`
-            // (屏上看到的与我按下的是一回事,故事 5)。纯导航零引擎调用——册体到编目
-            // 屏按 `l` 才读,门禁也按册各自给,不在指令栏做禁用态。
+            // 与既有 `a/h/l` 跳屏同构;屏上指令栏、帮助、README 三处同写 `v`
+            // (屏上看到的与我按下的是一回事,故事 5)。HUD 不写它——HUD 是壳级
+            // 提示栏,只有 j/k 切屏 / Enter 确认 / t 主题 / ? 帮助 / q 退出。
+            // 纯导航零引擎调用——册体到编目屏按 `l` 才读,门禁也按册各自给,
+            // 不在指令栏做禁用态。
             KeyCode::Char('v') => self.screen = Screen::Vps,
             KeyCode::Down | KeyCode::Char('n') => {
                 if n > 0 {
@@ -2738,12 +2743,15 @@ impl App {
         match out.args.get(1).map(String::as_str) {
             Some("ls") => {
                 self.tag_ls_loading = false;
-                let asked = out
-                    .args
-                    .iter()
-                    .skip(2)
-                    .find(|a| !a.starts_with("--"))
-                    .cloned();
+                // 问的是哪一条,读**下发时**记下的 [`App::tag_lookup`]
+                // (`run_tag_ls` 的入参,`None` = 列全部),不从回音 argv 重新推导。
+                // 早先这里写的是 `args.iter().skip(2).find(非 -- 开头)`,它会把
+                // `--root` 的**值**当成标签名:机器册反查(#70)发的正是不带参的
+                // `tag ls --root <根>`,于是「列全部标签」被冒充成「反查一个叫
+                // `/tmp` 的标签」——册头(`当前册 标签 · 反查 /tmp`)与日志
+                // (`反查完成(标签 /tmp:4 条,只读)`)两处都跟着错。一种状态冒充
+                // 另一种,正是铁律不许的事;记在下发处,回音只读回来。
+                let asked = self.tag_lookup.clone();
                 // 反查上浮在途(#70):机器册问「什么标签引用了这一条」——回音落地
                 // 时按在途记住的那台机器,从这次 fresh 标签册里就地按 `<kind>/<条目>`
                 // 精确匹配推导。**只在在途时收敛**:操作者已返航(Idle)/ 已看到
@@ -2775,9 +2783,6 @@ impl App {
                                 crate::screens::catalog::tags_referring(&d.sheet(), "vps", m);
                             (m.clone(), hits)
                         });
-                        if asked.is_some() {
-                            self.tag_lookup = asked.clone();
-                        }
                         self.tag_ls_echo = Some(out);
                         self.catalog_clamp();
                         // 有 N 条 / 一条都没有:都是 rc 0 合法回音,只是命中数不同
@@ -5266,7 +5271,8 @@ mod tests {
 
     /// 键盘路:概览按 `v` 一键到第六屏(编目),且纯导航零引擎调用、不写流水。
     /// 键位选 `v`(屏枚举 `Screen::Vps` 首字母)与既有 `a`/`h`/`l` 跳屏同构,
-    /// 全仓无 `Char('v')` 冲突;HUD/帮助/README 三处同写 `v`(屏上=按下,#68 故事 5)。
+    /// 全仓无 `Char('v')` 冲突;指令栏 / 帮助 / README 三处同写 `v`
+    /// (屏上=按下,#68 故事 5)。HUD 不写它:壳级提示栏只写 j/k、Enter、t、?、q。
     #[test]
     fn 概览_按v跳到编目屏_零引擎调用() {
         let mut app = fake_app();
@@ -5547,6 +5553,14 @@ mod tests {
         );
     }
 
+    /// 点顶栏 / HUD 行零状态变化(#16 钉住:HUD 是提示栏,永远不可点)。
+    ///
+    /// 快照字段刻意带上**编目册本轮新增的三个状态**(#65 评审第 10 条):
+    /// `catalog_kind` / `catalog_filter_on` / `vps_reverse`。它们在结构上今天
+    /// 不可能被这一下改到(`area_pad` 先把 HUD 整行从命中区切掉,任何 `*_hits`
+    /// 都在切过的区域上跑),但正因为切得干净,旧的快照元组**结构上就看不见
+    /// 编目屏上的回归**——而这正是本轮长出三个可点正文段的地方。带上这三个
+    /// 字段,将来看不见的回归才会真的红。
     #[test]
     fn 点空白不改状态_顶栏与hud行() {
         let mut app = mouse_ls_app();
@@ -5561,6 +5575,9 @@ mod tests {
             app.queue.len(),
             app.as_confirm,
             app.help,
+            app.catalog_kind,
+            app.catalog_filter_on,
+            app.vps_reverse.clone(),
         );
         // 顶栏(y=0)与 HUD(y=29)都不在命中区内(#16 钉住)
         app.update(Message::Mouse(mouse_at(
@@ -5583,6 +5600,9 @@ mod tests {
                 app.queue.len(),
                 app.as_confirm,
                 app.help,
+                app.catalog_kind,
+                app.catalog_filter_on,
+                app.vps_reverse.clone(),
             ),
             before,
             "点空白零变化"
@@ -7271,9 +7291,26 @@ mod tests {
     /// 鼠标章节覆盖 README「鼠标(默认开捕获)」已写全部条目:点导航/Tab 切屏与
     /// 点行选中、滚轮两用、发射仪式两段、浮层吞点击、Shift 放行复制、
     /// `--no-mouse` 与设置屏 `m` 两逃逸——每条都有短语在场。
+    ///
+    /// **反方向也钉(#65 评审第 4 条)**:册体画得出来的每一个**可点段**,章节
+    /// 与 README 鼠标小节两边都点名。旧版只查了「README 有的短语在不在章节
+    /// 里」这一个方向,于是 #69 给机器册加了 `/ 过滤` 段、#70 加了
+    /// `Enter 反查` 段,README 还停在「换册 / Enter 反查」两段,两边悄悄不
+    /// 一致也没人红。段名词从**画段的那三份常量**取
+    /// ([`crate::screens::catalog::CATALOG_SWITCH`] / `CATALOG_FILTER` /
+    /// `CATALOG_REVERSE`——`catalog_key_parts` 里全部 `Some(Target)` 的段都
+    /// 是它们),不另抄一份清单:将来加第四个可点段而文档没跟上,这条就红。
     #[test]
     fn 帮助鼠标章节_覆盖_readme_全部条目() {
+        use crate::screens::catalog::{CATALOG_FILTER, CATALOG_REVERSE, CATALOG_SWITCH};
         use crate::ui::MOUSE_LINES;
+        let readme = include_str!("../README.md");
+        // README 鼠标小节:从 `### 鼠标(默认开捕获)` 到下一个 `##` 标题之间
+        let section = readme
+            .split("### 鼠标(默认开捕获)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("README 应有「鼠标(默认开捕获)」小节");
         let joined = MOUSE_LINES.join("\n");
         for phrase in [
             "切屏",
@@ -7287,8 +7324,23 @@ mod tests {
             "Shift",
             "--no-mouse",
             "设置屏 m",
+            "编目",
+            "过滤",
         ] {
             assert!(joined.contains(phrase), "鼠标章节缺 README 条目 `{phrase}`");
+        }
+        // 反方向:画在屏上的每一个可点段,章节与 README 两边都点名
+        for seg in [CATALOG_SWITCH, CATALOG_FILTER, CATALOG_REVERSE] {
+            // 段文案是 `m 换册` / `/ 过滤` / `Enter 反查`:名词取最后一段
+            let noun = seg.split_whitespace().last().unwrap_or(seg);
+            assert!(
+                joined.contains(noun),
+                "鼠标章节漏了可点段 `{seg}`(册体画得出来,章节却没写)"
+            );
+            assert!(
+                section.contains(noun),
+                "README 鼠标小节漏了可点段 `{seg}`(屏上点得中,README 却没写)"
+            );
         }
     }
 }

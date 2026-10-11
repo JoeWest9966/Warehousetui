@@ -60,7 +60,8 @@ fn 概览屏渲染派表与计数卡() {
 /// #68 概览指令栏加第五条「浏览编目 (v)」的整帧 golden:指令框从 6 长到 7
 /// (边框 2 + 5 条),余高由「最近日志」的 `Min` 吸收——其余部件(警示带/派表/
 /// 计数卡)排布与高度不变,只多这一行。常畅(110×30 / 80×30)与紧凑(66×50)
-/// 两档都放得下这条入口且无行超宽;键位 `v` 与 HUD/帮助同写(故事 5/6/7)。
+/// 两档都放得下这条入口且无行超宽;键位 `v` 与指令栏 / 帮助 / README 同写
+/// (故事 5/6/7;HUD 是壳级提示栏,不写这一屏的跳屏键)。
 /// 紧凑态内层仅 18 列,19 宽的指令行沿用 #22 既定裁法把 `)` 裁掉(同 `h/l/r`),
 /// 不放宽指令框、不引限高、不居中。
 #[test]
@@ -144,18 +145,39 @@ fn 装配屏运行中七步与日志() {
     );
 }
 
-/// 装配在途两档都给中止键提示(#59):日志窗Pane 标题带着 `x`,操作者翻日志的
-/// 视线不用离开窗Pane 去找键。
+/// 装配在途两档都给中止键提示(#59 / #71):`x 中止` 在**正文末行的可点键位行**
+/// 上——操作者翻日志的视线不用离开日志区去找键。
+///
+/// #71 特意把它从日志窗 Pane 的**块标题**挪了出来(块标题只描述这块
+/// 是什么:stderr 实时日志;话术单源在键位行 `assemble::assemble_key_parts`,
+/// 渲染画的与命中测的同一份)。所以这条钉两个方向:键位行那一行在场、块标题
+/// 那一行不带它——早先只断言「帧里出现过 `x 中止`」,那个串被挪回块标题也
+/// 照样绿,测试就不再钉它声称钉的位置。
 #[test]
 fn 装配中_日志窗给中止键提示_两档都在() {
+    use crate::screens::assemble::ASSEMBLE_ABORT;
     let mut app = fake_app();
     app.screen = Screen::Assemble;
     app.assembling = true;
     app.as_running = true;
     app.as_log = vec!["铺骨架…".into()];
+    app.splash = false; // 整帧壳渲染走 splash 优先,先交棒(屏幕本体的 draw 不看它)
     for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
         let s = draw(&app, w, h);
-        assert!(s.contains("x 中止"), "{w}×{h} 在途给中止键提示:{s}");
+        assert!(s.contains(ASSEMBLE_ABORT), "{w}×{h} 在途给中止键提示:{s}");
+        // 位置:正文键位行那一行在场(HUD 那句之外另有一行),且日志窗 Pane 的
+        // 块标题那一行不带它
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(
+            f.lines()
+                .any(|l| l.contains(ASSEMBLE_ABORT) && !l.contains("装配中")),
+            "{w}×{h} 中止键在正文键位行上:{f}"
+        );
+        assert!(
+            f.lines()
+                .all(|l| !(l.contains("stderr 实时日志") && l.contains(ASSEMBLE_ABORT))),
+            "{w}×{h} 块标题只描述这块是什么,不夹带键位提示:{f}"
+        );
     }
 }
 

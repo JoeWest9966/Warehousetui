@@ -41,7 +41,7 @@ use ratatui::Frame;
 
 use crossterm::event::KeyCode;
 
-use crate::app::{App, DataRootCause};
+use crate::app::App;
 use crate::engine::{
     capability, capability::Capability, CatalogEntryView, CatalogGate, CatalogRef, CatalogSheet,
     EngineOutput, KeyRegisterData, State, SubRegisterData, SubStatusCounts, TagAddData, TagLsData,
@@ -312,7 +312,7 @@ impl CatalogKind {
     // 落账闸 / 投影数据源 / 空册文案 / 附述行 / 边界表述 / 键位行 / 浮层 /
     // 册内键位表」收成 `CatalogKind` 的成员。**调用方不再写第四份
     // `if kind == …`**:命中区(`layout::catalog_hits`)、册内键位路由
-    // (`App::key_catalog`)、渲染(`render_catalog` / `catalog_keys`)与
+    // (`App::key_catalog`)、渲染(`render_catalog` / `catalog_key_parts`)与
     // `App` 的册级访问器各只剩一处公共代码路径,四本册走同一条。
     //
     // 加一条只在一本册上成立的关切 = 在这里加一个成员(那一本给真值,
@@ -574,9 +574,19 @@ impl CatalogKind {
     /// 空册时的册内键位行**段清单**(与鼠标命中区同文案同序;四本各一组)。
     /// 给段而不是给一整行字符串,好让 #67 的可点「换册」段接在末段——渲染
     /// 与命中共用同一份段清单,一处真相。新增第五本册只加一行。
+    ///
+    /// 机器册空册态与有条目态同一口径(#65 评审第 8 条):`q` 在编目册册体上
+    /// 是壳级「退出」(`on_key` 的 `Char('q') => quit`),**不是返航**——`keys_body`
+    /// 已按这条收窄成裸 `Esc`,空册态却还写着 `Esc/q 返航`,同一块屏上两个态
+    /// 对同一个键说两样话。这里跟上:`Esc`(语义同册体,清当前册过滤词;
+    /// 空册没词时它不出声,但至少不虚指一个 quit 键当返航)。
+    ///
+    /// 另三本的空册态仍写 `Esc/q 返航`,是另一件既有事:它们的 `keys_body`
+    /// 根本不给 Esc 提示段(整行没有它),所以本册内并不自相矛盾;要跨四本
+    /// 统一口径得连册体一起动,那是另一条工单,不夹在本评审里。
     pub fn keys_empty(self) -> &'static [&'static str] {
         match self {
-            CatalogKind::Vps => &["  r 登记机器", "Esc/q 返航"],
+            CatalogKind::Vps => &["  r 登记机器", "Esc"],
             CatalogKind::Tag => &["  l 反查全部", "r 挂标签", "Esc/q 返航"],
             CatalogKind::Subscription => &["  r 登记订阅", "l 重读", "Esc/q 返航"],
             CatalogKind::Key => &["  r 登记钥匙", "l 重读", "Esc/q 返航"],
@@ -1716,10 +1726,9 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     let block = body(app, "机器写 · 永不手改");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let w = inner.width.saturating_sub(2) as usize;
+    let w = body_text_width(inner);
 
     let mut lines = catalog_body_lines(app, w);
-    let _ = cause_line(app);
     lines.push(key_line(inner, &catalog_key_parts(app), p));
     frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
 
@@ -1741,17 +1750,16 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
 /// 烤进锁定集等于每次改标签重烤一次派——面板不提供任何这样的入口。
 const TAG_BOUNDARY: &str = "  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)";
 
-/// 数据仓根三态的一行说明(能力可用而根不可用时给人话;根就绪时给空)。
-fn cause_line(app: &App) -> String {
-    match app.data_root_cause() {
-        Some(DataRootCause::Unset) => {
-            "  数据仓根未设:去设置屏按 d 录入(面板不拿当前目录兜底)。".into()
-        }
-        Some(DataRootCause::Unavailable) => {
-            "  数据仓根不可用:目录不存在或不可读,去设置屏按 d 重设。".into()
-        }
-        _ => String::new(),
-    }
+/// 编目册正文行的**宽度预算**(#65 评审第 6 条:渲染与命中区同一处取,
+/// ADR-0005「渲染与命中同源」的几何那一半)。`render_catalog` 与
+/// `layout::catalog_hits` 都经这一个函数问「正文行按多宽算」——早先两边各写
+/// 一遍(渲染 `inner.width - 2`、命中区 `inner.width`),今天两边的正文**行数**
+/// 相同,只因为 `catalog_body_lines` 的每一支都出宽度无关的行数(`clip` 截断、
+/// 从不折行)。将来哪一支开始折行,两边就会静默算出不同的行数,键位行的行号
+/// 与它的命中矩形从此分叉——而这种事在测试里看不出来,因为命中矩形仍然「在
+/// 某一行的正确列上」。收成一处:折行行为真要变,两边一起变。
+pub(crate) fn body_text_width(inner: Rect) -> usize {
+    inner.width.saturating_sub(2) as usize
 }
 
 /// 编目册**正文行**(键位行之前的一切:标题 + 册体 + 各册附加行)。
@@ -1809,15 +1817,24 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
         // 并且**绝不画成空列表**——「这次没读到」与「一条标签引用都没有」是
         // 两件事,话不许互相冒充(spec #65 铁律 4)。册体与选中行原样在场:
         // 反查从头到尾不写 `vps_sel`,读不到也不该把册体收走。
-        if let VpsReverse::Unreadable { reason, .. } = &app.vps_reverse {
-            lines.push(Line::from(Span::styled(
-                format!("  ⚠ 反查没结果:{}", clip(reason, w.saturating_sub(12))),
-                p.warn().bold(),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  标签册这次没读到,不是「一条标签引用都没有」;册体与选中行原样不动。",
-                p.dim(),
-            )));
+        //
+        // **只在机器册画**(`kind == CatalogKind::Vps`):反查上浮是机器册独有
+        // 的动作,换册(`cycle_catalog_kind`)会把 `vps_reverse` 清回 Idle,所以
+        // 今天别三本册上这条指路本来就画不出来。但把不变量写在**用它的这一处**
+        // 本地,而不是靠调用方在远处复位:将来哪条路径换了册却忘了清
+        // `vps_reverse`,画出来的会是机器册的指路摊在标签 / 订阅 / 钥匙册上——
+        // 一态冒充另一态。
+        if kind == CatalogKind::Vps {
+            if let VpsReverse::Unreadable { reason, .. } = &app.vps_reverse {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ 反查没结果:{}", clip(reason, w.saturating_sub(12))),
+                    p.warn().bold(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  标签册这次没读到,不是「一条标签引用都没有」;册体与选中行原样不动。",
+                    p.dim(),
+                )));
+            }
         }
         // 反查回音的终态(#54):问错了名字(rc 3)/ 合法空态 / 有内容,
         // 三者互不冒充——都画成「空列表」会丢掉「这个名字不存在」的信息
@@ -1916,6 +1933,15 @@ pub(crate) const CATALOG_FILTER: &str = "/ 过滤";
 /// **规格订正(#67 承载)**:可点动作段画在**正文里**,不画在 HUD——命中区模型
 /// 历来把顶栏与 HUD 整行切在外面(spec #15/#16)。在途浮层/删除确认态换册键被
 /// 浮层受理(`m` 到不了 `key_catalog`),键位行只留浮层提示、不画可点段。
+///
+/// **浮层态的 `Esc/q 返航` 是有意两键都写**(#65 评审第 8 条:这一处与册体
+/// 态口径不同,理由键在这儿,别再当成遗漏):登记流 / 删除确认浮层在场时,
+/// `on_key` 先把键交给浮层那层(`RegState` 非 Idle 走 `on_key_reg_flow`、
+/// `as_confirm` 走确认分支),`Esc` 与 `q` **都**收敛浮层
+/// (`cancel_register` / `dismiss_popup`),壳级的 `q => quit` 那一次判定排
+/// 在更后面,根本轮不到。所以这一态写两键不是虚指。册体态反过来:
+/// `q` 直接 quit、`Esc` 只清过滤词,故 `keys_body` 收窄成裸 `Esc`(机器册)、
+/// 另三本干脆不给 Esc 段。
 pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::layout::Target>)> {
     use crate::layout::Target;
     let kind = app.catalog_kind;
@@ -6855,6 +6881,153 @@ mod tests {
         assert_eq!(app.catalog_filter(), "", "第二次 Esc 清词");
     }
 
+    /// 回归(#65 评审第 3 条):机器册反查(#70)发的是**不带参**的
+    /// `tag ls --root <根>`,所以切到标签册时册头必须说「列全部标签」。
+    /// 早先回音路由从 argv 重新推导「问的是哪一条」
+    /// (`skip(2).find(非 -- 开头)`),它把 `--root` 的**值**当成了标签名:
+    /// 册头写「当前册 标签 · 反查 /tmp」、日志写「反查完成(标签 /tmp:4 条,
+    /// 只读)」——「列全部标签」被冒充成「反查一个叫 /tmp 的标签」,一种
+    /// 状态冒充另一种。下面两条把册头与日志两处都钉住:带的只能是
+    /// `run_tag_ls` 下发时记下的那个入参(`None` = 列全部)。
+    #[test]
+    fn 反查后切到标签册_册头与日志都说全部标签_不把数据仓根当标签名() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "反查结论先在场");
+        tap(&mut app, KeyCode::Esc); // 先收浮层(它在场时吞册体键)
+        tap(&mut app, KeyCode::Char('m')); // 机器册 → 标签册
+        let root = app.usable_data_root().unwrap_or_default();
+        assert_eq!(
+            app.catalog_scope_label(),
+            "全部标签",
+            "不带参反查 = 列全部:册头别把数据仓根 {root} 当成标签名"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            s.contains("当前册 标签 · 全部标签 ·"),
+            "帧上册头同口径(下面两帧 golden 就钉在这一行):{s}"
+        );
+        assert!(
+            !s.contains(&format!("反查 {root}")),
+            "册头不出现「反查 <数据仓根>」:{s}"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查完成(全部标签:")),
+            "日志同口径:列全部,不是一个叫 {root} 的标签:{:?}",
+            app.log.first()
+        );
+        assert!(
+            app.log
+                .iter()
+                .all(|l| !l.contains(&format!("标签 {root}:"))),
+            "日志不把数据仓根 {root} 当成标签名:{:?}",
+            app.log.first()
+        );
+    }
+
+    /// 机器册键位行三个态的 `Esc` 口径一致(#65 评审第 8 条):`q` 在编目册册体上
+    /// 是壳级 quit(`on_key` 的 `Char('q') => quit`),**不是返航**——`keys_body`
+    /// 已为此收窄成裸 `Esc`,空册态却还写着 `Esc/q 返航`,同一块屏两个态对同一
+    /// 个键说两样话。这条把「册体态 / 空册态都不许把 `q` 当返航、浮层态两键
+    /// 都认」钉住:谁再把 `Esc/q 返航` 写回册体或空册的段清单,这里就红。
+    ///
+    /// 浮层态是**有意**两键都写:登记流 / 删除确认在场时 `on_key` 先把键交给浮层
+    /// 那层,`Esc` 与 `q` 都收敛浮层,壳级 quit 那次判定排在更后面、根本轮不到
+    /// (详见 `catalog_key_parts` 的注释)。
+    #[test]
+    fn 机器册键位行_esc口径三态一致_册体与空册都不把q当返航() {
+        // ① 有条目(册体态):`Esc`,且不出现 `q 返航`
+        let mut app = book("机器");
+        let body = crate::testutil::frame_display(&app, 110, 30);
+        let body_line = body
+            .lines()
+            .find(|l| l.contains("↑/↓ 选"))
+            .expect("册体态键位行在场")
+            .to_string();
+        assert!(body_line.contains("Esc"), "册体态给 Esc 提示:{body_line}");
+        assert!(
+            !body_line.contains("q 返航"),
+            "册体态不把 q 当返航(q 是壳级退出):{body_line}"
+        );
+        // ② 空册态:同一个口径
+        let mut empty =
+            crate::app::App::with_runner(std::sync::Arc::new(crate::engine::FakeRunner::new(&[(
+                "vps ls",
+                0,
+                r#"{"catalogPath":"/r/vps.json","machines":[]}"#,
+            )])));
+        empty.splash = false;
+        empty.screen = crate::app::Screen::Vps;
+        empty.catalog_kind = CatalogKind::Vps;
+        empty.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        empty.vps_ls =
+            Some(serde_json::from_str(r#"{"catalogPath":"/r/vps.json","machines":[]}"#).unwrap());
+        empty.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        assert_eq!(empty.catalog_len(), 0, "确实是空册");
+        let ef = crate::testutil::frame_display(&empty, 110, 30);
+        let empty_line = ef
+            .lines()
+            .find(|l| l.contains("r 登记机器"))
+            .expect("空册态键位行在场")
+            .to_string();
+        assert!(empty_line.contains("Esc"), "空册态给 Esc 提示:{empty_line}");
+        assert!(
+            !empty_line.contains("q 返航"),
+            "空册态与册体态同一口径,不把 q 当返航:{empty_line}"
+        );
+        // ③ 浮层态:两键都认(这一处与册体态口径不同,理由见 catalog_key_parts)
+        tap(&mut app, KeyCode::Char('r'));
+        let of = crate::testutil::frame_display(&app, 110, 30);
+        assert!(
+            of.contains("Esc/q 返航"),
+            "浮层态 Esc 与 q 都收敛浮层,两句都写:{of}"
+        );
+    }
+
+    /// 键位行的**行号**与它的**命中矩形**钉在同一处(#65 评审第 6 条):命中区用
+    /// `catalog_body_lines` 的行数推出键位行的 y,渲染用同一份行数把键位行画到
+    /// 那一行。这一条从行为上再钉一道——命中矩形落在的那一行,渲染出来的行里
+    /// **真的带着键位段**。谁再把两边的宽度预算拆开(渲染一个数、命中另一个数),
+    /// 键位行就会整体错一行,这条就红。
+    ///
+    /// 顺带钉三档:常畅 80×30、紧凑 66×50、宽 110×30(三段可点段都放得下的那一档)。
+    #[test]
+    fn 键位行命中矩形那一行_渲染出来真的带着键位段() {
+        for (w, h) in [(80u16, 30u16), (66, 50), (110, 30)] {
+            let mut app = book("机器");
+            let size = Rect::new(0, 0, w, h);
+            app.size = size;
+            let hits = crate::layout::hitmap(size, &app, crate::layout::size_class(size));
+            let rows: Vec<u16> = hits
+                .iter()
+                .filter(|(_, t)| {
+                    matches!(
+                        t,
+                        crate::layout::Target::SwitchBook
+                            | crate::layout::Target::CatalogFilter
+                            | crate::layout::Target::VpsReverse
+                    )
+                })
+                .map(|(r, _)| r.y)
+                .collect();
+            assert!(!rows.is_empty(), "{w}×{h} 机器册键位行应有可点段:{hits:?}");
+            assert!(
+                rows.iter().all(|&y| y == rows[0]),
+                "{w}×{h} 可点段应同一行:{rows:?}"
+            );
+            let f = crate::testutil::frame_display(&app, w, h);
+            let line = f.lines().nth(rows[0] as usize).unwrap_or_default();
+            assert!(
+                line.contains(CATALOG_SWITCH),
+                "{w}×{h} 命中矩形那一行渲染出来真的带着键位段:{line}"
+            );
+        }
+    }
+
     // ---- 工单 #66:四本册整帧 golden(逐字节) ----
     //
     // 本票是**纯重构**:操作者感知不到任何变化。上面四条
@@ -6863,10 +7036,23 @@ mod tests {
     // 紧凑(66×50)两档各一份——按册分叉收敛成查表成员之后,任何一本的
     // 文案 / 行序 / 行数 / 折列漂了一个字节,这里就红。
     //
-    // 期望值取自**本票之前**的第 8 轮 tip `bb19d70`(同一夹具、同一尺寸),
-    // 并经人工逐行核对。修订纪律同 `ui::tests::golden_常畅态_80x30_整帧逐字节`:
-    // 若既有渲染面发生真实回归而改期望,必须与该回归同一次提交并说明——
-    // 不许为过测试回填。
+    // **期望值的来历(不止一句「本票之前」,每一次刷新都记在这儿)**:
+    // 基线 = 第 8 轮 tip `bb19d70` + 工单 #66(同一夹具、同一尺寸,人工逐行
+    // 核对;#66 确是纯重构,基线帧与 `bb19d70` 逐字节相同)。基线之后有过三
+    // 次**真实的用户可见变化**,每次都刷新过期望,差都记在各自工单里:
+    //   · #67(合入点 `42eb955`):机器册键位行末尾多出可点的 `m 换册` 段;
+    //   · #69(`8f676fc`):机器册键位行再多 `/ 过滤` 段(另三本放不下,段就
+    //     不画也不给命中,见 `过滤段渲染与命中同源_放不下则两厢都不出现`);
+    //   · #70(`31f069d`):机器册键位行 `↑/↓ 选机器`→`↑/↓ 选`、
+    //     `Esc/q 返航`→`Esc`,并多出 `Enter 反查` 段;
+    //   · 本票 #65 评审第 3 条:标签册册头把 `反查 /tmp` 改回 `全部标签`
+    //     (那一行原是把 `--root` 的值错当成标签名,见 `App::on_tag_echo`)。
+    // 除机器册键位行与标签册册头这两处,其余六帧自 #66 基线以来一个字节
+    // 都没动过——所以「基线 + 三次有记账的刷新」就是这一族期望值的全部来历,
+    // 没有第四次,也没有哪一次是悄悄回填的。
+    //
+    // 修订纪律同 `ui::tests::golden_常畅态_80x30_整帧逐字节`:若既有渲染面
+    // 发生真实回归而改期望,必须与该回归同一次提交并说明——不许为过测试回填。
 
     /// 四本册各就绪一个 app(夹具 / splash / 只读 ls 回音全部钉死),
     /// 整帧 golden 与「四本册走同一条键位路径」共用。
@@ -6928,7 +7114,7 @@ mod tests {
             "{w}×{h} 整帧渲染发生变化(见本族测试头注的修订纪律)"
         );
     }
-    /// 机器册 80×30 整帧 golden(本票之前逐字节)。
+    /// 机器册 80×30 整帧 golden(基线 `bb19d70` + #66;此后 #67 加 `m 换册`、#69 加 `/ 过滤`、#70 改 `Esc` 并加 `Enter 反查`)。
     const VPS_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 机器 · 机器 · 编目 /r/vps.json                           │
@@ -6959,7 +7145,7 @@ mod tests {
 │          ││                                                                  │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
-    /// 机器册 66×50 整帧 golden(本票之前逐字节)。
+    /// 机器册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
     const VPS_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
 ┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
@@ -7010,10 +7196,10 @@ mod tests {
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
-    /// 标签册 80×30 整帧 golden(本票之前逐字节)。
+    /// 标签册 80×30 整帧 golden(基线 `bb19d70` + #66;#65 评审第 3 条把册头 `反查 /tmp` 改回 `全部标签`)。
     const TAG_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
-│  ▸ 概览  ││  当前册 标签 · 反查 /tmp · 编目 /r/tags.json                     │
+│  ▸ 概览  ││  当前册 标签 · 全部标签 · 编目 /r/tags.json                      │
 │  ⚙ 装配  ││  ▸ bare                                                          │
 │  ✚ 健康  ││    引用 ——                                                       │
 │  ▤ 配方  ││    pi                                                            │
@@ -7041,11 +7227,11 @@ mod tests {
 │          ││                                                                  │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
-    /// 标签册 66×50 整帧 golden(本票之前逐字节)。
+    /// 标签册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
     const TAG_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
 ┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
-│  当前册 标签 · 反查 /tmp · 编目 /r/tags.json                   │
+│  当前册 标签 · 全部标签 · 编目 /r/tags.json                    │
 │  ▸ bare                                                        │
 │    引用 ——                                                     │
 │    pi                                                          │
@@ -7092,7 +7278,7 @@ mod tests {
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
-    /// 订阅册 80×30 整帧 golden(本票之前逐字节)。
+    /// 订阅册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动)。
     const SUB_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 订阅 · 全部订阅 · 编目 /r/subscriptions.json             │
@@ -7123,7 +7309,7 @@ mod tests {
 │          ││                                                                  │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
-    /// 订阅册 66×50 整帧 golden(本票之前逐字节)。
+    /// 订阅册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
     const SUB_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
 ┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
@@ -7174,7 +7360,7 @@ mod tests {
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
-    /// 钥匙册 80×30 整帧 golden(本票之前逐字节)。
+    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动)。
     const KEY_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                      │
@@ -7205,7 +7391,7 @@ mod tests {
 │          ││                                                                  │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
-    /// 钥匙册 66×50 整帧 golden(本票之前逐字节)。
+    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
     const KEY_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
 ┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
@@ -7257,37 +7443,41 @@ mod tests {
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
 
-    /// 机器册整帧 golden:常畅 80×30 与紧凑 66×50 两档都逐字节不变
-    /// (#66 验收第 1 条:纯重构,零用户可见变化)。
+    /// 机器册整帧 golden:常畅 80×30 与紧凑 66×50 两档各一份,逐字节钉住
+    /// (#66 验收第 1 条:纯重构,零用户可见变化——基线 `bb19d70` + #66;
+    /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
     #[test]
-    fn 机器册整帧golden_两档逐字节不变() {
+    fn 机器册整帧golden_两档golden() {
         let app = book("机器");
         assert_book_frame(&app, 80, 30, VPS_80X30);
         assert_book_frame(&app, 66, 50, VPS_66X50);
     }
 
-    /// 标签册整帧 golden:常畅 80×30 与紧凑 66×50 两档都逐字节不变
-    /// (#66 验收第 1 条:纯重构,零用户可见变化)。
+    /// 标签册整帧 golden:常畅 80×30 与紧凑 66×50 两档各一份,逐字节钉住
+    /// (#66 验收第 1 条:纯重构,零用户可见变化——基线 `bb19d70` + #66;
+    /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
     #[test]
-    fn 标签册整帧golden_两档逐字节不变() {
+    fn 标签册整帧golden_两档golden() {
         let app = book("标签");
         assert_book_frame(&app, 80, 30, TAG_80X30);
         assert_book_frame(&app, 66, 50, TAG_66X50);
     }
 
-    /// 订阅册整帧 golden:常畅 80×30 与紧凑 66×50 两档都逐字节不变
-    /// (#66 验收第 1 条:纯重构,零用户可见变化)。
+    /// 订阅册整帧 golden:常畅 80×30 与紧凑 66×50 两档各一份,逐字节钉住
+    /// (#66 验收第 1 条:纯重构,零用户可见变化——基线 `bb19d70` + #66;
+    /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
     #[test]
-    fn 订阅册整帧golden_两档逐字节不变() {
+    fn 订阅册整帧golden_两档golden() {
         let app = book("订阅");
         assert_book_frame(&app, 80, 30, SUB_80X30);
         assert_book_frame(&app, 66, 50, SUB_66X50);
     }
 
-    /// 钥匙册整帧 golden:常畅 80×30 与紧凑 66×50 两档都逐字节不变
-    /// (#66 验收第 1 条:纯重构,零用户可见变化)。
+    /// 钥匙册整帧 golden:常畅 80×30 与紧凑 66×50 两档各一份,逐字节钉住
+    /// (#66 验收第 1 条:纯重构,零用户可见变化——基线 `bb19d70` + #66;
+    /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
     #[test]
-    fn 钥匙册整帧golden_两档逐字节不变() {
+    fn 钥匙册整帧golden_两档golden() {
         let app = book("钥匙");
         assert_book_frame(&app, 80, 30, KEY_80X30);
         assert_book_frame(&app, 66, 50, KEY_66X50);
@@ -7455,6 +7645,35 @@ mod tests {
                 assert_eq!(app.catalog_sel(), sel_before, "{label}册选中原样");
             }
         }
+    }
+
+    /// `catalog_filter: [String; 4]` 与 `CatalogKind::idx()` 的耦合钉在这儿
+    /// (#65 评审第 9 条):第五本册子若只给 `idx()` 加了第 5 个下标、却忘了把
+    /// 数组放宽成 5,`catalog_filter()[idx]` 就是一次**运行期索引 panic**,不是
+    /// 编译错误——编译期一处都不红,单测跑到那一本才炸。这条按换册环(`next()`)
+    /// 把每一本都走一遍,断言每本的 `idx()` 都落在那只数组的长度里;顺带钉各本
+    /// 占的槽两两不同(重槽 = 两本册子共用一个过滤词,规格故事 24「按册各留一份」
+    /// 就破了)。走环而不写死四本清单,是为了第五本真来时这条自己会长。
+    #[test]
+    fn 每本册的idx都落进过滤词数组_且各本不重槽() {
+        let slots =
+            crate::app::App::with_runner(std::sync::Arc::new(crate::engine::FakeRunner::new(&[])))
+                .catalog_filter
+                .len();
+        let mut seen: Vec<usize> = Vec::new();
+        let mut k = CatalogKind::Vps;
+        for _ in 0..slots {
+            let i = k.idx();
+            assert!(
+                i < slots,
+                "{} 册的 idx()={i} 超出过滤词数组长度 {slots}:加第五本册子时要把 `catalog_filter: [String; N]` 一起放宽",
+                k.label()
+            );
+            assert!(!seen.contains(&i), "{} 册与别的册重槽(idx={i})", k.label());
+            seen.push(i);
+            k = k.next();
+        }
+        assert_eq!(seen.len(), slots, "换册环一圈走过的册数 = 数组长度");
     }
 
     // ---- #69 册内过滤:四本册都能 `/` 过滤,纯本地筛选(与 #61 五域同源同形) ----

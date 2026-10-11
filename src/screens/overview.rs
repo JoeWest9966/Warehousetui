@@ -180,7 +180,8 @@ fn render_profiles(frame: &mut Frame, area: Rect, app: &App) {
 fn render_commands(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     // 指令栏是「家」的动线,不是能力表(#68):每条常驻可点、无禁用态。第五条
-    // 「浏览编目 (v)」一键到第六屏(编目),键位 `v` 与 HUD/帮助/README 同写;
+    // 「浏览编目 (v)」一键到第六屏(编目),键位 `v` 与**指令栏 / 帮助 / README**
+    // 三处同写(HUD 是壳级提示栏,只写 j/k/Enter/t/?/q,不写这一屏的跳屏键);
     // 点它也等于按 `v`(命中区见 `layout::overview_hits`,与这里同一组 Layout)。
     // 四条既有跳屏键 `h/a/l` 之后接 `v`(屏枚举 `Screen::Vps` 首字母,全仓无冲突)。
     let items = vec![
