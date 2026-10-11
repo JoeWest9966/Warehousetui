@@ -41,6 +41,12 @@ pub enum Target {
     /// 与键盘 `cycle_catalog_kind` 同一路;不绑定具体键——段上文案由渲染与
     /// 命中共用,点哪打哪)。
     SwitchBook,
+    /// 点装配屏正文键位行的「中止」段 = 按 `x`(#71,补 #59 欠下的鼠标命中):
+    /// 在途 `nw up` 子进程**进程级真止**(与键盘 `abort_assembling` 完全同一路)。
+    /// 只在真有 up 在途(`as_running`)时由 `assemble_hits` 产出——不在场时不画
+    /// 也不给命中;与发射前浮层里的「Esc 返航」(`DismissPopup`)是两个语义,
+    /// 不共屏、不共话术。
+    Abort,
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -345,25 +351,50 @@ fn overview_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
 /// 带边框、首行即数据;结果态/无日志区,不产目标。
 fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
     if app.assembling {
-        // 与 render_running_comfy/compact 同一个 Layout:七步栏/进度行
-        // 之外就是日志块,再缩一圈块边框(与 row_hits 的取内层同约定)。
-        let log = match class {
-            SizeClass::Comfy => ratatui::layout::Layout::horizontal([
-                ratatui::layout::Constraint::Length(14),
-                ratatui::layout::Constraint::Min(20),
-            ])
-            .split(area)[1],
-            SizeClass::Compact => ratatui::layout::Layout::vertical([
-                ratatui::layout::Constraint::Length(1),
-                ratatui::layout::Constraint::Min(3),
-            ])
-            .split(area)[1],
+        // 与 render_running_comfy/compact 同一个 Layout:七步栏/进度行 + 日志块
+        // + 末行键位行(可点「中止」段),再缩一圈块边框(与 row_hits 取内层同约定)。
+        // 渲染与命中共用这一组 Layout 常量——几何零分歧(ADR-0005)。
+        let (log, key_row) = match class {
+            SizeClass::Comfy => {
+                let rows = ratatui::layout::Layout::vertical([
+                    ratatui::layout::Constraint::Min(3),
+                    ratatui::layout::Constraint::Length(1),
+                ])
+                .split(area);
+                let log = ratatui::layout::Layout::horizontal([
+                    ratatui::layout::Constraint::Length(14),
+                    ratatui::layout::Constraint::Min(20),
+                ])
+                .split(rows[0])[1];
+                (log, rows[1])
+            }
+            SizeClass::Compact => {
+                let rows = ratatui::layout::Layout::vertical([
+                    ratatui::layout::Constraint::Length(1),
+                    ratatui::layout::Constraint::Min(3),
+                    ratatui::layout::Constraint::Length(1),
+                ])
+                .split(area);
+                (rows[1], rows[2])
+            }
         };
         let log = shrink_border(log);
         if log.width > 0 && log.height > 0 {
             // 方向由滚轮事件在分派时携带;命中区是纯几何,此处的值
             // 仅为满足 Target 形状(spec #15),不参与语义。
             hits.push((log, Target::ScrollLog(ScrollDir::Down)));
+        }
+        // 正文键位行的可点「中止」段(#71):段清单由 `assemble::assemble_key_parts`
+        // 一处产出——渲染画的与命中测的逐字同源(ADR-0005)。只在真有 up 在途
+        // (as_running)时 parts 非空;不在场时不画也不给命中。放不下(越出 key_row
+        // 右界)由 key_line_segments 收口——画不出的段不给点(#67 同款纪律)。
+        let parts = crate::screens::assemble::assemble_key_parts(app);
+        let gap = crate::screens::assemble::ASSEMBLE_KEY_GAP;
+        for seg in key_line_segments(key_row, key_row.y, &parts, gap) {
+            // 只画不点的提示段(None)不进命中区;可点动作段才给矩形。
+            if let Some(t) = seg.target {
+                hits.push((seg.rect, t));
+            }
         }
         return;
     }
@@ -1307,6 +1338,36 @@ mod tests {
                 .iter()
                 .any(|(_, t)| matches!(t, Target::ScrollLog(_))),
             "闲置装配屏不产日志滚动区"
+        );
+    }
+
+    /// #71 装配中止段命中区:只在真有 up 在途(`as_running`)时产出,与 stderr 日志
+    /// 滚动区同源于 `assemble_hits`(同一组 `Layout`——渲染与命中共用一份几何,
+    /// ADR-0005)。常畅(80×30)与紧凑(66×50)两档都在场、是 1 行可点段、不越界;
+    /// 在途标记一收敛(仍 assembling = 运行视图在场)即不产——点不到一个当前不
+    /// 存在的动作(规格故事 47)。
+    #[test]
+    fn hitmap_装配中止段_在途产出_闲置不产() {
+        let mut app = test_app();
+        app.screen = Screen::Assemble;
+        app.assembling = true;
+        app.as_running = true;
+        for (w, h) in [(80u16, 30u16), (66, 50u16)] {
+            let a = area(w, h);
+            let hits = hitmap(a, &app, size_class(a));
+            check(&hits, a, "{w}×{h}");
+            let r = first(&hits, |t| *t == Target::Abort)
+                .unwrap_or_else(|| panic!("{w}×{h} up 在途应有中止段命中区"));
+            assert!(r.height == 1, "{w}×{h} 中止段是 1 行可点段");
+        }
+        // 在途标记收敛(仍 assembling,运行视图在场):中止段不产命中区
+        app.as_running = false;
+        let a = area(80, 30);
+        assert!(
+            hitmap(a, &app, size_class(a))
+                .iter()
+                .all(|(_, t)| *t != Target::Abort),
+            "非 up 在途:中止段不产命中区"
         );
     }
 }
