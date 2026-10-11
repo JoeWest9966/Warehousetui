@@ -292,6 +292,78 @@ impl CatalogKind {
             CatalogKind::Key => CatalogKind::Vps,
         }
     }
+
+    // ---- 册级查表(工单 #66:按册差异只剩数据,不再有分支) ----
+    //
+    // 下面这一族把「这一本的登记流槽 / 删除确认旗 / 册体条数 / 落账闸」
+    // 收成 `CatalogKind` 的成员。**调用方不再写第四份 `if kind == …`**:
+    // 命中区(`layout::catalog_hits`)与册内键位路由(`App::key_catalog`)
+    // 各只剩一处公共代码路径,四本册走同一条。加一条只在一本册上成立的
+    // 关切 = 在这里加一个成员(那一本给真值,其余三本给 `false` / 空),
+    // 不是往调用方再插一个分支——第五本册子来时同样只改这一处。
+
+    /// 这一本的登记流槽(两段式 / 无确认闸两种形态,四本各一份)。
+    pub fn flow<'a>(self, app: &'a App) -> &'a RegisterFlow {
+        match self {
+            CatalogKind::Vps => &app.vps_flow,
+            CatalogKind::Tag => &app.tag_flow,
+            CatalogKind::Subscription => &app.sub_flow,
+            CatalogKind::Key => &app.key_flow,
+        }
+    }
+
+    /// 这一本的删除确认弹层是否打开(ADR-0009 §2:面板加一道图形确认,
+    /// 不改引擎语义;四本各一面旗)。
+    pub fn rm_confirm(self, app: &App) -> bool {
+        match self {
+            CatalogKind::Vps => app.vps_rm_confirm,
+            CatalogKind::Tag => app.tag_rm_confirm,
+            CatalogKind::Subscription => app.sub_rm_confirm,
+            CatalogKind::Key => app.key_rm_confirm,
+        }
+    }
+
+    /// 这一本册体的条数(没读到 = 0;与 [`Self::sel`] 同一张表)。
+    pub fn len(self, app: &App) -> usize {
+        match self {
+            CatalogKind::Vps => app.vps_len(),
+            CatalogKind::Tag => app.tag_len(),
+            CatalogKind::Subscription => app.sub_len(),
+            CatalogKind::Key => app.key_len(),
+        }
+    }
+
+    /// 这一本的选中行(↑/↓ 与鼠标点行同源;四本各一个槽,换册不串味)。
+    pub fn sel(self, app: &App) -> usize {
+        match self {
+            CatalogKind::Vps => app.vps_sel,
+            CatalogKind::Tag => app.tag_sel,
+            CatalogKind::Subscription => app.sub_sel,
+            CatalogKind::Key => app.key_sel,
+        }
+    }
+
+    /// 这一本的选中槽(可写侧;键位 ↑/↓、鼠标点行、滚轮移选中都走这一口)。
+    pub fn sel_mut<'a>(self, app: &'a mut App) -> &'a mut usize {
+        match self {
+            CatalogKind::Vps => &mut app.vps_sel,
+            CatalogKind::Tag => &mut app.tag_sel,
+            CatalogKind::Subscription => &mut app.sub_sel,
+            CatalogKind::Key => &mut app.key_sel,
+        }
+    }
+
+    /// 这一本的登记确认态是否放行落账。**标签册恒 `false`**:上游
+    /// `tag add` 没有确认闸(追加合并、幂等),ADR-0009 §2 不许面板自己造
+    /// 一道——所以标签册的确认屏没有「Enter 落账」段可点,这一条就是那道闸。
+    pub fn can_commit(self, app: &App) -> bool {
+        match self {
+            CatalogKind::Vps => app.vps_can_commit(),
+            CatalogKind::Tag => false,
+            CatalogKind::Subscription => app.sub_can_commit(),
+            CatalogKind::Key => app.key_can_commit(),
+        }
+    }
 }
 
 /// 一本册子的条目明细画法:名字行右侧的弱化后缀(机器册给端口,标签册
