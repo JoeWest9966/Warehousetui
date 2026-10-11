@@ -6102,10 +6102,11 @@ mod tests {
     // 函数口径,这一族钉「一个键问下去之后操作者看见什么、引擎收到什么」。
 
     /// 反查上浮的**三标签夹具**(#70 规格验收 1):prod / edge / pi 三条都
-    /// 引用 `vps/gate`(各自引用原样在场),另放一条 `same` 引用 `skill/dr`
-    /// ——条目名撞车,反查机器时不该被算进来(纯函数那一族已钉,这里在帧上
-    /// 复核一遍:屏上只有三条,没有第四条)。
-    const TAG_LS_GATE3: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[{"name":"prod","refs":[{"kind":"vps","id":"gate"},{"kind":"skill","id":"dr"}]},{"name":"edge","refs":[{"kind":"vps","id":"gate"}]},{"name":"pi","refs":[{"kind":"vps","id":"gate"}]},{"name":"same","refs":[{"kind":"skill","id":"gate"}]}]}}"#;
+    /// 引用 `vps/gate`(各自引用原样在场);另放一条**名字也叫 gate** 的标签,
+    /// 它引用的是 `skill/gate`——条目名撞车,反查机器时不该被算进来(纯函数
+    /// 那一族已钉口径,这里在帧上复核)。prod 多带一条 `skill/dr` 引用,用来
+    /// 钉「命中标签的**各自**引用原样上场,不只印名字」。
+    const TAG_LS_GATE3: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[{"name":"prod","refs":[{"kind":"vps","id":"gate"},{"kind":"skill","id":"dr"}]},{"name":"edge","refs":[{"kind":"vps","id":"gate"}]},{"name":"pi","refs":[{"kind":"vps","id":"gate"}]},{"name":"gate","refs":[{"kind":"skill","id":"gate"}]}]}}"#;
 
     /// 反查上浮的**机器册夹具**(#70):gate 带一条登录指针 `$DEPLOY_KEY`
     /// (用来钉「结果不印机密本体」——投影里就只有指针,面板也不该多印),
@@ -6193,7 +6194,6 @@ mod tests {
         assert!(s.contains("3 个标签引用了 gate"), "命中条数明说:{s}");
         assert!(s.contains("skill/dr"), "prod 的另一条引用原样在场:{s}");
         assert!(s.contains("Esc 或点击任意处关闭"), "收口给返航路:{s}");
-        assert!(!s.contains("same"), "引用 skill/gate 的 same 不算命中:{s}");
         // 在途的那一次只读调用确有一次到达运行器,形状与 nw tag ls 契约一致
         assert_eq!(
             _r.call_argvs(),
@@ -6220,6 +6220,25 @@ mod tests {
         assert!(s.contains("没有标签引用 bare"), "明说一条都没有:{s}");
         assert!(s.contains("挂第一个标签"), "给下一步:{s}");
         assert!(!s.contains("个标签引用了"), "不是有 N 条那一态:{s}");
+    }
+
+    /// 规格验收 5 / 故事 41 的**帧上层**:同时存在一台叫 `gate` 的机器与一条
+    /// 叫 `gate` 的技能标签时,反查机器只摊开引用 `vps/gate` 的那几条——帧上
+    /// 出现 `skill/gate` 就是匹配退化成了子串包含(纯函数那一族钉口径,这一
+    /// 条钉「口径真的走到了屏上」)。
+    #[test]
+    fn 反查_机器与技能同名_帧上只有vps_gate的引用() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 投影按名排序:首行 bare,第二行才是 gate
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("3 个标签引用了 gate"), "只数出三条:{s}");
+        assert!(
+            !s.contains("skill/gate"),
+            "引用 skill/gate 的那条标签不上屏(同名不串味):{s}"
+        );
+        assert!(!s.contains("4 个标签"), "不是四条:同名的那条没被算进来:{s}");
     }
 
     /// 规格验收 3 / 故事 34:标签册回 rc 3,**走指路、不画成空列表**。
@@ -6366,6 +6385,121 @@ mod tests {
             !line.contains("升级所配 nw"),
             "能力那句的下一步也不出现:{line}"
         );
+    }
+
+    /// 规格验收 6 / 故事 38:反查**只在机器册**提供。订阅册与钥匙册的条目
+    /// 不在 `TAG_REF_KINDS` 里,在那里放这个键注定只返回「没有」——所以同一
+    /// 个 `Enter` 在这两本上**无事可做**:不开浮层、不入在途、不排队一条
+    /// `tag ls`。这里把两道门都开到过得去(根设了、tag 能力记成可用), 钉的
+    /// 就是「没有这一行」而不是「门挡掉了」。
+    #[test]
+    fn 反查边界_订阅册与钥匙册上同一个键不做反查() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        for (name, mk) in [
+            (
+                "订阅",
+                sub_app
+                    as fn(
+                        &[(&str, i32, &str)],
+                    )
+                        -> (crate::app::App, std::sync::Arc<crate::engine::FakeRunner>),
+            ),
+            ("钥匙", key_app),
+        ] {
+            let (mut app, runner) = mk(&[]);
+            app.data_root = Some(root.clone());
+            app.capabilities.record(
+                crate::engine::Capability::Tag,
+                crate::engine::Probe::Available,
+            );
+            tap(&mut app, KeyCode::Char('l')); // 先把册体读出来(有行可选)
+            feed(&mut app);
+            let before = runner.call_argvs();
+            tap(&mut app, KeyCode::Down);
+            tap(&mut app, KeyCode::Enter);
+            assert!(!app.vps_reverse_open(), "{name}册上 Enter 不开反查浮层");
+            assert_eq!(
+                runner.call_argvs(),
+                before,
+                "{name}册上 Enter 不下发任何命令(连 tag ls 都不排)"
+            );
+        }
+    }
+
+    /// 规格验收 8 / 故事 42:反查**复用既有的只读调用形状**——队里那一条
+    /// argv 逐字节就是 `nw tag ls --root <根>`(无参全列)。不新增调用形状、
+    /// 不新增写路径,`tags.json` 因此一个字节都不会被碰。
+    #[test]
+    fn 反查_复用既有只读调用_队里argv逐字节是tag_ls_root() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        assert_eq!(
+            app.queue.last().cloned(),
+            Some(vec![
+                "tag".to_string(),
+                "ls".to_string(),
+                "--root".to_string(),
+                root.clone()
+            ]),
+            "无参全列 + 只认 --root:与既有的 nw tag ls 逐字节同形"
+        );
+        assert!(
+            app.queue
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("tag")
+                    || a.get(1) == Some(&"ls".to_string())),
+            "反查这一路只有只读的 ls,没有任何写路径:{:?}",
+            app.queue
+        );
+    }
+
+    /// 规格验收 9 / 故事 43:反查结果**不印密钥引用、不印机密本体**。机器册
+    /// 帧上本来就有 `$DEPLOY_KEY` 这个指针(那是登录槽的 ref,指针不是密钥),
+    /// 所以断言要更严:浮层里只准出现 `<kind>/<条目>` 形式的标签引用,不准
+    /// 出现任何 `$` 引用、任何形如地址/端口的本体。
+    #[test]
+    fn 反查结果_不印密钥引用不印机密本体() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        // 浮层那一块(取「反查 · 什么标签引用了这一条」到收口行之间)
+        let popup: String = s
+            .lines()
+            .skip_while(|l| !l.contains("反查 · 什么标签引用了这一条"))
+            .take_while(|l| !l.contains("Esc 或点击任意处关闭"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(popup.contains("prod"), "浮层确凿在场:{popup}");
+        assert!(!popup.contains('$'), "浮层不印任何 $ 引用:{popup}");
+        assert!(!popup.contains("10.0.0.1"), "浮层不印地址本体:{popup}");
+        assert!(!popup.contains(":22"), "浮层不印端口:{popup}");
+        assert!(!popup.contains("门口"), "浮层不印备注:{popup}");
+        assert!(!popup.contains("root"), "浮层不印登录名:{popup}");
+    }
+
+    /// 规格验收 11:反查是**只读**,不并入 `assembling` 全局写互斥。按下去
+    /// 之后 `assembling` 必须还是灭的——否则在途的一次反查会把登记 / 装配
+    /// 一路全挡住(那是写闸,不是读闸)。
+    #[test]
+    fn 反查_是只读_不点亮assembling写互斥() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        assert!(!app.assembling, "起初没有写在途");
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        assert!(!app.assembling, "反查在途不点亮写互斥(只读,不占写闸)");
+        assert_eq!(app.queue.len(), 1, "确有一次只读调用排队");
+        feed(&mut app);
+        assert!(!app.assembling, "反查落地也不点亮写互斥");
+        // 反证:写互斥亮着(装配在途)时反查照样问得动。若把反查并进
+        // `assembling`,这一下就会被互斥语挡掉,队里一条都不多。
+        tap(&mut app, KeyCode::Esc); // 先返航,否则结果浮层吞键
+        app.assembling = true;
+        反查这台(&mut app);
+        assert_eq!(app.queue.len(), 1, "装配在途也问得动(只读不占写闸)");
     }
 
     // ---- 工单 #66:四本册整帧 golden(逐字节) ----
