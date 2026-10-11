@@ -7274,9 +7274,26 @@ mod tests {
     /// 鼠标章节覆盖 README「鼠标(默认开捕获)」已写全部条目:点导航/Tab 切屏与
     /// 点行选中、滚轮两用、发射仪式两段、浮层吞点击、Shift 放行复制、
     /// `--no-mouse` 与设置屏 `m` 两逃逸——每条都有短语在场。
+    ///
+    /// **反方向也钉(#65 评审第 4 条)**:册体画得出来的每一个**可点段**,章节
+    /// 与 README 鼠标小节两边都点名。旧版只查了「README 有的短语在不在章节
+    /// 里」这一个方向,于是 #69 给机器册加了 `/ 过滤` 段、#70 加了
+    /// `Enter 反查` 段,README 还停在「换册 / Enter 反查」两段,两边悄悄不
+    /// 一致也没人红。段名词从**画段的那三份常量**取
+    /// ([`crate::screens::catalog::CATALOG_SWITCH`] / `CATALOG_FILTER` /
+    /// `CATALOG_REVERSE`——`catalog_key_parts` 里全部 `Some(Target)` 的段都
+    /// 是它们),不另抄一份清单:将来加第四个可点段而文档没跟上,这条就红。
     #[test]
     fn 帮助鼠标章节_覆盖_readme_全部条目() {
+        use crate::screens::catalog::{CATALOG_FILTER, CATALOG_REVERSE, CATALOG_SWITCH};
         use crate::ui::MOUSE_LINES;
+        let readme = include_str!("../README.md");
+        // README 鼠标小节:从 `### 鼠标(默认开捕获)` 到下一个 `##` 标题之间
+        let section = readme
+            .split("### 鼠标(默认开捕获)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("README 应有「鼠标(默认开捕获)」小节");
         let joined = MOUSE_LINES.join("\n");
         for phrase in [
             "切屏",
@@ -7290,8 +7307,23 @@ mod tests {
             "Shift",
             "--no-mouse",
             "设置屏 m",
+            "编目",
+            "过滤",
         ] {
             assert!(joined.contains(phrase), "鼠标章节缺 README 条目 `{phrase}`");
+        }
+        // 反方向:画在屏上的每一个可点段,章节与 README 两边都点名
+        for seg in [CATALOG_SWITCH, CATALOG_FILTER, CATALOG_REVERSE] {
+            // 段文案是 `m 换册` / `/ 过滤` / `Enter 反查`:名词取最后一段
+            let noun = seg.split_whitespace().last().unwrap_or(seg);
+            assert!(
+                joined.contains(noun),
+                "鼠标章节漏了可点段 `{seg}`(册体画得出来,章节却没写)"
+            );
+            assert!(
+                section.contains(noun),
+                "README 鼠标小节漏了可点段 `{seg}`(屏上点得中,README 却没写)"
+            );
         }
     }
 }
