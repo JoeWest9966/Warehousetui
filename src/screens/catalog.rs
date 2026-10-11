@@ -41,7 +41,7 @@ use ratatui::Frame;
 
 use crossterm::event::KeyCode;
 
-use crate::app::{App, DataRootCause};
+use crate::app::App;
 use crate::engine::{
     capability, capability::Capability, CatalogEntryView, CatalogGate, CatalogRef, CatalogSheet,
     EngineOutput, KeyRegisterData, State, SubRegisterData, SubStatusCounts, TagAddData, TagLsData,
@@ -1719,7 +1719,6 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     let w = inner.width.saturating_sub(2) as usize;
 
     let mut lines = catalog_body_lines(app, w);
-    let _ = cause_line(app);
     lines.push(key_line(inner, &catalog_key_parts(app), p));
     frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
 
@@ -1740,19 +1739,6 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
 /// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
 /// 烤进锁定集等于每次改标签重烤一次派——面板不提供任何这样的入口。
 const TAG_BOUNDARY: &str = "  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)";
-
-/// 数据仓根三态的一行说明(能力可用而根不可用时给人话;根就绪时给空)。
-fn cause_line(app: &App) -> String {
-    match app.data_root_cause() {
-        Some(DataRootCause::Unset) => {
-            "  数据仓根未设:去设置屏按 d 录入(面板不拿当前目录兜底)。".into()
-        }
-        Some(DataRootCause::Unavailable) => {
-            "  数据仓根不可用:目录不存在或不可读,去设置屏按 d 重设。".into()
-        }
-        _ => String::new(),
-    }
-}
 
 /// 编目册**正文行**(键位行之前的一切:标题 + 册体 + 各册附加行)。
 /// #67 抽出供渲染与命中测试共用:键位行的行号 = `inner.y + 本函数行数`,
