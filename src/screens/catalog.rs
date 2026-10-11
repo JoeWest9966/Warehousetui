@@ -6122,17 +6122,20 @@ mod tests {
     /// `data_as` 拆不出型——绝不按旧形状降级解析,也不画成空列表。
     const TAG_LS_GUARD: &str = r#"{"schema":"nw/tag-ls.v9","nw":"9.9.9","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[]}}"#;
 
-    /// 建一本就绪的机器册,且**反查的两道门俱开**(#70):数据仓根显式钉成
-    /// 临时目录(否则数据仓根门随跑测试那台机器的配置漂,门禁两态测不准),
-    /// tag 组能力记成可用。`rules` 是 FakeRunner 的回放规则——反查只读走
-    /// `tag ls` 无参全列,把标签册夹具喂在这里。
+    /// 建一本就绪的机器册(#70 反查上浮的行为夹具)。`machines` 是 VpsLsData
+    /// 的 machines JSON 数组;`rules` 是 FakeRunner 的回放规则——反查只读走
+    /// `tag ls` 无参全列,把标签册夹具喂在这里;`root` = 数据仓根(`None` =
+    /// 未设);`tag_cap` = 标签组能力可不可用。后两个参数让**门禁两态**可分别
+    /// 自造:门禁顺序钉死「先根、再能力、最后才发那一次只读调用」,任缺一条
+    /// 给各自指路且**一次引擎调用都不发**。
     ///
-    /// 返回 runner 是为了探针:门禁不过时 `call_argvs()` 必须**空的**,这是
-    /// 「任缺一条不发命令」唯一可观察的证据(FakeRunner 只记 argv、不存 stdin
-    /// 本体,守「面板侧不留副本」铁律)。
+    /// 返回 runner 是为了探针:`call_argvs()` 是「发没发命令」唯一可观察的
+    /// 证据(FakeRunner 只记 argv、绝不存 stdin 本体,守「面板侧不留副本」铁律)。
     fn reverse_app(
         machines: &str,
         rules: &[(&str, i32, &str)],
+        root: Option<&str>,
+        tag_cap: bool,
     ) -> (std::sync::Arc<crate::engine::FakeRunner>, crate::app::App) {
         let ls = format!(r#"{{"catalogPath":"/r/vps.json","machines":{machines}}}"#);
         let mut all: Vec<(&str, i32, &str)> = vec![("vps ls", 0, ls.as_str())];
@@ -6145,14 +6148,26 @@ mod tests {
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
         );
-        app.capabilities.record(
-            crate::engine::Capability::Tag,
-            crate::engine::Probe::Available,
-        );
+        if tag_cap {
+            app.capabilities.record(
+                crate::engine::Capability::Tag,
+                crate::engine::Probe::Available,
+            );
+        }
         app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
-        // 数据仓根钉成临时目录:门禁第一道(根)与第二道(能力)因此可分别自造
-        app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        app.data_root = root.map(str::to_string);
         (runner, app)
+    }
+
+    /// 反查上浮两门俱开的就绪机器册(上面各族的行为夹具都走这一档)。
+    fn reverse_ready(
+        machines: &str,
+        rules: &[(&str, i32, &str)],
+    ) -> (std::sync::Arc<crate::engine::FakeRunner>, crate::app::App) {
+        // 数据仓根钉成临时目录:门禁第一道(根)因此确确过得去,第二道(能力)
+        // 由 `tag_cap` 另造。不钉就会随跑测试那台机器的配置漂,门禁测不准。
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        reverse_app(machines, rules, Some(&root), true)
     }
 
     /// 反查上浮在机器册选中行上的键盘触发(规格故事 31):Enter 问「什么标签
@@ -6166,7 +6181,7 @@ mod tests {
     /// **都在帧上**;条目名撞车的 `skill/gate` 不混进来。
     #[test]
     fn 反查_三个标签都在帧上_名字撞车那条不混进来() {
-        let (_r, mut app) = reverse_app(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
         tap(&mut app, KeyCode::Down); // 投影按名排序:首行 bare,第二行才是 gate
         assert_eq!(app.catalog_sel(), 1, "选中 gate");
         反查这台(&mut app);
@@ -6197,7 +6212,7 @@ mod tests {
     /// 共用一个空列表。
     #[test]
     fn 反查_一条标签都没有_明说并给下一步() {
-        let (_r, mut app) = reverse_app(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
         assert_eq!(app.catalog_sel(), 0, "投影按名排序:首行 bare");
         反查这台(&mut app);
         feed(&mut app);
@@ -6214,7 +6229,7 @@ mod tests {
     /// 落在日志行里(人话原文 + 说清不是空结果)。
     #[test]
     fn 反查_标签册回rc3_走指路不画成空列表() {
-        let (_r, mut app) = reverse_app(REVERSE_MACHINES, &[("tag ls", 3, TAG_LS_RC3)]);
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 3, TAG_LS_RC3)]);
         反查这台(&mut app);
         feed(&mut app);
         let s = crate::testutil::frame_display(&app, 80, 30);
@@ -6251,7 +6266,7 @@ mod tests {
     /// 路形状不同,但落到操作者眼里必须是同一件事:**没读到**。
     #[test]
     fn 反查_契约守卫需升级nw_走指路不画成空列表() {
-        let (_r, mut app) = reverse_app(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GUARD)]);
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GUARD)]);
         反查这台(&mut app);
         feed(&mut app);
         let s = crate::testutil::frame_display(&app, 80, 30);
@@ -6266,6 +6281,90 @@ mod tests {
             app.log.iter().any(|l| l.contains("需升级 nw")),
             "说清是两端 schema 没对齐,不是数据没了:{:?}",
             app.log
+        );
+    }
+
+    /// 规格验收 4 / 故事 40:数据仓根**未设**时给数据仓根指路(帧上 + 日志),
+    /// 且**一次引擎调用都没发**。夹具里明明摆着能答对的 `tag ls` 回放规则,
+    /// 所以「没发」不是夹具答不上,是面板自己没收口。
+    #[test]
+    fn 反查门禁_数据仓根未设_指路且零引擎调用() {
+        let (runner, mut app) =
+            reverse_app(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)], None, true);
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "根未设:一条 argv 都不发(探针是空的):{:?}",
+            runner.call_argvs()
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查未下发")),
+            "日志给指路:{:?}",
+            app.log
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("数据仓根未设"), "帧上也给人话:{s}");
+        assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
+    }
+
+    /// 规格验收 4 / 故事 39:标签组能力不可用时给能力指路(缺的是引擎能力,
+    /// 不是面板坏了),同样**零引擎调用**。数据仓根这一道是过的——所以这一
+    /// 条钉的是第二道门真的在管事,不是被第一道顺手挡掉的。
+    #[test]
+    fn 反查门禁_标签组能力不可用_指路且零引擎调用() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            Some(&root),
+            false,
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "能力不可用:一条 argv 都不发:{:?}",
+            runner.call_argvs()
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("缺的是引擎能力")),
+            "说清缺的是引擎能力,不是面板坏了:{:?}",
+            app.log
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
+    }
+
+    /// 规格验收 4 的**门禁顺序**:根未设与能力不可用同时在场时,**根那句赢**
+    /// (与面板其余入口同一信任序:先根、再能力),并且仍然是零引擎调用。
+    /// 两条指路措辞互不冒充——操作者该先去设根,而不是先被告知去升级 nw。
+    #[test]
+    fn 反查门禁_根与能力双缺_根那句赢且零调用() {
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            None,
+            false,
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "两道门都不过:更是一条都不发:{:?}",
+            runner.call_argvs()
+        );
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("反查未下发"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(line.contains("五域读不到数据仓"), "根那句赢:{line}");
+        assert!(
+            !line.contains("缺的是引擎能力"),
+            "不让能力那句抢在前面(两条指路互不冒充):{line}"
+        );
+        assert!(
+            !line.contains("升级所配 nw"),
+            "能力那句的下一步也不出现:{line}"
         );
     }
 
