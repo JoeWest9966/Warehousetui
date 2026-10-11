@@ -1084,8 +1084,7 @@ mod tests {
             .expect("命中行在渲染中在场");
         assert!(
             rendered.contains("web-search"),
-            "命中行 = 渲染清单首行:{}",
-            rendered
+            "命中行 = 渲染清单首行:{rendered}"
         );
         assert!(
             hits.iter()

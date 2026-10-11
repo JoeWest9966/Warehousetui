@@ -103,10 +103,7 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
     }
     // 指路:只在真有「引擎没这能力」时给(未决不冒充禁用,指路屏另管)。
     if !disabled.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", GATE_HINT),
-            p.dim(),
-        )));
+        lines.push(Line::from(Span::styled(format!("  {GATE_HINT}"), p.dim())));
     }
     lines.extend(vec![
         Line::from(""),

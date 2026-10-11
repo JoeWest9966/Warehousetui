@@ -1930,58 +1930,16 @@ impl App {
             self.cycle_catalog_kind();
             return;
         }
-        if self.catalog_kind == catalog::CatalogKind::Subscription {
-            match k.code {
-                KeyCode::Char('r') if !self.assembling => self.start_sub_register(),
-                // 取回链接本体:只给建议命令,面板不代跑 get(ADR-0009 §1)
-                KeyCode::Char('g') => self.log_sub_get_suggest(),
-                KeyCode::Char('d') => self.start_sub_rm(),
-                KeyCode::Down => self.catalog_move(true),
-                KeyCode::Up => self.catalog_move(false),
-                KeyCode::Char('l') => self.run_sub_ls(),
-                _ => {}
-            }
+        // 册内动作键(#66):**四本册同一处查表 + 同一处落实**。按册差异全在
+        // `CatalogKind::action` 那张表上(同一个键在不同册上可以落到不同
+        // 方法,也可以这一本没有这个键),这里不再有四份逐字重复的
+        // `match k.code`。加第五本册子 = 表里加行,本函数不动。
+        let Some(act) = self.catalog_kind.action(self, k.code) else {
             return;
-        }
-        if self.catalog_kind == catalog::CatalogKind::Key {
-            match k.code {
-                KeyCode::Char('r') if !self.assembling => self.start_key_register(),
-                // 取回钥匙本体:只给建议命令,面板不代跑 get(ADR-0009 §1)
-                KeyCode::Char('g') => self.log_key_get_suggest(),
-                KeyCode::Char('d') => self.start_key_rm(),
-                KeyCode::Down => self.catalog_move(true),
-                KeyCode::Up => self.catalog_move(false),
-                KeyCode::Char('l') => self.run_key_ls(),
-                _ => {}
-            }
-            return;
-        }
-        if self.catalog_kind == catalog::CatalogKind::Tag {
-            match k.code {
-                KeyCode::Char('r') if !self.assembling => self.start_tag_add(),
-                KeyCode::Char('d') => self.start_tag_rm(),
-                // 反查这一条(带参 `tag ls <标签>`):本票主价值的第二个态
-                KeyCode::Enter => {
-                    let Some(name) = self.selected_tag_name() else {
-                        self.push_log("反查未下发:没有选中的标签(↑/↓ 先选一行)");
-                        return;
-                    };
-                    self.run_tag_ls(Some(&name));
-                }
-                KeyCode::Down => self.catalog_move(true),
-                KeyCode::Up => self.catalog_move(false),
-                KeyCode::Char('l') => self.run_tag_ls(None),
-                _ => {}
-            }
-            return;
-        }
-        match k.code {
-            KeyCode::Char('r') if !self.assembling => self.start_vps_register(),
-            KeyCode::Down => self.catalog_move(true),
-            KeyCode::Up => self.catalog_move(false),
-            KeyCode::Char('d') => self.start_vps_rm(),
-            KeyCode::Char('l') => self.run_vps_ls(),
-            _ => {}
+        };
+        match act {
+            catalog::CatalogAction::Move(down) => self.catalog_move(down),
+            catalog::CatalogAction::Act(f) => f(self),
         }
     }
 
@@ -2102,7 +2060,7 @@ impl App {
     }
 
     /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
-    fn start_vps_rm(&mut self) {
+    pub fn start_vps_rm(&mut self) {
         if self.assembling {
             self.push_log("装配进行中:删除与装配互斥,稍后再试");
             return;
@@ -2271,69 +2229,39 @@ impl App {
             "换册:{}册({});{}",
             k.label(),
             k.file(),
-            match k {
-                catalog::CatalogKind::Tag => "按 l 反查全部标签(只读)",
-                catalog::CatalogKind::Key => "按 l 重读钥匙编目(只读,无本体槽、不印指纹)",
-                catalog::CatalogKind::Subscription => "按 l 重读订阅编目(只读,含到期三态)",
-                catalog::CatalogKind::Vps => "按 l 重读机器编目(只读)",
-            }
+            k.next_hint()
         ));
     }
 
     /// 编目册屏当前这一本的投影(四本各自的数据源汇到同一个
     /// `CatalogSheet`——列表件只有一份,见 `screens::catalog`)。
+    ///
+    /// 「四本各读哪个状态」那处匹配长在 [`catalog::CatalogKind::sheet`] 上
+    /// (#66:数据源形状本就不同,这一处匹配是全模块唯一 unavoidable 的
+    /// 一处,那就让它只存在于查表成员里,调用方不再各自分册)。
     pub fn catalog_sheet(&self) -> Option<crate::engine::CatalogSheet> {
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => self.vps_ls.as_ref().map(|d| d.sheet()),
-            catalog::CatalogKind::Tag => self
-                .tag_ls_echo
-                .as_ref()
-                .filter(|o| o.ok)
-                .and_then(|o| o.envelope.as_ref())
-                .and_then(|e| e.data_as::<crate::engine::TagLsData>())
-                .map(|d| d.sheet()),
-            catalog::CatalogKind::Subscription => self.sub_ls.as_ref().map(|d| d.sheet()),
-            catalog::CatalogKind::Key => self.key_ls.as_ref().map(|d| d.sheet()),
-        }
+        self.catalog_kind.sheet(self)
     }
 
     /// 反查回音的失败态(带参问错了名字 = rc 3 / 回音不可定型)。
     /// `None` = 没有失败态。**只标签册有这一态**:机器册的 `vps ls` 没有
     /// 位置参数,失败时只留日志(51 §6.11:两种语义不都画成空列表)。
+    /// 「只有一本册有」这条关切落在查表成员上(#66)。
     pub fn catalog_ls_error(&self) -> Option<&EngineOutput> {
-        if self.catalog_kind != catalog::CatalogKind::Tag {
-            return None;
-        }
-        let out = self.tag_ls_echo.as_ref()?;
-        let typed = out
-            .envelope
-            .as_ref()
-            .and_then(|e| e.data_as::<crate::engine::TagLsData>());
-        (typed.is_none() || !out.ok).then_some(out)
+        self.catalog_kind.ls_error(self)
     }
 
     /// 册体首行的口径词:机器册给册名,标签册把「列全部 / 只列一个」
     /// 这档差别显式画出来(51 §6.11:两种语义不都画成空列表)。
+    /// 查表成员 [`catalog::CatalogKind::scope_label`] 的一层转发(#66)。
     pub fn catalog_scope_label(&self) -> String {
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => "机器".to_string(),
-            catalog::CatalogKind::Tag => match self.tag_lookup.as_deref() {
-                Some(name) => format!("反查 {name}"),
-                None => "全部标签".to_string(),
-            },
-            catalog::CatalogKind::Subscription => "全部订阅".to_string(),
-            catalog::CatalogKind::Key => "全部钥匙".to_string(),
-        }
+        self.catalog_kind.scope_label(self)
     }
 
     /// 编目册当前这一本的选中行(↑/↓ 与鼠标点行同源)。
+    /// 查表成员 [`catalog::CatalogKind::sel`] 的一层转发(#66)。
     pub fn catalog_sel(&self) -> usize {
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => self.vps_sel,
-            catalog::CatalogKind::Tag => self.tag_sel,
-            catalog::CatalogKind::Subscription => self.sub_sel,
-            catalog::CatalogKind::Key => self.key_sel,
-        }
+        self.catalog_kind.sel(self)
     }
 
     /// 册级选中态的**单一查表**:当前是哪一本,就借出它自己的选中槽与行数
@@ -2341,22 +2269,13 @@ impl App {
     /// 只读侧的同源口径是 [`App::catalog_sel`] / [`App::catalog_len`]。
     fn catalog_sel_mut(&mut self) -> (&mut usize, usize) {
         let n = self.catalog_len();
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => (&mut self.vps_sel, n),
-            catalog::CatalogKind::Tag => (&mut self.tag_sel, n),
-            catalog::CatalogKind::Subscription => (&mut self.sub_sel, n),
-            catalog::CatalogKind::Key => (&mut self.key_sel, n),
-        }
+        (self.catalog_kind.sel_mut(self), n)
     }
 
     /// 当前这一本的行数(只读侧;与 `catalog_sel_mut` 同一张表)。
+    /// 查表成员 [`catalog::CatalogKind::len`] 的一层转发(#66)。
     pub fn catalog_len(&self) -> usize {
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => self.vps_len(),
-            catalog::CatalogKind::Tag => self.tag_len(),
-            catalog::CatalogKind::Subscription => self.sub_len(),
-            catalog::CatalogKind::Key => self.key_len(),
-        }
+        self.catalog_kind.len(self)
     }
 
     /// 册级选中行钳回可见范围内(刷新后旧下标可能越界;四本册同一口径)。
@@ -2430,6 +2349,25 @@ impl App {
         };
         self.queue.push(argv);
         self.push_log(format!("tag ls 已入队({scope},只读不写任何文件)"));
+    }
+
+    /// 标签册 `l`:列全部标签(不带参的只读反查)。单独一个方法名,是为了让
+    /// [`catalog::CatalogKind::action`] 的键位表能把它当**数据**指过去
+    /// (#66:表里每一项都是「这个键在这一本上落到哪个方法」,不塞闭包、
+    /// 不在调用方留分支)。
+    pub fn run_tag_ls_all(&mut self) {
+        self.run_tag_ls(None);
+    }
+
+    /// 标签册 `Enter`:反查选中的这一条(带参 `tag ls <标签>`,本票主价值
+    /// 的第二个态)。没选中行 = 一行日志、不下发命令——与 `run_tag_ls`
+    /// 的门禁同一口径:面板不空手发命令,也不把「没选」画成一次反查。
+    pub fn tag_lookup_selected(&mut self) {
+        let Some(name) = self.selected_tag_name() else {
+            self.push_log("反查未下发:没有选中的标签(↑/↓ 先选一行)");
+            return;
+        };
+        self.run_tag_ls(Some(&name));
     }
 
     /// 发起挂标签:进表单态(Enter 即下发——上游没有 `--yes`,面板不自己
@@ -2921,7 +2859,7 @@ impl App {
     }
 
     /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
-    fn start_sub_rm(&mut self) {
+    pub fn start_sub_rm(&mut self) {
         if self.assembling {
             self.push_log("装配进行中:删除与装配互斥,稍后再试");
             return;
@@ -3270,7 +3208,7 @@ impl App {
     }
 
     /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
-    fn start_key_rm(&mut self) {
+    pub fn start_key_rm(&mut self) {
         if self.assembling {
             self.push_log("装配进行中:删除与装配互斥,稍后再试");
             return;
@@ -5461,8 +5399,7 @@ mod tests {
         for cap in Capability::ALL {
             assert!(
                 argvs.contains(&cap.probe_args()),
-                "{:?} 探针必须经 spawn_engine 下发",
-                cap
+                "{cap:?} 探针必须经 spawn_engine 下发"
             );
         }
         // 无害性:探针不携带任何会动文件的旗标
@@ -5502,7 +5439,7 @@ mod tests {
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         feed_bootstrap(&mut app2, &tx2, &mut rx2);
         for cap in Capability::ALL {
-            assert!(app2.entry_enabled(cap), "齐备引擎下 {:?} 应放行", cap);
+            assert!(app2.entry_enabled(cap), "齐备引擎下 {cap:?} 应放行");
         }
         app2.splash = false;
         app2.screen = Screen::Settings;
