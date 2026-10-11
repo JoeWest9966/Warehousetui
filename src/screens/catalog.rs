@@ -499,25 +499,27 @@ impl CatalogKind {
         }
     }
 
-    /// 空册时的册内键位行(与鼠标命中区同文案同序;四本各一句)。
-    pub fn keys_empty(self) -> &'static str {
+    /// 空册时的册内键位行**段清单**(与鼠标命中区同文案同序;四本各一组)。
+    /// 给段而不是给一整行字符串,好让 #67 的可点「换册」段接在末段——渲染
+    /// 与命中共用同一份段清单,一处真相。新增第五本册只加一行。
+    pub fn keys_empty(self) -> &'static [&'static str] {
         match self {
-            CatalogKind::Vps => "  r 登记机器 · Esc/q 返航 ",
-            CatalogKind::Tag => "  l 反查全部 · r 挂标签 · m 换册 · Esc/q 返航 ",
-            CatalogKind::Subscription => "  r 登记订阅 · l 重读 · m 换册 · Esc/q 返航 ",
-            CatalogKind::Key => "  r 登记钥匙 · l 重读 · m 换册 · Esc/q 返航 ",
+            CatalogKind::Vps => &["  r 登记机器", "Esc/q 返航"],
+            CatalogKind::Tag => &["  l 反查全部", "r 挂标签", "Esc/q 返航"],
+            CatalogKind::Subscription => &["  r 登记订阅", "l 重读", "Esc/q 返航"],
+            CatalogKind::Key => &["  r 登记钥匙", "l 重读", "Esc/q 返航"],
         }
     }
 
-    /// 册体有条目时的册内键位行(常态)。
-    pub fn keys_body(self) -> &'static str {
+    /// 册体有条目时的册内键位行**段清单**(常态)。
+    pub fn keys_body(self) -> &'static [&'static str] {
         match self {
-            CatalogKind::Vps => "  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 ",
-            CatalogKind::Tag => "  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册 ",
+            CatalogKind::Vps => &["  ↑/↓ 选机器", "r 登记", "d 删除", "Esc/q 返航"],
+            CatalogKind::Tag => &["  ↑/↓ 选", "Enter 反查", "l 全部", "r 挂标签", "d 摘/删"],
             CatalogKind::Subscription => {
-                "  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 "
+                &["  ↑/↓ 选订阅", "r 登记", "g 取回命令", "d 删除", "l 重读"]
             }
-            CatalogKind::Key => "  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
+            CatalogKind::Key => &["  ↑/↓ 选钥匙", "r 登记", "g 取回命令", "d 删除", "l 重读"],
         }
     }
 
@@ -1557,6 +1559,42 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     let w = inner.width.saturating_sub(2) as usize;
 
+    let mut lines = catalog_body_lines(app, w);
+    let _ = cause_line(app);
+    lines.push(key_line(&catalog_key_parts(app), p));
+    frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
+
+    // 浮层:登记 / 删除确认(弹层优先级高于册体;骨架同一件)。
+    // 画哪个、谁盖谁都在 `CatalogKind::overlay` 这张表上(#66),本函数不再分册。
+    if let Some(form) = kind.overlay(app) {
+        kind.draw_overlay(form, frame, area, app);
+    }
+}
+
+/// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
+/// 烤进锁定集等于每次改标签重烤一次派——面板不提供任何这样的入口。
+const TAG_BOUNDARY: &str = "  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)";
+
+/// 数据仓根三态的一行说明(能力可用而根不可用时给人话;根就绪时给空)。
+fn cause_line(app: &App) -> String {
+    match app.data_root_cause() {
+        Some(DataRootCause::Unset) => {
+            "  数据仓根未设:去设置屏按 d 录入(面板不拿当前目录兜底)。".into()
+        }
+        Some(DataRootCause::Unavailable) => {
+            "  数据仓根不可用:目录不存在或不可读,去设置屏按 d 重设。".into()
+        }
+        _ => String::new(),
+    }
+}
+
+/// 编目册**正文行**(键位行之前的一切:标题 + 册体 + 各册附加行)。
+/// #67 抽出供渲染与命中测试共用:键位行的行号 = `inner.y + 本函数行数`,
+/// 一处真相——可点的「换册」段落在键位行上,渲染画的那一行与命中测的
+/// 那一行由同一份行数算出,点哪打哪(ADR-0005 渲染与命中同源)。
+pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
+    let p = &app.palette;
+    let kind = app.catalog_kind;
     let mut lines: Vec<Line> = Vec::new();
     // 引擎没有这一本的能力:入口禁用并指路(既有门控语义不变,面板不自造替代品)
     if !app.capabilities.enabled(kind.capability()) {
@@ -1632,52 +1670,63 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(Span::styled(clip(b, w), p.dim())));
         }
     }
-    let _ = cause_line(app);
-    lines.push(Line::from(Span::styled(catalog_keys(app), p.dim())));
-    frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
-
-    // 浮层:登记 / 删除确认(弹层优先级高于册体;四本各一套画法,骨架同一件)。
-    // 画哪个、谁盖谁都在 `CatalogKind::overlay` 这张表上,本函数不再分册。
-    if let Some(form) = kind.overlay(app) {
-        kind.draw_overlay(form, frame, area, app);
-    }
+    lines
 }
 
-/// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
-/// 烤进锁定集等于每次改标签重烤一次派——面板不提供任何这样的入口。
-const TAG_BOUNDARY: &str = "  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)";
+/// 键位行可点段之间(以及段内各项之间)的分隔串:渲染与命中共用同一份,
+/// 段宽按 `unicode_width` 量——一处真相,点哪打哪。
+pub(crate) const CATALOG_KEY_GAP: &str = " · ";
 
-/// 数据仓根三态的一行说明(能力可用而根不可用时给人话;根就绪时给空)。
-fn cause_line(app: &App) -> String {
-    match app.data_root_cause() {
-        Some(DataRootCause::Unset) => {
-            "  数据仓根未设:去设置屏按 d 录入(面板不拿当前目录兜底)。".into()
-        }
-        Some(DataRootCause::Unavailable) => {
-            "  数据仓根不可用:目录不存在或不可读,去设置屏按 d 重设。".into()
-        }
-        _ => String::new(),
-    }
-}
+/// 键位行末段的「换册」可点文案(#67):点它 = 按 `m` 轮转四本册。渲染画这个
+/// 串、命中测这个串的宽,同一份字符串;段可点(accent 高亮),与键盘 `m` 同路。
+pub(crate) const CATALOG_SWITCH: &str = "m 换册";
 
-/// 编目册键位行(与鼠标命中区同文案同序)。
-/// 册级键位行**按 kind 查表**(四本册各一组;在途浮层与空册各换一句,
-/// 三态形状相同)。新增第五本册只加两个成员——册级状态不再复制四份
-/// if-else(双轴评审发现 9:Mysterious Name,catalog_keys 曾用四条 if)。
+/// 编目册键位行的**段清单**(#67 通用接缝的第一个用户):提示段只画不点
+/// (`None`),末段「换册」可点(`Some(SwitchBook)`)。渲染与命中测试共用这
+/// 同一份清单——段文案与段宽一处真相。
 ///
-/// 「在途」与「空册」两个判定也走查表成员(`flow` / `rm_confirm` /
-/// `len`),与命中区 `layout::catalog_hits` 用的是同一口——键位行画的和
-/// 命中区算的从此不可能各说各话(#66)。
-fn catalog_keys(app: &App) -> &'static str {
-    const IN_FLOW: &str = "  Enter 确认 · Esc/q 返航 ";
+/// 册级键位行按 kind 查表(#66):「在途」「空册」「有条目」三个判定与三组段
+/// 清单全在 `CatalogKind` 成员上(`flow` / `rm_confirm` / `len` /
+/// `keys_empty` / `keys_body`),本函数不再有第四份 `match app.catalog_kind`
+/// ——键位行画的和命中区算的走同一口,不可能各说各话。
+///
+/// **规格订正(#67 承载)**:可点动作段画在**正文里**,不画在 HUD——命中区模型
+/// 历来把顶栏与 HUD 整行切在外面(spec #15/#16)。在途浮层/删除确认态换册键被
+/// 浮层受理(`m` 到不了 `key_catalog`),键位行只留浮层提示、不画可点段。
+pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::layout::Target>)> {
+    use crate::layout::Target;
     let kind = app.catalog_kind;
     if kind.flow(app).phase != RegPhase::Idle || kind.rm_confirm(app) {
-        IN_FLOW
-    } else if kind.len(app) == 0 {
+        return vec![("  Enter 确认", None), ("Esc/q 返航", None)];
+    }
+    let hint: &'static [&'static str] = if kind.len(app) == 0 {
         kind.keys_empty()
     } else {
         kind.keys_body()
+    };
+    let mut parts: Vec<(&'static str, Option<Target>)> = hint.iter().map(|s| (*s, None)).collect();
+    parts.push((CATALOG_SWITCH, Some(Target::SwitchBook)));
+    parts
+}
+
+/// 把段清单画成一行 `Line`(渲染侧):可点段(`Some`)accent 高亮、提示段
+/// (`None`)dim;段间用 [`CATALOG_KEY_GAP`] 连接。与命中侧
+/// [`crate::layout::key_line_segments`] 同一份 `parts` + 同一个 gap——屏上画的
+/// 和点得的逐字同源。
+fn key_line(parts: &[(&str, Option<crate::layout::Target>)], p: &Palette) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (text, target)) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(CATALOG_KEY_GAP, p.dim()));
+        }
+        let style = if target.is_some() {
+            p.accent().bold()
+        } else {
+            p.dim()
+        };
+        spans.push(Span::styled((*text).to_string(), style));
     }
+    Line::from(spans)
 }
 
 /// **编目册列表件**(#53 骨架第二件):按投影字段渲染,遵循确定性排序。
@@ -5654,7 +5703,7 @@ mod tests {
 │          ││    地址 home=10.0.0.1                                            │
 │          ││    登录 root→$DEPLOY_KEY                                         │
 │          ││    备注 门口                                                     │
-│          ││  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航                       │
+│          ││  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册              │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -5686,7 +5735,7 @@ mod tests {
 │    地址 home=10.0.0.1                                          │
 │    登录 root→$DEPLOY_KEY                                       │
 │    备注 门口                                                   │
-│  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航                     │
+│  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 · m 换册            │
 │                                                                │
 │                                                                │
 │                                                                │

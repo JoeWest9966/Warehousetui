@@ -37,6 +37,10 @@ pub enum Target {
     /// 点配方域建议命令键位行 = 切换只读选中态(#39,与键盘 `c` 同路;
     /// 面板不执行该命令,也不碰剪贴板——名字里没有 "copy" 就是因为没有复制)。
     ToggleSuggest,
+    /// 点正文键位行的「换册」段 = 按 `m` 轮转四本编目册(#67:鼠标只是叠加,
+    /// 与键盘 `cycle_catalog_kind` 同一路;不绑定具体键——段上文案由渲染与
+    /// 命中共用,点哪打哪)。
+    SwitchBook,
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -249,10 +253,29 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     }
     // 册体:清单行命中(渲染每条目占 `row_lines` 行,命中按条给整块)
     let n = kind.len(app);
-    if n == 0 {
-        return;
-    }
     push_sheet_rows(inner, n, kind.row_lines(), hits);
+
+    // 正文键位行的可点动作段(#67):段清单由 `catalog::catalog_key_parts` 一处
+    // 产出——渲染画的与命中测的逐字同源(ADR-0005)。**键位行被册体顶出可见
+    // 区时不产命中**:画不出来的段不给点,「屏上没有、点得到」比反过来更糟。
+    // 行号 = `inner.y + 正文行数`(正文由 `catalog::catalog_body_lines` 产,
+    // 行数同一处算,不另写一份「键位行在第几行」)。
+    let body_rows = crate::screens::catalog::catalog_body_lines(app, inner.width as usize).len();
+    let key_y = inner.y + u16::try_from(body_rows).unwrap_or(u16::MAX);
+    if key_y < inner.y + inner.height {
+        let parts = crate::screens::catalog::catalog_key_parts(app);
+        for seg in key_line_segments(
+            inner,
+            key_y,
+            &parts,
+            crate::screens::catalog::CATALOG_KEY_GAP,
+        ) {
+            // 只画不点的提示段(`None`)不进命中区;可点动作段才给矩形。
+            if let Some(t) = seg.target {
+                hits.push((seg.rect, t));
+            }
+        }
+    }
 }
 
 /// 册体清单的行命中:首行是「当前是哪一本 + 编目路径」,末行是键位行,
@@ -563,6 +586,61 @@ fn two_key_segments(popup: Rect, y: u16, left: &str, right: &str, hits: &mut Vec
             Target::DismissPopup,
         ));
     }
+}
+
+/// 正文键位行的**一段**(#67 通用接缝的第一件):一段文案 + 命中目标。
+/// `target` 为 `None` 表示「只画不点」的提示段(如动作说明),`Some` 表示可点
+/// 动作段(点它 = 按对应键)。渲染与命中共用同一份 `KeySegment` 清单——段宽
+/// 由 [`key_line_segments`] 按 `unicode_width` 量出,屏上画的和点得的逐字同源
+/// (ADR-0005:一处几何真相,不出现第二份「键位行长什么样」)。
+pub struct KeySegment {
+    /// 段文案(渲染照此画,命中也照此量宽——同一份字符串)。
+    pub text: String,
+    /// 命中目标;`None` = 只画不点。
+    pub target: Option<Target>,
+    /// 段在屏上的矩形(宽 = `unicode_width(text)`,高 1 行,贴 anchor 右界裁)。
+    pub rect: Rect,
+}
+
+/// 把一串 `(段文案, 目标)` 按 `gap` 从 `anchor.x` 左起铺成一行键位段
+/// (#67):generalise [`two_key_segments`](弹层两段)与 [`tab_cell`](紧凑屏 Tab)
+/// 的先例——段宽 = `unicode_width(文案)`(与渲染逐字同源),段间不重叠、不留
+/// 歧义区。**这是纯布局模型里的通用件:不绑定任何屏、不绑定任何键**,调用方
+/// 给什么 `(text, target)` 就铺什么;渲染按同一份 `parts` 画 `Span`,命中按
+/// 同一份取 `Some(target)` 段——一处真相。
+///
+/// 放不下就整段收口:任一段完整越出 `anchor` 右界(或空段)即到此为止,这一段
+/// 及后续**既不画也不给命中**(#67:66×50 下限内放不下就不画这段、也不给命中——
+/// 画出去点不中的段比不画更糟)。
+pub fn key_line_segments(
+    anchor: Rect,
+    y: u16,
+    parts: &[(&str, Option<Target>)],
+    gap: &str,
+) -> Vec<KeySegment> {
+    use unicode_width::UnicodeWidthStr;
+    let right = anchor.x.saturating_add(anchor.width);
+    let gap_w = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(0);
+    let mut out = Vec::new();
+    let mut x = anchor.x;
+    for (i, (text, target)) in parts.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(gap_w);
+        }
+        let w = u16::try_from(UnicodeWidthStr::width(*text)).unwrap_or(0);
+        let end = x.saturating_add(w);
+        // 整段放不下(越出 anchor 右界 / 空段):这一段及后续都不画不命中。
+        if w == 0 || x >= right || end > right {
+            break;
+        }
+        out.push(KeySegment {
+            text: (*text).to_string(),
+            target: *target,
+            rect: Rect::new(x, y, w, 1),
+        });
+        x = end;
+    }
+    out
 }
 
 /// 登记浮层(#30 #31):几何与 `recipes::render_register_overlay` 同一组
