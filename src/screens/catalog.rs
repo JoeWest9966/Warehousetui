@@ -1726,7 +1726,7 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     let block = body(app, "机器写 · 永不手改");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let w = inner.width.saturating_sub(2) as usize;
+    let w = body_text_width(inner);
 
     let mut lines = catalog_body_lines(app, w);
     lines.push(key_line(inner, &catalog_key_parts(app), p));
@@ -1749,6 +1749,18 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
 /// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
 /// 烤进锁定集等于每次改标签重烤一次派——面板不提供任何这样的入口。
 const TAG_BOUNDARY: &str = "  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)";
+
+/// 编目册正文行的**宽度预算**(#65 评审第 6 条:渲染与命中区同一处取,
+/// ADR-0005「渲染与命中同源」的几何那一半)。`render_catalog` 与
+/// `layout::catalog_hits` 都经这一个函数问「正文行按多宽算」——早先两边各写
+/// 一遍(渲染 `inner.width - 2`、命中区 `inner.width`),今天两边的正文**行数**
+/// 相同,只因为 `catalog_body_lines` 的每一支都出宽度无关的行数(`clip` 截断、
+/// 从不折行)。将来哪一支开始折行,两边就会静默算出不同的行数,键位行的行号
+/// 与它的命中矩形从此分叉——而这种事在测试里看不出来,因为命中矩形仍然「在
+/// 某一行的正确列上」。收成一处:折行行为真要变,两边一起变。
+pub(crate) fn body_text_width(inner: Rect) -> usize {
+    inner.width.saturating_sub(2) as usize
+}
 
 /// 编目册**正文行**(键位行之前的一切:标题 + 册体 + 各册附加行)。
 /// #67 抽出供渲染与命中测试共用:键位行的行号 = `inner.y + 本函数行数`,
@@ -6974,6 +6986,46 @@ mod tests {
             of.contains("Esc/q 返航"),
             "浮层态 Esc 与 q 都收敛浮层,两句都写:{of}"
         );
+    }
+
+    /// 键位行的**行号**与它的**命中矩形**钉在同一处(#65 评审第 6 条):命中区用
+    /// `catalog_body_lines` 的行数推出键位行的 y,渲染用同一份行数把键位行画到
+    /// 那一行。这一条从行为上再钉一道——命中矩形落在的那一行,渲染出来的行里
+    /// **真的带着键位段**。谁再把两边的宽度预算拆开(渲染一个数、命中另一个数),
+    /// 键位行就会整体错一行,这条就红。
+    ///
+    /// 顺带钉三档:常畅 80×30、紧凑 66×50、宽 110×30(三段可点段都放得下的那一档)。
+    #[test]
+    fn 键位行命中矩形那一行_渲染出来真的带着键位段() {
+        for (w, h) in [(80u16, 30u16), (66, 50), (110, 30)] {
+            let mut app = book("机器");
+            let size = Rect::new(0, 0, w, h);
+            app.size = size;
+            let hits = crate::layout::hitmap(size, &app, crate::layout::size_class(size));
+            let rows: Vec<u16> = hits
+                .iter()
+                .filter(|(_, t)| {
+                    matches!(
+                        t,
+                        crate::layout::Target::SwitchBook
+                            | crate::layout::Target::CatalogFilter
+                            | crate::layout::Target::VpsReverse
+                    )
+                })
+                .map(|(r, _)| r.y)
+                .collect();
+            assert!(!rows.is_empty(), "{w}×{h} 机器册键位行应有可点段:{hits:?}");
+            assert!(
+                rows.iter().all(|&y| y == rows[0]),
+                "{w}×{h} 可点段应同一行:{rows:?}"
+            );
+            let f = crate::testutil::frame_display(&app, w, h);
+            let line = f.lines().nth(rows[0] as usize).unwrap_or_default();
+            assert!(
+                line.contains(CATALOG_SWITCH),
+                "{w}×{h} 命中矩形那一行渲染出来真的带着键位段:{line}"
+            );
+        }
     }
 
     // ---- 工单 #66:四本册整帧 golden(逐字节) ----

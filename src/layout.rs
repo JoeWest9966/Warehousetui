@@ -292,8 +292,14 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     // 产出——渲染画的与命中测的逐字同源(ADR-0005)。**键位行被册体顶出可见
     // 区时不产命中**:画不出来的段不给点,「屏上没有、点得到」比反过来更糟。
     // 行号 = `inner.y + 正文行数`(正文由 `catalog::catalog_body_lines` 产,
-    // 行数同一处算,不另写一份「键位行在第几行」)。
-    let body_rows = crate::screens::catalog::catalog_body_lines(app, inner.width as usize).len();
+    // 行数同一处算,不另写一份「键位行在第几行」)。正文行的宽度预算也同一处
+    // 取(`catalog::body_text_width`):渲染侧就是这么折的,命中区照抄同一个数,
+    // 两边不可能各算各的。
+    let body_rows = crate::screens::catalog::catalog_body_lines(
+        app,
+        crate::screens::catalog::body_text_width(inner),
+    )
+    .len();
     let key_y = inner.y + u16::try_from(body_rows).unwrap_or(u16::MAX);
     if key_y < inner.y + inner.height {
         let parts = crate::screens::catalog::catalog_key_parts(app);
