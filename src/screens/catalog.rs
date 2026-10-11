@@ -574,9 +574,19 @@ impl CatalogKind {
     /// 空册时的册内键位行**段清单**(与鼠标命中区同文案同序;四本各一组)。
     /// 给段而不是给一整行字符串,好让 #67 的可点「换册」段接在末段——渲染
     /// 与命中共用同一份段清单,一处真相。新增第五本册只加一行。
+    ///
+    /// 机器册空册态与有条目态同一口径(#65 评审第 8 条):`q` 在编目册册体上
+    /// 是壳级「退出」(`on_key` 的 `Char('q') => quit`),**不是返航**——`keys_body`
+    /// 已按这条收窄成裸 `Esc`,空册态却还写着 `Esc/q 返航`,同一块屏上两个态
+    /// 对同一个键说两样话。这里跟上:`Esc`(语义同册体,清当前册过滤词;
+    /// 空册没词时它不出声,但至少不虚指一个 quit 键当返航)。
+    ///
+    /// 另三本的空册态仍写 `Esc/q 返航`,是另一件既有事:它们的 `keys_body`
+    /// 根本不给 Esc 提示段(整行没有它),所以本册内并不自相矛盾;要跨四本
+    /// 统一口径得连册体一起动,那是另一条工单,不夹在本评审里。
     pub fn keys_empty(self) -> &'static [&'static str] {
         match self {
-            CatalogKind::Vps => &["  r 登记机器", "Esc/q 返航"],
+            CatalogKind::Vps => &["  r 登记机器", "Esc"],
             CatalogKind::Tag => &["  l 反查全部", "r 挂标签", "Esc/q 返航"],
             CatalogKind::Subscription => &["  r 登记订阅", "l 重读", "Esc/q 返航"],
             CatalogKind::Key => &["  r 登记钥匙", "l 重读", "Esc/q 返航"],
@@ -1911,6 +1921,15 @@ pub(crate) const CATALOG_FILTER: &str = "/ 过滤";
 /// **规格订正(#67 承载)**:可点动作段画在**正文里**,不画在 HUD——命中区模型
 /// 历来把顶栏与 HUD 整行切在外面(spec #15/#16)。在途浮层/删除确认态换册键被
 /// 浮层受理(`m` 到不了 `key_catalog`),键位行只留浮层提示、不画可点段。
+///
+/// **浮层态的 `Esc/q 返航` 是有意两键都写**(#65 评审第 8 条:这一处与册体
+/// 态口径不同,理由键在这儿,别再当成遗漏):登记流 / 删除确认浮层在场时,
+/// `on_key` 先把键交给浮层那层(`RegState` 非 Idle 走 `on_key_reg_flow`、
+/// `as_confirm` 走确认分支),`Esc` 与 `q` **都**收敛浮层
+/// (`cancel_register` / `dismiss_popup`),壳级的 `q => quit` 那一次判定排
+/// 在更后面,根本轮不到。所以这一态写两键不是虚指。册体态反过来:
+/// `q` 直接 quit、`Esc` 只清过滤词,故 `keys_body` 收窄成裸 `Esc`(机器册)、
+/// 另三本干脆不给 Esc 段。
 pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::layout::Target>)> {
     use crate::layout::Target;
     let kind = app.catalog_kind;
@@ -6892,6 +6911,68 @@ mod tests {
                 .all(|l| !l.contains(&format!("标签 {root}:"))),
             "日志不把数据仓根 {root} 当成标签名:{:?}",
             app.log.first()
+        );
+    }
+
+    /// 机器册键位行三个态的 `Esc` 口径一致(#65 评审第 8 条):`q` 在编目册册体上
+    /// 是壳级 quit(`on_key` 的 `Char('q') => quit`),**不是返航**——`keys_body`
+    /// 已为此收窄成裸 `Esc`,空册态却还写着 `Esc/q 返航`,同一块屏两个态对同一
+    /// 个键说两样话。这条把「册体态 / 空册态都不许把 `q` 当返航、浮层态两键
+    /// 都认」钉住:谁再把 `Esc/q 返航` 写回册体或空册的段清单,这里就红。
+    ///
+    /// 浮层态是**有意**两键都写:登记流 / 删除确认在场时 `on_key` 先把键交给浮层
+    /// 那层,`Esc` 与 `q` 都收敛浮层,壳级 quit 那次判定排在更后面、根本轮不到
+    /// (详见 `catalog_key_parts` 的注释)。
+    #[test]
+    fn 机器册键位行_esc口径三态一致_册体与空册都不把q当返航() {
+        // ① 有条目(册体态):`Esc`,且不出现 `q 返航`
+        let mut app = book("机器");
+        let body = crate::testutil::frame_display(&app, 110, 30);
+        let body_line = body
+            .lines()
+            .find(|l| l.contains("↑/↓ 选"))
+            .expect("册体态键位行在场")
+            .to_string();
+        assert!(body_line.contains("Esc"), "册体态给 Esc 提示:{body_line}");
+        assert!(
+            !body_line.contains("q 返航"),
+            "册体态不把 q 当返航(q 是壳级退出):{body_line}"
+        );
+        // ② 空册态:同一个口径
+        let mut empty =
+            crate::app::App::with_runner(std::sync::Arc::new(crate::engine::FakeRunner::new(&[(
+                "vps ls",
+                0,
+                r#"{"catalogPath":"/r/vps.json","machines":[]}"#,
+            )])));
+        empty.splash = false;
+        empty.screen = crate::app::Screen::Vps;
+        empty.catalog_kind = CatalogKind::Vps;
+        empty.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        empty.vps_ls =
+            Some(serde_json::from_str(r#"{"catalogPath":"/r/vps.json","machines":[]}"#).unwrap());
+        empty.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        assert_eq!(empty.catalog_len(), 0, "确实是空册");
+        let ef = crate::testutil::frame_display(&empty, 110, 30);
+        let empty_line = ef
+            .lines()
+            .find(|l| l.contains("r 登记机器"))
+            .expect("空册态键位行在场")
+            .to_string();
+        assert!(empty_line.contains("Esc"), "空册态给 Esc 提示:{empty_line}");
+        assert!(
+            !empty_line.contains("q 返航"),
+            "空册态与册体态同一口径,不把 q 当返航:{empty_line}"
+        );
+        // ③ 浮层态:两键都认(这一处与册体态口径不同,理由见 catalog_key_parts)
+        tap(&mut app, KeyCode::Char('r'));
+        let of = crate::testutil::frame_display(&app, 110, 30);
+        assert!(
+            of.contains("Esc/q 返航"),
+            "浮层态 Esc 与 q 都收敛浮层,两句都写:{of}"
         );
     }
 
