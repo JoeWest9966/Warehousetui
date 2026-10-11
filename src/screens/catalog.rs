@@ -6208,7 +6208,7 @@ mod tests {
     /// 规格验收 1 / 故事 32:一台挂了 3 个标签的机器,三个标签名与各自引用
     /// **都在帧上**;条目名撞车的 `skill/gate` 不混进来。
     #[test]
-    fn 反查_三个标签都在帧上_名字撞车那条不混进来() {
+    fn 反查_三个标签与各自引用都在帧上() {
         let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
         tap(&mut app, KeyCode::Down); // 投影按名排序:首行 bare,第二行才是 gate
         assert_eq!(app.catalog_sel(), 1, "选中 gate");
