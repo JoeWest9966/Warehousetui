@@ -6,7 +6,7 @@ use ratatui::Frame;
 use crate::app::App;
 use crate::ui::screen_block;
 
-mod assemble;
+pub(crate) mod assemble;
 pub(crate) mod catalog;
 mod health;
 mod overview;

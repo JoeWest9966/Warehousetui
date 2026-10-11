@@ -230,21 +230,33 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// 常畅态:七步栏(定宽 14)+ stderr 日志,既有外观逐像素不变。
+/// 常畅态:七步栏(定宽 14)+ stderr 日志 + 末行键位行(可点「中止」段,#71)。
+/// 键位行占末行 1 行,余高全归七步栏/日志;键位行的命中区由
+/// `layout::assemble_hits` 用同一组 Layout 算出——渲染与命中共用一份几何
+/// (ADR-0005),不另写一套「键位行在第几行」。
 fn render_running_comfy(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let cols = Layout::horizontal([Constraint::Length(14), Constraint::Min(20)]).split(area);
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    let cols = Layout::horizontal([Constraint::Length(14), Constraint::Min(20)]).split(rows[0]);
     frame.render_widget(step_rail(p), cols[0]);
     frame.render_widget(log_block(app, p, cols[1].height), cols[1]);
+    frame.render_widget(running_key_line(app, p), rows[1]);
 }
 
-/// 紧凑态:七步栏收成一行进度,日志独占余下全部行(ADR-0004)。
-/// 判定走 `layout::size_class`(终端面每帧现算),不在此处散判宽窄。
+/// 紧凑态:七步栏收成一行进度,日志独占中段,末行是键位行(可点「中止」段,#71)。
+/// 判定走 `layout::size_class`(终端面每帧现算),不在此处散判宽窄;键位行命中区
+/// 由 `layout::assemble_hits` 用同一组 Layout 算出(渲染与命中共用一份几何)。
 fn render_running_compact(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .split(area);
     frame.render_widget(progress_line(p), rows[0]);
     frame.render_widget(log_block(app, p, rows[1].height), rows[1]);
+    frame.render_widget(running_key_line(app, p), rows[2]);
 }
 
 /// 七步栏(常畅态用):装配中七步一律**未决**,底注明示粗粒度(#60)。
@@ -302,10 +314,61 @@ fn log_block(app: &App, p: &crate::theme::Palette, height: u16) -> Paragraph<'st
     Paragraph::new(log).block(
         Block::bordered()
             .border_style(p.dim())
-            // 中止键(#59)跟着日志窗Pane走:两档共用这一处,操作者翻日志的
-            // 视线不用离开窗Pane去找键。
-            .title(Span::styled(" stderr 实时日志 · x 中止 ", p.dim())),
+            // 中止提示(#71)从块标题挪到正文末行的可点键位行「x 中止」——块标题
+            // 只描述这块是什么(stderr 实时日志)。话术单源在键位行上:渲染画的与
+            // 命中测的同一份(`assemble::assemble_key_parts`),且只在真有 up 在途
+            // (as_running)时在场;不在场时连提示都不给(点不到一个当前不存在的动作,
+            // 比点得到更糟)。
+            .title(Span::styled(" stderr 实时日志 ", p.dim())),
     )
+}
+
+/// 装配运行中正文键位行可点段之间的分隔串(#71):与命中侧
+/// [`crate::layout::assemble_hits`] 共用同一份,段宽按 `unicode_width` 量——
+/// 一处真相,点哪打哪(目前键位行只有一个可点段,此 gap 留作同款纪律,#67)。
+pub(crate) const ASSEMBLE_KEY_GAP: &str = "  ";
+
+/// 装配运行中正文键位行的「中止」可点文案(#71):点它 = 按 `x` 进程级真止在途
+/// `nw up` 子进程。渲染(`render_running_*`)与命中(`layout::assemble_hits`)共用
+/// 这一份字符串量宽——点哪打哪(ADR-0005,#67 接缝的同一个用户形状)。段文案带
+/// 键 hint `x`(同 `m 换册` / `Esc 返航` 的先例):鼠标用户点它,键盘用户照按。
+///
+/// 与发射前浮层的「Esc 返航」是两个取消、两套话术,不许混:返航是命令还没下发
+/// (什么都没发生),中止是在途子进程真止(可能停在未收敛中间态)。
+pub(crate) const ASSEMBLE_ABORT: &str = "x 中止";
+
+/// 装配运行中正文键位行的**段清单**(#71,通用接缝 `key_line_segments` 的用户):
+/// 只在真有 `up` 在途(`as_running`)时给一个可点的「中止」段(`Some(Abort)`);
+/// 不在场时给空——既不画也不给命中(规格故事 47:点不到一个当前不存在的动作)。
+/// 渲染与命中共用这同一份清单,段文案与段宽一处真相(ADR-0005)。
+pub(crate) fn assemble_key_parts(app: &App) -> Vec<(&'static str, Option<crate::layout::Target>)> {
+    use crate::layout::Target;
+    if app.as_running {
+        vec![(ASSEMBLE_ABORT, Some(Target::Abort))]
+    } else {
+        Vec::new()
+    }
+}
+
+/// 把段清单画成一行键位行(渲染侧,#71):可点段(`Some`)accent 高亮、提示段
+/// (`None`)dim,段间用 [`ASSEMBLE_KEY_GAP`] 连接——与命中侧
+/// [`crate::layout::key_line_segments`] 同一份 `parts` + 同一个 gap,屏上画的
+/// 和点得的逐字同源。没有段(非 up 在途)时画空行,占位不显示任何东西。
+fn running_key_line(app: &App, p: &crate::theme::Palette) -> Paragraph<'static> {
+    let parts = assemble_key_parts(app);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (text, target)) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(ASSEMBLE_KEY_GAP, p.dim()));
+        }
+        let style = if target.is_some() {
+            p.accent().bold()
+        } else {
+            p.dim()
+        };
+        spans.push(Span::styled((*text).to_string(), style));
+    }
+    Paragraph::new(Line::from(spans))
 }
 
 /// 跑完后的七步结论行(#60):判据只有冻结面。
