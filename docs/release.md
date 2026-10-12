@@ -120,3 +120,4 @@ apt install gcc-aarch64-linux-gnu mingw-w64 zip
 |---|---|---|---|
 | 2026-10-06 | v0.1.0 | Action(彩排 run [37443153354](https://github.com/JoeWest9966/Warehousetui/actions/runs/37443153354)) | 5 组合全绿;修复两条彩排问题(macOS x86_64 改交叉编译、runs-on 重复定义)后正式成发布 |
 | 2026-10-09 | v0.2.0 | **手动**(`gh release create`,[release 页](https://github.com/JoeWest9966/Warehousetui/releases/tag/v0.2.0)) | 真机首跑实证(docs/real-first-run.md)后发布;Action 因账号级计费全部无法启动(run [37880214287](https://github.com/JoeWest9966/Warehousetui/actions/runs/37880214287) 五 job 无 runner),改为本地交叉构建 3 平台手动发布;macOS 暂缺、windows 换 gnu 目标、glibc 基线 2.41,均记于「支持级与已知取舍」 |
+| 2026-10-12 | v0.3.0 | **手动**(`gh release create`,[release 页](https://github.com/JoeWest9966/Warehousetui/releases/tag/v0.3.0)) | 第 8/9/10 轮(#64→#74→#79 并入 main,62 提交 / 22 票)合并后发布;发布证据裁 A(C-first,#77):fixture + 本地四项闸门(test 421 passed)为凭,真机首跑另立里程碑;三平台本地交叉构建(linux x86_64 / aarch64 + windows x86_64 gnu 静态 CRT),macOS 仍暂缺,glibc 基线 2.41(同 Debian 13 构建机),私有仓匿名 404。 |
