@@ -340,31 +340,32 @@ pub(crate) const ASSEMBLE_ABORT: &str = "x 中止";
 /// 装配运行中正文键位行的**段清单**(#71,通用接缝 `key_line_segments` 的用户):
 /// 只在真有 `up` 在途(`as_running`)时给一个可点的「中止」段(`Some(Abort)`);
 /// 不在场时给空——既不画也不给命中(规格故事 47:点不到一个当前不存在的动作)。
-/// 渲染与命中共用这同一份清单,段文案与段宽一处真相(ADR-0005)。
-pub(crate) fn assemble_key_parts(app: &App) -> Vec<(&'static str, Option<crate::layout::Target>)> {
+/// 渲染与命中共用这同一份清单,段文案与段宽一处真相(ADR-0005)。第三项
+/// `live` 恒 `true`(#70 的禁用态位,装配中止段没有门禁——有 up 在途就止得了)。
+pub(crate) fn assemble_key_parts(app: &App) -> Vec<crate::layout::KeyPart<'static>> {
     use crate::layout::Target;
     if app.as_running {
-        vec![(ASSEMBLE_ABORT, Some(Target::Abort))]
+        vec![(ASSEMBLE_ABORT, Some(Target::Abort), true)]
     } else {
         Vec::new()
     }
 }
 
-/// 把段清单画成一行键位行(渲染侧,#71):可点段(`Some`)accent 高亮、提示段
-/// (`None`)dim,段间用 [`ASSEMBLE_KEY_GAP`] 连接——与命中侧
+/// 把段清单画成一行键位行(渲染侧,#71):**可用**可点段 accent 加粗、提示段
+/// 与**禁用态**可点段(#70)都 dim,段间用 [`ASSEMBLE_KEY_GAP`] 连接——与命中侧
 /// [`crate::layout::key_line_segments`] 同一份 `parts` + 同一个 gap,屏上画的
 /// 和点得的逐字同源。没有段(非 up 在途)时画空行,占位不显示任何东西。
 fn running_key_line(app: &App, p: &crate::theme::Palette) -> Paragraph<'static> {
     let parts = assemble_key_parts(app);
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, (text, target)) in parts.iter().enumerate() {
+    for (i, (text, target, live)) in parts.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(ASSEMBLE_KEY_GAP, p.dim()));
         }
-        let style = if target.is_some() {
-            p.accent().bold()
-        } else {
-            p.dim()
+        let style = match (target.is_some(), live) {
+            (true, true) => p.accent().bold(), // 可用动作段
+            (true, false) => p.dim(),          // #70 禁用态:在场、可点,但不加强调
+            _ => p.dim(),                      // 提示段
         };
         spans.push(Span::styled((*text).to_string(), style));
     }

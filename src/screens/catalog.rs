@@ -1942,38 +1942,52 @@ pub(crate) const CATALOG_FILTER: &str = "/ 过滤";
 /// 在更后面,根本轮不到。所以这一态写两键不是虚指。册体态反过来:
 /// `q` 直接 quit、`Esc` 只清过滤词,故 `keys_body` 收窄成裸 `Esc`(机器册)、
 /// 另三本干脆不给 Esc 段。
-pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::layout::Target>)> {
+///
+/// 第三项 `live`(#70 故事 39):「这一段此刻是活的吗」。**只有反查段会传
+/// `false`**——门禁是 `App::tag_entry_enabled`(数据仓根优先、再看标签组
+/// 能力),与 `App::vps_reverse_lookup` 进门那一个判据同一个,不另推一份;
+/// 过不了时这一条**照画、照给命中**(禁用并指路:点下去仍走
+/// `vps_reverse_lookup`,仍给人话、仍零引擎调用),只是画成 dim。其余段
+/// (提示段与其余可点段)一律 `true`。
+pub(crate) fn catalog_key_parts(app: &App) -> Vec<crate::layout::KeyPart<'static>> {
     use crate::layout::Target;
     let kind = app.catalog_kind;
     if kind.flow(app).phase != RegPhase::Idle || kind.rm_confirm(app) {
-        return vec![("  Enter 确认", None), ("Esc/q 返航", None)];
+        return vec![("  Enter 确认", None, true), ("Esc/q 返航", None, true)];
     }
     let hint: &'static [&'static str] = if kind.len(app) == 0 {
         kind.keys_empty()
     } else {
         kind.keys_body()
     };
-    let mut parts: Vec<(&'static str, Option<Target>)> = hint.iter().map(|s| (*s, None)).collect();
+    let mut parts: Vec<crate::layout::KeyPart<'static>> =
+        hint.iter().map(|s| (*s, None, true)).collect();
     // 反查上浮触发段(#70):只机器册、且册体有条目(= 选中了一行)才给。
     // 判据与 `keys_body` / `keys_empty` 的分岔同一个——空册没有「选中的这一
     // 条」可问,面板不空手问,也不画一个点下去只得到一行指路的段。
     if kind == CatalogKind::Vps && kind.len(app) > 0 {
-        parts.push((CATALOG_REVERSE, Some(Target::VpsReverse)));
+        // 门禁过不了:段仍在场、仍可点(指路照旧发生),画成 dim(#70 故事 39
+        // 「入口禁用并指路」)。判据与 `App::vps_reverse_lookup` 进门那一个
+        // 同一个 `tag_entry_enabled`,不在这儿另推一份。
+        parts.push((
+            CATALOG_REVERSE,
+            Some(Target::VpsReverse),
+            app.tag_entry_enabled(),
+        ));
     }
-    parts.push((CATALOG_SWITCH, Some(Target::SwitchBook)));
+    parts.push((CATALOG_SWITCH, Some(Target::SwitchBook), true));
     // 册内过滤入口(#69):有条目可筛时才给这一段(空册没东西可筛,给了反而
     // 误导)。点它 = 按 `/`,与键盘同一路;空册键位行(`keys_empty`)不带它。
     if kind.len(app) > 0 {
-        parts.push((CATALOG_FILTER, Some(Target::CatalogFilter)));
+        parts.push((CATALOG_FILTER, Some(Target::CatalogFilter), true));
     }
     parts
 }
 
-/// 把段清单画成一行 `Line`(渲染侧):可点段(`Some`)accent 高亮、提示段
-/// (`None`)dim;段间用 [`CATALOG_KEY_GAP`] 连接。与命中侧
-/// [`crate::layout::key_line_segments`] 同一份 `parts` + 同一个 gap——屏上画的
-/// 和点得的逐字同源。
-/// 编目册键位行的**渲染**(#67/#69):段清单 `parts` 由
+/// 把段清单画成一行 `Line`(渲染侧):**可用**可点段 accent 加粗,提示段与
+/// **禁用态**可点段(#70 故事 39)都 dim;段间用 [`CATALOG_KEY_GAP`] 连接。
+/// 与命中侧
+/// 编目册键位行的**渲染**(#67/#69/#70):段清单 `parts` 由
 /// [`catalog_key_parts`] 一处产出,渲染与命中测试共用。
 ///
 /// #69 修一处「渲染与命中不同源」的隐患:键位行若直接铺全部段、靠终端
@@ -1981,13 +1995,15 @@ pub(crate) fn catalog_key_parts(app: &App) -> Vec<(&'static str, Option<crate::l
 /// 而命中侧 [`crate::layout::key_line_segments`] 早就是「放不下整段收口、
 /// 这一段及后续既不画也不给命中」。两边口径一旦分叉,就破了 ADR-0005「渲染
 /// 与命中同源」。故渲染也走同一份 [`crate::layout::key_line_segments`]:
-/// 放得下的段才画、放不下的段(如紧凑态够不着 `/ 过滤` 的标签 / 订阅 / 钥匙册)
-/// 两厢都不出现——屏上没有的段,鼠标也点不到,点哪打哪。
-fn key_line(
-    inner: Rect,
-    parts: &[(&str, Option<crate::layout::Target>)],
-    p: &Palette,
-) -> Line<'static> {
+/// 放得下的段才画、放不下的段两厢都不出现——屏上没有的段,鼠标也点不到,
+/// 点哪打哪。
+///
+/// #70 故事 39 的**禁用态**:`live == false` 的可点段画成 dim(与提示段同色,
+/// 不再 accent 加粗),段本身照画、命中区照给——操作者在点之前就看出
+///「这台引擎干不了」,点下去仍由动作自己收口给人话(`App::vps_reverse_lookup`
+/// 的门禁指路)。不按能力把这一段收掉:那会把机器册的键位行耦合到另一本册
+/// 的能力上(#66 刚刚拆掉的耦合),规格要的也是「禁用并指路」而不是「消失」。
+fn key_line(inner: Rect, parts: &[crate::layout::KeyPart<'_>], p: &Palette) -> Line<'static> {
     // 与命中侧同一 anchor(`inner`)、同一 gap:逐字同源。y 只进命中矩形,
     // 渲染不取矩形,传 0 即可。
     let segs = crate::layout::key_line_segments(inner, 0, parts, CATALOG_KEY_GAP);
@@ -1996,10 +2012,10 @@ fn key_line(
         if i > 0 {
             spans.push(Span::styled(CATALOG_KEY_GAP, p.dim()));
         }
-        let style = if seg.target.is_some() {
-            p.accent().bold()
-        } else {
-            p.dim()
+        let style = match (seg.target.is_some(), seg.live) {
+            (true, true) => p.accent().bold(), // 可用动作段
+            (true, false) => p.dim(),          // #70 禁用态:在场、可点,但不加强调
+            _ => p.dim(),                      // 提示段
         };
         spans.push(Span::styled(seg.text.clone(), style));
     }
@@ -6400,6 +6416,74 @@ mod tests {
         assert!(
             app.log.iter().any(|l| l.contains("缺的是引擎能力")),
             "说清缺的是引擎能力,不是面板坏了:{:?}",
+            app.log
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
+    }
+
+    /// 故事 39 的**鼠标那一侧**(「反查要求标签组能力可用,缺能力时入口禁用并
+    /// 指路」):标签组能力缺席时「Enter 反查」段**照画、照给命中**,画成 dim
+    /// (禁用态);点它仍走 `App::vps_reverse_lookup` 的同一条门禁——给人话、
+    /// 一次引擎调用都不发。
+    ///
+    /// 与 [`反查门禁_标签组能力不可用_指路且零引擎调用`] 同一夹具、同一结论,
+    /// 这一条只补键盘那一侧没覆盖的三件事:① 帧上真的有这一段(不是收掉了);
+    /// ② 命中区真的有矩形,且矩形正是帧上这一段所在的那几列(点哪打哪);
+    /// ③ 点下去仍然零调用、仍然给指路。禁用态的颜色不在这条里断言
+    /// (`frame_display` 只拚符号、不带样式),由渲染侧 `key_line` 的分叉承载。
+    #[test]
+    fn 反查段_标签组能力缺席_段照画点得中_指路且零调用() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            Some(&root),
+            false, // 标签组能力缺席(数据仓根这一道是过的)
+        );
+        tap(&mut app, KeyCode::Down); // 选中 gate:这一段只在册体有条目时给
+        assert!(
+            !app.tag_entry_enabled(),
+            "夹具确确落在门禁不过那一侧(缺的是标签组能力)"
+        );
+        // ① 帧上在场:禁用 ≠ 消失(规格要的是「禁用并指路」)
+        let f = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            f.contains("Enter 反查"),
+            "能力缺席也画这一段(画成禁用态):{f}"
+        );
+        // ② 命中区在场,且矩形就是帧上这一段所在的几列(同一份段清单,ADR-0005)
+        let size = Rect::new(0, 0, 80, 30);
+        app.size = size;
+        let hit = crate::layout::hitmap(size, &app, crate::layout::size_class(size))
+            .into_iter()
+            .find(|(_, t)| matches!(t, crate::layout::Target::VpsReverse))
+            .map(|(r, _)| r)
+            .expect("能力缺席:反查段仍应有命中区(禁用并指路)");
+        let row = f.lines().nth(hit.y as usize).expect("命中行在渲染中在场");
+        let byte = row.find("Enter 反查").expect("帧上找得着这一段");
+        let col: u16 = row[..byte]
+            .chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+            .sum();
+        assert!(
+            hit.x <= col && col < hit.x + hit.width,
+            "段起始列 {col} 落在命中矩形 {}..{} 内(点哪打哪)",
+            hit.x,
+            hit.x + hit.width
+        );
+        // ③ 点下去:同一条门禁、同一条指路、零引擎调用
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::VpsReverse)
+        });
+        assert!(
+            runner.call_argvs().is_empty(),
+            "点禁用态段也一条 argv 都不发:{:?}",
+            runner.call_argvs()
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查未下发")),
+            "点了仍给指路:{:?}",
             app.log
         );
         let s = crate::testutil::frame_display(&app, 80, 30);
