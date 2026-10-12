@@ -666,9 +666,19 @@ fn two_key_segments(popup: Rect, y: u16, left: &str, right: &str, hits: &mut Vec
     }
 }
 
+/// 键位行**一段**的输入形状(#67 接缝的通用件,#70 加第三项):
+/// 段文案 + 命中目标 + 「这一段此刻是活的吗」。`target` 为 `None` 表示
+/// 「只画不点」的提示段(如动作说明),`Some` 表示可点动作段(点它 = 按对应
+/// 键);`live` 为 `false` 表示**这一段在场但当前不可用**(入口禁用态,#70
+/// 故事 39:禁用并指路)——仍然画、仍然给命中(点了照旧走同一条路、照旧
+/// 收口给人话),只是画成 dim,让操作者在点之前就看出「这台引擎干不了」。
+/// 提示段与可用动作段都传 `true`。
+pub type KeyPart<'a> = (&'a str, Option<Target>, bool);
+
 /// 正文键位行的**一段**(#67 通用接缝的第一件):一段文案 + 命中目标。
 /// `target` 为 `None` 表示「只画不点」的提示段(如动作说明),`Some` 表示可点
-/// 动作段(点它 = 按对应键)。渲染与命中共用同一份 `KeySegment` 清单——段宽
+/// 动作段(点它 = 按对应键)。`live` 同 [`KeyPart`] 的第三项(渲染据此选
+/// 禁用态)。渲染与命中共用同一份 `KeySegment` 清单——段宽
 /// 由 [`key_line_segments`] 按 `unicode_width` 量出,屏上画的和点得的逐字同源
 /// (ADR-0005:一处几何真相,不出现第二份「键位行长什么样」)。
 pub struct KeySegment {
@@ -676,16 +686,19 @@ pub struct KeySegment {
     pub text: String,
     /// 命中目标;`None` = 只画不点。
     pub target: Option<Target>,
+    /// 这一段此刻是活的吗;`false` = 在场但禁用(画 dim,仍给命中,点下去
+    /// 由动作自己收口给人话——#70 故事 39「入口禁用并指路」)。
+    pub live: bool,
     /// 段在屏上的矩形(宽 = `unicode_width(text)`,高 1 行,贴 anchor 右界裁)。
     pub rect: Rect,
 }
 
-/// 把一串 `(段文案, 目标)` 按 `gap` 从 `anchor.x` 左起铺成一行键位段
+/// 把一串 [`KeyPart`] 按 `gap` 从 `anchor.x` 左起铺成一行键位段
 /// (#67):generalise [`two_key_segments`](弹层两段)与 [`tab_cell`](紧凑屏 Tab)
 /// 的先例——段宽 = `unicode_width(文案)`(与渲染逐字同源),段间不重叠、不留
 /// 歧义区。**这是纯布局模型里的通用件:不绑定任何屏、不绑定任何键**,调用方
-/// 给什么 `(text, target)` 就铺什么;渲染按同一份 `parts` 画 `Span`,命中按
-/// 同一份取 `Some(target)` 段——一处真相。
+/// 给什么 `(text, target, live)` 就铺什么;渲染按同一份 `parts` 画 `Span`,
+/// 命中按同一份取 `Some(target)` 段——一处真相。
 ///
 /// 放不下就整段收口:任一段完整越出 `anchor` 右界(或空段)即到此为止,这一段
 /// 及后续**既不画也不给命中**(#67:66×50 下限内放不下就不画这段、也不给命中——
@@ -693,7 +706,7 @@ pub struct KeySegment {
 pub fn key_line_segments(
     anchor: Rect,
     y: u16,
-    parts: &[(&str, Option<Target>)],
+    parts: &[KeyPart<'_>],
     gap: &str,
 ) -> Vec<KeySegment> {
     use unicode_width::UnicodeWidthStr;
@@ -701,7 +714,7 @@ pub fn key_line_segments(
     let gap_w = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(0);
     let mut out = Vec::new();
     let mut x = anchor.x;
-    for (i, (text, target)) in parts.iter().enumerate() {
+    for (i, (text, target, live)) in parts.iter().enumerate() {
         if i > 0 {
             x = x.saturating_add(gap_w);
         }
@@ -714,6 +727,7 @@ pub fn key_line_segments(
         out.push(KeySegment {
             text: (*text).to_string(),
             target: *target,
+            live: *live,
             rect: Rect::new(x, y, w, 1),
         });
         x = end;
