@@ -495,15 +495,19 @@ impl RegisterSpec for TagSpec {
 ///
 /// 两段式要求预审与落账**各喂一次**(喂入是一次性的、随进程结束即弃,不能复用
 /// 同一次管道),所以本体在面板侧必须在登记流程的在途状态里停留一会儿。裁断
-/// (ADR-0009 §3):它只以这一个类型存在——
-/// - [`std::fmt::Debug`] **不打印内容**(只报字节数),所以它进不了日志行,
-///   也进不了崩溃上报;
-/// - 渲染只经 [`SecretBody::mask`] 拿「已喂入 N 字节」这一句,字符一个都不出现;
-/// - 面板不把它写进 config / 任何持久化路径(也没有这样的 API);
-/// - 流程结束(落账 / 返航 / 切屏 / 面板退出)随表单一起 drop,面板侧不留副本。
+/// (ADR-0009 §3):它只以这一个类型存在——「面板侧不留副本」由此拆成两句,
+/// 各自可判定:
+/// - **不留引用**:[`std::fmt::Debug`] **不打印内容**(只报字节数),所以它进不了
+///   日志行,也进不了崩溃上报;渲染只经 [`SecretBody::mask`] 拿「已喂入 N 字节」
+///   这一句,字符一个都不出现;面板不把它写进 config / 任何持久化路径(也没有这样
+///   的 API);`fed_queue` 只是交给 runner 的在途中转,每个 tick 被 `std::mem::take`
+///   抽空,不是缓存。
+/// - **流程结束即擦字节**:见 [`impl Drop`]——`Vec<u8>` 的默认 drop 只释放堆、
+///   不擦字节,core dump 或内存复用都能还原明文,所以 `Drop` 里 `fill(0)`。
 ///
 /// 它**只从 stdin 进**(`App` 经 `CommandRunner::spawn_with_stdin` 喂给子进程,
 /// 写后即关、即弃):argv 面没有任何明文形参,误粘的 argv 会进 ps / history。
+/// [`impl Drop`]: SecretBody#impl-Drop-for-SecretBody
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SecretBody(Vec<u8>);
 
@@ -530,8 +534,23 @@ impl SecretBody {
     }
 
     /// 交出字节(喂给子进程 stdin 的那一刻;调用方用完即弃)。
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+    ///
+    /// 注意这之后明文就出了本类型的管辖:接手的 `Vec<u8>` 必须在喂完
+    /// (`write_all`) 之后自己 `fill(0)`——`CommandRunner::spawn_with_stdin`
+    /// 那条路已经这么做,ADR-0009 §3 的「流程结束即擦字节」才不说谎。
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for SecretBody {
+    /// **流程结束即擦字节**(ADR-0009 §3):`Vec<u8>` 的默认 drop 只把堆还给
+    /// 分配器、不擦内容——进程被 core dump、那些页被后续分配复用,明文都还
+    /// 还原得出来。这里补上默认 drop 缺的那一步。
+    ///
+    /// 不加 `zeroize` crate:一行 `fill(0)` 就够,且不引 `unsafe`。
+    fn drop(&mut self) {
+        self.0.fill(0);
     }
 }
 
@@ -1943,10 +1962,10 @@ fn sub_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
 }
 
 /// 钥匙册的条目明细:名字行后缀给 kind(条目级,恒 `github-key`),之下给
-/// **主机 / 作用域条数 / 轮换日**(缺字段显式「——」)。**没有本体槽,也不印
+/// **主机 / 作用域 / 轮换日**(缺字段显式「——」)。**没有本体槽,也不印
 /// 指纹**——投影里就没有这两格(上游 `KeySummary` 五键冻结),面板连「这像是
-/// 哪把钥匙」都不该让人推断出来。作用域只报**条数**(只登记不设闸,面板不代管、
-/// 不提醒、不评审)。
+/// 哪把钥匙」都不该让人推断出来。作用域**原样逐条报**(只登记不设闸,面板不代管、
+/// 不提醒、不评审;它们是登记元数据,与 secret 槽的「不印指纹」是两回事)。
 fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDetailOut {
     let kind = e
         .kind
@@ -2992,7 +3011,7 @@ fn render_tag_form(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(Span::styled(
         match f.mode {
             // add 无确认闸(ADR-0009 §2):Enter 就是下发写命令那一下
-            TagFormMode::Add => "  Enter 挂上去(无确认闸) · Esc/q 返航",
+            TagFormMode::Add => "  Enter 挂上去(无确认闸:追加合并可重放) · Esc/q 返航",
             // rm 上游也没有 --yes,面板加一道图形确认
             TagFormMode::Rm => "  Enter 去确认 · Esc/q 返航",
         },
@@ -3161,7 +3180,7 @@ fn render_tag_review(frame: &mut Frame, area: Rect, app: &App) {
         ])
     } else {
         Line::from(Span::styled(
-            "  Esc/q 返航(无确认闸:改好表单重下同一条 argv)",
+            "  Esc/q 返航(无确认闸:追加合并、幂等可重放,点错重跑同一 argv 即回到同一态)",
             p.dim(),
         ))
     });
@@ -4394,6 +4413,29 @@ mod tests {
         assert!(app.sub_form.body.is_empty(), "返航即 drop,面板侧不留副本");
     }
 
+    /// **流程结束即擦字节**(ADR-0009 §3,2026-10-12 业主裁断)的交接一头:
+    /// `into_bytes` 把字节**全部**交给 runner,之后明文只存在于接手的那个
+    /// `Vec<u8>` 里——由 runner 在 `write_all` 之后 `fill(0)` 收口(另一头)。
+    /// 表单里那份已被 move 进来,不会同时留两份。
+    ///
+    /// `Drop` 里那句 `fill(0)` 本身没有单元测试:要观测它就得在 `drop` 之后读
+    /// 已释放的堆,那是未定义行为。它的存在由 `impl Drop for SecretBody` 与那段
+    /// 注释锚着,后人要删会先撞上注释。
+    #[test]
+    fn into_bytes_交出全部字节_之后明文只在接手的那一份里() {
+        let mut body = SecretBody::default();
+        for b in [0x41u8, 0x42, 0x43] {
+            on_key_secret(
+                &mut body,
+                KeyEvent::new(KeyCode::Char(b as char), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(body.len(), 3, "先喂三个字节");
+        let handed = body.into_bytes();
+        assert_eq!(handed, vec![0x41u8, 0x42, 0x43], "字节原样交出,一个不少");
+        // `body` 到此已被 move:面板侧不再有第二份。交给 runner 的那份喂完即擦。
+    }
+
     /// ls 投影**无链接槽**:三态与剩余天数按 UTC、由引擎在回音里给足,面板不
     /// 自己算一套;过期不改退出码(整份回音 ok:true)。
     #[test]
@@ -5047,7 +5089,7 @@ mod tests {
     }
 
     /// ls 投影**无本体槽、不印指纹**:结构上放不下 secret,面板连「这像是哪把
-    /// 钥匙」都不该让人推断出来;作用域只报**条数**、轮换日原样(只登记不设闸)。
+    /// 钥匙」都不该让人推断出来;作用域原样逐条报、轮换日原样(只登记不设闸)。
     #[test]
     fn ls投影无本体槽不印指纹_作用域轮换日只登记不设闸() {
         let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
@@ -5075,8 +5117,8 @@ mod tests {
         assert_eq!(deploy.host.as_deref(), Some("github.com"));
         assert_eq!(
             deploy.scopes_line(),
-            "2 条",
-            "作用域只报条数(不代管、不评审)"
+            "repo · read:org",
+            "作用域原样逐条报(登记元数据,与 secret 槽的不印指纹是两回事)"
         );
         assert_eq!(deploy.rotated_at_line(), "2026-01-15", "轮换日原样呈现");
         let ci = sheet.entries.iter().find(|e| e.name == "ci").unwrap();
@@ -5088,7 +5130,7 @@ mod tests {
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(s.contains("deploy"), "{s}");
         assert!(s.contains("github.com"), "{s}");
-        assert!(s.contains("2 条"), "{s}");
+        assert!(s.contains("read:org"), "作用域报值:{s}");
         assert!(!s.contains("ghp_"), "册体不出现本体/指纹:{s}");
     }
 
@@ -5236,7 +5278,7 @@ mod tests {
         let key = text(key_detail_rows);
         assert!(key.contains("kind github-key"), "钥匙册:{key}");
         assert!(key.contains("github.com"), "钥匙册:{key}");
-        assert!(key.contains("2 条"), "作用域只报条数:{key}");
+        assert!(key.contains("read:org"), "作用域报值:{key}");
         assert!(key.contains("2026-01-15"), "轮换日在场:{key}");
         assert!(!key.contains("端口"), "钥匙册不画端口槽:{key}");
         assert!(!key.contains("引用"), "钥匙册不画引用槽:{key}");

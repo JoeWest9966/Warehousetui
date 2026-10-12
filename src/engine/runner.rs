@@ -319,9 +319,12 @@ impl RealRunner {
             };
             // 喂入(#55):原样写进子进程 stdin 后立即关闭;None = 不喂入,
             // 与开 stdin 通道前逐字节一致。内容随进程结束即弃,不进任何结构。
-            if let (Some(bytes), Some(mut sink)) = (stdin, cmd.stdin.take()) {
+            // 写完即 `fill(0)`:这是本体在面板侧的最后一处明文副本(见
+            // `SecretBody` 的 `Drop`),ADR-0009 §3「流程结束即擦字节」要两头都擦。
+            if let (Some(mut bytes), Some(mut sink)) = (stdin, cmd.stdin.take()) {
                 tokio::spawn(async move {
                     let _ = sink.write_all(&bytes).await;
+                    bytes.fill(0);
                 });
             }
             // stderr 实时逐行推 UI(装配日志窗格的数据源),同时收拢成

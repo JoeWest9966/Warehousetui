@@ -169,7 +169,7 @@ vps 登录里指向机密的 **opaque 串**（`$ENV` / `!command` / ssh-agent / 
 _Avoid_: 密钥、凭据引用
 
 **到期标记（expiry marking）**：
-订阅的 `status` / `daysLeft` 三态 active / expiring / expired，按 **UTC 日期在读取时算、永不写进文件**，7 天阈值不配置化，只标记不治理（不改退出码、不提醒、不靠 ANSI 颜色）。
+订阅的 `status` / `daysLeft` 三态 active / expiring / expired，**由上游 `status.go` 读取时算好、随回音下发，永不写进文件**；面板只做状态映射，本地零日期运算（ADR-0009 §3）。7 天阈值是上游的、不配置化，只标记不治理（不改退出码、不提醒、不靠 ANSI 颜色）。
 _Avoid_: 过期、续期
 
 ### 尺寸与呈现
