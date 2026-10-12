@@ -9,7 +9,6 @@ use tokio::sync::mpsc;
 use crate::engine::{
     capability::{self, Capability, Probe},
     commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, Gate, LsData, State,
-    VpsLsData,
 };
 use crate::input::{self, InputAction};
 use crate::layout::{hitmap, size_class, ScrollDir, Target};
@@ -353,7 +352,8 @@ pub struct App {
     /// 最近一次反查问的是哪一条(**由下发时记下**:`run_tag_ls` 的入参,
     /// `None` = 列全部)。只为把「列全部 / 只列一个」这档差别显式画出来——
     /// 操作者看得见自己问的是什么,不靠记性。回音路由
-    /// ([`App::on_tag_echo`])只把它读回来,不再从 argv 重新推导:argv 里
+    /// ([`CatalogKind::absorb_ls`](crate::screens::CatalogKind::absorb_ls) 的标签册臂)
+    /// 只把它读回来,不再从 argv 重新推导:argv 里
     /// `--root` 的值长得跟标签名一样,推导就会把「列全部」冒充成「反查
     /// 一个叫 <根> 的标签」。
     pub tag_lookup: Option<String>,
@@ -1125,18 +1125,17 @@ impl App {
                     self.push_log("登记预审回音已丢弃(流程已返航)");
                 }
             }
-            // 编目册回音(#53):ls 只读 / register 两段式 / rm 带面板确认。
-            // 只认真实 argv——精确的无参组级探针仍归下面的能力回音路。
-            "vps" if Capability::from_probe(&out.args).is_none() => self.on_vps_echo(out),
-            // 标签册回音(#54):ls 反查两态 / add 无确认闸 / rm 两态。
-            // 只认真实 argv(精确的无参 `tag` 探针仍归能力回音路)。
-            "tag" if Capability::from_probe(&out.args).is_none() => self.on_tag_echo(out),
-            // 订阅册回音(#56):ls 只读 / register 两段式(本体经 stdin)/ rm。
-            // 只认真实 argv(精确的无参 `subscription` 探针仍归能力回音路)。
-            "subscription" if Capability::from_probe(&out.args).is_none() => self.on_sub_echo(out),
-            // 钥匙册回音(#57):ls 只读 / register 两段式(本体经 stdin)/ rm。
-            // 只认真实 argv(精确的无参 `key` 探针仍归能力回音路)。
-            "key" if Capability::from_probe(&out.args).is_none() => self.on_key_echo(out),
+            // 编目册回音(#53 / #54 / #56 / #57;#76 起四本收成一条):ls 只读 /
+            // register 两段式 / add 无确认闸 / rm。命令组名查表落到
+            // `CatalogKind`,`on_echo` 一份实现按子命令分发——只认真实 argv
+            // (精确的无参组级探针仍归下面的能力回音路)。
+            cmd if crate::screens::CatalogKind::from_command(cmd).is_some()
+                && Capability::from_probe(&out.args).is_none() =>
+            {
+                let kind = crate::screens::CatalogKind::from_command(cmd)
+                    .expect("guard ensured a catalog command group");
+                self.on_echo(kind, out);
+            }
             // 外部源漂移复核回音(#40):只读,只认真实 argv(带 --root 或
             // --name);精确的无参探针仍归下面的能力回音路。
             "source"
@@ -2233,7 +2232,7 @@ impl App {
         self.vps_rm_confirm = false;
         self.vps_rm_result = None;
         // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
-        // 与 register 落账段同一处点灯,回音到达时灭,见 on_vps_echo)。
+        // 与 register 落账段同一处点灯,回音到达时灭,见 `on_echo_rm` → `CatalogKind::absorb_rm`)。
         self.assembling = true;
         self.queue.push(commands::vps_rm(&name, &root));
         self.push_log(format!("删除已入队:vps rm {name} --root {root}"));
@@ -2254,102 +2253,135 @@ impl App {
         self.push_log("vps ls 已入队(只读,不写任何文件)");
     }
 
-    /// 编目册回音路由(#53):ls 只读 / register 两段式 / rm。
-    fn on_vps_echo(&mut self, out: EngineOutput) {
+    /// 编目册回音路由(#76:`on_*_echo` 四份收成一份)。按子命令分发,按册差异
+    /// 走 [`crate::screens::CatalogKind`] 查表成员,这里不再有 `match kind`。
+    fn on_echo(&mut self, kind: crate::screens::CatalogKind, out: EngineOutput) {
         match out.args.get(1).map(String::as_str) {
-            Some("ls") => {
-                self.vps_ls_loading = false;
-                match out.envelope.as_ref().and_then(|e| e.data_as::<VpsLsData>()) {
-                    Some(d) => {
-                        let n = d.machines.len();
-                        self.vps_ls = Some(d);
-                        self.catalog_clamp();
-                        self.push_log(format!("vps 编目册已刷新:{n} 台机器(只读)"));
-                    }
-                    None => self.push_log(format!("vps ls 结果不可用:{}", out.headline())),
+            Some("ls") => self.on_echo_ls(kind, out),
+            Some("register") => self.on_echo_register(kind, out),
+            Some("add") => self.on_echo_add(out),
+            Some("rm") => self.on_echo_rm(kind, out),
+            _ => {}
+        }
+    }
+
+    /// ls 回音(只读刷新):灭「在读」旗后,按册落地(`kind.absorb_ls`)。
+    fn on_echo_ls(&mut self, kind: crate::screens::CatalogKind, out: EngineOutput) {
+        *kind.ls_loading_mut(self) = false;
+        kind.absorb_ls(self, out);
+    }
+
+    /// 登记回音两段式(#53 / #56 / #57;vps / 订阅 / 钥匙三本同形,收成一份):
+    /// 预审段摊开闸结论,落账段(图形确认后才可能到达)收敛写互斥并刷新册。
+    /// 标签册没有这一段(它的写命令是 `add`,见 [`Self::on_echo_add`])。
+    fn on_echo_register(&mut self, kind: crate::screens::CatalogKind, out: EngineOutput) {
+        let is_commit = out.args.iter().any(|a| a == "--yes");
+        if is_commit {
+            let echo_ok = out.ok;
+            let verdict = kind.flow_mut(self).commit_back(out);
+            match verdict {
+                Some(true) => {
+                    self.assembling = false;
+                    self.push_log(format!(
+                        "登记落账完成:{} 已写入数据仓根(一次 git 变更)",
+                        kind.file()
+                    ));
+                    kind.run_ls(self);
                 }
-            }
-            Some("register") => {
-                let is_commit = out.args.iter().any(|a| a == "--yes");
-                if is_commit {
-                    let echo_ok = out.ok;
-                    match self.vps_flow.commit_back(out) {
-                        Some(true) => {
-                            self.assembling = false;
-                            self.push_log("登记落账完成:vps.json 已写入数据仓根(一次 git 变更)");
-                            self.run_vps_ls();
-                        }
-                        Some(false) => {
-                            self.assembling = false;
-                            let h = self
-                                .vps_flow
-                                .result
-                                .as_ref()
-                                .map(|o| o.headline())
-                                .unwrap_or_default();
-                            self.push_log(format!("登记落账失败:{h}"));
-                        }
-                        None => {
-                            // 在途返航收不回引擎的写:回音报成功则刷新并明示
-                            // 「写可能已落盘」(与外部源登记同一收敛行为)。
-                            self.assembling = false;
-                            if echo_ok {
-                                self.run_vps_ls();
-                                self.push_log(
-                                    "登记写盘可能已完成:编目册已刷新,vps.json 走 PR + 家长审复核"
-                                        .to_string(),
-                                );
-                            } else {
-                                self.push_log("登记落账回音已丢弃(流程已返航,写未成功)");
-                            }
-                        }
-                    }
-                } else if self.vps_flow.preaudit_back(out) {
-                    let h = self
-                        .vps_flow
+                Some(false) => {
+                    self.assembling = false;
+                    let h = kind
+                        .flow(self)
                         .result
                         .as_ref()
                         .map(|o| o.headline())
                         .unwrap_or_default();
-                    self.push_log(format!("登记预审完成:{h}"));
-                } else {
-                    self.push_log("登记预审回音已丢弃(流程已返航)");
+                    self.push_log(format!("登记落账失败:{h}"));
                 }
-            }
-            Some("rm") => {
-                // 写互斥随 rm 回音收敛(ADR-0009 §4;删不存在的名 rc 3 同样
-                // 到达这里——互斥释放,文件一个字节都没动)。
-                self.assembling = false;
-                let typed = out
-                    .envelope
-                    .as_ref()
-                    .and_then(|e| e.data_as::<crate::engine::VpsRmData>());
-                let rm_ok = out.ok;
-                let rm_headline = out.headline();
-                self.vps_rm_result = Some(out);
-                match typed {
-                    Some(d) if d.removed => {
+                None => {
+                    // 在途返航收不回引擎的写:回音报成功则刷新并明示
+                    // 「写可能已落盘」(与外部源登记同一收敛行为)。
+                    self.assembling = false;
+                    if echo_ok {
+                        kind.run_ls(self);
                         self.push_log(format!(
-                            "已删除 {}:剩余 {} 台(一次 git 变更,走 PR + 家长审)",
-                            d.name, d.remaining
+                            "登记写盘可能已完成:{}册已刷新,{} 走 PR + 家长审复核",
+                            kind.write_refreshed_noun(),
+                            kind.file()
                         ));
-                        self.run_vps_ls();
-                    }
-                    Some(d) => {
-                        // 删不存在的名:rc 3 + 证据五字段 + 文件一个字节不动
-                        self.push_log(format!(
-                            "没删成:{} 不在编目里(action {}),vps.json 一个字节都没动",
-                            d.name, d.action
-                        ));
-                    }
-                    None => {
-                        let _ = rm_ok;
-                        self.push_log(format!("删除结果不可用:{rm_headline}"))
+                    } else {
+                        self.push_log("登记落账回音已丢弃(流程已返航,写未成功)");
                     }
                 }
             }
-            _ => {}
+        } else if kind.flow_mut(self).preaudit_back(out) {
+            let h = kind
+                .flow(self)
+                .result
+                .as_ref()
+                .map(|o| o.headline())
+                .unwrap_or_default();
+            self.push_log(format!("登记预审完成:{h}"));
+        } else {
+            self.push_log("登记预审回音已丢弃(流程已返航)");
         }
+    }
+
+    /// 挂标签回音(#54;标签册独有的写命令,无确认闸):落账即终态,回音摊开
+    /// 闸结论。只有标签册走这一段(`add` 是上游 `tag add` 的动词,别本没有)。
+    fn on_echo_add(&mut self, out: EngineOutput) {
+        self.assembling = false;
+        let echo_ok = out.ok;
+        let typed = out
+            .envelope
+            .as_ref()
+            .and_then(|e| e.data_as::<crate::engine::TagAddData>());
+        match self.tag_flow.commit_back(out) {
+            Some(true) => {
+                let (name, cleaned) = match typed {
+                    Some(ref d) => (d.name.clone(), d.cleaned_count()),
+                    None => (String::new(), 0),
+                };
+                let cleaned_line = if cleaned > 0 {
+                    format!(";悬空引用已清 {cleaned} 条(已明示)")
+                } else {
+                    String::new()
+                };
+                self.push_log(format!(
+                    "挂标签完成:{name} 已写入 tags.json(一次 git 变更){cleaned_line}"
+                ));
+                self.run_tag_ls(None);
+            }
+            Some(false) => {
+                let h = self
+                    .tag_flow
+                    .result
+                    .as_ref()
+                    .map(|o| o.headline())
+                    .unwrap_or_default();
+                self.push_log(format!("没挂成:{h}(四道闸有 fail,一个字节都没落)"));
+            }
+            None => {
+                // 在途返航收不回引擎的写:回音报成功则反查刷新并明示
+                // 「写可能已落盘」(与 vps 登记同一收敛行为)
+                if echo_ok {
+                    self.run_tag_ls(None);
+                    self.push_log(
+                        "挂标签写盘可能已完成:标签册已刷新,tags.json 走 PR + 家长审复核"
+                            .to_string(),
+                    );
+                } else {
+                    self.push_log("挂标签回音已丢弃(流程已返航,写未成功)");
+                }
+            }
+        }
+    }
+
+    /// rm 回音(#53 / #54 / #56 / #57):写互斥随 rm 回音收敛(删不存在的名 rc 3
+    /// 同样到达这里——互斥释放,文件一个字节都没动)。按册落地 `kind.absorb_rm`。
+    fn on_echo_rm(&mut self, kind: crate::screens::CatalogKind, out: EngineOutput) {
+        self.assembling = false;
+        kind.absorb_rm(self, out);
     }
 
     // ---- 编目册屏·标签册(spec #50 工单 #54,ADR-0009) ----
@@ -2473,7 +2505,7 @@ impl App {
     }
 
     /// 册级选中行钳回可见范围内(刷新后旧下标可能越界;四本册同一口径)。
-    fn catalog_clamp(&mut self) {
+    pub(crate) fn catalog_clamp(&mut self) {
         let (sel, n) = self.catalog_sel_mut();
         *sel = if n == 0 { 0 } else { (*sel).min(n - 1) };
     }
@@ -2736,7 +2768,7 @@ impl App {
         self.tag_rm_confirm = false;
         self.tag_rm_result = None;
         // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
-        // 与 tag add 同一处点灯,回音到达时灭,见 on_tag_echo)。
+        // 与 tag add 同一处点灯,回音到达时灭,见 `on_echo_rm` → `CatalogKind::absorb_rm`)。
         self.assembling = true;
         let refs = spec.refs.len();
         self.queue
@@ -2762,177 +2794,6 @@ impl App {
         self.tag_rm_confirm = false;
         self.tag_form = catalog::new_tag_form(catalog::TagFormMode::Add);
         self.push_log("标签册返航");
-    }
-
-    /// 标签册回音路由(#54):ls 反查两态 / add 无确认闸 / rm 两态。
-    fn on_tag_echo(&mut self, out: EngineOutput) {
-        match out.args.get(1).map(String::as_str) {
-            Some("ls") => {
-                self.tag_ls_loading = false;
-                // 问的是哪一条,读**下发时**记下的 [`App::tag_lookup`]
-                // (`run_tag_ls` 的入参,`None` = 列全部),不从回音 argv 重新推导。
-                // 早先这里写的是 `args.iter().skip(2).find(非 -- 开头)`,它会把
-                // `--root` 的**值**当成标签名:机器册反查(#70)发的正是不带参的
-                // `tag ls --root <根>`,于是「列全部标签」被冒充成「反查一个叫
-                // `/tmp` 的标签」——册头(`当前册 标签 · 反查 /tmp`)与日志
-                // (`反查完成(标签 /tmp:4 条,只读)`)两处都跟着错。一种状态冒充
-                // 另一种,正是铁律不许的事;记在下发处,回音只读回来。
-                let asked = self.tag_lookup.clone();
-                // 反查上浮在途(#70):机器册问「什么标签引用了这一条」——回音落地
-                // 时按在途记住的那台机器,从这次 fresh 标签册里就地按 `<kind>/<条目>`
-                // 精确匹配推导。**只在在途时收敛**:操作者已返航(Idle)/ 已看到
-                // 结论(Hits/Empty)时,迟到回音不重开、不覆盖;换册 / 切屏已把在途
-                // 清成 Idle,所以这里天然只对机器册生效。
-                let machine = match &self.vps_reverse {
-                    crate::screens::catalog::VpsReverse::InFlight { machine } => {
-                        Some(machine.clone())
-                    }
-                    _ => None,
-                };
-                // 「读到了」的判据(#70):**rc 0 且拆得出 TagLsData**。rc≠0 的
-                // 回音 `data` 仍可能是可定型形状,只凭「拆不拆得出型」判定就会把
-                // 「这次没读到」冒充成「一条标签引用都没有」——两态互相冒充,正是
-                // spec #65 铁律 4 钉死不许发生的事。契约守卫合成「需升级 nw」
-                // 由 `data_as` 的 None 分支接住(schema 不认识就拆不出型,绝不按旧
-                // 形状降级解析),rc 这一路单独立判。
-                match out
-                    .ok
-                    .then_some(out.envelope.as_ref())
-                    .flatten()
-                    .and_then(|e| e.data_as::<crate::engine::TagLsData>())
-                {
-                    Some(d) => {
-                        let n = d.tags.len();
-                        // 先算收敛结论(借用 d),再 move out 进 tag_ls_echo。
-                        let converged = machine.as_ref().map(|m| {
-                            let hits =
-                                crate::screens::catalog::tags_referring(&d.sheet(), "vps", m);
-                            (m.clone(), hits)
-                        });
-                        self.tag_ls_echo = Some(out);
-                        self.catalog_clamp();
-                        // 有 N 条 / 一条都没有:都是 rc 0 合法回音,只是命中数不同
-                        // ——两态可区分,不共用一个空列表。
-                        if let Some((m, hits)) = converged {
-                            self.vps_reverse = if hits.is_empty() {
-                                crate::screens::catalog::VpsReverse::Empty { machine: m }
-                            } else {
-                                crate::screens::catalog::VpsReverse::Hits {
-                                    machine: m,
-                                    tags: hits,
-                                }
-                            };
-                        }
-                        let scope = match asked.as_deref() {
-                            Some(name) => format!("标签 {name}:{n} 条"),
-                            None => format!("全部标签:{n} 条"),
-                        };
-                        self.push_log(format!("反查完成({scope},只读)"));
-                    }
-                    None => {
-                        // 带参问错了名字(rc 3)/ 回音不可定型:留证据,册体
-                        // 不画空列表(51 §6.11)。反查上浮在途时这一态 = 「读不到」:
-                        // 转 Unreadable 走既有指路(日志),**绝不画成空列表**。
-                        let h = out.headline().to_string();
-                        self.tag_ls_echo = Some(out);
-                        if let Some(m) = machine {
-                            self.vps_reverse = crate::screens::catalog::VpsReverse::Unreadable {
-                                machine: m,
-                                reason: h.clone(),
-                            };
-                        }
-                        self.push_log(format!("反查没结果:{h}"));
-                    }
-                }
-            }
-            Some("add") => {
-                self.assembling = false;
-                let echo_ok = out.ok;
-                let typed = out
-                    .envelope
-                    .as_ref()
-                    .and_then(|e| e.data_as::<crate::engine::TagAddData>());
-                match self.tag_flow.commit_back(out) {
-                    Some(true) => {
-                        let (name, cleaned) = match typed {
-                            Some(ref d) => (d.name.clone(), d.cleaned_count()),
-                            None => (String::new(), 0),
-                        };
-                        let cleaned_line = if cleaned > 0 {
-                            format!(";悬空引用已清 {cleaned} 条(已明示)")
-                        } else {
-                            String::new()
-                        };
-                        self.push_log(format!(
-                            "挂标签完成:{name} 已写入 tags.json(一次 git 变更){cleaned_line}"
-                        ));
-                        self.run_tag_ls(None);
-                    }
-                    Some(false) => {
-                        let h = self
-                            .tag_flow
-                            .result
-                            .as_ref()
-                            .map(|o| o.headline())
-                            .unwrap_or_default();
-                        self.push_log(format!("没挂成:{h}(四道闸有 fail,一个字节都没落)"));
-                    }
-                    None => {
-                        // 在途返航收不回引擎的写:回音报成功则反查刷新并明示
-                        // 「写可能已落盘」(与 vps 登记同一收敛行为)
-                        if echo_ok {
-                            self.run_tag_ls(None);
-                            self.push_log(
-                                "挂标签写盘可能已完成:标签册已刷新,tags.json 走 PR + 家长审复核"
-                                    .to_string(),
-                            );
-                        } else {
-                            self.push_log("挂标签回音已丢弃(流程已返航,写未成功)");
-                        }
-                    }
-                }
-            }
-            Some("rm") => {
-                // 写互斥随 rm 回音收敛(ADR-0009 §4;删不存在的标签 rc 3 同样
-                // 到达这里——互斥释放,文件一个字节都没动)。
-                self.assembling = false;
-                let typed = out
-                    .envelope
-                    .as_ref()
-                    .and_then(|e| e.data_as::<crate::engine::TagRmData>());
-                self.tag_rm_result = Some(out);
-                match typed {
-                    Some(d) if d.removed => {
-                        let what = if d.action == "ref_removed" {
-                            format!("已从 {} 摘掉引用(标签还在)", d.name)
-                        } else {
-                            format!("已删除标签 {}", d.name)
-                        };
-                        self.push_log(format!(
-                            "{what}:剩余 {} 个标签(一次 git 变更,走 PR + 家长审)",
-                            d.remaining
-                        ));
-                        self.run_tag_ls(None);
-                    }
-                    Some(d) => {
-                        // 删不存在的标签:rc 3 + 证据五字段 + 文件一个字节不动
-                        self.push_log(format!(
-                            "没删成:{} 不在编目里(action {}),tags.json 一个字节都没动",
-                            d.name, d.action
-                        ));
-                    }
-                    None => {
-                        let h = self
-                            .tag_rm_result
-                            .as_ref()
-                            .map(|o| o.headline())
-                            .unwrap_or_default();
-                        self.push_log(format!("删除结果不可用:{h}"));
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     // ---- 编目册屏·订阅册(spec #50 工单 #56,ADR-0009) ----
@@ -3174,121 +3035,10 @@ impl App {
         self.sub_rm_confirm = false;
         self.sub_rm_result = None;
         // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
-        // 与 register 落账段同一处点灯,回音到达时灭,见 on_sub_echo)。
+        // 与 register 落账段同一处点灯,回音到达时灭,见 `on_echo_rm` → `CatalogKind::absorb_rm`)。
         self.assembling = true;
         self.queue.push(commands::subscription_rm(&name, &root));
         self.push_log(format!("删除已入队:subscription rm {name} --root {root}"));
-    }
-
-    /// 订阅册回音路由(#56):ls 只读 / register 两段式(本体经 stdin)/ rm。
-    fn on_sub_echo(&mut self, out: EngineOutput) {
-        match out.args.get(1).map(String::as_str) {
-            Some("ls") => {
-                self.sub_ls_loading = false;
-                match out
-                    .envelope
-                    .as_ref()
-                    .and_then(|e| e.data_as::<crate::engine::SubLsData>())
-                {
-                    Some(d) => {
-                        let n = d.subscriptions.len();
-                        let counts = d.status_counts();
-                        self.sub_ls = Some(d);
-                        self.catalog_clamp();
-                        self.sub_get_logged = false;
-                        self.push_log(format!(
-                            "订阅册已刷新:{n} 条(active {} · expiring {} · expired {},只读)",
-                            counts.active, counts.expiring, counts.expired
-                        ));
-                    }
-                    None => self.push_log(format!("subscription ls 结果不可用:{}", out.headline())),
-                }
-            }
-            Some("register") => {
-                let is_commit = out.args.iter().any(|a| a == "--yes");
-                if is_commit {
-                    let echo_ok = out.ok;
-                    match self.sub_flow.commit_back(out) {
-                        Some(true) => {
-                            self.assembling = false;
-                            self.push_log(
-                                "登记落账完成:subscriptions.json 已写入数据仓根(一次 git 变更)"
-                                    .to_string(),
-                            );
-                            self.run_sub_ls();
-                        }
-                        Some(false) => {
-                            self.assembling = false;
-                            let h = self
-                                .sub_flow
-                                .result
-                                .as_ref()
-                                .map(|o| o.headline())
-                                .unwrap_or_default();
-                            self.push_log(format!("登记落账失败:{h}"));
-                        }
-                        None => {
-                            // 在途返航收不回引擎的写(与 vps / 外部源登记同一收敛行为)
-                            self.assembling = false;
-                            if echo_ok {
-                                self.run_sub_ls();
-                                self.push_log(
-                                    "登记写盘可能已完成:订阅册已刷新,subscriptions.json 走 PR + 家长审复核"
-                                        .to_string(),
-                                );
-                            } else {
-                                self.push_log("登记落账回音已丢弃(流程已返航,写未成功)");
-                            }
-                        }
-                    }
-                } else if self.sub_flow.preaudit_back(out) {
-                    let h = self
-                        .sub_flow
-                        .result
-                        .as_ref()
-                        .map(|o| o.headline())
-                        .unwrap_or_default();
-                    self.push_log(format!("登记预审完成:{h}"));
-                } else {
-                    self.push_log("登记预审回音已丢弃(流程已返航)");
-                }
-            }
-            Some("rm") => {
-                // 写互斥随 rm 回音收敛(ADR-0009 §4;删不存在的订阅 rc 3 同样
-                // 到达这里——互斥释放,文件一个字节都没动)。
-                self.assembling = false;
-                let typed = out
-                    .envelope
-                    .as_ref()
-                    .and_then(|e| e.data_as::<crate::engine::SubRmData>());
-                self.sub_rm_result = Some(out);
-                match typed {
-                    Some(d) if d.removed => {
-                        self.push_log(format!(
-                            "已删除订阅 {}:剩余 {} 条(一次 git 变更,走 PR + 家长审)",
-                            d.name, d.remaining
-                        ));
-                        self.run_sub_ls();
-                    }
-                    Some(d) => {
-                        // 删不存在的名:rc 3 + 证据五字段 + 文件一个字节都不动
-                        self.push_log(format!(
-                            "没删成:{} 不在编目里(action {}),subscriptions.json 一个字节都没动",
-                            d.name, d.action
-                        ));
-                    }
-                    None => {
-                        let h = self
-                            .sub_rm_result
-                            .as_ref()
-                            .map(|o| o.headline())
-                            .unwrap_or_default();
-                        self.push_log(format!("删除结果不可用:{h}"));
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     // ---- 编目册屏·钥匙册(spec #50 工单 #57,ADR-0009;机密纪律最严的一本) ----
@@ -3523,116 +3273,10 @@ impl App {
         self.key_rm_confirm = false;
         self.key_rm_result = None;
         // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
-        // 与 register 落账段同一处点灯,回音到达时灭,见 on_key_echo)。
+        // 与 register 落账段同一处点灯,回音到达时灭,见 `on_echo_rm` → `CatalogKind::absorb_rm`)。
         self.assembling = true;
         self.queue.push(commands::key_rm(&name, &root));
         self.push_log(format!("删除已入队:key rm {name} --root {root}"));
-    }
-
-    /// 钥匙册回音路由(#57):ls 只读 / register 两段式(本体经 stdin)/ rm。
-    fn on_key_echo(&mut self, out: EngineOutput) {
-        match out.args.get(1).map(String::as_str) {
-            Some("ls") => {
-                self.key_ls_loading = false;
-                match out
-                    .envelope
-                    .as_ref()
-                    .and_then(|e| e.data_as::<crate::engine::KeyLsData>())
-                {
-                    Some(d) => {
-                        let n = d.keys.len();
-                        self.key_ls = Some(d);
-                        self.catalog_clamp();
-                        self.key_get_logged = false;
-                        self.push_log(format!("钥匙册已刷新:{n} 条(只读,无本体槽、不印指纹)"));
-                    }
-                    None => self.push_log(format!("key ls 结果不可用:{}", out.headline())),
-                }
-            }
-            Some("register") => {
-                let is_commit = out.args.iter().any(|a| a == "--yes");
-                if is_commit {
-                    let echo_ok = out.ok;
-                    match self.key_flow.commit_back(out) {
-                        Some(true) => {
-                            self.assembling = false;
-                            self.push_log(
-                                "登记落账完成:keys.json 已写入数据仓根(一次 git 变更)".to_string(),
-                            );
-                            self.run_key_ls();
-                        }
-                        Some(false) => {
-                            self.assembling = false;
-                            let h = self
-                                .key_flow
-                                .result
-                                .as_ref()
-                                .map(|o| o.headline())
-                                .unwrap_or_default();
-                            self.push_log(format!("登记落账失败:{h}"));
-                        }
-                        None => {
-                            // 在途返航收不回引擎的写(与 vps / subscription 同一收敛行为)
-                            self.assembling = false;
-                            if echo_ok {
-                                self.run_key_ls();
-                                self.push_log(
-                                    "登记写盘可能已完成:钥匙册已刷新,keys.json 走 PR + 家长审复核"
-                                        .to_string(),
-                                );
-                            } else {
-                                self.push_log("登记落账回音已丢弃(流程已返航,写未成功)");
-                            }
-                        }
-                    }
-                } else if self.key_flow.preaudit_back(out) {
-                    let h = self
-                        .key_flow
-                        .result
-                        .as_ref()
-                        .map(|o| o.headline())
-                        .unwrap_or_default();
-                    self.push_log(format!("登记预审完成:{h}"));
-                } else {
-                    self.push_log("登记预审回音已丢弃(流程已返航)");
-                }
-            }
-            Some("rm") => {
-                // 写互斥随 rm 回音收敛(ADR-0009 §4;删不存在的钥匙 rc 3 同样
-                // 到达这里——互斥释放,文件一个字节都没动)。
-                self.assembling = false;
-                let typed = out
-                    .envelope
-                    .as_ref()
-                    .and_then(|e| e.data_as::<crate::engine::KeyRmData>());
-                self.key_rm_result = Some(out);
-                match typed {
-                    Some(d) if d.removed => {
-                        self.push_log(format!(
-                            "已删除钥匙 {}:剩余 {} 条(一次 git 变更,走 PR + 家长审)",
-                            d.name, d.remaining
-                        ));
-                        self.run_key_ls();
-                    }
-                    Some(d) => {
-                        // 删不存在的名:rc 3 + 证据五字段 + 文件一个字节都不动
-                        self.push_log(format!(
-                            "没删成:{} 不在编目里(action {}),keys.json 一个字节都没动",
-                            d.name, d.action
-                        ));
-                    }
-                    None => {
-                        let h = self
-                            .key_rm_result
-                            .as_ref()
-                            .map(|o| o.headline())
-                            .unwrap_or_default();
-                        self.push_log(format!("删除结果不可用:{h}"));
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     /// 轮换 NW_HOME:写进程环境(子进程继承)、持久化、顺手刷新 ls。

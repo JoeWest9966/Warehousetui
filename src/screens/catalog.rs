@@ -330,6 +330,321 @@ impl CatalogKind {
         }
     }
 
+    // ---- 册级回音命令族查表(工单 #76:`on_*_echo` 四份收成一份) ----
+    //
+    // 下面这一族把「ls / register / rm / add 回音」按册的差异收成
+    // `CatalogKind` 的成员。调用方(`App::on_echo` 及其子路由)只写
+    // `kind.xxx(app, out)`,**不再有第二处 `match kind` / `if kind ==`**:
+    // 登记段(vps / 订阅 / 钥匙三本同形)在 `App::on_echo_register` 里收成一份
+    // 实现;ls / rm 的按册差异(数据型 / 存储槽 / 日志口径,以及标签册独有的
+    // 反查收敛)落在 `absorb_ls` / `absorb_rm` 两个查表成员里——与 #66
+    // `sheet` 同一形状:一处匹配长在 [`CatalogKind`] 上,调用方不分册。
+    //
+    // 加一条按册的回音关切 = 在这里加 / 改一个成员,不是往调用方再插一个分支。
+
+    /// 回音 argv 的命令组名 → 这一本(`App::on_engine_finished` 的回音路由:
+    /// 四条 `"vps" => …` / `"tag" => …` … 收成一条 `from_command` 查表)。
+    pub fn from_command(s: &str) -> Option<Self> {
+        match s {
+            "vps" => Some(CatalogKind::Vps),
+            "tag" => Some(CatalogKind::Tag),
+            "subscription" => Some(CatalogKind::Subscription),
+            "key" => Some(CatalogKind::Key),
+            _ => None,
+        }
+    }
+
+    /// 这一本登记流槽的可写侧(登记回音两段式收敛走这一口;与 [`Self::flow`]
+    /// 同一张表)。
+    pub fn flow_mut(self, app: &mut App) -> &mut RegisterFlow {
+        match self {
+            CatalogKind::Vps => &mut app.vps_flow,
+            CatalogKind::Tag => &mut app.tag_flow,
+            CatalogKind::Subscription => &mut app.sub_flow,
+            CatalogKind::Key => &mut app.key_flow,
+        }
+    }
+
+    /// 这一本的只读刷新(登记 / 删除回音成功后重读编目册;四本各调自己的
+    /// `run_*_ls`,标签册的反查刷新带 `None` = 列全部)。
+    pub fn run_ls(self, app: &mut App) {
+        match self {
+            CatalogKind::Vps => app.run_vps_ls(),
+            CatalogKind::Tag => app.run_tag_ls(None),
+            CatalogKind::Subscription => app.run_sub_ls(),
+            CatalogKind::Key => app.run_key_ls(),
+        }
+    }
+
+    /// 这一本 ls 回音的「在读」旗(可写侧;回音落地即灭,与 `App` 各册自己的
+    /// `*_ls_loading` 同一张表)。
+    pub fn ls_loading_mut(self, app: &mut App) -> &mut bool {
+        match self {
+            CatalogKind::Vps => &mut app.vps_ls_loading,
+            CatalogKind::Tag => &mut app.tag_ls_loading,
+            CatalogKind::Subscription => &mut app.sub_ls_loading,
+            CatalogKind::Key => &mut app.key_ls_loading,
+        }
+    }
+
+    /// 登记写盘「可能已完成」那句里的册名词(按册:机器册沿用量「编目册」,
+    /// 后三本给各自册名)。**只登记回音段用**(vps / 订阅 / 钥匙;标签册无登记段)。
+    pub fn write_refreshed_noun(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "编目册",
+            CatalogKind::Tag => "标签册",
+            CatalogKind::Subscription => "订阅册",
+            CatalogKind::Key => "钥匙册",
+        }
+    }
+
+    /// 这一本 ls 回音的落地(只读刷新:#53 / #54 / #56 / #57)。按册差异全在
+    /// 这里:数据型(`VpsLsData` / `TagLsData` / `SubLsData` / `KeyLsData`)、
+    /// 存储槽、日志口径,以及**标签册独有的反查收敛**(#70:机器册问「什么标签
+    /// 引用了这一条」,回音落地时从 fresh 标签册就地推导 `vps_reverse`)。
+    /// 调用方(`App::on_echo_ls`)只负责灭「在读」旗,不再分册。
+    pub fn absorb_ls(self, app: &mut App, out: EngineOutput) {
+        match self {
+            CatalogKind::Vps => {
+                match out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::VpsLsData>())
+                {
+                    Some(d) => {
+                        let n = d.machines.len();
+                        app.vps_ls = Some(d);
+                        app.catalog_clamp();
+                        app.push_log(format!("vps 编目册已刷新:{n} 台机器(只读)"));
+                    }
+                    None => app.push_log(format!("vps ls 结果不可用:{}", out.headline())),
+                }
+            }
+            CatalogKind::Tag => {
+                // 问的是哪一条,读下发时记下的 tag_lookup(None = 列全部),
+                // 不从回音 argv 重新推导(见 App::run_tag_ls 的入参)。
+                let asked = app.tag_lookup.clone();
+                // 反查上浮在途(#70):按在途记住的那台机器,从这次 fresh 标签册
+                // 就地按 `<kind>/<条目>` 精确匹配推导。只在在途时收敛。
+                let machine = match &app.vps_reverse {
+                    VpsReverse::InFlight { machine } => Some(machine.clone()),
+                    _ => None,
+                };
+                // 「读到了」的判据:rc 0 且拆得出 TagLsData(两种语义不互相冒充)。
+                match out
+                    .ok
+                    .then_some(out.envelope.as_ref())
+                    .flatten()
+                    .and_then(|e| e.data_as::<crate::engine::TagLsData>())
+                {
+                    Some(d) => {
+                        let n = d.tags.len();
+                        // 先算收敛结论(借用 d),再 move out 进 tag_ls_echo。
+                        let converged = machine.as_ref().map(|m| {
+                            let hits = tags_referring(&d.sheet(), "vps", m);
+                            (m.clone(), hits)
+                        });
+                        app.tag_ls_echo = Some(out);
+                        app.catalog_clamp();
+                        if let Some((m, hits)) = converged {
+                            app.vps_reverse = if hits.is_empty() {
+                                VpsReverse::Empty { machine: m }
+                            } else {
+                                VpsReverse::Hits {
+                                    machine: m,
+                                    tags: hits,
+                                }
+                            };
+                        }
+                        let scope = match asked.as_deref() {
+                            Some(name) => format!("标签 {name}:{n} 条"),
+                            None => format!("全部标签:{n} 条"),
+                        };
+                        app.push_log(format!("反查完成({scope},只读)"));
+                    }
+                    None => {
+                        let h = out.headline().to_string();
+                        app.tag_ls_echo = Some(out);
+                        if let Some(m) = machine {
+                            app.vps_reverse = VpsReverse::Unreadable {
+                                machine: m,
+                                reason: h.clone(),
+                            };
+                        }
+                        app.push_log(format!("反查没结果:{h}"));
+                    }
+                }
+            }
+            CatalogKind::Subscription => {
+                match out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::SubLsData>())
+                {
+                    Some(d) => {
+                        let n = d.subscriptions.len();
+                        let counts = d.status_counts();
+                        app.sub_ls = Some(d);
+                        app.catalog_clamp();
+                        app.sub_get_logged = false;
+                        app.push_log(format!(
+                            "订阅册已刷新:{n} 条(active {} · expiring {} · expired {},只读)",
+                            counts.active, counts.expiring, counts.expired
+                        ));
+                    }
+                    None => app.push_log(format!("subscription ls 结果不可用:{}", out.headline())),
+                }
+            }
+            CatalogKind::Key => {
+                match out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::KeyLsData>())
+                {
+                    Some(d) => {
+                        let n = d.keys.len();
+                        app.key_ls = Some(d);
+                        app.catalog_clamp();
+                        app.key_get_logged = false;
+                        app.push_log(format!("钥匙册已刷新:{n} 条(只读,无本体槽、不印指纹)"));
+                    }
+                    None => app.push_log(format!("key ls 结果不可用:{}", out.headline())),
+                }
+            }
+        }
+    }
+
+    /// 这一本 rm 回音的落地(#53 / #54 / #56 / #57;写互斥的灭由调用方
+    /// `App::on_echo_rm` 统一做)。按册差异(rm 数据型 / 结果槽 / 成功口径,
+    /// 以及标签册的「摘引用 vs 删标签」两态)全在这里。
+    pub fn absorb_rm(self, app: &mut App, out: EngineOutput) {
+        match self {
+            CatalogKind::Vps => {
+                let typed = out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::VpsRmData>());
+                let rm_ok = out.ok;
+                let rm_headline = out.headline();
+                app.vps_rm_result = Some(out);
+                match typed {
+                    Some(d) if d.removed => {
+                        app.push_log(format!(
+                            "已删除 {}:剩余 {} 台(一次 git 变更,走 PR + 家长审)",
+                            d.name, d.remaining
+                        ));
+                        app.run_vps_ls();
+                    }
+                    Some(d) => {
+                        app.push_log(format!(
+                            "没删成:{} 不在编目里(action {}),vps.json 一个字节都没动",
+                            d.name, d.action
+                        ));
+                    }
+                    None => {
+                        let _ = rm_ok;
+                        app.push_log(format!("删除结果不可用:{rm_headline}"))
+                    }
+                }
+            }
+            CatalogKind::Tag => {
+                let typed = out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::TagRmData>());
+                app.tag_rm_result = Some(out);
+                match typed {
+                    Some(d) if d.removed => {
+                        let what = if d.action == "ref_removed" {
+                            format!("已从 {} 摘掉引用(标签还在)", d.name)
+                        } else {
+                            format!("已删除标签 {}", d.name)
+                        };
+                        app.push_log(format!(
+                            "{what}:剩余 {} 个标签(一次 git 变更,走 PR + 家长审)",
+                            d.remaining
+                        ));
+                        app.run_tag_ls(None);
+                    }
+                    Some(d) => {
+                        app.push_log(format!(
+                            "没删成:{} 不在编目里(action {}),tags.json 一个字节都没动",
+                            d.name, d.action
+                        ));
+                    }
+                    None => {
+                        let h = app
+                            .tag_rm_result
+                            .as_ref()
+                            .map(|o| o.headline())
+                            .unwrap_or_default();
+                        app.push_log(format!("删除结果不可用:{h}"));
+                    }
+                }
+            }
+            CatalogKind::Subscription => {
+                let typed = out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::SubRmData>());
+                app.sub_rm_result = Some(out);
+                match typed {
+                    Some(d) if d.removed => {
+                        app.push_log(format!(
+                            "已删除订阅 {}:剩余 {} 条(一次 git 变更,走 PR + 家长审)",
+                            d.name, d.remaining
+                        ));
+                        app.run_sub_ls();
+                    }
+                    Some(d) => {
+                        app.push_log(format!(
+                            "没删成:{} 不在编目里(action {}),subscriptions.json 一个字节都没动",
+                            d.name, d.action
+                        ));
+                    }
+                    None => {
+                        let h = app
+                            .sub_rm_result
+                            .as_ref()
+                            .map(|o| o.headline())
+                            .unwrap_or_default();
+                        app.push_log(format!("删除结果不可用:{h}"));
+                    }
+                }
+            }
+            CatalogKind::Key => {
+                let typed = out
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.data_as::<crate::engine::KeyRmData>());
+                app.key_rm_result = Some(out);
+                match typed {
+                    Some(d) if d.removed => {
+                        app.push_log(format!(
+                            "已删除钥匙 {}:剩余 {} 条(一次 git 变更,走 PR + 家长审)",
+                            d.name, d.remaining
+                        ));
+                        app.run_key_ls();
+                    }
+                    Some(d) => {
+                        app.push_log(format!(
+                            "没删成:{} 不在编目里(action {}),keys.json 一个字节都没动",
+                            d.name, d.action
+                        ));
+                    }
+                    None => {
+                        let h = app
+                            .key_rm_result
+                            .as_ref()
+                            .map(|o| o.headline())
+                            .unwrap_or_default();
+                        app.push_log(format!("删除结果不可用:{h}"));
+                    }
+                }
+            }
+        }
+    }
+
     /// 这一本的删除确认弹层是否打开(ADR-0009 §2:面板加一道图形确认,
     /// 不改引擎语义;四本各一面旗)。
     pub fn rm_confirm(self, app: &App) -> bool {
@@ -7268,7 +7583,7 @@ mod tests {
     //   · #70(`31f069d`):机器册键位行 `↑/↓ 选机器`→`↑/↓ 选`、
     //     `Esc/q 返航`→`Esc`,并多出 `Enter 反查` 段;
     //   · 本票 #65 评审第 3 条:标签册册头把 `反查 /tmp` 改回 `全部标签`
-    //     (那一行原是把 `--root` 的值错当成标签名,见 `App::on_tag_echo`);
+    //     (那一行原是把 `--root` 的值错当成标签名,见 `CatalogKind::absorb_ls` 的标签册臂);
     //   · **本工单(#69 后续 / #70 评审第 5 条)**:键位行分隔
     //     `CATALOG_KEY_GAP` 由 3 列收窄到 2 列(`" · "` → `" ·"`),订阅 /
     //     钥匙册 `g 取回命令` → `g 取回`,于是 `/ 过滤` 在四本册 × 两档内都
@@ -7974,7 +8289,7 @@ mod tests {
         }));
     }
 
-    /// 喂一条 vps ls 回音(走 on_vps_echo → catalog_clamp,即 `l` 刷新的收敛路径;
+    /// 喂一条 vps ls 回音(走 `on_echo_ls` → `CatalogKind::absorb_ls`,即 `l` 刷新的收敛路径;
     /// FakeRunner 每次回放同一 fixture,故自造回音面来验「刷新后选中钳回可见行数」)。
     fn feed_vps_echo(app: &mut crate::app::App, machines: &str) {
         let data = format!(r#"{{"catalogPath":"/r/vps.json","machines":{machines}}}"#);
