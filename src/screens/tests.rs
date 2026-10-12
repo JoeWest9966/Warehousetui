@@ -88,7 +88,29 @@ fn 装配屏运行中七步与日志() {
     app.as_log = vec!["铺骨架…".into(), "落组件…".into()];
     let s = draw(&app, 110, 30);
     assert!(s.contains("七步"));
-    assert!(s.contains("落组件"));
+    assert!(
+        s.contains("落组件"),
+        "stderr 日志原样上屏(操作者唯一的人话面)"
+    );
+    assert!(
+        !s.contains("✓ 3 落组件"),
+        "七步不按 stderr 措辞打勾(#60):{s:?}"
+    );
+}
+
+/// 装配在途两档都给中止键提示(#59):日志窗Pane 标题带着 `x`,操作者翻日志的
+/// 视线不用离开窗Pane 去找键。
+#[test]
+fn 装配中_日志窗给中止键提示_两档都在() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_running = true;
+    app.as_log = vec!["铺骨架…".into()];
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(s.contains("x 中止"), "{w}×{h} 在途给中止键提示:{s}");
+    }
 }
 
 #[test]
@@ -572,35 +594,27 @@ fn 纵向密度_50行高无大片空白() {
 
 // ---- #18 紧凑态内层栏收起(66×50 快照)+ 常畅态回归 ----
 
-/// 66×50 紧凑态:装配七步栏收成一行进度——位置化标记 + 当前阶段名,
-/// 随 stderr 日志推进打 ✓;日志独占余下全部行(不再被 14 列竖栏挤压)。
+/// 66×50 紧凑态:装配七步栏收成一行进度——七格未决标记 + 明示粗粒度;
+/// 日志独占余下全部行(不再被 14 列竖栏挤压)。
+/// #60 起判定不再读 stderr 措辞:引擎七步执行期间不打增量进度,在途
+/// 一律未决,结论等 envelope 落地后按 `nw/up.v1` 冻结字段判。
 #[test]
 fn 紧凑_装配收起一行进度_66x50() {
     let mut app = fake_app();
     app.screen = Screen::Assemble;
     app.assembling = true;
-    app.as_log = vec![
-        "0 前置 …".into(),
-        "1 引导 …".into(),
-        "2 铺骨架 …".into(),
-        "3 落组件 …".into(),
-    ];
+    // 旧实现的毒丸:七个步骤名逐字进 stderr 日志,字符串匹配会把七步全打 ✓
+    app.as_log = STEPS_LOG_ALL.iter().map(|s| s.to_string()).collect();
     let s = draw(&app, 66, 50);
     assert!(
-        s.contains("七步 ✓✓✓✓▸·· 4 合配置"),
-        "一行进度:4 步完成、当前第 5 步可辨识,原文拿到: {s:?}"
+        s.contains("七步 ······· 引擎无增量进度,跑完给结论"),
+        "一行进度:七格未决 + 明示粗粒度,原文拿到: {s:?}"
     );
+    assert!(!s.contains('✓'), "在途一个 ✓ 都不该有: {s:?}");
     assert!(!s.contains("┌ 七步 "), "七步竖栏必须收起");
     assert!(
         s.contains("stderr 实时日志") && s.contains("0 前置 …"),
         "日志全宽可见,早先行也在(行数变多)"
-    );
-    // 全部完成:七格满✓,不再有未完成的「·」悬挂
-    app.as_log = STEPS_LOG_ALL.iter().map(|s| s.to_string()).collect();
-    let done = draw(&app, 66, 50);
-    assert!(
-        done.contains("七步 ✓✓✓✓✓✓✓ 全部完成"),
-        "七步全完成:满格标记,原文拿到: {done:?}"
     );
 }
 
@@ -645,6 +659,8 @@ fn 紧凑_配方五域收起tab行_66x50() {
 }
 
 /// ≥ 断点回归:80×30 常畅态两处内层栏保持既有竖栏(快照基线不回退)。
+/// 七步竖栏仍在场,但 #60 起装配中一律未决(引擎无增量进度),不再按
+/// stderr 措辞打 ✓。
 #[test]
 fn 常畅_内层栏回归_80x30竖轨在场() {
     let mut app = fake_app();
@@ -653,7 +669,11 @@ fn 常畅_内层栏回归_80x30竖轨在场() {
     app.as_log = vec!["0 前置 …".into(), "1 引导 …".into()];
     let s = draw(&app, 80, 30);
     assert!(s.contains("┌ 七步 "), "常畅态七步竖栏原样在场");
-    assert!(s.contains("✓ 0 前置"), "竖栏逐步打勾原样在场");
+    assert!(
+        s.contains("· 0 前置"),
+        "竖栏未决态原样在场(不按日志打勾):{s:?}"
+    );
+    assert!(s.contains("跑完给结论"), "明示粗粒度");
 
     let mut app2 = fake_app();
     app2.screen = Screen::Recipes;
@@ -680,15 +700,111 @@ fn 日志偏移取窗_跳过偏移行_七步判定不受影响() {
     assert!(!s2.contains("行09") && !s2.contains("行08"), "偏移行移出窗");
     assert!(s2.contains("行07"), "更早的行入窗");
     assert!(s2.contains("行00"), "窗内仍有更早内容");
-    // 越界/陈旧偏移:min 钳制取窗不 panic;七步判定读全量 as_log,不受取窗影响
+    // 越界/陈旧偏移:min 钳制取窗不 panic;#60 起七步判定不读 as_log,取窗照旧
     app.as_log.push("5 写清单 完成".into());
     app.as_log_offset = 100;
     let s3 = draw(&app, 80, 30);
     assert!(!s3.contains("行0"), "取窗钳在日志内,不越界");
     assert!(
-        s3.contains("✓ 5 写清单"),
-        "七步判定读全量日志:行被移出窗仍打勾"
+        !s3.contains("✓ 5 写清单"),
+        "日志里出现步骤名不再打勾(#60):{s3:?}"
     );
+    assert!(
+        s3.contains("跑完给结论"),
+        "偏移把日志行推出窗也不影响粗粒度明示:{s3:?}"
+    );
+}
+
+// ---- #60 七步进度改稳健判定:判据只取冻结面,不取 stderr 措辞 ----
+
+/// 装配中:七个步骤名逐字进 stderr 日志(旧实现的字符串匹配会把七步全打
+/// ✓),现在一律未决 + 明示「引擎无增量进度」。两档外观结构不变。
+#[test]
+fn 装配中七步一律未决_明示粗粒度_不按stderr措辞打勾() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.assembling = true;
+    app.as_log = STEPS_LOG_ALL.iter().map(|s| s.to_string()).collect();
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(!s.contains('✓'), "{w}×{h} 在途一个 ✓ 都不该有:{s:?}");
+        assert!(s.contains("跑完给结论"), "{w}×{h} 明示粗粒度");
+    }
+    // 常畅态:竖栏在场、七行未决、底注明示
+    let comfy = draw(&app, 80, 30);
+    assert!(comfy.contains("┌ 七步 "), "常畅态七步竖栏原样在场");
+    for name in ["0 前置", "6 自检"] {
+        assert!(comfy.contains(&format!("· {name}")), "未决态:{name}");
+    }
+    // 紧凑态:收成一行进度,那一行不带「当前步」名(没有增量信号可指)
+    let compact = draw(&app, 66, 50);
+    assert!(!compact.contains("┌ 七步 "), "七步竖栏必须收起");
+    let line = compact
+        .lines()
+        .find(|l| l.contains("七步 ") && l.contains('·'))
+        .expect("一行进度在场");
+    assert!(
+        line.contains("七步 ······· 引擎无增量进度,跑完给结论"),
+        "一行进度原文:{line:?}"
+    );
+    for name in ["0 前置", "4 合配置", "6 自检"] {
+        assert!(!line.contains(name), "一行进度不指认当前步:{name}:{line:?}");
+    }
+}
+
+const UP_FULL: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","profileDir":"/d","runtimeKey":"rk-1","components":["retention"],"skeletonFiles":["settings.json"],"configKeys":["models.json"],"envPresent":[],"envMissing":[],"convergeHash":"abc123","lockId":"9f8e","upgraded":false,"installedAt":"2026-10-01"}}"#;
+
+/// 跑完后:七步结论只认 `nw/up.v1` data 的冻结字段在场。六面有结论;
+/// 自检在 up 面恒无字段(上游由 CLI 层另起 doctor 复核),明示归 doctor。
+#[test]
+fn 跑完后七步结论按up_v1冻结字段判() {
+    let mut app = fake_app();
+    app.assembling = true;
+    feed(&mut app, out(&["up", "--lock", "9f8e"], 0, UP_FULL));
+    assert!(!app.assembling);
+    app.screen = Screen::Assemble;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("✓✓✓✓✓✓·"), "六面有结论、自检未决,原文拿到:{s:?}");
+    assert!(s.contains("6 面有结论;自检归 doctor(up 不自检)"), "{s:?}");
+}
+
+/// 失败在早段(data 为 null):七步结论明说「引擎没给」,不用 ✓/· 假装。
+#[test]
+fn up失败早段_七步结论明说没给() {
+    let mut app = fake_app();
+    app.assembling = true;
+    feed(
+        &mut app,
+        out(
+            &["up", "--lock", "9f8e"],
+            4,
+            r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":false,"errors":[{"code":"APPLY_FAILED","exitCode":4,"message":"sha256 不符","hint":"重新 bake"}],"warnings":[],"data":null}"#,
+        ),
+    );
+    app.screen = Screen::Assemble;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("引擎没给七步结论(up 面 data 无字段)"), "{s:?}");
+    assert!(!s.contains("✓"), "一个 ✓ 都不编:{s:?}");
+}
+
+/// 契约守卫同源:schema 不是 `nw/up.v1`(如未来的 up.v2)时,七步结论
+/// 明说取不到,绝不按旧形状降级解析出一排 ✓。
+#[test]
+fn schema不是up_v1_七步结论不按旧形状猜() {
+    let mut app = fake_app();
+    app.assembling = true;
+    feed(
+        &mut app,
+        out(
+            &["up", "--lock", "9f8e"],
+            0,
+            r#"{"schema":"nw/up.v2","nw":"9.9.9","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","runtimeKey":"rk","skeletonFiles":[],"components":[],"configKeys":[],"convergeHash":"z"}}"#,
+        ),
+    );
+    app.screen = Screen::Assemble;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("结论取不到:envelope 不是 nw/up.v1"), "{s:?}");
+    assert!(!s.contains("✓✓"), "不按旧形状凑一排 ✓:{s:?}");
 }
 
 // ---- #28 契约守卫:不认识的 schema 走证据面板呈现 ----
@@ -727,15 +843,48 @@ fn 设置屏_引擎版本行常驻_复用既有版本调用() {
     );
 }
 
+#[tokio::test]
+async fn 喂入内容不经运行器进入日志或渲染或配置_机密本体不回显不落盘() {
+    // #55:喂入是运行器能力,但本体绝不进日志行 / 渲染缓冲 / 配置。用 FakeRunner
+    // 记录「收到过喂入」,再把 Finished 路由进 App:喂入的标记(模拟机密)不该出现在
+    // 任何日志行、屏渲染或配置里 —— 守「永不回显密钥」铁律,不是靠注释守。
+    let runner = Arc::new(FakeRunner::new(&[(
+        "ls",
+        0,
+        r#"{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}}"#,
+    )]));
+    let mut app = App::with_runner(runner.clone());
+    let marker = "SUPER-SECRET-TOKEN-55-XYZ";
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    runner.spawn_with_stdin(
+        vec!["ls".into(), "--repo".into(), "/x".into()],
+        marker.as_bytes().to_vec(),
+        tx,
+    );
+    assert_eq!(runner.stdin_feed_count(), 1, "喂入确有一次到达运行器");
+    if let Some(EngineEvent::Finished(o)) = rx.recv().await {
+        feed(&mut app, *o);
+    }
+    assert!(
+        app.log.iter().all(|l| !l.contains(marker)),
+        "最近日志不回显喂入的机密:{:?}",
+        app.log
+    );
+    let s = draw(&app, 110, 30);
+    assert!(!s.contains(marker), "渲染缓冲不回显喂入的机密");
+    let (cfg, _) = crate::engine::config::load();
+    assert!(!format!("{cfg:?}").contains(marker), "配置不落喂入的机密");
+}
+
 // ---- #29 能力探测门(设置屏能力清单渲染) ----
 
 #[test]
 fn 设置屏能力清单_缺能力禁用并指路_紧凑态不截断() {
     use crate::engine::{Capability, FakeRunner, Probe};
-    let runner = FakeRunner::with_stderr(&[("category", 3, "", "nw: 未知子命令 \"category\"")]);
+    // 老引擎(没有 tag 命令组)对 `nw tag` 的回放:stderr 人话「未知子命令」
+    let runner = FakeRunner::with_stderr(&[("tag", 3, "", "nw: 未知子命令 \"tag\"")]);
     let mut app = App::with_runner(std::sync::Arc::new(runner));
-    app.capabilities
-        .record(Capability::Category, Probe::Unavailable);
+    app.capabilities.record(Capability::Tag, Probe::Unavailable);
     app.capabilities.record(Capability::Vps, Probe::Unavailable);
     app.capabilities
         .record(Capability::SourceRegister, Probe::Available);
@@ -744,7 +893,7 @@ fn 设置屏能力清单_缺能力禁用并指路_紧凑态不截断() {
     app.screen = Screen::Settings;
     // 常畅态:禁用组 + 指路句都在
     let s = draw(&app, 110, 30);
-    assert!(s.contains("入口禁用:类别、vps"), "禁用组可见:{s}");
+    assert!(s.contains("入口禁用:vps、标签"), "禁用组可见:{s}");
     assert!(s.contains("缺的是引擎能力,不是面板坏了"), "指路句可见:{s}");
     assert!(s.contains("✓外部源登记"), "齐备能力可见:{s}");
     // 紧凑态 66×50(保证最小):能力行渲染不炸、禁用组可见
@@ -754,10 +903,43 @@ fn 设置屏能力清单_缺能力禁用并指路_紧凑态不截断() {
 }
 
 #[test]
+fn 设置屏能力清单_recipe_new_与烘焙同组不同项_紧凑态不截断() {
+    use crate::engine::{Capability, Probe};
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Settings;
+    for cap in Capability::ALL {
+        app.capabilities.record(cap, Probe::Available);
+    }
+    // 常畅态:八项能力一排(顺序 = 入口清单),recipe new 与 bake 并列(同组不同项)
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    assert!(s.contains("✓配方烘焙"), "烘焙能力在场:{s}");
+    assert!(s.contains("✓配方新建"), "新建能力在场:{s}");
+    assert!(
+        !s.contains("入口禁用") && !s.contains("未决"),
+        "全部可用时不占归组行:{s}"
+    );
+    // 紧凑态 66×50(保证最小):能力行不溢出(竖向预算不变——能力仍是一行)
+    let c = crate::testutil::frame_display(&app, 66, 50);
+    for l in c.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(l) <= 66,
+            "66×50 设置行不溢出:{l}"
+        );
+    }
+    assert!(c.contains("配方新建"), "紧凑态新建能力可见:{c}");
+    assert!(c.contains("标签"), "紧凑态标签能力可见:{c}");
+    // 八项入口一个不少:紧凑态 64 列放不下一行时按显示宽度折行,但不许丢入口
+    for cap in Capability::ALL {
+        assert!(c.contains(cap.label()), "紧凑态 {cap:?} 入口不许被折掉:{c}");
+    }
+}
+
+#[test]
 fn 设置屏能力_无响应回未决不冒充禁用() {
     use crate::engine::{Capability, FakeRunner, Probe};
     // found=true 但探针无回答:空 stdout、无「未知子命令」——归未决
-    let runner = FakeRunner::with_stderr(&[("category", -1, "", "")]);
+    let runner = FakeRunner::with_stderr(&[("tag", -1, "", "")]);
     let mut app = App::with_runner(std::sync::Arc::new(runner));
     for cap in Capability::ALL {
         app.capabilities.record(cap, Probe::Unknown);
@@ -1010,6 +1192,101 @@ fn 配方域建议命令_引擎无bake能力给指路_不冒充面板故障() {
     assert!(
         s2.contains("引擎缺 recipe bake 能力"),
         "未决与禁用同走缺能力指路:{s2}"
+    );
+}
+
+// ---- #58 配方域建议命令补 recipe new:与 bake 同源同层,执行权留给操作者 ----
+
+#[test]
+fn 配方域建议命令_选中即给出recipe_new_骨架名与out_dir同源() {
+    use crate::engine::{Capability, Probe};
+    let mut app = bake_app();
+    app.capabilities
+        .record(Capability::RecipeNew, Probe::Available);
+    app.data_root = Some("/tmp".to_string());
+    // 常畅态:新建骨架命令整段在场(详情内层窄,按宽折行是真设计;
+    // 旗标一段都不少,拼回来的串与纯函数层逐字相同)
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("nw recipe new research-desk"), "命令起头:{s}");
+    assert!(s.contains("--out-dir"), "--out-dir 填数据仓根:{s}");
+    assert!(
+        crate::engine::commands::recipe_new_suggest(Some("research-desk"), Some("/tmp"), true)
+            .expect("三前提齐备")
+            .display
+            == "nw recipe new research-desk --out-dir /tmp",
+        "展示串由 argv 拼出(与屏上折行片段同一处真相)"
+    );
+    assert!(s.contains("新建配方骨架"), "标成新建骨架:{s}");
+    assert!(s.contains("执行权在你"), "执行权归属说清:{s}");
+    assert!(s.contains("面板不代跑"), "不冒充面板代跑:{s}");
+    assert!(
+        s.contains("schema nw/recipe-new.v1"),
+        "schema 照引擎原话:{s}"
+    );
+    assert!(
+        s.contains("不填 --profile") && s.contains("按配方名兜底"),
+        "派名缺省照引擎原话:{s}"
+    );
+    // bake 仍在:两条建议命令同一块区域,谁也不顶掉谁
+    assert!(
+        s.contains("nw recipe bake research-desk@1.0.0"),
+        "bake 建议命令仍在:{s}"
+    );
+    // 常畅态两档 + 紧凑态:命令按内层宽折行,旗标一段都不少,行不溢出
+    for (w, h) in [(110u16, 30u16), (90, 30), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("nw recipe new"), "{w}×{h} 新建命令在场:{f}");
+        assert!(f.contains("--out-dir"), "{w}×{h} 旗标在场:{f}");
+        for l in f.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= usize::from(w),
+                "{w}×{h} 行不溢出:{l}"
+            );
+        }
+    }
+    // 最挤的常畅态 80×30:详情内层只有 22 列,bake 的建议命令就把内层占满——
+    // 放不下就**整块**不渲染,绝不在屏上留半条命令(标题在、旗标被裁)。
+    let tight = crate::testutil::frame_display(&app, 80, 30);
+    assert!(tight.contains("nw recipe bake"), "bake 不受影响:{tight}");
+    assert!(
+        !tight.contains("nw recipe new"),
+        "放不下时整块不收,不给半条命令:{tight}"
+    );
+}
+
+#[test]
+fn 配方域建议命令_recipe_new_三种缺前提各有可区分指路_不给半条命令() {
+    use crate::engine::{Capability, Probe};
+    // 引擎没有 recipe new 能力:指路点名 recipe new,不拿 bake 的话冒充
+    let mut app = bake_app();
+    app.capabilities
+        .record(Capability::RecipeNew, Probe::Unavailable);
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("引擎缺 recipe new 能力"), "缺能力指路:{s}");
+    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    assert!(!s.contains("nw recipe new"), "缺能力不给半条命令:{s}");
+    // 未决(探测失败)同样不给命令,且与禁用同走缺能力指路
+    app.capabilities
+        .record(Capability::RecipeNew, Probe::Unknown);
+    let s3 = draw(&app, 110, 30);
+    assert!(!s3.contains("nw recipe new"), "未决不给命令:{s3}");
+    assert!(
+        s3.contains("引擎缺 recipe new 能力"),
+        "未决与禁用同走缺能力指路:{s3}"
+    );
+    // 未设数据仓根:--out-dir 指不到本地仓,同样不给半条命令
+    let mut app = bake_app();
+    app.capabilities
+        .record(Capability::RecipeNew, Probe::Available);
+    app.data_root = None;
+    let s2 = draw(&app, 110, 30);
+    assert!(s2.contains("数据仓根未设"), "未设根指路:{s2}");
+    assert!(!s2.contains("nw recipe new"), "未设根不给半条命令:{s2}");
+    assert!(!s2.contains("--out-dir"), "连旗标都不给:{s2}");
+    // 门不放行(纯函数层的三态可区分已在 commands.rs 单测钉过)
+    assert_eq!(
+        app.recipe_new_suggest_gate(),
+        Err(crate::engine::commands::RecipeNewGate::NoDataRoot)
     );
 }
 
@@ -1352,4 +1629,302 @@ fn 外部源漂移_紧凑66x50_结论与证据可读不溢出() {
             "66×50 行不溢出:{l}"
         );
     }
+}
+
+// ---- #61 五域搜索过滤:纯本地筛选,空结果两态可区分指路 ----
+
+/// 五域各两条的夹具(#61):每域第二条都带独特可检索词,过滤后应只剩它一条。
+/// 形状照引擎 `nw ls` 原文(components 带 path/depends 对象数组/usedBy;
+/// locks 的 recipe 是裸字符串形),不是面板自造。
+const LS_FIVE: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0","path":"recipes/research-desk/recipe.yaml"},{"name":"night-shift","version":"1.1.0","path":"recipes/night-shift/recipe.yaml"}],"components":[{"name":"retention","version":"0.4.1","path":"components/retention","depends":[],"usedBy":["research-desk"]},{"name":"sentry","version":"0.9.0","path":"components/sentry","depends":[{"name":"retention","version":"0.4.1"}],"usedBy":[]}],"sources":[{"name":"web-search","repo":"JoeWest9966/skills-web","kind":"skill","category":["检索","网络"],"entries":[{"name":"deep-research","path":"skills/deep-research"}]},{"name":"theme-pack","kind":"extension","category":[],"entries":[]}],"profiles":[{"name":"desk","state":"drift","lockId":"9f8e"},{"name":"lab","state":"ok","lockId":"a1b2"}],"locks":[{"lockId":"9f8e","recipe":"research-desk","bakedAt":"2026-10-01"},{"lockId":"c3d4","recipe":"night-shift","bakedAt":"2026-10-02"}]}"#;
+
+fn five_app() -> App {
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Recipes;
+    app.ls = Some(serde_json::from_str(LS_FIVE).unwrap());
+    app
+}
+
+/// 派一个键(与既有测试同一条入口:`Message::Key` → `App::update`)。
+fn key(app: &mut App, code: crossterm::event::KeyCode) {
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        code,
+        crossterm::event::KeyModifiers::NONE,
+    )));
+}
+
+/// 敲一串字符(过滤词键入)。
+fn type_str(app: &mut App, s: &str) {
+    for c in s.chars() {
+        key(app, crossterm::event::KeyCode::Char(c));
+    }
+}
+
+/// 进过滤输入态并敲入 `q`(不做收词,保留输入态可断言)。
+fn filter_with(app: &mut App, q: &str) {
+    key(app, crossterm::event::KeyCode::Char('/'));
+    type_str(app, q);
+}
+
+/// 走**回音路**的 ls 夹具(#61):与直接塞 `app.ls` 不同,这条经过 envelope
+/// 解析(schema 认识才拆 data)——用来验证「刷新五域」的真路径,不是旁路设状态。
+const LS_ONE_RECIPE: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0"}],"components":[],"sources":[],"profiles":[],"locks":[]}"#;
+const LS_EMPTY: &str =
+    r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#;
+
+fn ls_out(data: &str) -> EngineOutput {
+    out(
+        &["ls"],
+        0,
+        &format!(
+            r#"{{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{data}}}"#
+        ),
+    )
+}
+
+/// 每域一个只命中第二条的独特词(#61:五域都要能过滤)。
+fn five_query(d: crate::app::Domain) -> &'static str {
+    match d {
+        crate::app::Domain::Recipes => "night",
+        crate::app::Domain::Components => "sentry",
+        crate::app::Domain::Sources => "theme",
+        crate::app::Domain::Profiles => "lab",
+        crate::app::Domain::Locks => "c3d4",
+    }
+}
+
+#[test]
+fn 五域搜索过滤_键入即筛_纯本地不新增引擎调用() {
+    for d in crate::app::Domain::ALL {
+        let mut app = five_app();
+        app.rc_domain = d;
+        let before = format!("{:?}", app.ls);
+        filter_with(&mut app, five_query(d));
+        assert_eq!(app.domain_len(), 1, "{d:?} 过滤后只剩命中那条");
+        assert_eq!(app.rc_sel, 0, "{d:?} 选中回顶");
+        let s = draw(&app, 110, 30);
+        assert!(s.contains(five_query(d)), "{d:?} 命中行在场:{s}");
+        assert!(!s.contains("research-desk"), "{d:?} 未命中行被筛掉:{s}");
+        // 纯本地铁律:不入队、不下发任何引擎命令,ls 回音逐字节不动
+        assert!(app.queue.is_empty(), "{d:?} 过滤不入队:{:?}", app.queue);
+        assert_eq!(format!("{:?}", app.ls), before, "{d:?} 数据来源不动");
+        assert!(!app.ls_loading, "{d:?} 不假装在加载");
+    }
+}
+
+#[test]
+fn 五域搜索过滤_大小写不敏感_可退格改词() {
+    let mut app = five_app();
+    filter_with(&mut app, "NIGHT");
+    assert_eq!(app.domain_len(), 1, "大写同样命中");
+    let mut app2 = five_app();
+    filter_with(&mut app2, "Shift");
+    assert_eq!(app2.domain_len(), 1, "小写片段同样命中");
+    // 退格到空 = 不过滤,回到全量(与过滤前逐字节相同)
+    for _ in 0..5 {
+        key(&mut app, crossterm::event::KeyCode::Backspace);
+    }
+    assert!(app.rc_filter.is_empty(), "退格清空缓冲");
+    assert_eq!(app.domain_len(), 2, "空词回到全量");
+}
+
+#[test]
+fn 空结果两态指路_域真空与被过滤空_标题与说法两两不同() {
+    // 域真空:组件域就是没有条目,且没有过滤词
+    let mut vacant = five_app();
+    vacant.rc_domain = crate::app::Domain::Components;
+    vacant.ls = Some(
+        serde_json::from_str(
+            r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
+        )
+        .unwrap(),
+    );
+    let s = draw(&vacant, 110, 30);
+    assert!(s.contains("组件域为空"), "域真空有指路:{s}");
+    assert!(s.contains("还没有条目"), "域真空说清是域里没有:{s}");
+    assert!(!s.contains("无命中"), "域真空不被说成过滤空:{s}");
+
+    // 被过滤空:同一域两条,关键词把两条都筛掉
+    let mut filtered = five_app();
+    filtered.rc_domain = crate::app::Domain::Components;
+    filter_with(&mut filtered, "zzz");
+    assert_eq!(filtered.domain_len(), 0, "全被筛掉");
+    let s2 = draw(&filtered, 110, 30);
+    assert!(s2.contains("组件无命中"), "被过滤空有指路:{s2}");
+    assert!(
+        s2.contains("「zzz」在 2 条里没有命中"),
+        "被过滤空带词与总数:{s2}"
+    );
+    assert!(s2.contains("按 / 改词"), "给改词的路:{s2}");
+    assert!(s2.contains("Esc 清空过滤"), "给清空的路:{s2}");
+    assert!(!s2.contains("组件域为空"), "被过滤空不冒充域真空:{s2}");
+    assert!(!s2.contains("还没有条目"), "两态说法不混用:{s2}");
+    // 详情栏同样不给旧行残影,也不换一套说法
+    assert!(s2.contains("组件无命中"), "详情同因由:{s2}");
+    assert!(!s2.contains("retention"), "旧行不残影:{s2}");
+}
+
+#[test]
+fn 切域清空过滤词_选中回顶_旧词不跨域滞留() {
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Components;
+    filter_with(&mut app, "sentry");
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    app.rc_sel = 0;
+    key(&mut app, crossterm::event::KeyCode::Char('l'));
+    assert_eq!(app.rc_domain, crate::app::Domain::Sources, "l 切到外部源");
+    assert!(app.rc_filter.is_empty(), "切域清空过滤词");
+    assert!(!app.rc_filter_on, "输入态不跨域停留");
+    assert_eq!(app.rc_sel, 0, "选中回顶");
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("web-search"), "切域后回到全量:{s}");
+    assert!(s.contains("theme-pack"), "全量两条都在:{s}");
+}
+
+#[test]
+fn 切屏保留过滤词但退输入态_输入态不吞新屏的键() {
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Recipes;
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    assert!(app.rc_filter_on, "/ 进过滤输入态");
+    type_str(&mut app, "night");
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(!app.rc_filter_on, "Enter 收词退输入态");
+    assert_eq!(app.rc_filter, "night", "收词后过滤词留着");
+    // 切屏(j):过滤词保留,输入态已退,新屏的键位照常
+    // (#53 起屏序六块:概览/装配/健康/配方/编目/设置,配方之后是编目屏)
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    assert_eq!(app.screen, Screen::Vps, "j 切到下一屏(编目册屏)");
+    assert!(!app.rc_filter_on, "切屏后输入态不驻留");
+    assert_eq!(app.rc_filter, "night", "过滤词跨屏保留");
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    assert_eq!(app.screen, Screen::Settings, "新屏的键位照常");
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    assert_eq!(app.screen, Screen::Overview, "再切绕回概览");
+    // 回配方屏:列表仍是过滤态(标题显命中/总数,状态可见)
+    key(&mut app, crossterm::event::KeyCode::Char('k'));
+    key(&mut app, crossterm::event::KeyCode::Char('k'));
+    key(&mut app, crossterm::event::KeyCode::Char('k'));
+    assert_eq!(app.screen, Screen::Recipes, "k 回配方屏");
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("night-shift"), "过滤态跨屏仍在:{s}");
+    assert!(!s.contains("research-desk"), "未命中行仍被筛掉:{s}");
+    assert!(s.contains("配方 1/2"), "标题显命中/总数:{s}");
+    // 输入态里 j 是缓冲字符,不是切屏(输入态优先于屏键位,同两份手填)
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    key(&mut app, crossterm::event::KeyCode::Char('j'));
+    assert_eq!(app.screen, Screen::Recipes, "输入态里 j 不切屏");
+    assert_eq!(app.rc_filter, "nightj", "输入态里 j 进缓冲");
+}
+
+#[test]
+fn 刷新五域_过滤词仍生效_选中钳到新的可见行数() {
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Recipes;
+    filter_with(&mut app, "desk");
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(app.domain_len(), 1, "desk 只命中 research-desk");
+    // 刷新:新回音仍过同一道筛(纯本地),选中不越界
+    feed(&mut app, ls_out(LS_ONE_RECIPE));
+    assert_eq!(app.domain_len(), 1, "刷新后过滤词仍生效");
+    assert_eq!(app.rc_sel, 0, "选中钳在可见行数内");
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("research-desk"), "新回音过筛后在场:{s}");
+    // 再刷新成空域:可见行数 0,选中钳回 0(不越界、不指向另一条)
+    feed(&mut app, ls_out(LS_EMPTY));
+    assert_eq!(app.domain_len(), 0, "空域可见 0 条");
+    assert_eq!(app.rc_sel, 0, "选中钳回 0");
+    let s2 = draw(&app, 110, 30);
+    assert!(s2.contains("配方无命中"), "过滤词把新回音也筛空了:{s2}");
+    assert!(
+        app.queue.is_empty(),
+        "过滤与回音处理都不入队:{:?}",
+        app.queue
+    );
+}
+
+#[test]
+fn 过滤后选中行不错位_c取用建议命令作用于看得见的那一行() {
+    use crate::engine::{Capability, Probe};
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Recipes;
+    app.capabilities
+        .record(Capability::RecipeBake, Probe::Available);
+    app.data_root = Some("/tmp".into());
+    // 不过滤时第 0 条是 research-desk:先钉住过滤前的口径
+    let plain = draw(&app, 110, 30);
+    assert!(
+        plain.contains("nw recipe bake research-desk@0.2.0"),
+        "{plain}"
+    );
+    filter_with(&mut app, "night");
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(app.domain_len(), 1, "只剩 night-shift");
+    key(&mut app, crossterm::event::KeyCode::Char('c'));
+    assert!(app.rc_bake_sel, "过滤后仍可取用(只读)");
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("nw recipe bake night-shift@1.1.0"),
+        "取用的是看得见的那一行:{s}"
+    );
+    assert!(
+        !s.contains("research-desk@0.2.0"),
+        "不错位到原始数组第 0 条:{s}"
+    );
+    // 选中态复位:过滤词一动,建议命令的只读选中态跟着清(不冒充旧行的)
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    type_str(&mut app, "x");
+    assert!(!app.rc_bake_sel, "改词即复位只读选中态");
+    assert!(app.queue.is_empty(), "全程不入队、不执行:{:?}", app.queue);
+}
+
+#[test]
+fn 常畅与紧凑两档_过滤态布局不溢出不删内容() {
+    let mut app = five_app();
+    app.rc_domain = crate::app::Domain::Components;
+    filter_with(&mut app, "sentry");
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        for l in f.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= usize::from(w),
+                "{w}×{h} 行不溢出:{l}"
+            );
+        }
+        assert!(f.lines().any(|l| l.contains("└")), "{w}×{h} 块边框在场");
+        assert!(f.contains("sentry"), "{w}×{h} 命中行可见:{f}");
+    }
+    // 紧凑态:五域 Tab 行照旧一排,当前域计数显命中/总数
+    let c = crate::testutil::frame_display(&app, 66, 50);
+    for label in ["配方", "组件", "外部源", "派", "锁定集"] {
+        assert!(c.contains(label), "66×50 五域 Tab 齐:{label}");
+    }
+    assert!(
+        c.contains("▸ 组件(2)"),
+        "过滤态 Tab 计数仍是原总数(不改导航布局):{c}"
+    );
+    assert!(c.contains("组件 1/2"), "命中/总数由列表块标题说:{c}");
+    // 常畅态:五域竖轨照旧
+    let m = crate::testutil::frame_display(&app, 80, 30);
+    assert!(m.contains("┌ 五域 "), "常畅态五域竖轨原样在场:{m}");
+}
+
+#[test]
+fn 不过滤时渲染与过滤前逐字节相同() {
+    let mut app = five_app();
+    let plain = draw(&app, 110, 30);
+    // 无过滤词:标题只有域名、计数是原总数,没有任何过滤痕迹
+    assert!(plain.contains(" 配方 "), "标题只有域名:{plain}");
+    assert!(!plain.contains('/'), "无过滤痕迹:{plain}");
+    assert!(!plain.contains("无命中"), "无空态指路:{plain}");
+    assert!(!plain.contains("域为空"), "无空态指路:{plain}");
+    // Esc 在无过滤词时什么都不做(不新增键位语义)
+    let before = format!("{:?}", app.rc_filter);
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert_eq!(
+        format!("{:?}", app.rc_filter),
+        before,
+        "无过滤词时 Esc 空动作"
+    );
 }

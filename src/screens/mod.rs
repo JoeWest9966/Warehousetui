@@ -7,12 +7,21 @@ use crate::app::App;
 use crate::ui::screen_block;
 
 mod assemble;
+pub(crate) mod catalog;
 mod health;
 mod overview;
-mod recipes;
+pub(crate) mod recipes;
 mod settings;
 
 pub use assemble::render_assemble;
+#[allow(unused_imports)]
+pub use catalog::{
+    new_form, new_key_form, new_sub_form, new_tag_form, on_key_form, on_key_key_form,
+    on_key_sub_form, on_key_tag_form, render_catalog, spec_from_form, spec_from_key_form,
+    spec_from_sub_form, spec_from_tag_form, Audit, CatalogKind, FormAction, KeyField, KeyForm,
+    KeySpec, RegPhase, RegisterFlow, RegisterSpec, SecretBody, SubField, SubForm, SubscriptionSpec,
+    TagField, TagForm, TagFormMode, TagSpec, VpsField, VpsForm, VpsSpec,
+};
 pub use health::render_health;
 pub use overview::render_overview;
 pub use recipes::render_recipes;
@@ -27,6 +36,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         crate::app::Screen::Assemble => render_assemble(frame, area, app),
         crate::app::Screen::Health => render_health(frame, area, app),
         crate::app::Screen::Recipes => render_recipes(frame, area, app),
+        crate::app::Screen::Vps => render_catalog(frame, area, app),
         crate::app::Screen::Settings => render_settings(frame, area, app),
     }
 }

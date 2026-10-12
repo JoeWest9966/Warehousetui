@@ -4,6 +4,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::engine::config;
@@ -44,22 +45,37 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
     // 能力节(#29):竖向预算钉死——面板在 110×30 内层 24 行,既有 21 行
     // 之外只许 +3(config 告警必须留在屏内,既有测试钉着);横向按紧凑态
     // 62 列排:总行只放标记+名,状态归组行,指路单独一行。
+    // #63:入口清单八项(去掉指向上游不存在子命令的「类别」,补 key/订阅/标签
+    // 三条组级探针),常畅态 96 列仍是一行;紧凑态内层 64 列放不下时按显示
+    // 宽度折行——竖向只多一行(紧凑态 66×50 内层 40+ 行,放得下),**不许
+    // 截掉入口**:截掉等于面板对操作者隐瞒引擎有或没有的能力。
     let verdicts: Vec<(Capability, Probe)> = Capability::ALL
         .into_iter()
         .map(|c| (c, app.capabilities.get(c)))
         .collect();
-    let mut row1 = vec![Span::raw("  "), Span::styled("能力 ", p.accent())];
+    let mut rows: Vec<Line> = Vec::new();
+    let mut row = vec![Span::raw("  "), Span::styled("能力 ", p.accent())];
+    let mut used = UnicodeWidthStr::width("  能力 ");
     for (cap, v) in &verdicts {
         let (mark, style) = match v {
             Probe::Available => ("✓", p.ok()),
             Probe::Unavailable => ("✗", p.fail()),
             Probe::Unknown => ("?", p.warn()),
         };
-        row1.push(Span::styled(mark, style));
-        row1.push(Span::raw(cap.label()));
-        row1.push(Span::raw(" "));
+        // 一格宽标记 + 入口名 + 一格间隔
+        let w = 1 + UnicodeWidthStr::width(cap.label()) + 1;
+        if used + w > inner.width as usize && row.len() > 2 {
+            rows.push(Line::from(std::mem::take(&mut row)));
+            row.push(Span::raw("  "));
+            used = 2;
+        }
+        row.push(Span::styled(mark, style));
+        row.push(Span::raw(cap.label()));
+        row.push(Span::raw(" "));
+        used += w;
     }
-    lines.push(Line::from(row1));
+    rows.push(Line::from(row));
+    lines.extend(rows);
     let disabled: Vec<&str> = verdicts
         .iter()
         .filter(|(_, v)| *v == Probe::Unavailable)

@@ -14,7 +14,8 @@ Status: accepted
 
 ## Consequences
 
-- ADR-0003 的「三类」扩为「四类」，新增仅 register / recheck 这一类；`bake` / `recipe new` / `category` / `vps` / 手改配置维持「只展示证据与建议命令，不代跑」。
+- ADR-0003 的「三类」扩为「四类」，新增仅 register / recheck 这一类；`bake` / 手改配置维持「只展示证据与建议命令，不代跑」。
+- **订正（ADR-0009，accepted）**：本句原稿还把 `recipe new` / `category` / `vps` 列在「维持只展示证据与建议命令」里，三者的现状都已变——`recipe new` 由 #58 给出建议命令（仍未代跑，形态不变）；`category` **从来就不存在**（`--category` 是 `source register` 的旗标，该能力项已由 #63 移除，不是「等引擎升级」）；`vps` 由 ADR-0009 获准两段式代跑。**本 ADR 开的口子只到 `source register` / `source recheck`，没有扩展到四组编目；那一层由 ADR-0009 单独裁定。**
 - `src/engine/commands.rs` 增 `source_register(repo, kind, name?, yes)`、`source_recheck(name?)`；一律走既有 `App::spawn_engine` 单缝与 `CommandRunner`（Real / Missing / Fake 可测）。
 
 > **实现勘误（以工单 #30/#31 实装为准）**：实装为 `commands::source_register_preaudit(repo, kind, root)` 与 `commands::source_register_commit(repo, kind, root)` 两函数——均带 `--root <数据仓根>`，均无 `--name`（类别不输入、落「未分类」），与上文草图 `source_register(repo, kind, name?, yes)` 不同。

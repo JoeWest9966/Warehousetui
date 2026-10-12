@@ -45,7 +45,7 @@ NW_HOME=/opt/nwt-realrun/nw-home sh assembly-command.sh   # 用已发布的那�
 | 帧 | 屏 | 真数据实录 |
 |---|---|---|
 | 01 | 概览 | 数据仓根未设指路(不拿当前目录兜底);日志 `ls 未下发:数据仓根未设` |
-| 02–04 | 设置 | 手填数据仓根 `/opt/Data-001` → 真 ls 回音;引擎发现:PATH `/usr/local/bin/nw`,**版本 nw 0.1.0**,能力 ✓登记 ✓复核 ✓烘焙 ?类别(未决)✓vps |
+| 02–04 | 设置 | 手填数据仓根 `/opt/Data-001` → 真 ls 回音;引擎发现:PATH `/usr/local/bin/nw`,**版本 nw 0.1.0**,能力 ✓登记 ✓复核 ✓烘焙 ✗类别 ✓vps(帧 04 实录:`nw category` 无此子命令,stderr 回「未知子命令」→ 该行判「入口禁用」并带一句指路;#63 起这项入口已从能力清单移除——它指着一台上游不存在的机器,同时补探 key / 订阅 / 标签 三个上游真实命令组) |
 | 05 | 配方 | 五域真计数:配方 1 / 组件 2 / 外部源 0 / 派 1 / 锁定集 1;`research-desk 1.0.0` 详情;**建议命令** `nw recipe bake research-desk@1.0.0 --out research-desk.sh --repo /opt/Data-001`(执行权留给操作者) |
 | 07 | 健康·doctor | **rc 10 降级**七面:manifest ● / consist ●● / converge ●(指纹与清单一致)/ config ●(9 键)/ env ✗(TAVILY_API_KEY)/ runtime ◐(派目录里 pi 尚未起过,预期)/ provider ✗;证据五字段原样:`[DEGRADED rc10] env {"missing":["TAVILY_API_KEY"]}`、`provider {"reason":"credentials_not_configured"}` |
 | 08 | 健康·validate | **27 项:过 12 警 0 败 0 略 15**(真配方文件路径下发,见 G4) |

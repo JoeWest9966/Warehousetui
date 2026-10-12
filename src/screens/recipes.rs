@@ -150,15 +150,20 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    let items: Vec<Line> = match app.ls.as_ref() {
+    // 过滤后的可见行(#61):列表、选中、命中区、详情都走这一份下标——
+    // 「看得见的那一行」全屏只有一个口径。
+    let vis = app.rc_visible();
+    let filtering = !app.rc_filter.trim().is_empty();
+    let mut items: Vec<Line> = match app.ls.as_ref() {
         None => vec![Line::from(Span::styled(
             "没有 ls 数据,回概览按 r。",
             p.dim(),
         ))],
         Some(l) => match app.rc_domain {
-            Domain::Recipes => l
-                .recipes
+            Domain::Recipes => vis
                 .iter()
+                .copied()
+                .filter_map(|i| l.recipes.get(i))
                 .map(|r| {
                     Line::from(format!(
                         "{}  {}",
@@ -167,9 +172,10 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
                     ))
                 })
                 .collect(),
-            Domain::Components => l
-                .components
+            Domain::Components => vis
                 .iter()
+                .copied()
+                .filter_map(|i| l.components.get(i))
                 .map(|c| {
                     Line::from(vec![
                         Span::raw(c.name.clone()),
@@ -192,29 +198,26 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
                     ])
                 })
                 .collect(),
-            Domain::Sources => {
-                let mut v: Vec<Line> = l
-                    .sources
-                    .iter()
-                    .map(|s| {
-                        Line::from(vec![
-                            Span::raw(s.name.clone()),
-                            Span::raw(" "),
-                            // 链接缺失给「——」,不用空串冒充「没有这个字段」(#37)
-                            Span::styled(
-                                s.repo.as_deref().filter(|r| !r.is_empty()).unwrap_or("——"),
-                                p.dim(),
-                            ),
-                        ])
-                    })
-                    .collect();
-                // 登记入口提示(#30):根不可用时整个域已走上方 signpost,不进此分支。
-                v.push(register_entry_hint(app));
-                v
-            }
-            Domain::Profiles => l
-                .profiles
+            Domain::Sources => vis
                 .iter()
+                .copied()
+                .filter_map(|i| l.sources.get(i))
+                .map(|s| {
+                    Line::from(vec![
+                        Span::raw(s.name.clone()),
+                        Span::raw(" "),
+                        // 链接缺失给「——」,不用空串冒充「没有这个字段」(#37)
+                        Span::styled(
+                            s.repo.as_deref().filter(|r| !r.is_empty()).unwrap_or("——"),
+                            p.dim(),
+                        ),
+                    ])
+                })
+                .collect(),
+            Domain::Profiles => vis
+                .iter()
+                .copied()
+                .filter_map(|i| l.profiles.get(i))
                 .map(|pr| {
                     Line::from(format!(
                         "{}  {}",
@@ -223,9 +226,10 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
                     ))
                 })
                 .collect(),
-            Domain::Locks => l
-                .locks
+            Domain::Locks => vis
                 .iter()
+                .copied()
+                .filter_map(|i| l.locks.get(i))
                 .map(|k| {
                     Line::from(format!(
                         "{}  {}",
@@ -236,6 +240,15 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
                 .collect(),
         },
     };
+    // 空列表的两态指路(#61):域真空 vs 被过滤空——占数据行位。
+    if app.ls.is_some() && vis.is_empty() {
+        items.extend(list_empty_lines(app, p));
+    }
+    // 登记入口提示(#30)是入口、不是数据行:始终留在列表**尾行**,
+    // 过滤后也不例外(根不可用时整个域已走上方 signpost,不进此分支)。
+    if app.rc_domain == Domain::Sources && app.ls.is_some() {
+        items.push(register_entry_hint(app));
+    }
     let mut st = ListState::default();
     let n = app.domain_len();
     if n > 0 {
@@ -243,14 +256,85 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
     }
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::bordered().border_style(p.dim()).title(Span::styled(
-                format!(" {} ", app.rc_domain.label()),
-                p.accent(),
-            )))
+            .block(
+                Block::bordered()
+                    .border_style(p.dim())
+                    .title(Span::styled(list_title(app, filtering), p.accent())),
+            )
             .highlight_style(p.sel()),
         area,
         &mut st,
     );
+}
+
+/// 列表块标题(#61):过滤态显「命中/总数」——被过滤空在标题层就与域真空
+/// (标题只有域名)可区分;无过滤词时与过滤前逐字节相同。
+fn list_title(app: &App, filtering: bool) -> String {
+    let label = app.rc_domain.label();
+    if !filtering {
+        return format!(" {label} ");
+    }
+    format!(
+        " {label} {}/{} ",
+        app.domain_len(),
+        domain_count(app, app.rc_domain)
+    )
+}
+
+/// 空列表的两种因由(#61):照仓内 `DataRootCause` / `BakeGate` 的既有范式——
+/// 一个 enum 管「为什么空」,标题与说法两两不同。域真空说「这一域没有条目」,
+/// 被过滤空说「词把条目筛掉了」并给改词/清空的路;两种空互不冒充。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListEmptyCause {
+    /// 数据仓里这一域就是没有条目。
+    Vacant,
+    /// 有关键词,把它全筛掉了。
+    Filtered,
+}
+
+impl ListEmptyCause {
+    /// 由当前过滤词定性:空串 = 域真空,非空 = 被过滤空。
+    fn of_app(app: &App) -> Self {
+        if app.rc_filter.trim().is_empty() {
+            Self::Vacant
+        } else {
+            Self::Filtered
+        }
+    }
+
+    /// 指路标题:两态各说各话。
+    fn title(self, d: Domain) -> String {
+        match self {
+            Self::Vacant => format!("{}域为空", d.label()),
+            Self::Filtered => format!("{}无命中", d.label()),
+        }
+    }
+
+    /// 指路人话:每态一条,带各自的事实与下一步。
+    fn advice(self, d: Domain, q: &str, total: usize) -> Vec<String> {
+        match self {
+            Self::Vacant => vec![format!("数据仓的{}里还没有条目。", d.label())],
+            Self::Filtered => vec![
+                format!("「{q}」在 {total} 条里没有命中。"),
+                "按 / 改词 · Esc 清空过滤".to_string(),
+            ],
+        }
+    }
+}
+
+/// 空态指路行(#61):标题一行 + 说法若干行,两态两套文案。列表块与详情块
+/// **共用同一份**(一个概念只有一个拼写,不在两处各写一句)。
+fn list_empty_lines(app: &App, p: &crate::theme::Palette) -> Vec<Line<'static>> {
+    let cause = ListEmptyCause::of_app(app);
+    let total = domain_count(app, app.rc_domain);
+    let mut v = vec![Line::from(Span::styled(
+        cause.title(app.rc_domain),
+        p.warn(),
+    ))];
+    for a in cause.advice(app.rc_domain, app.rc_filter.trim(), total) {
+        v.push(Line::from(Span::styled(a, p.dim())));
+    }
+    v
 }
 
 /// 字段缺失(引擎没给 / 空串)时给「——」——不猜、不编默认值(#37 验收)。
@@ -393,20 +477,94 @@ fn bake_empty_lines(p: &crate::theme::Palette, app: &App, w: usize) -> Vec<Line<
     lines
 }
 
+/// 配方域**新建骨架**建议命令区(spec #33 / 工单 #58,ADR-0003 + ADR-0006):
+/// 紧随 bake 之后同一块地方给出 `nw recipe new …` 文案。与 bake 完全同源——
+/// argv 与展示串都出自 `commands::recipe_new_suggest` 这一个纯函数层,
+/// 旗标拼装只有一处真相;面板**永远不执行**(执行权留给操作者,
+/// `App` 没有任何路径会把它下发)。
+///
+/// 三种缺前提各有可区分指路(标题 + 说法),**绝不渲染半条命令**;
+/// 说法与 bake 的同名指路不同文——点名的旗标是 `--out-dir`,不冒充。
+///
+/// `room` 是详情内层还能给几行(末行已预留给 `c` 键位行)。竖向放不下时
+/// 从尾部收口:先收引擎口径注(整条收,不截半句),头(标题 + 命令)
+/// 放不下就整块不渲染——窗口再窄,屏上也不会出现半条命令。
+fn recipe_new_suggest_lines(
+    p: &crate::theme::Palette,
+    app: &App,
+    r: &crate::engine::RecipeRow,
+    w: usize,
+    room: usize,
+) -> Vec<Line<'static>> {
+    // 头:标题 + 命令本体(或指路标题 + 说法)。
+    let mut head = vec![Line::from(Span::styled(
+        "建议命令 · 新建配方骨架(执行权在你)",
+        p.accent(),
+    ))];
+    let mut notes: Vec<String> = Vec::new();
+    match crate::engine::commands::recipe_new_suggest(
+        Some(r.name.as_str()),
+        app.usable_data_root().as_deref(),
+        app.capabilities
+            .enabled(crate::engine::Capability::RecipeNew),
+    ) {
+        Ok(s) => {
+            for (i, ln) in wrap(&s.display, w.saturating_sub(4)).iter().enumerate() {
+                let indent = if i == 0 { "  " } else { "    " };
+                head.push(Line::from(Span::styled(format!("{indent}{ln}"), p.text())));
+            }
+            // 引擎自己的缺省与落点照原话说:面板不内置第二份真相,
+            // 也不替引擎承诺它没说的行为。
+            notes.push("面板不代跑;不填 --profile 引擎按配方名兜底(#8 布局)".to_string());
+            notes.push(
+                "骨架落 <out-dir>/recipes/<名>/recipe.yaml —— schema nw/recipe-new.v1".to_string(),
+            );
+        }
+        Err(g) => {
+            head.push(Line::from(Span::styled(
+                format!("  ⚠ {}", g.title()),
+                p.warn().bold(),
+            )));
+            notes.push(g.advice());
+        }
+    }
+    if head.len() > room {
+        return Vec::new();
+    }
+    let mut lines = head;
+    for n in &notes {
+        let wrapped = wrap(n, w.saturating_sub(2));
+        if lines.len() + wrapped.len() > room {
+            break;
+        }
+        for ln in wrapped {
+            lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+        }
+    }
+    lines
+}
+
 fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
+    // 过滤后的可见下标:详情取的是**看得见的那一行**(#61),不过滤时与过去
+    // 的 `l.xxx.get(rc_sel)` 逐个等价。
+    let vis = app.rc_visible();
+    let row = |i: usize| vis.get(i).copied();
     let mut lines: Vec<Line> = if app.data_root_cause().is_some() {
         vec![Line::from(Span::styled(
             "根不对,详情未读取——先按指路设好数据仓根。",
             p.dim(),
         ))]
+    // 被过滤空(#61):详情不给旧行残影,也不拿域真空的说法冒充——
+    // 与列表块同一份因由,标题与说法两态两套。
+    } else if app.ls.is_some() && !app.rc_filter.trim().is_empty() && vis.is_empty() {
+        list_empty_lines(app, p)
     } else {
         match app.ls.as_ref() {
             None => vec![Line::from(Span::styled("—", p.dim()))],
             Some(l) => match app.rc_domain {
-                Domain::Recipes => l
-                    .recipes
-                    .get(app.rc_sel)
+                Domain::Recipes => row(app.rc_sel)
+                    .and_then(|i| l.recipes.get(i))
                     .map(|r| {
                         // 建议命令区(#39)与选中行联动重算;键位行钉在内层
                         // 末行(命中侧同几何,见 layout::recipes_hits)。
@@ -419,12 +577,16 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                             Line::from(""),
                         ];
                         v.extend(bake_suggest_lines(p, app, r, inner_w(area)));
+                        // 新建骨架建议命令(#58):紧随 bake 同一块区域,
+                        // 与 bake 同源同层(同一个纯函数层算 argv 与展示串)。
+                        // 末行预留给 `c` 键位行,放不下时该块自行收口。
+                        let room = inner_h(area).saturating_sub(1).saturating_sub(v.len());
+                        v.extend(recipe_new_suggest_lines(p, app, r, inner_w(area), room));
                         v
                     })
                     .unwrap_or_else(|| bake_empty_lines(p, app, inner_w(area))),
-                Domain::Components => l
-                    .components
-                    .get(app.rc_sel)
+                Domain::Components => row(app.rc_sel)
+                    .and_then(|i| l.components.get(i))
                     .map(|c| {
                         vec![
                             Line::from(format!("名称     {}", c.name)),
@@ -464,9 +626,8 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                         ]
                     })
                     .unwrap_or_default(),
-                Domain::Locks => l
-                    .locks
-                    .get(app.rc_sel)
+                Domain::Locks => row(app.rc_sel)
+                    .and_then(|i| l.locks.get(i))
                     .map(|k| {
                         vec![
                             Line::from(format!(
@@ -505,9 +666,8 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                         ]
                     })
                     .unwrap_or_default(),
-                Domain::Profiles => l
-                    .profiles
-                    .get(app.rc_sel)
+                Domain::Profiles => row(app.rc_sel)
+                    .and_then(|i| l.profiles.get(i))
                     .map(|pr| {
                         vec![
                             Line::from(format!("派      {}", pr.name)),
@@ -528,7 +688,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                     .unwrap_or_default(),
                 // 外部源域(#37):选中一条记录 = 它的类别/链接/条目清单;
                 // 编目为空时给指向登记的指路,不摆空框。
-                Domain::Sources => match l.sources.get(app.rc_sel) {
+                Domain::Sources => match row(app.rc_sel).and_then(|i| l.sources.get(i)) {
                     Some(s) => source_detail(p, s),
                     None => vec![
                         Line::from(Span::styled(
@@ -578,7 +738,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
 // ---- 登记两段式浮层(spec #25 / 工单 #30):输入 → kind → 预审回音 → 确认 ----
 
 /// 按显示宽截断(不切宽字符,防 CJK 混排错位)。
-fn clip(s: &str, w: usize) -> String {
+pub(crate) fn clip(s: &str, w: usize) -> String {
     let mut out = String::new();
     let mut used = 0usize;
     for ch in s.chars() {
@@ -594,7 +754,7 @@ fn clip(s: &str, w: usize) -> String {
 
 /// 按显示宽折行:优先在空格处断(schema、URL、人话短语不被拦腰切开),
 /// 无处可断才按字符硬切。证据整句可见,不被弹层宽度截尾。
-fn wrap(s: &str, w: usize) -> Vec<String> {
+pub(crate) fn wrap(s: &str, w: usize) -> Vec<String> {
     let w = w.max(1);
     let mut out: Vec<String> = Vec::new();
     let mut rest: Vec<char> = s.chars().collect();
@@ -635,7 +795,7 @@ fn wrap(s: &str, w: usize) -> Vec<String> {
 
 /// 五字段证据落行:`[code/rc] message` 折行呈现,指路与详情随后缩进——
 /// 错误/警告取前几条原样给人话,不静默降级成一句「出错了」。
-fn push_evidence(
+pub(crate) fn push_evidence(
     lines: &mut Vec<Line>,
     label: &str,
     head_style: ratatui::style::Style,

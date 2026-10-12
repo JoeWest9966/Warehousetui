@@ -4,21 +4,43 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListState, Paragraph};
 use ratatui::Frame;
+use serde_json::Value;
 
 use crate::app::App;
 use crate::engine::{EngineOutput, ExitCode};
 use crate::layout::{size_class, SizeClass};
 use crate::screens::{body, data_root_signpost};
 
-const STEPS: [&str; 7] = [
-    "0 前置",
-    "1 引导",
-    "2 铺骨架",
-    "3 落组件",
-    "4 合配置",
-    "5 写清单",
-    "6 自检",
+/// 七步:显示名 + `nw/up.v1` 的 data 里给这一步结论的**冻结字段名**(#60)。
+///
+/// 判据只取契约面:字段在场 = 这一步有结论;缺场 = 引擎没给(没跑到、
+/// 或老引擎没这个字段)——既不打 ✓ 也不打 ✗,不猜。stderr 的人话措辞
+/// 不是契约,引擎改个说法七步栏不该跟着变。
+///
+/// 步 6 自检的字段名留空:上游 `internal/up/up.go` 头注写明「由 CLI 层
+/// 另起 nw doctor 复核,本包不做」,`up` 面永远不给这一步的结论;它的
+/// 判据是 doctor 七面的 `surface` 冻结名(健康屏)。
+const STEPS: [(&str, &str); 7] = [
+    ("0 前置", "profile"),
+    ("1 引导", "runtimeKey"),
+    ("2 铺骨架", "skeletonFiles"),
+    ("3 落组件", "components"),
+    ("4 合配置", "configKeys"),
+    ("5 写清单", "convergeHash"),
+    ("6 自检", ""),
 ];
+
+/// 装配中的明示语(紧凑态一行进度用):上游 `nw up` 七步执行期间没有任何
+/// 增量 stdout/stderr 进度行(调研底稿 §5:chezmoi 的 stderr 被截断 400
+/// 字节收进 details,跑完只在 stderr 打一行汇总)。这句话两档都摆,不让
+/// 操作者把 ✓ 的缺席误读成「还没开始」。
+const COARSE_NOTE: &str = "引擎无增量进度,跑完给结论";
+
+/// 同上,常畅态七步栏底注用——栏内宽只有 12 列,放不下整句。
+const COARSE_NOTE_SHORT: &str = "跑完给结论";
+
+/// `nw/up.v1`:七步结论唯一的冻结 schema 判据(#60)。
+const UP_SCHEMA: &str = "nw/up.v1";
 
 pub fn render_assemble(frame: &mut Frame, area: Rect, app: &App) {
     if app.as_confirm {
@@ -109,8 +131,16 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
             Line::from("  Enter   发射仪式(先看清单再上车)"),
             Line::from("  ↑/↓     选锁定集"),
             Line::from(""),
+            // 两个取消语义分开说(#59):返航在发射前(还没下发,什么都没发生),
+            // 中止在发射后(在途子进程真止,可能已写了一半)——不共用一键,
+            // 也不共用一句话;收敛路由指「重跑同一条命令」+ 健康屏 doctor。
+            Line::from(Span::styled("  Esc 返航 = 还没下发,什么都没发生;", p.dim())),
             Line::from(Span::styled(
-                "up 幂等可重入;取消安全,重跑同一命令继续。",
+                "  x 中止 = 在途子进程真止,可能写了一半;",
+                p.dim(),
+            )),
+            Line::from(Span::styled(
+                "  up 幂等:重跑同一命令收敛,doctor 说了算。",
                 p.dim(),
             )),
         ])
@@ -204,7 +234,7 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
 fn render_running_comfy(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     let cols = Layout::horizontal([Constraint::Length(14), Constraint::Min(20)]).split(area);
-    frame.render_widget(step_rail(app, p), cols[0]);
+    frame.render_widget(step_rail(p), cols[0]);
     frame.render_widget(log_block(app, p, cols[1].height), cols[1]);
 }
 
@@ -213,59 +243,46 @@ fn render_running_comfy(frame: &mut Frame, area: Rect, app: &App) {
 fn render_running_compact(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
-    frame.render_widget(progress_line(app, p), rows[0]);
+    frame.render_widget(progress_line(p), rows[0]);
     frame.render_widget(log_block(app, p, rows[1].height), rows[1]);
 }
 
-/// 七步栏(常畅态用):每步一行,日志里出现过步骤名即打 ✓。
-fn step_rail(app: &App, p: &crate::theme::Palette) -> Paragraph<'static> {
-    let step_lines: Vec<Line> = STEPS
+/// 七步栏(常畅态用):装配中七步一律**未决**,底注明示粗粒度(#60)。
+///
+/// 旧实现按「stderr 日志里出现过步骤名」打 ✓——拿人话措辞当契约。引擎
+/// 一旦改说法、或某一步恰好不打日志,七步栏就显示错,而操作者看不出那是
+/// 错的。现在:在途时一个 ✓ 都不打(引擎确实没有增量信号),结论等 envelope
+/// 落地后按冻结字段判(见 [`step_verdict_line`])。
+fn step_rail(p: &crate::theme::Palette) -> Paragraph<'static> {
+    let mut lines: Vec<Line> = STEPS
         .iter()
-        .map(|s| {
-            let (mark, style) = if step_done(app, s) {
-                ("✓", p.ok())
-            } else {
-                (" ", p.dim())
-            };
+        .map(|(name, _)| {
             Line::from(vec![
-                Span::raw(mark),
+                Span::raw("·"),
                 Span::raw(" "),
-                Span::styled(*s, style),
+                Span::styled(*name, p.dim()),
             ])
         })
         .collect();
-    Paragraph::new(step_lines).block(
+    // 明示粗粒度:不让操作者把 ✓ 的缺席误读成「还没开始」。
+    lines.push(Line::from(Span::styled(COARSE_NOTE_SHORT, p.dim())));
+    Paragraph::new(lines).block(
         Block::bordered()
             .border_style(p.dim())
             .title(Span::styled(" 七步 ", p.accent())),
     )
 }
 
-/// 一行进度(紧凑态用):位置化标记 7 格 + 当前阶段名,如
-/// `七步 ✓✓✓▸··· 3 落组件`——阶段名让当前步可辨识,标记随日志推进。
-fn progress_line(app: &App, p: &crate::theme::Palette) -> Paragraph<'static> {
-    let done: Vec<bool> = STEPS.iter().map(|s| step_done(app, s)).collect();
-    let current = done.iter().position(|d| !d);
+/// 一行进度(紧凑态用):七格未决标记 + 明示粗粒度(#60)。
+/// 在途没有可判决的增量信号,所以没有「当前步」可指——指了就是猜。
+fn progress_line(p: &crate::theme::Palette) -> Paragraph<'static> {
     let mut spans = vec![Span::styled("七步 ", p.accent())];
-    for (i, d) in done.iter().enumerate() {
-        let (ch, style) = match (d, current) {
-            (true, _) => ("✓", p.ok()),
-            (false, Some(c)) if i == c => ("▸", p.accent().bold()),
-            _ => ("·", p.dim()),
-        };
-        spans.push(Span::styled(ch, style));
+    for _ in STEPS.iter() {
+        spans.push(Span::styled("·", p.dim()));
     }
     spans.push(Span::raw(" "));
-    match current {
-        Some(i) => spans.push(Span::styled(STEPS[i], p.info())),
-        None => spans.push(Span::styled("全部完成", p.ok())),
-    }
+    spans.push(Span::styled(COARSE_NOTE, p.dim()));
     Paragraph::new(Line::from(spans))
-}
-
-/// 步骤完成判定与常畅态七步栏同一把尺:stderr 日志里出现过步骤名。
-fn step_done(app: &App, step: &str) -> bool {
-    app.as_log.iter().any(|l| l.contains(step))
 }
 
 /// stderr 实时日志块,两档共用(只随分栏几何变化);`height` 是日志块自身高度,
@@ -285,8 +302,54 @@ fn log_block(app: &App, p: &crate::theme::Palette, height: u16) -> Paragraph<'st
     Paragraph::new(log).block(
         Block::bordered()
             .border_style(p.dim())
-            .title(Span::styled(" stderr 实时日志 ", p.dim())),
+            // 中止键(#59)跟着日志窗Pane走:两档共用这一处,操作者翻日志的
+            // 视线不用离开窗Pane去找键。
+            .title(Span::styled(" stderr 实时日志 · x 中止 ", p.dim())),
     )
+}
+
+/// 跑完后的七步结论行(#60):判据只有冻结面。
+///
+/// `nw/up.v1` 的 data 字段**在场** = 这一步有结论;缺场 = 引擎没给
+/// (没跑到 / 老引擎没这个字段),既不打 ✓ 也不打 ✗。schema 不是
+/// `nw/up.v1` 时明说取得到不到——不按旧形状降级解析(与 #28 契约守卫
+/// 同一立场)。步 6 自检在 up 面恒无字段,它的判据是 doctor 七面的
+/// `surface` 冻结名(健康屏),这里不替它猜。
+fn step_verdict_line(out: &EngineOutput, p: &crate::theme::Palette) -> Line<'static> {
+    let mut spans = vec![Span::raw("  七步   ")];
+    let up_data = out
+        .envelope
+        .as_ref()
+        .filter(|e| e.schema == UP_SCHEMA)
+        .map(|e| &e.data);
+    match up_data {
+        Some(data) => {
+            let settled = settled_steps(data);
+            let n = settled.iter().filter(|s| **s).count();
+            let marks: String = settled.iter().map(|s| if *s { "✓" } else { "·" }).collect();
+            spans.push(Span::styled(marks, if n == 0 { p.dim() } else { p.ok() }));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                if n == 0 {
+                    "引擎没给七步结论(up 面 data 无字段)".to_string()
+                } else {
+                    format!("{n} 面有结论;自检归 doctor(up 不自检)")
+                },
+                p.dim(),
+            ));
+        }
+        None => spans.push(Span::styled(
+            format!("结论取不到:envelope 不是 {UP_SCHEMA}(契约守卫)"),
+            p.dim(),
+        )),
+    }
+    Line::from(spans)
+}
+
+/// 按 `nw/up.v1` data 的冻结字段在场判七步结论(#60)。
+fn settled_steps(data: &Value) -> [bool; 7] {
+    let obj = data.as_object();
+    STEPS.map(|(_, field)| !field.is_empty() && obj.map(|o| o.contains_key(field)).unwrap_or(false))
 }
 
 fn render_result(frame: &mut Frame, area: Rect, app: &App, out: &EngineOutput) {
@@ -324,6 +387,8 @@ fn render_result(frame: &mut Frame, area: Rect, app: &App, out: &EngineOutput) {
             )));
         }
     }
+    // 七步结论:跑完了才按冻结面判(#60),不拿 stderr 措辞凑。
+    lines.push(step_verdict_line(out, p));
     for ev in out.evidence().iter().take(3) {
         lines.push(Line::from(Span::styled(
             format!(
