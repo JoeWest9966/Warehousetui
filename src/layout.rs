@@ -56,6 +56,24 @@ pub enum Target {
     /// 点正文键位行的「过滤」段 = 按 `/` 进册内过滤输入态(#69:与键盘 `/`
     /// 同一路,鼠标只是叠加;段上文案由渲染与命中共用,点哪打哪)。
     CatalogFilter,
+    /// 点编目屏正文键位行的「g 取回」段 = 按 `g`(#73:补 #65 §6 延期的那处
+    /// 「屏上写着、鼠标点不到」)。与键盘 `g` **同一个函数、同一条后果链**——
+    /// 当前选中订阅 / 钥匙的建议命令(`nw subscription get …` / `nw key get …`)
+    /// 收进日志,
+    /// 屏上「按 g 收进日志」翻成「已按 g 收进日志」;不入队、不下发、不碰
+    /// 剪贴板(ADR-0009 §1:get 一律不代跑,上游才是唯一回显本体的出口)。
+    ///
+    /// **只订阅册 / 钥匙册的非空册体变体在场**(空册没有「取回哪一条」、在途
+    /// 变体整行换成浮层提示、机器册 / 标签册的条目没有本体可取)——在场条件
+    /// 由 [`catalog_key_parts`](crate::screens::catalog::catalog_key_parts)
+    /// 按 `CatalogKind` 查表决定,命中区不另推一份。边缘态(册已读到、数据仓根
+    /// 随后被撤)段仍在场,点下去复现键盘 `g` 的既有指路日志。
+    ///
+    /// **唯一与按键不同步的态**:册内过滤输入态(#69)里键入归输入态(敲 `g` 是
+    /// 往过滤框里写字),而鼠标点段照旧走取回——这是键位行**所有**可点段的共同
+    /// 边界(输入态只管键入,见 `catalog.rs` 反查段那条同口径测试),不是本段
+    /// 特有的分叉。
+    CatalogGet,
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -288,20 +306,22 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     let n = app.catalog_visible().len();
     push_sheet_rows(inner, n, kind.row_lines(), hits);
 
-    // 正文键位行的可点动作段(#67):段清单由 `catalog::catalog_key_parts` 一处
-    // 产出——渲染画的与命中测的逐字同源(ADR-0005)。**键位行被册体顶出可见
-    // 区时不产命中**:画不出来的段不给点,「屏上没有、点得到」比反过来更糟。
-    // 行号 = `inner.y + 正文行数`(正文由 `catalog::catalog_body_lines` 产,
-    // 行数同一处算,不另写一份「键位行在第几行」)。正文行的宽度预算也同一处
-    // 取(`catalog::body_text_width`):渲染侧就是这么折的,命中区照抄同一个数,
-    // 两边不可能各算各的。
-    let body_rows = crate::screens::catalog::catalog_body_lines(
-        app,
-        crate::screens::catalog::body_text_width(inner),
-    )
-    .len();
-    let key_y = inner.y + u16::try_from(body_rows).unwrap_or(u16::MAX);
-    if key_y < inner.y + inner.height {
+    // 正文键位行的可点动作段(#67 接缝,#70/#69/#73 各加一段):段清单由
+    // `catalog::catalog_key_parts` 一处产出——渲染画的与命中测的逐字同源
+    // (ADR-0005)。
+    //
+    // **键位行钉在册体内层末行**(#73 补 #67 欠的那一半:几何真相只能有一处)。
+    // 末行是布局事实,不数正文行数:渲染侧把册体内容截到末行之前、欠量留空,
+    // 键位行恒在 `inner.y + inner.height - 1`——册体 1 条与 20 条,可点段的 y
+    // 同一个数(规格故事 7 / 验收「键位行钉末行」)。早先这里按
+    // `catalog_body_lines` 的行数推 y,行数一多键位行就被顶出可见区、命中区
+    // 整段消失,而渲染侧那一行也跟着漂——同一处几何两套算法。今天两边都只认
+    // 末行,不再有「第几行」的第二种推法。
+    //
+    // 行高必须真的有一行(内层被压成 0 行时什么都不产);段的列几何与裁剪仍由
+    // `key_line_segments` 按 `inner` 右界收口(放不下的整段不画也不给命中)。
+    let key_y = catalog_key_row(inner);
+    if inner.height > 0 {
         let parts = crate::screens::catalog::catalog_key_parts(app);
         for seg in key_line_segments(
             inner,
@@ -317,16 +337,30 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     }
 }
 
+/// 编目册屏**键位行**那一行的 y(#73:几何真相只能有一处)。
+///
+/// 键位行钉在册体内层**末行**,这一个数同时服务三处,谁都不自己算:
+/// 命中区取它铺段矩形([`catalog_hits`])、册体条目行命中不越它
+/// ([`push_sheet_rows`])、渲染把册体内容垫空 / 截到它之前
+/// (`catalog::render_catalog`)。册体内容长短因此影响不到键位行的位置。
+///
+/// 内层被压成 0 行时它仍回一个数(回绕到 `inner.y - 1`),调用方各自看
+/// `inner.height > 0`:没有行就没有键位行,也不产命中。
+pub(crate) fn catalog_key_row(inner: Rect) -> u16 {
+    inner.y + inner.height.saturating_sub(1)
+}
+
 /// 册体清单的行命中:首行是「当前是哪一本 + 编目路径」,末行是键位行,
 /// 中间每条目占 `per` 行(`CatalogKind::row_lines`,渲染与命中共用)。
 fn push_sheet_rows(inner: Rect, n: usize, per: u16, hits: &mut Vec<(Rect, Target)>) {
-    let rows = inner.height.saturating_sub(2);
+    let key_y = catalog_key_row(inner);
+    let rows = key_y.saturating_sub(inner.y + 1);
     if rows == 0 || per == 0 {
         return;
     }
     let mut y = inner.y + 1;
     for i in 0..n as u16 {
-        if y + per > inner.y + inner.height.saturating_sub(1) {
+        if y + per > key_y {
             break;
         }
         hits.push((
@@ -681,6 +715,7 @@ pub type KeyPart<'a> = (&'a str, Option<Target>, bool);
 /// 禁用态)。渲染与命中共用同一份 `KeySegment` 清单——段宽
 /// 由 [`key_line_segments`] 按 `unicode_width` 量出,屏上画的和点得的逐字同源
 /// (ADR-0005:一处几何真相,不出现第二份「键位行长什么样」)。
+#[derive(Debug)]
 pub struct KeySegment {
     /// 段文案(渲染照此画,命中也照此量宽——同一份字符串)。
     pub text: String,
@@ -1416,5 +1451,136 @@ mod tests {
                 .all(|(_, t)| *t != Target::Abort),
             "非 up 在途:中止段不产命中区"
         );
+    }
+
+    // ---- #67 接缝的纯函数:`key_line_segments` 的段表分解与收口 ----
+    //
+    // 段表分解是被钉住的几何口径(规格故事 31):一行有哪些段、各多宽、哪段可点、
+    // 放不放得下——纯函数、可单测,不依赖任何屏状态。
+
+    /// 段按序铺开:段宽 = `unicode_width(文案)`,段 x = 行内累计显示宽,段间不
+    /// 重叠、不留歧义区;`target` 原样带着(`None` = 只画不点)。
+    #[test]
+    fn key_line_segments_按序铺开_段宽按unicode宽度量() {
+        let anchor = Rect::new(4, 9, 40, 1);
+        let parts: [KeyPart; 3] = [
+            ("  ↑/↓ 选", None, true),
+            ("g 取回", Some(Target::CatalogGet), true),
+            ("m 换册", Some(Target::SwitchBook), true),
+        ];
+        let segs = key_line_segments(anchor, 9, &parts, " ·");
+        assert_eq!(segs.len(), 3, "三段都放得下:{segs:?}");
+        // 第一段贴在 anchor 左界(含段内前导空格),后续段 = 上一段末 + gap 宽
+        assert_eq!(segs[0].rect.x, 4);
+        let gap = unicode_width::UnicodeWidthStr::width(" ·");
+        assert_eq!(
+            segs[1].rect.x,
+            segs[0].rect.x + segs[0].rect.width + gap as u16,
+            "段 x = 行内累计显示宽"
+        );
+        for s in &segs {
+            assert_eq!(
+                s.rect.width as usize,
+                unicode_width::UnicodeWidthStr::width(s.text.as_str()),
+                "段宽 = 文案显示宽({})",
+                s.text
+            );
+            assert_eq!(s.rect.y, 9, "段高 1 行,落在给定 y 上");
+        }
+        assert_eq!(segs[1].target, Some(Target::CatalogGet));
+        assert_eq!(segs[0].target, None, "提示段不带命中目标");
+    }
+
+    /// **整段可见才可点**(#67 纪律,#73 验收 8):任一段完整越出 anchor 右界,
+    /// 这一段及后续既不画也不给命中——放不下的段一个矩形都不产,不会出现
+    /// 「屏上半截、点得到另外半截」的半个命中。
+    ///
+    /// 为什么在纯函数上钉:四本册的键位行今天在 66×50 下限内都放得下(#69 收窄
+    /// 分隔后还剩余量,见 `过滤段四本册两档都放得下_渲染与命中共源`),所以在真
+    /// 尺寸上构造不出「g 段被裁」——这条纪律只能就着 anchor 宽度直接钉,否则
+    /// 将来键位行再长一截、或下限再降,裁切行为悄悄退化也没人红。
+    #[test]
+    fn key_line_segments_放不下整段收口_不给半个命中() {
+        // 「ab」(2)+ gap(1)+ 「cd」(2)+ gap(1)+ 「ef」(2)= 8 列,anchor 只给 6 列
+        let anchor = Rect::new(0, 0, 6, 1);
+        let parts: [KeyPart; 3] = [
+            ("ab", None, true),
+            ("cd", Some(Target::CatalogGet), true),
+            ("ef", None, true),
+        ];
+        let segs = key_line_segments(anchor, 0, &parts, " ");
+        assert_eq!(
+            segs.len(),
+            2,
+            "第三段越界:这一段及后续都不画不命中:{segs:?}"
+        );
+        assert_eq!(segs[1].rect.x, 3, "第二段仍整段在场");
+        assert_eq!(segs[1].rect.width, 2);
+        // 产出的矩形一个都不越界;第 5、6 两列(被收掉的第三段)没有任何命中
+        for s in &segs {
+            assert!(
+                s.rect.x + s.rect.width <= anchor.x + anchor.width,
+                "段不越出 anchor 右界:{s:?}"
+            );
+        }
+        assert!(
+            segs.iter().all(|s| s.rect.x + s.rect.width <= 5),
+            "被裁掉的那一列起无命中(不是半个命中):{segs:?}"
+        );
+        // 空段也到此为止(画不出东西的段不给命中)
+        let blank: [KeyPart; 2] = [("ab", None, true), ("", Some(Target::CatalogGet), true)];
+        assert_eq!(
+            key_line_segments(Rect::new(0, 0, 10, 1), 0, &blank, " ").len(),
+            1,
+            "空段不画不给命中"
+        );
+    }
+
+    /// 编目册键位行的段表(#73):订阅 / 钥匙册的非空册体变体带一个
+    /// `CatalogGet` 段,空册 / 在途 / 机器册 / 标签册一个都没有——段表是
+    /// 「这一段在不在场」的唯一真相,命中区只照它取矩形。
+    #[test]
+    fn 编目册段表_取回段按册按变体在场() {
+        let mut app = test_app();
+        app.screen = Screen::Vps;
+        app.catalog_kind = crate::screens::CatalogKind::Subscription;
+        let gets = |app: &App| -> usize {
+            crate::screens::catalog::catalog_key_parts(app)
+                .iter()
+                .filter(|(_, t, _)| *t == Some(Target::CatalogGet))
+                .count()
+        };
+        // 空册:没有条目就没有「取回哪一条」
+        assert_eq!(gets(&app), 0, "空册变体无取回段");
+        // 非空册体:恰好一段
+        app.sub_ls = Some(
+            serde_json::from_str(
+                r#"{"catalogPath":"/r/subscriptions.json","subscriptions":[{"name":"airport","kind":"subscription-url","client":"Mihomo","expires":"2099-03-01","status":"active","daysLeft":1}]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(gets(&app), 1, "订阅册非空册体恰一个取回段");
+        // 钥匙册同款
+        app.catalog_kind = crate::screens::CatalogKind::Key;
+        assert_eq!(gets(&app), 0, "换到钥匙册:订阅册的投影不跟过来");
+        app.key_ls = Some(
+            serde_json::from_str(
+                r#"{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"h","scopes":[],"rotatedAt":"2025-11-02"}]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(gets(&app), 1, "钥匙册非空册体恰一个取回段");
+        // 机器册 / 标签册:任何变体都没有
+        for kind in [
+            crate::screens::CatalogKind::Vps,
+            crate::screens::CatalogKind::Tag,
+        ] {
+            app.catalog_kind = kind;
+            assert_eq!(gets(&app), 0, "{kind:?} 册没有取回段");
+        }
+        // 在途变体:整行换成浮层提示
+        app.catalog_kind = crate::screens::CatalogKind::Subscription;
+        app.sub_rm_confirm = true;
+        assert_eq!(gets(&app), 0, "删除确认态无取回段");
     }
 }

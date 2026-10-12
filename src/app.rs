@@ -837,6 +837,13 @@ impl App {
             // 点正文键位行的「过滤」段(#69):与键盘 `/` 完全同路——进册内过滤
             // 输入态。鼠标只是叠加,不新增语义。
             Target::CatalogFilter => self.catalog_filter_on = true,
+            // 点正文键位行的「g 取回」段(#73):与键盘 `g` 同一个函数、同一条
+            // 后果链——当前册选中订阅 / 钥匙的建议命令收进日志,面板不代跑 get、
+            // 不入队、不碰剪贴板(ADR-0009 §1)。路由只有这一处,且分叉的是「哪个
+            // 册」而不是「哪条路径」:查 `CatalogKind::action` 同一张表(与
+            // `key_catalog` 同一个),所以鼠标与键盘不可能给出两种后果。(过滤输入态
+            // 里键入归输入态、鼠标照旧点得动,那是键位行所有可点段的共同边界。)
+            Target::CatalogGet => self.catalog_get(),
         }
     }
 
@@ -2346,6 +2353,25 @@ impl App {
     }
 
     // ---- 编目册屏·标签册(spec #50 工单 #54,ADR-0009) ----
+
+    /// 点键位行「g 取回」段 = 按 `g`(#73)。
+    ///
+    /// 走 [`catalog::CatalogKind::action`] **同一张表**(与 `key_catalog` 受理
+    /// `g` 的那一次查表同一个入口),由当前是哪一本决定落实方法:订阅册 →
+    /// [`App::log_sub_get_suggest`],钥匙册 → [`App::log_key_get_suggest`]。鼠标
+    /// 与键盘因此不可能给出两种后果,也不会有第二份「点下去发生什么」。
+    ///
+    /// 段只在订阅 / 钥匙册的非空册体变体在场(命中区的产地
+    /// [`catalog::catalog_key_parts`]),所以这一处到达即确有命令可取;表里查不到
+    /// (机器册 / 标签册没有 `g`)就什么都不做——不为鼠标补一条键盘也没有的路。
+    fn catalog_get(&mut self) {
+        if let Some(catalog::CatalogAction::Act(f)) = self
+            .catalog_kind
+            .action(self, crossterm::event::KeyCode::Char('g'))
+        {
+            f(self);
+        }
+    }
 
     /// 当前是哪一本(`m` 换册)。换册只改维度、不清另一本的投影——
     /// 四本各有自己的账,回来还在(不重跑、不轮询)。
@@ -7302,7 +7328,9 @@ mod tests {
     /// 是它们),不另抄一份清单:将来加第四个可点段而文档没跟上,这条就红。
     #[test]
     fn 帮助鼠标章节_覆盖_readme_全部条目() {
-        use crate::screens::catalog::{CATALOG_FILTER, CATALOG_REVERSE, CATALOG_SWITCH};
+        use crate::screens::catalog::{
+            CATALOG_FILTER, CATALOG_GET, CATALOG_REVERSE, CATALOG_SWITCH,
+        };
         use crate::ui::MOUSE_LINES;
         let readme = include_str!("../README.md");
         // README 鼠标小节:从 `### 鼠标(默认开捕获)` 到下一个 `##` 标题之间
@@ -7330,7 +7358,7 @@ mod tests {
             assert!(joined.contains(phrase), "鼠标章节缺 README 条目 `{phrase}`");
         }
         // 反方向:画在屏上的每一个可点段,章节与 README 两边都点名
-        for seg in [CATALOG_SWITCH, CATALOG_FILTER, CATALOG_REVERSE] {
+        for seg in [CATALOG_SWITCH, CATALOG_FILTER, CATALOG_REVERSE, CATALOG_GET] {
             // 段文案是 `m 换册` / `/ 过滤` / `Enter 反查`:名词取最后一段
             let noun = seg.split_whitespace().last().unwrap_or(seg);
             assert!(
