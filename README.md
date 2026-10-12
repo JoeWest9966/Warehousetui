@@ -27,7 +27,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # 或 ~/.zshrc
 
 Windows:去 [releases](https://github.com/JoeWest9966/Warehousetui/releases) 手动下载 `nwt_<版本>_windows_x86_64.zip`。支持级是「编译可运行」([spec #10](https://github.com/JoeWest9966/Warehousetui/issues/10) 钉死的 R3 决定;ADR-0002 只定 Rust/ratatui 技术栈,不涉支持级),不提供 installer;资产与校验细节见 [docs/release.md](./docs/release.md)。
 
-> 预编译二进制随 tag 发布(当前最新 v0.2.0:**linux x86_64 / aarch64 + windows x86_64** 三个包;macOS 暂缺,请源码构建);安装脚本默认取 latest,也可 `--version` 钉版本。命名契约与已知取舍见 [docs/release.md](./docs/release.md)。
+> 预编译二进制随 tag 发布(当前最新 v0.3.0:**linux x86_64 / aarch64 + windows x86_64** 三个包;macOS 暂缺,请源码构建);安装脚本默认取 latest,也可 `--version` 钉版本。命名契约与已知取舍见 [docs/release.md](./docs/release.md)。
 
 ## 从源码构建
 
@@ -74,7 +74,7 @@ cargo build --release
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets     # 单测:契约解析 / 发现策略 / 五屏快照 / 装配四路径 / 命中区与响应式两档 / 数据仓根三态指路 / 登记两段式 / 80×30 整帧 golden
+cargo test --all-targets     # 单测:契约解析 / 发现策略 / 六屏快照 / 装配四路径 / 命中区与响应式两档 / 数据仓根三态指路 / 登记两段式 / 80×30 整帧 golden
 cargo build --release
 ```
 
