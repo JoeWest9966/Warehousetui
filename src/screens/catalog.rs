@@ -616,10 +616,11 @@ impl CatalogKind {
         match self {
             CatalogKind::Vps => &["  ↑/↓ 选", "r 登记", "d 删除", "Esc"],
             CatalogKind::Tag => &["  ↑/↓ 选", "Enter 反查", "l 全部", "r 挂标签", "d 摘/删"],
-            CatalogKind::Subscription => {
-                &["  ↑/↓ 选订阅", "r 登记", "g 取回命令", "d 删除", "l 重读"]
-            }
-            CatalogKind::Key => &["  ↑/↓ 选钥匙", "r 登记", "g 取回命令", "d 删除", "l 重读"],
+            // #69 后续:订阅 / 钥匙册的 `g 取回命令` 收窄成 `g 取回`(#69 的
+            // 鼠标过滤入口要在 66×50 下限内也放得下,两本册的键位行本来就最长;
+            // 「取回」二字已够提示这个键,全句建议命令就在册体下一行摊着)。
+            CatalogKind::Subscription => &["  ↑/↓ 选订阅", "r 登记", "g 取回", "d 删除", "l 重读"],
+            CatalogKind::Key => &["  ↑/↓ 选钥匙", "r 登记", "g 取回", "d 删除", "l 重读"],
         }
     }
 
@@ -1901,7 +1902,14 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
 
 /// 键位行可点段之间(以及段内各项之间)的分隔串:渲染与命中共用同一份,
 /// 段宽按 `unicode_width` 量——一处真相,点哪打哪。
-pub(crate) const CATALOG_KEY_GAP: &str = " · ";
+///
+/// #69 收窄到 **2 列**(`" ·"`,原为 3 列的 `" · "`):订阅 / 钥匙两本册的
+/// 键位行在 66×50 下限(正文 64 列)内放不下 `m 换册` + `/ 过滤` 两段,于是
+/// 鼠标过滤入口只在机器册有、键盘 `/` 却四本册都能按(故事 29 要的是两边
+/// 都能用)。gap 是这一个常量、渲染与命中共用,收窄它不丢任何一段文案,
+/// 只把分隔从「空格·空格」改成「·空格」。收窄后四本册两档都放得下,还剩
+/// ≥2 列余量(见 `过滤段四本册两档都放得下_渲染与命中共源`)。
+pub(crate) const CATALOG_KEY_GAP: &str = " ·";
 
 /// 键位行末段的「换册」可点文案(#67):点它 = 按 `m` 轮转四本册。渲染画这个
 /// 串、命中测这个串的宽,同一份字符串;段可点(accent 高亮),与键盘 `m` 同路。
@@ -1997,6 +2005,12 @@ pub(crate) fn catalog_key_parts(app: &App) -> Vec<crate::layout::KeyPart<'static
 /// 与命中同源」。故渲染也走同一份 [`crate::layout::key_line_segments`]:
 /// 放得下的段才画、放不下的段两厢都不出现——屏上没有的段,鼠标也点不到,
 /// 点哪打哪。
+///
+/// #69 后续(本工单)把「放不下」这件事在四本册 × 两档内**做没了**:键位行
+/// 分隔收窄到 2 列 + 订阅 / 钥匙册 `g 取回命令` → `g 取回` 之后,`m 换册`
+/// 与 `/ 过滤` 在 66×50 下限内都放得下(见
+/// `过滤段四本册两档都放得下_渲染与命中共源`)。收口纪律本身留着——它管的是
+/// 「更窄的终端 / 将来更长的键位行」,不是现在这四行。
 ///
 /// #70 故事 39 的**禁用态**:`live == false` 的可点段画成 dim(与提示段同色,
 /// 不再 accent 加粗),段本身照画、命中区照给——操作者在点之前就看出
@@ -7122,18 +7136,23 @@ mod tests {
     //
     // **期望值的来历(不止一句「本票之前」,每一次刷新都记在这儿)**:
     // 基线 = 第 8 轮 tip `bb19d70` + 工单 #66(同一夹具、同一尺寸,人工逐行
-    // 核对;#66 确是纯重构,基线帧与 `bb19d70` 逐字节相同)。基线之后有过三
+    // 核对;#66 确是纯重构,基线帧与 `bb19d70` 逐字节相同)。基线之后有过四
     // 次**真实的用户可见变化**,每次都刷新过期望,差都记在各自工单里:
     //   · #67(合入点 `42eb955`):机器册键位行末尾多出可点的 `m 换册` 段;
     //   · #69(`8f676fc`):机器册键位行再多 `/ 过滤` 段(另三本放不下,段就
-    //     不画也不给命中,见 `过滤段渲染与命中同源_放不下则两厢都不出现`);
+    //     不画也不给命中——那一版的取舍由本工单推翻,见下一条);
     //   · #70(`31f069d`):机器册键位行 `↑/↓ 选机器`→`↑/↓ 选`、
     //     `Esc/q 返航`→`Esc`,并多出 `Enter 反查` 段;
     //   · 本票 #65 评审第 3 条:标签册册头把 `反查 /tmp` 改回 `全部标签`
-    //     (那一行原是把 `--root` 的值错当成标签名,见 `App::on_tag_echo`)。
-    // 除机器册键位行与标签册册头这两处,其余六帧自 #66 基线以来一个字节
-    // 都没动过——所以「基线 + 三次有记账的刷新」就是这一族期望值的全部来历,
-    // 没有第四次,也没有哪一次是悄悄回填的。
+    //     (那一行原是把 `--root` 的值错当成标签名,见 `App::on_tag_echo`);
+    //   · **本工单(#69 后续 / #70 评审第 5 条)**:键位行分隔
+    //     `CATALOG_KEY_GAP` 由 3 列收窄到 2 列(`" · "` → `" ·"`),订阅 /
+    //     钥匙册 `g 取回命令` → `g 取回`,于是 `/ 过滤` 在四本册 × 两档内都
+    //     放得下(此前只有机器册画得出、点得着)。八帧全部重刷,每帧差的就是
+    //     键位行这一行,逐字节对过;帧上其余部分与上一次刷新逐字节相同。
+    // 除上面记下的几处,其余六帧自 #66 基线以来一个字节都没动过——所以
+    // 「基线 + 四次有记账的刷新」就是这一族期望值的全部来历,没有第五次,
+    // 也没有哪一次是悄悄回填的。
     //
     // 修订纪律同 `ui::tests::golden_常畅态_80x30_整帧逐字节`:若既有渲染面
     // 发生真实回归而改期望,必须与该回归同一次提交并说明——不许为过测试回填。
@@ -7210,7 +7229,7 @@ mod tests {
 │          ││    地址 home=10.0.0.1                                            │
 │          ││    登录 root→$DEPLOY_KEY                                         │
 │          ││    备注 门口                                                     │
-│          ││  ↑/↓ 选 · r 登记 · d 删除 · Esc · Enter 反查 · m 换册 · / 过滤   │
+│          ││  ↑/↓ 选 ·r 登记 ·d 删除 ·Esc ·Enter 反查 ·m 换册 ·/ 过滤         │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -7242,7 +7261,7 @@ mod tests {
 │    地址 home=10.0.0.1                                          │
 │    登录 root→$DEPLOY_KEY                                       │
 │    备注 门口                                                   │
-│  ↑/↓ 选 · r 登记 · d 删除 · Esc · Enter 反查 · m 换册 · / 过滤 │
+│  ↑/↓ 选 ·r 登记 ·d 删除 ·Esc ·Enter 反查 ·m 换册 ·/ 过滤       │
 │                                                                │
 │                                                                │
 │                                                                │
@@ -7289,7 +7308,7 @@ mod tests {
 │  ▤ 配方  ││    pi                                                            │
 │▸ ▩ 编目  ││    引用 skill/o/r/deep-research · vps/gate                       │
 │  ✦ 设置  ││  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)      │
-│          ││  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册      │
+│          ││  ↑/↓ 选 ·Enter 反查 ·l 全部 ·r 挂标签 ·d 摘/删 ·m 换册 ·/ 过滤   │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -7321,7 +7340,7 @@ mod tests {
 │    pi                                                          │
 │    引用 skill/o/r/deep-research · vps/gate                     │
 │  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)    │
-│  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册    │
+│  ↑/↓ 选 ·Enter 反查 ·l 全部 ·r 挂标签 ·d 摘/删 ·m 换册 ·/ 过滤 │
 │                                                                │
 │                                                                │
 │                                                                │
@@ -7380,7 +7399,7 @@ mod tests {
 │          ││nw subscription get --name airport --root /tmp | jq -r .data.url  │
 │          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
 │          ││  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发重   │
-│          ││  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册     │
+│          ││  ↑/↓ 选订阅 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤      │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -7412,7 +7431,7 @@ mod tests {
 │nw subscription get --name airport --root /tmp | jq -r .data.u  │
 │  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
 │  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发   │
-│  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册   │
+│  ↑/↓ 选订阅 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤    │
 │                                                                │
 │                                                                │
 │                                                                │
@@ -7460,7 +7479,7 @@ mod tests {
 │          ││nw key get --name ci --root /tmp | jq -r .data.key                │
 │          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
 │          ││  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供烤  │
-│          ││  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册     │
+│          ││  ↑/↓ 选钥匙 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤      │
 │          ││                                                                  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -7492,7 +7511,7 @@ mod tests {
 │nw key get --name ci --root /tmp | jq -r .data.key              │
 │  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
 │  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供  │
-│  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册   │
+│  ↑/↓ 选钥匙 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤    │
 │                                                                │
 │                                                                │
 │                                                                │
@@ -8166,48 +8185,95 @@ mod tests {
         }
     }
 
-    /// ADR-0005「渲染与命中同源」:#69 修掉一处隐患——键位行段放不下时,渲染
-    /// 若靠终端裁尾会画出点不到的残段,而命中侧早就是「放不下整段收口」。这里
-    /// 钉住:够宽的终端四本册都画得出、点得中;常畅/紧凑两档下标签/订阅/钥匙册
-    /// 键位行够长、`/ 过滤` 放不下,于是屏上不画、命中区也不产(两厢一致,
-    /// 不出现「屏上写着 / 却点不到」)。键盘 `/` 四本册始终可用(见输入态测试)。
+    /// 帧上某一行的**显示列**(列按显示宽累计——`frame_display` 已跳过宽字
+    /// 续格,字节偏移 ≠ 终端列,与命中区同一把尺)。
+    fn display_col(row: &str, byte: usize) -> u16 {
+        use unicode_width::UnicodeWidthChar;
+        row[..byte]
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+            .sum()
+    }
+
+    /// 规格验收 9 / 故事 29 + ADR-0005「渲染与命中同源」:鼠标过滤入口
+    /// **四本册、两档都在场**。#69 只给机器册做成了这件事——`key_line_segments`
+    /// 的「放不下整段收口」把标签 / 订阅 / 钥匙三本册的 `/ 过滤` 整段收掉
+    /// (键位行太长),于是键盘 `/` 四本册都能按、鼠标却只有机器册点得着;
+    /// 旧版这条测试把那个取舍当既成事实钉着(#69 后续:#70 评审把它判成
+    /// 「该补齐的 parity」,工单已批准)。
+    ///
+    /// 现在键位行在 66×50 下限(正文 64 列)内放得下全部段:分隔
+    /// [`CATALOG_KEY_GAP`] 由 3 列收窄到 2 列(` · ` → ` ·`,一个常量、渲染与
+    /// 命中共用,不丢任何一段文案),订阅 / 钥匙册的 `g 取回命令` 再收窄成
+    /// `g 取回`(全句建议命令就在册体下一行摊着)。
+    ///
+    /// 这一条钉四件事:① 四本册 × 两档都画得出 `/ 过滤`、都有命中矩形;
+    /// ② 渲染行与命中矩形逐字同源(段起始列 == 矩形 x,段右界 == 矩形右界);
+    /// ③ 键位行右侧**至少留 1 列余量**(不是恰好贴边框赌出来的);
+    /// ④ 一段提示段 / 动作段都没被收掉(#67 的收口纪律仍在,只是够宽到不用收)。
     #[test]
-    fn 过滤段渲染与命中同源_放不下则两厢都不出现() {
-        // 够宽(110×30):四本册都放得下 `/ 过滤`,画得出也点得中
+    fn 过滤段四本册两档都放得下_渲染与命中共源() {
         for name in ["机器", "标签", "订阅", "钥匙"] {
-            let mut app = book(name);
-            app.size = Rect::new(0, 0, 110, 30);
-            let f = crate::testutil::frame_display(&app, 110, 30);
-            assert!(f.contains("/ 过滤"), "{name} 110×30 屏上应画出 / 过滤:{f}");
-            let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
-            assert!(
-                hits.iter()
-                    .any(|(_, t)| *t == crate::layout::Target::CatalogFilter),
-                "{name} 110×30 应有过滤命中区"
-            );
-            点中(&mut app, 110, 30, |t| {
-                *t == crate::layout::Target::CatalogFilter
-            });
-            assert!(app.catalog_filter_on, "{name} 110×30 点中 = 进输入态");
-        }
-        // 常畅/紧凑两档:键位行较长的三本册放不下,屏上不画残段、命中区也不产
-        for name in ["标签", "订阅", "钥匙"] {
             for (w, h) in [(80u16, 30u16), (66, 50)] {
-                let app = book(name);
+                let mut app = book(name);
+                app.size = Rect::new(0, 0, w, h);
+                let size = Rect::new(0, 0, w, h);
                 let f = crate::testutil::frame_display(&app, w, h);
+                let hits = crate::layout::hitmap(size, &app, crate::layout::size_class(size));
+                // ① 过滤段与换册段都在场、都有命中矩形,且同一行
+                let filt = hits
+                    .iter()
+                    .find(|(_, t)| *t == crate::layout::Target::CatalogFilter)
+                    .map(|(r, _)| *r)
+                    .unwrap_or_else(|| panic!("{name} {w}×{h} 过滤段应有命中区"));
+                let sw = hits
+                    .iter()
+                    .find(|(_, t)| *t == crate::layout::Target::SwitchBook)
+                    .map(|(r, _)| *r)
+                    .unwrap_or_else(|| panic!("{name} {w}×{h} 换册段应有命中区"));
+                assert_eq!(filt.y, sw.y, "{name} {w}×{h} 两段同一行(键位行)");
+                let row = f.lines().nth(filt.y as usize).expect("命中行在渲染中在场");
                 assert!(
-                    !f.contains("/ 过滤"),
-                    "{name} {w}×{h} 放不下 / 过滤,屏上不该画出:{f}"
-                );
-                let hits = crate::layout::hitmap(
-                    Rect::new(0, 0, w, h),
-                    &app,
-                    crate::layout::size_class(Rect::new(0, 0, w, h)),
+                    row.contains(CATALOG_FILTER),
+                    "{name} {w}×{h} 屏上应画出过滤段:{row}"
                 );
                 assert!(
-                    hits.iter()
-                        .all(|(_, t)| *t != crate::layout::Target::CatalogFilter),
-                    "{name} {w}×{h} 放不下,过滤命中区也不该产(渲染与命中同源)"
+                    row.contains(CATALOG_SWITCH),
+                    "{name} {w}×{h} 屏上应画出换册段:{row}"
+                );
+                // ② 渲染与命中共源:段起始列 == 矩形 x,段右界 == 矩形右界
+                let byte = row.find(CATALOG_FILTER).expect("帧上有过滤段");
+                let col = display_col(row, byte);
+                assert_eq!(
+                    col, filt.x,
+                    "{name} {w}×{h} 渲染段起始列 == 命中矩形 x(点哪打哪)"
+                );
+                assert_eq!(
+                    col + u16::try_from(unicode_width::UnicodeWidthStr::width(CATALOG_FILTER))
+                        .unwrap(),
+                    filt.x + filt.width,
+                    "{name} {w}×{h} 渲染段右界 == 命中矩形右界(同为 unicode_width 量出的宽)"
+                );
+                // ③ 至少 1 列余量:过滤段右侧第一个格子是空白,不是边框
+                let after = &row[byte + CATALOG_FILTER.len()..];
+                assert!(
+                    after.starts_with(' '),
+                    "{name} {w}×{h} 键位行右侧至少留 1 列余量:{row}"
+                );
+                // ④ 一段都没被收掉:段清单里每一段(提示段 + 动作段)都在这一行上
+                for (text, _t, _live) in catalog_key_parts(&app) {
+                    assert!(
+                        row.contains(text),
+                        "{name} {w}×{h} 段「{text}」被收掉了(放不下就整段收口,#67):{row}"
+                    );
+                }
+                // 点中 = 按 /(键盘那条路见输入态测试)
+                点中(&mut app, w, h, |t| {
+                    *t == crate::layout::Target::CatalogFilter
+                });
+                assert!(
+                    app.catalog_filter_on,
+                    "{name} {w}×{h} 点过滤段 = 进输入态(同按 /)"
                 );
             }
         }
