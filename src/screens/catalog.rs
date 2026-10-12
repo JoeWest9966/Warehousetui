@@ -656,6 +656,120 @@ impl CatalogKind {
         }
     }
 
+    // ---- 册级登记 / 删除入口查表(工单 #76:`start_*` 八份收成一份) ----
+    //
+    // 下面这一族把「这一本的登记入口开不开 / 入口指路 / 复位表单 / 选中名 /
+    // 起删除确认 / 登记提示口径」收成 `CatalogKind` 的成员。调用方
+    // (`App::start`)只写 `kind.xxx(app)`,**不再有第二处 `match kind` /
+    // `if kind ==`**:登记 / 删除八份 `start_*` 收成一份 `App::start(kind, mode)`,
+    // 按册差异(入口门、表单形态、删除是进确认弹层还是嵌套进表单流、提示口径)
+    // 全落在这一族成员上。
+    //
+    // 加一条按册的登记 / 删除关切 = 在这里加 / 改一个成员,不是往调用方再插
+    // 一个分支——第五本册子来时同样只改这一处。
+
+    /// 这一本的删除确认旗(可写侧;登记入口先清它,删除入口按册置位——
+    /// 标签册的删除嵌套在表单流里,confirm 旗恒 false)。
+    pub fn rm_confirm_set(self, app: &mut App, val: bool) {
+        match self {
+            CatalogKind::Vps => app.vps_rm_confirm = val,
+            CatalogKind::Tag => app.tag_rm_confirm = val,
+            CatalogKind::Subscription => app.sub_rm_confirm = val,
+            CatalogKind::Key => app.key_rm_confirm = val,
+        }
+    }
+
+    /// 这一本的登记入口开不开(#29 能力门 + #27 数据仓根;四本各问自己的
+    /// `*_entry_enabled`,调用方不再分册)。
+    pub fn entry_enabled(self, app: &App) -> bool {
+        match self {
+            CatalogKind::Vps => app.vps_entry_enabled(),
+            CatalogKind::Tag => app.tag_entry_enabled(),
+            CatalogKind::Subscription => app.sub_entry_enabled(),
+            CatalogKind::Key => app.key_entry_enabled(),
+        }
+    }
+
+    /// 入口不可用时的一句指路(与册体提示同源;四本各问自己的 `*_gate_hint`)。
+    pub fn gate_hint(self, app: &App) -> String {
+        match self {
+            CatalogKind::Vps => app.vps_gate_hint(),
+            CatalogKind::Tag => app.tag_gate_hint(),
+            CatalogKind::Subscription => app.sub_gate_hint(),
+            CatalogKind::Key => app.key_gate_hint(),
+        }
+    }
+
+    /// 复位这一本的登记表单(登记 / 挂标签入口进表单态前清干净:机器 /
+    /// 订阅 / 钥匙三本各新建一张空表单,标签册新建 Add 态空表单)。
+    pub fn form_reset(self, app: &mut App) {
+        match self {
+            CatalogKind::Vps => app.vps_form = new_form(),
+            CatalogKind::Tag => app.tag_form = new_tag_form(TagFormMode::Add),
+            CatalogKind::Subscription => app.sub_form = new_sub_form(),
+            CatalogKind::Key => app.key_form = new_key_form(),
+        }
+    }
+
+    /// 这一本此刻选中的条目名(删除确认 / 反查同源;经过滤后的可见列表映射
+    /// 回原始投影,四本各问自己的 `selected_*_name`)。
+    pub fn selected_name(self, app: &App) -> Option<String> {
+        match self {
+            CatalogKind::Vps => app.selected_vps_name(),
+            CatalogKind::Tag => app.selected_tag_name(),
+            CatalogKind::Subscription => app.selected_sub_name(),
+            CatalogKind::Key => app.selected_key_name(),
+        }
+    }
+
+    /// 登记 / 删除入口那句提示里的动词(按册:机器 / 订阅 / 钥匙三本「登记」,
+    /// 标签册「挂标签」)。装配冲突句与入口门句都拿它拼,四本各一句。
+    pub fn register_verb(self) -> &'static str {
+        match self {
+            CatalogKind::Vps | CatalogKind::Subscription | CatalogKind::Key => "登记",
+            CatalogKind::Tag => "挂标签",
+        }
+    }
+
+    /// 登记 / 挂标签入口进表单态后那句提示(四本各一句,逐字节不同)。
+    pub fn register_prompt(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "登记机器:填名字/地址/端口/登录/备注,Enter 预审,Esc/q 返航",
+            CatalogKind::Tag => "挂标签:填标签名与若干条 kind/条目 引用,Enter 挂上去,Esc/q 返航",
+            CatalogKind::Subscription => {
+                "登记订阅:填名字/应用/到期日,在链接框贴一次本体,Enter 预审,Esc/q 返航"
+            }
+            CatalogKind::Key => {
+                "登记钥匙:填名字/主机/作用域/轮换日,在钥匙框贴一次本体,Enter 预审,Esc/q 返航"
+            }
+        }
+    }
+
+    /// 起这一本的删除(删除键 `d` 的按册分叉下沉处):机器 / 订阅 / 钥匙三本
+    /// 置 rm 确认旗 + 打确认提示;标签册的删除嵌套在表单流里(预填选中标签名,
+    /// 光标落引用字段,引用留空 = 删整个标签)。
+    pub fn start_rm(self, app: &mut App, name: String) {
+        match self {
+            CatalogKind::Vps | CatalogKind::Subscription | CatalogKind::Key => {
+                self.rm_confirm_set(app, true);
+                app.push_log(format!("删除确认:{name}(Enter 确认,Esc/q 取消)"));
+            }
+            CatalogKind::Tag => {
+                app.tag_rm_confirm = false;
+                app.tag_flow.begin();
+                app.tag_form = new_tag_form(TagFormMode::Rm);
+                app.tag_form.name = name.clone();
+                // 光标落在引用字段:名字已预填,摘引用/删标签的动作全在引用行
+                // (留空 = 删整个标签)。不预填该标签现有的引用——摘哪几条由操作者
+                // 明确点出来,面板不替他决定(全预填 + 一路 Enter = 悄悄摘光)。
+                app.tag_form.field = TagField::Refs;
+                app.push_log(format!(
+                    "摘引用 / 删标签 {name}:引用留空 = 删整个标签,填 kind/条目 = 只摘那几条"
+                ));
+            }
+        }
+    }
+
     /// 这一本册体的条数(没读到 = 0;与 [`Self::sel`] 同一张表)。
     pub fn len(self, app: &App) -> usize {
         match self {
@@ -1046,30 +1160,20 @@ impl CatalogKind {
     /// `r` 行不成立(与既有的 `if !self.assembling` 守卫同一口径),
     /// 落空即「这个键此刻无事可做」。第五本册子来时只加行,不改调用方。
     pub fn action(self, app: &App, k: KeyCode) -> Option<CatalogAction> {
-        use CatalogAction::{Act, Move};
+        use CatalogAction::{Act, Move, Start};
         match (self, k) {
             // ↑/↓ 选行:四本同一口(不是按册差异,但同表驱动,四本走一条路)
             (_, KeyCode::Down) => Some(Move(true)),
             (_, KeyCode::Up) => Some(Move(false)),
-            // r 登记 / 挂标签:两段式(带确认闸)与无确认闸两种形态,各本自己的方法
-            (CatalogKind::Vps, KeyCode::Char('r')) if !app.assembling => {
-                Some(Act(App::start_vps_register))
-            }
-            (CatalogKind::Tag, KeyCode::Char('r')) if !app.assembling => {
-                Some(Act(App::start_tag_add))
-            }
-            (CatalogKind::Subscription, KeyCode::Char('r')) if !app.assembling => {
-                Some(Act(App::start_sub_register))
-            }
-            (CatalogKind::Key, KeyCode::Char('r')) if !app.assembling => {
-                Some(Act(App::start_key_register))
-            }
-            // d 删除:机器 / 订阅 / 钥匙三本进 rm 确认弹层;标签册的删除
-            // 嵌套在表单流里(摘引用 / 删整个标签两态),是另一条路
-            (CatalogKind::Vps, KeyCode::Char('d')) => Some(Act(App::start_vps_rm)),
-            (CatalogKind::Tag, KeyCode::Char('d')) => Some(Act(App::start_tag_rm)),
-            (CatalogKind::Subscription, KeyCode::Char('d')) => Some(Act(App::start_sub_rm)),
-            (CatalogKind::Key, KeyCode::Char('d')) => Some(Act(App::start_key_rm)),
+            // r 登记 / 挂标签(#76:`start_*` 八份收成一份后,四本册同一个动作值)。
+            // 真正的按册差异——两段式带确认闸 vs 无确认闸、各自的表单与提示——
+            // 下沉到 `App::start` + `CatalogKind` 查表成员,表里不再分册。写互斥
+            // 守卫不变:装配在途时 `r` 行不成立,落空即「这个键此刻无事可做」。
+            (_, KeyCode::Char('r')) if !app.assembling => Some(Start(StartMode::Register)),
+            // d 删除:四本册同一个动作值。机器 / 订阅 / 钥匙三本进 rm 确认弹层,
+            // 标签册的删除嵌套在表单流里(摘引用 / 删整个标签两态)——这条按册
+            // 分叉也下沉到 `App::start` → `CatalogKind::start_rm`,表里不分册。
+            (_, KeyCode::Char('d')) => Some(Start(StartMode::Rm)),
             // l 重读册体 / 列全部标签:四本各一次只读调用,argv 同形
             (CatalogKind::Vps, KeyCode::Char('l')) => Some(Act(App::run_vps_ls)),
             (CatalogKind::Tag, KeyCode::Char('l')) => Some(Act(App::run_tag_ls_all)),
@@ -1166,13 +1270,31 @@ pub enum OverlayForm {
     RmConfirm,
 }
 
+/// 册内登记 / 删除入口的模式(#76:四本册的 `start_*` 八份收成一份后,由
+/// [`CatalogAction::Start`] 带着)。只留「登记 / 挂标签」与「删除」两种模式,
+/// 按册差异(入口门、表单形态、删除是进确认弹层还是嵌套进表单流)全部下沉到
+/// [`CatalogKind`] 查表成员 + [`App::start`](crate::app::App::start),这里不分册。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StartMode {
+    /// 登记 / 挂标签:进登记流表单(vps / 订阅 / 钥匙两段式带确认闸,标签册无确认闸)。
+    Register,
+    /// 删除:机器 / 订阅 / 钥匙三本进 rm 确认弹层;标签册的删除嵌套在表单流里。
+    Rm,
+}
+
 /// 册内键位触发的动作(#66 查表表的取值)。`Act` 直接带这一本的落实方法
 /// ——按册差异就是「哪个方法」,这是数据,不是调用方的一个分支。
+/// [`Start`](CatalogAction::Start) 是 #76 收敛后的登记 / 删除入口:它**不带**
+/// 方法指针(那会把按册分叉重新搬回表里),只带模式,真正的按册差异走
+/// [`App::start`](crate::app::App::start) + [`CatalogKind`] 查表成员。
 pub enum CatalogAction {
     /// ↑/↓ 移选中(`true` = 向下;到界绕回,见 `App::catalog_move`)。
     Move(bool),
     /// 这一本对这一键的落实(登记 / 删除 / 重读 / 取回命令 / 反查)。
     Act(fn(&mut App)),
+    /// 登记 / 删除入口(#76:`r` / `d` 两键,四本册同一个动作值;按册差异在
+    /// [`App::start`](crate::app::App::start) 里查表落地)。
+    Start(StartMode),
 }
 
 /// 一本册子的条目明细画法:名字行右侧的弱化后缀(机器册给端口,标签册
