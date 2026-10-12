@@ -2073,23 +2073,63 @@ impl App {
         match act {
             catalog::CatalogAction::Move(down) => self.catalog_move(down),
             catalog::CatalogAction::Act(f) => f(self),
+            catalog::CatalogAction::Start(mode) => self.start(self.catalog_kind, mode),
         }
     }
 
-    /// 发起 vps 登记:先过两道门 + 写互斥,再进表单态。
-    pub fn start_vps_register(&mut self) {
+    /// 册级登记 / 删除入口(#76:四本册的 `start_*` 八份收成一份)。
+    ///
+    /// 操作者感知不到任何变化——四本册各自的入口门、写互斥、表单复位与提示
+    /// 逐字节不变;这一票买的是「加一条按册的登记 / 删除关切只改一处」(
+    /// [`crate::screens::CatalogKind`] 查表成员),不再改四处。按册差异全走查表,
+    /// 这里不再有 `match kind` / `if kind ==`:装配在途与入口门两道守卫按 mode
+    /// 取各自的日志口径(登记 vs 删除),过了守卫后 Register/Add 复位表单进登记
+    /// 流、Rm 先取选中名再走各自的删除发起(机器 / 订阅 / 钥匙三本进 rm 确认
+    /// 弹层;标签册的删除嵌套在表单流里)。
+    fn start(&mut self, kind: crate::screens::CatalogKind, mode: crate::screens::StartMode) {
         if self.assembling {
-            self.push_log("装配进行中:登记与装配互斥,稍后再试");
+            match mode {
+                crate::screens::StartMode::Register => self.push_log(format!(
+                    "装配进行中:{}与装配互斥,稍后再试",
+                    kind.register_verb()
+                )),
+                crate::screens::StartMode::Rm => {
+                    self.push_log("装配进行中:删除与装配互斥,稍后再试")
+                }
+            }
             return;
         }
-        if !self.vps_entry_enabled() {
-            self.push_log(format!("登记入口不可用:{}", self.vps_gate_hint()));
+        if !kind.entry_enabled(self) {
+            match mode {
+                crate::screens::StartMode::Register => self.push_log(format!(
+                    "{}入口不可用:{}",
+                    kind.register_verb(),
+                    kind.gate_hint(self)
+                )),
+                crate::screens::StartMode::Rm => {
+                    self.push_log(format!("删除未下发:{}", kind.gate_hint(self)))
+                }
+            }
             return;
         }
-        self.vps_rm_confirm = false;
-        self.vps_flow.begin();
-        self.vps_form = catalog::new_form();
-        self.push_log("登记机器:填名字/地址/端口/登录/备注,Enter 预审,Esc/q 返航");
+        match mode {
+            crate::screens::StartMode::Register => {
+                kind.rm_confirm_set(self, false);
+                kind.flow_mut(self).begin();
+                kind.form_reset(self);
+                self.push_log(kind.register_prompt());
+            }
+            crate::screens::StartMode::Rm => {
+                let Some(name) = kind.selected_name(self) else {
+                    self.push_log(format!(
+                        "删除未下发:没有选中的{}(↑/↓ 先选一行)",
+                        kind.label()
+                    ));
+                    return;
+                };
+                kind.start_rm(self, name);
+            }
+        }
     }
 
     /// 登记流程键位(表单 / 等回音 / 确认 / 落账在途 / 结果)。
@@ -2190,24 +2230,6 @@ impl App {
         self.vps_flow.abandon();
         self.vps_form = catalog::new_form();
         self.push_log("登记返航");
-    }
-
-    /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
-    pub fn start_vps_rm(&mut self) {
-        if self.assembling {
-            self.push_log("装配进行中:删除与装配互斥,稍后再试");
-            return;
-        }
-        if !self.vps_entry_enabled() {
-            self.push_log(format!("删除未下发:{}", self.vps_gate_hint()));
-            return;
-        }
-        let Some(name) = self.selected_vps_name() else {
-            self.push_log("删除未下发:没有选中的机器(↑/↓ 先选一行)");
-            return;
-        };
-        self.vps_rm_confirm = true;
-        self.push_log(format!("删除确认:{name}(Enter 确认,Esc/q 取消)"));
     }
 
     fn on_key_vps_rm_confirm(&mut self, k: KeyEvent) {
@@ -2635,50 +2657,6 @@ impl App {
         self.vps_reverse.is_open()
     }
 
-    /// 发起挂标签:进表单态(Enter 即下发——上游没有 `--yes`,面板不自己
-    /// 造一道确认,ADR-0009 §2)。
-    pub fn start_tag_add(&mut self) {
-        if self.assembling {
-            self.push_log("装配进行中:挂标签与装配互斥,稍后再试");
-            return;
-        }
-        if !self.tag_entry_enabled() {
-            self.push_log(format!("挂标签入口不可用:{}", self.tag_gate_hint()));
-            return;
-        }
-        self.tag_rm_confirm = false;
-        self.tag_flow.begin();
-        self.tag_form = catalog::new_tag_form(catalog::TagFormMode::Add);
-        self.push_log("挂标签:填标签名与若干条 kind/条目 引用,Enter 挂上去,Esc/q 返航");
-    }
-
-    /// 发起摘引用 / 删标签:表单预填选中的标签名(引用留空 = 删整个标签)。
-    pub fn start_tag_rm(&mut self) {
-        if self.assembling {
-            self.push_log("装配进行中:删除与装配互斥,稍后再试");
-            return;
-        }
-        if !self.tag_entry_enabled() {
-            self.push_log(format!("删除未下发:{}", self.tag_gate_hint()));
-            return;
-        }
-        let Some(name) = self.selected_tag_name() else {
-            self.push_log("删除未下发:没有选中的标签(↑/↓ 先选一行)");
-            return;
-        };
-        self.tag_rm_confirm = false;
-        self.tag_flow.begin();
-        self.tag_form = catalog::new_tag_form(catalog::TagFormMode::Rm);
-        self.tag_form.name = name.clone();
-        // 光标落在引用字段:名字已预填,摘引用/删标签的动作全在引用行
-        // (留空 = 删整个标签)。不预填该标签现有的引用——摘哪几条由操作者
-        // 明确点出来,面板不替他决定(全预填 + 一路 Enter = 悄悄摘光)。
-        self.tag_form.field = catalog::TagField::Refs;
-        self.push_log(format!(
-            "摘引用 / 删标签 {name}:引用留空 = 删整个标签,填 kind/条目 = 只摘那几条"
-        ));
-    }
-
     /// 标签册流程键位(表单 / 写在途 / 结论)。
     fn on_key_tag_flow(&mut self, k: KeyEvent) {
         match self.tag_flow.phase {
@@ -2868,22 +2846,6 @@ impl App {
         self.push_log("subscription ls 已入队(只读,不写任何文件)");
     }
 
-    /// 发起订阅登记:先过两道门 + 写互斥,再进表单态(含掩码喂入框)。
-    pub fn start_sub_register(&mut self) {
-        if self.assembling {
-            self.push_log("装配进行中:登记与装配互斥,稍后再试");
-            return;
-        }
-        if !self.sub_entry_enabled() {
-            self.push_log(format!("登记入口不可用:{}", self.sub_gate_hint()));
-            return;
-        }
-        self.sub_rm_confirm = false;
-        self.sub_flow.begin();
-        self.sub_form = crate::screens::new_sub_form();
-        self.push_log("登记订阅:填名字/应用/到期日,在链接框贴一次本体,Enter 预审,Esc/q 返航");
-    }
-
     /// 订阅登记流程键位(表单 / 等回音 / 确认 / 落账在途 / 结果)。
     fn on_key_sub_flow(&mut self, k: KeyEvent) {
         match self.sub_flow.phase {
@@ -2995,24 +2957,6 @@ impl App {
         self.push_log("登记返航(在途链接本体已 drop,面板侧不留副本)");
     }
 
-    /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
-    pub fn start_sub_rm(&mut self) {
-        if self.assembling {
-            self.push_log("装配进行中:删除与装配互斥,稍后再试");
-            return;
-        }
-        if !self.sub_entry_enabled() {
-            self.push_log(format!("删除未下发:{}", self.sub_gate_hint()));
-            return;
-        }
-        let Some(name) = self.selected_sub_name() else {
-            self.push_log("删除未下发:没有选中的订阅(↑/↓ 先选一行)");
-            return;
-        };
-        self.sub_rm_confirm = true;
-        self.push_log(format!("删除确认:{name}(Enter 确认,Esc/q 取消)"));
-    }
-
     fn on_key_sub_rm_confirm(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Enter => self.dispatch_sub_rm(),
@@ -3106,24 +3050,6 @@ impl App {
         self.key_ls_loading = true;
         self.queue.push(commands::key_ls(&root));
         self.push_log("key ls 已入队(只读,不写任何文件)");
-    }
-
-    /// 发起钥匙登记:先过两道门 + 写互斥,再进表单态(含掩码喂入框)。
-    pub fn start_key_register(&mut self) {
-        if self.assembling {
-            self.push_log("装配进行中:登记与装配互斥,稍后再试");
-            return;
-        }
-        if !self.key_entry_enabled() {
-            self.push_log(format!("登记入口不可用:{}", self.key_gate_hint()));
-            return;
-        }
-        self.key_rm_confirm = false;
-        self.key_flow.begin();
-        self.key_form = crate::screens::new_key_form();
-        self.push_log(
-            "登记钥匙:填名字/主机/作用域/轮换日,在钥匙框贴一次本体,Enter 预审,Esc/q 返航",
-        );
     }
 
     /// 钥匙登记流程键位(表单 / 等回音 / 确认 / 落账在途 / 结果)。
@@ -3231,24 +3157,6 @@ impl App {
         self.key_flow.abandon();
         self.key_form = crate::screens::new_key_form();
         self.push_log("登记返航(在途钥匙本体已 drop,面板侧不留副本)");
-    }
-
-    /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
-    pub fn start_key_rm(&mut self) {
-        if self.assembling {
-            self.push_log("装配进行中:删除与装配互斥,稍后再试");
-            return;
-        }
-        if !self.key_entry_enabled() {
-            self.push_log(format!("删除未下发:{}", self.key_gate_hint()));
-            return;
-        }
-        let Some(name) = self.selected_key_name() else {
-            self.push_log("删除未下发:没有选中的钥匙(↑/↓ 先选一行)");
-            return;
-        };
-        self.key_rm_confirm = true;
-        self.push_log(format!("删除确认:{name}(Enter 确认,Esc/q 取消)"));
     }
 
     fn on_key_key_rm_confirm(&mut self, k: KeyEvent) {
