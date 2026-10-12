@@ -7353,7 +7353,7 @@ mod tests {
         );
     }
     /// 机器册 80×30 整帧 golden(基线 `bb19d70` + #66;此后 #67 加 `m 换册`、#69 加 `/ 过滤`、#70 改 `Esc` 并加 `Enter 反查`)。
-    const VPS_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+    const VPS_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 机器 · 机器 · 编目 /r/vps.json                           │
 │  ⚙ 装配  ││  ▸ bare  端口 0                                                  │
@@ -7435,7 +7435,7 @@ mod tests {
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
     /// 标签册 80×30 整帧 golden(基线 `bb19d70` + #66;#65 评审第 3 条把册头 `反查 /tmp` 改回 `全部标签`)。
-    const TAG_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+    const TAG_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 标签 · 全部标签 · 编目 /r/tags.json                      │
 │  ⚙ 装配  ││  ▸ bare                                                          │
@@ -7517,7 +7517,7 @@ mod tests {
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
     /// 订阅册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动)。
-    const SUB_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+    const SUB_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 订阅 · 全部订阅 · 编目 /r/subscriptions.json             │
 │  ⚙ 装配  ││  ▸ airport  应用 Mihomo                                          │
@@ -7599,7 +7599,7 @@ mod tests {
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
     /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动)。
-    const KEY_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+    const KEY_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                      │
 │  ⚙ 装配  ││  ▸ ci  kind github-key                                           │

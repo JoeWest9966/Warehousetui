@@ -69,7 +69,7 @@ fn render_top_bar(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(" Warehousetui", p.accent().bold()),
             Span::styled(" · Nous Warehouse 驾驶舱 ", p.dim()),
-            Span::raw("  nwt v0.2 · "),
+            Span::raw("  nwt v0.3 · "),
             Span::styled(
                 format!("nw {} · {}", app.engine_version, app.engine.source),
                 p.info(),
@@ -695,7 +695,7 @@ fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
         p.text(),
     )));
     lines.push(Line::from(Span::styled(
-        "               nwt v0.2 · 按任意键进入",
+        "               nwt v0.3 · 按任意键进入",
         p.dim(),
     )));
     frame.render_widget(Paragraph::new(lines).centered(), area);
@@ -743,7 +743,7 @@ mod tests {
         app.nw_home = "/nw".into();
         app.ls = Some(serde_json::from_str(ls).unwrap());
         let got = crate::testutil::frame_display(&app, 80, 30);
-        let want = r#" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+        let want = r#" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 概览 ──────────────────────────────────────────────────目标侧日常┐
 │▸ ▸ 概览  ││ ⚠ 警示带 派 desk 需要关注(漂移/破损)                             │
 │  ⚙ 装配  ││┌ 派 (profiles) ────────────────────────────┐┌ 指令 ─────────────┐│
@@ -894,7 +894,7 @@ mod tests {
         assert!(top.contains("NW_HOME"), "NW_HOME 保留");
         assert!(top.contains("○ 空闲"), "装配态灯保留");
         assert!(!top.contains("驾驶舱"), "副品牌去掉了");
-        assert!(!top.contains("nwt v0.2"), "版本细节去掉了");
+        assert!(!top.contains("nwt v0.3"), "版本细节去掉了");
 
         // 行 1:横向屏 Tab,五屏齐全、顺序同 Screen::ALL、当前屏带选中标记
         let tabs = lines[1];
