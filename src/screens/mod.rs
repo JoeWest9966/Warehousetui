@@ -21,6 +21,7 @@ pub use catalog::{
     spec_from_sub_form, spec_from_tag_form, Audit, CatalogKind, FormAction, KeyField, KeyForm,
     KeySpec, RegPhase, RegisterFlow, RegisterSpec, SecretBody, StartMode, SubField, SubForm,
     SubscriptionSpec, TagField, TagForm, TagFormMode, TagSpec, VpsField, VpsForm, VpsSpec,
+    WriteRoute,
 };
 pub use health::render_health;
 pub use overview::render_overview;

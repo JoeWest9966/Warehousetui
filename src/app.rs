@@ -952,30 +952,26 @@ impl App {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
         } else if self.vps_rm_confirm {
-            self.vps_rm_confirm = false;
-            self.push_log("删除已取消:vps.json 一个字节都没动");
+            self.dismiss_rm(crate::screens::CatalogKind::Vps);
         } else if self.tag_rm_confirm {
-            self.tag_rm_confirm = false;
-            self.push_log("删除已取消:tags.json 一个字节都没动");
+            self.dismiss_rm(crate::screens::CatalogKind::Tag);
         } else if self.vps_flow.phase != catalog::RegPhase::Idle {
             // 编目册登记返航与 Esc 完全同路(骨架件同一语义)
-            self.cancel_vps_register();
+            self.cancel(crate::screens::CatalogKind::Vps);
         } else if self.tag_flow.phase != catalog::RegPhase::Idle {
-            self.cancel_tag_flow();
+            self.cancel(crate::screens::CatalogKind::Tag);
         } else if self.sub_rm_confirm {
-            self.sub_rm_confirm = false;
-            self.push_log("删除已取消:subscriptions.json 一个字节都没动");
+            self.dismiss_rm(crate::screens::CatalogKind::Subscription);
         } else if self.sub_flow.phase != catalog::RegPhase::Idle {
             // 编目册登记返航与 Esc 完全同路(骨架件同一语义);在途链接本体
             // 随表单 drop(ADR-0009 §3:面板侧不留副本)。
-            self.cancel_sub_register();
+            self.cancel(crate::screens::CatalogKind::Subscription);
         } else if self.key_rm_confirm {
-            self.key_rm_confirm = false;
-            self.push_log("删除已取消:keys.json 一个字节都没动");
+            self.dismiss_rm(crate::screens::CatalogKind::Key);
         } else if self.key_flow.phase != catalog::RegPhase::Idle {
             // 编目册登记返航与 Esc 完全同路(骨架件同一语义);在途钥匙本体
             // 随表单 drop(ADR-0009 §3:面板侧不留副本)。
-            self.cancel_key_register();
+            self.cancel(crate::screens::CatalogKind::Key);
         }
     }
 
@@ -1222,44 +1218,49 @@ impl App {
             return;
         }
         // 编目册登记两段式(#53):与外部源登记同级的浮层优先级,
-        // 骨架件同构(`screens::catalog::RegisterFlow`)。
+        // 骨架件同构(`screens::catalog::RegisterFlow`)。四本册各一道守卫,
+        // 受理次序固定(与 `CatalogKind::overlay` 逐字对齐:哪一本的哪道浮层
+        // 更里层)。**只转口不重排**(#76):每个叶子现在都走收敛后的那一份
+        // `on_key_flow` / `on_key_rm_confirm`,按册差异在查表成员上,这里不再有
+        // 四份逐字重复的处理器——但守卫本身仍按册的旗 / 槽判(不是按
+        // `catalog_kind` 判),次序与优先级一字节不动。
         if self.vps_flow.phase != catalog::RegPhase::Idle {
-            self.on_key_vps_flow(k);
+            self.on_key_flow(crate::screens::CatalogKind::Vps, k);
             return;
         }
         if self.vps_rm_confirm {
-            self.on_key_vps_rm_confirm(k);
+            self.on_key_rm_confirm(crate::screens::CatalogKind::Vps, k);
             return;
         }
         // 标签册浮层(#54):骨架件同一个 `RegisterFlow`。**rm 确认是嵌套在
         // 表单流里的一道浮层**(表单 Enter 才出现),所以它比流程态更里层,
         // 优先受理——否则 Enter 会被表单再收一次,确认框永远点不着。
         if self.tag_rm_confirm {
-            self.on_key_tag_rm_confirm(k);
+            self.on_key_rm_confirm(crate::screens::CatalogKind::Tag, k);
             return;
         }
         if self.tag_flow.phase != catalog::RegPhase::Idle {
-            self.on_key_tag_flow(k);
+            self.on_key_flow(crate::screens::CatalogKind::Tag, k);
             return;
         }
         // 订阅册浮层(#56):同一个骨架件。删除确认是独立一道图形确认
         // (ADR-0009 §2),登记流里没有 rm 那一步,所以两道浮层平级即可。
         if self.sub_rm_confirm {
-            self.on_key_sub_rm_confirm(k);
+            self.on_key_rm_confirm(crate::screens::CatalogKind::Subscription, k);
             return;
         }
         if self.sub_flow.phase != catalog::RegPhase::Idle {
-            self.on_key_sub_flow(k);
+            self.on_key_flow(crate::screens::CatalogKind::Subscription, k);
             return;
         }
         // 钥匙册浮层(#57):同一个骨架件。删除确认是独立一道图形确认
         // (ADR-0009 §2),登记流里没有 rm 那一步,所以两道浮层平级即可。
         if self.key_rm_confirm {
-            self.on_key_key_rm_confirm(k);
+            self.on_key_rm_confirm(crate::screens::CatalogKind::Key, k);
             return;
         }
         if self.key_flow.phase != catalog::RegPhase::Idle {
-            self.on_key_key_flow(k);
+            self.on_key_flow(crate::screens::CatalogKind::Key, k);
             return;
         }
         // 登记两段式(#30 #31):输入 → 预审 → 确认 → 落账 → 结果,
@@ -2132,89 +2133,191 @@ impl App {
         }
     }
 
-    /// 登记流程键位(表单 / 等回音 / 确认 / 落账在途 / 结果)。
-    fn on_key_vps_flow(&mut self, k: KeyEvent) {
-        match self.vps_flow.phase {
-            catalog::RegPhase::Form => match catalog::on_key_form(&mut self.vps_form, k) {
-                catalog::FormAction::Submit => self.dispatch_vps_register(),
-                catalog::FormAction::Cancel => self.cancel_vps_register(),
+    /// 册级登记流的键位(表单 / 等回音 / 确认 / 落账在途 / 结果;#76:四本册的
+    /// `on_key_*_flow` 四份收成一份)。
+    ///
+    /// 操作者感知不到任何变化——四本册各自的表单键位、等回音段、确认段、结论段
+    /// 逐字节不变;这一票买的是「加一条按册的登记流键位关切只改一处」
+    /// ([`crate::screens::CatalogKind`] 查表成员),不再改四处。按册差异全走查表,
+    /// 这里不再有 `match kind` / `if kind ==`:表单段问这一本的 `form_key`,确认段
+    /// 按这一本**有没有引擎确认闸**(`confirm_gate`)决定认不认「Enter 落账」——
+    /// 标签册没有 `--yes`(ADR-0009 §2 面板不自己造一道),它的结论屏只有返航。
+    fn on_key_flow(&mut self, kind: crate::screens::CatalogKind, k: KeyEvent) {
+        let phase = kind.flow(self).phase;
+        match phase {
+            catalog::RegPhase::Form => match kind.form_key(self, k) {
+                catalog::FormAction::Submit => self.dispatch_preaudit(kind),
+                catalog::FormAction::Cancel => self.cancel(kind),
                 catalog::FormAction::Edited => {}
             },
+            // 等回音段:Esc 返航。标签册没有预审段(它的写命令是 `tag add`,见
+            // `dispatch_preaudit` 的 `write_route`),这一条对它恒不成立。
             catalog::RegPhase::PreAudit | catalog::RegPhase::Commit => {
                 if matches!(k.code, KeyCode::Esc) {
-                    self.cancel_vps_register();
+                    self.cancel(kind);
                 }
             }
-            catalog::RegPhase::Review => match k.code {
-                KeyCode::Enter => self.dispatch_vps_commit(),
-                KeyCode::Esc => self.cancel_vps_register(),
-                _ => {}
-            },
+            catalog::RegPhase::Review => {
+                if kind.confirm_gate() {
+                    match k.code {
+                        KeyCode::Enter => self.dispatch_commit(kind),
+                        KeyCode::Esc => self.cancel(kind),
+                        _ => {}
+                    }
+                } else if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    // 标签册:没有引擎确认闸,面板也不自己造一道(ADR-0009 §2)——
+                    // 写已随那一次下发完成,结论屏只有返航,没有「Enter 落账」段。
+                    self.cancel(kind);
+                }
+            }
             catalog::RegPhase::Done => {
                 if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    self.cancel_vps_register();
+                    self.cancel(kind);
                 }
             }
             catalog::RegPhase::Idle => {}
         }
     }
 
-    /// 下发预审(两段式第一段):不带 `--yes`,文件不落;下发前重过两道门。
-    pub fn dispatch_vps_register(&mut self) {
-        if !self.vps_entry_enabled() {
-            self.push_log(format!("登记不下发:{}", self.vps_gate_hint()));
-            self.cancel_vps_register();
+    /// 删除确认弹层的键位(四本册逐字节相同:Enter 下发,Esc/q 收回;#76:四份
+    /// `on_key_*_rm_confirm` 收成一份)。
+    fn on_key_rm_confirm(&mut self, kind: crate::screens::CatalogKind, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => self.dispatch_rm(kind),
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
+            _ => {}
+        }
+    }
+
+    /// 下发登记 / 挂标签(#76:三本册的 `dispatch_*_register` 与标签册的
+    /// `dispatch_tag_write` 收成一份)。
+    ///
+    /// 四本册同一副骨架:两道守卫(入口门 / 数据仓根,任一不过即返航,不留半条
+    /// 记录)→ 面板侧定型(空名字 / 形状不合就拒,留表单可改,不喂给引擎跑一趟)→
+    /// 按这一本的 [`crate::screens::WriteRoute`] 递出去。按册差异(入口门与提示
+    /// 口径、表单形态、写命令进哪条队列、日志口径)全走查表,这里不再有
+    /// `match kind` / `if kind ==`。
+    ///
+    /// 名字不与外部源登记的 [`Self::dispatch_register`] 抢:那一族是另一副骨架
+    /// (`RegState` 六态),本函数只服务编目册四本。
+    fn dispatch_preaudit(&mut self, kind: crate::screens::CatalogKind) {
+        if !kind.entry_enabled(self) {
+            self.push_log(format!(
+                "{}{}",
+                kind.dispatch_gate_prefix(),
+                kind.gate_hint(self)
+            ));
+            self.cancel(kind);
             return;
         }
         let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("登记不下发:{}", self.data_root_gate_msg()));
-            self.cancel_vps_register();
+            self.push_log(format!(
+                "{}{}",
+                kind.dispatch_gate_prefix(),
+                self.data_root_gate_msg()
+            ));
+            self.cancel(kind);
             return;
         };
-        let spec = match catalog::spec_from_form(&self.vps_form) {
+        let spec = match kind.spec_from_form(self) {
             Ok(s) => s,
             Err(bad) => {
-                // 面板侧就拒(空名字 / label=addr 拆不出两侧),留表单可改,
-                // 不喂给引擎跑一趟。
-                self.push_log(format!("登记被拒:{},留表单可改", bad.join(";")));
+                // 面板侧就拒,留表单可改,不喂给引擎跑一趟。
+                self.push_log(format!(
+                    "{}{},留表单可改",
+                    kind.dispatch_reject_prefix(),
+                    bad.join(";")
+                ));
                 return;
             }
         };
-        self.vps_flow.preaudit_sent();
-        self.queue.push(spec.preaudit(&root));
-        self.push_log(format!(
-            "登记预审已入队:vps register {}(不带 --yes,文件不落)",
-            spec.name
-        ));
+        match kind.write_route(self) {
+            // 两段式第一段(预审):不带 `--yes`,文件不落。
+            crate::screens::WriteRoute::Preaudit => {
+                kind.flow_mut(self).preaudit_sent();
+                let fed = kind.dispatch_cmd(self, spec.preaudit(&root));
+                self.push_log(kind.preaudit_log(spec.name(), fed));
+            }
+            // 标签册的 `tag add`:没有确认闸,表单 Enter 直接进写段。
+            crate::screens::WriteRoute::Commit => self.dispatch_commit(kind),
+            // 标签册的 `tag rm`:只起面板侧那道图形确认,不下发。
+            crate::screens::WriteRoute::RmConfirm => kind.raise_rm_confirm(self, spec.name()),
+        }
     }
 
-    /// 落账(两段式第二段):图形确认后才可能到达——全流程唯一能产生
-    /// `--yes` 的转换。重过三道闸(入口 / 数据仓根 / 预审结论),全过才
-    /// 下发并点亮写互斥;任何一道不过都不下发写命令。
-    pub fn dispatch_vps_commit(&mut self) {
-        if self.vps_flow.phase != catalog::RegPhase::Review || !self.vps_can_commit() {
-            self.push_log("落账未下发:预审未通过(五道闸有 fail 或退出码非 0)");
+    /// 落账(两段式第二段):图形确认后才可能到达——全流程唯一能产生 `--yes`
+    /// 的转换。重过三道闸(入口 / 数据仓根 / 预审结论),全过才下发并点亮写
+    /// 互斥;任何一道不过都不下发写命令。#76:三本册的 `dispatch_*_commit` 收成
+    /// 一份,标签册的 `tag add`(没有确认闸)也从表单 Enter 直接到这一条。
+    fn dispatch_commit(&mut self, kind: crate::screens::CatalogKind) {
+        // 第一道闸只问有确认闸的三本:标签册从表单 Enter 直接进写段
+        // (`write_route` 的 Commit 臂),没有「预审通过」这一说。
+        if kind.confirm_gate()
+            && (kind.flow(self).phase != catalog::RegPhase::Review || !kind.can_commit(self))
+        {
+            self.push_log(kind.commit_gate_msg());
             return;
         }
-        if !self.vps_entry_enabled() {
-            self.push_log(format!("落账未下发:{}", self.vps_gate_hint()));
+        if !kind.entry_enabled(self) {
+            self.push_log(format!("落账未下发:{}", kind.gate_hint(self)));
             return;
         }
         let Some(root) = self.usable_data_root() else {
             self.push_log(format!("落账未下发:{}", self.data_root_gate_msg()));
             return;
         };
-        let Ok(spec) = catalog::spec_from_form(&self.vps_form) else {
+        let Ok(spec) = kind.spec_from_form(self) else {
             self.push_log("落账未下发:表单已不可定型(返航后从表单重来)");
             return;
         };
-        self.vps_flow.commit_sent();
+        kind.flow_mut(self).commit_sent();
         self.assembling = true;
-        self.queue.push(spec.commit(&root));
-        self.push_log(format!(
-            "登记落账已入队:vps register {} --yes(--root {})",
-            spec.name, root
-        ));
+        let fed = kind.dispatch_cmd(self, spec.commit(&root));
+        self.push_log(kind.commit_log(spec.name(), &root, fed));
+    }
+
+    /// 下发删除:argv 与在 shell 里敲的逐字相同(面板只决定何时递出去;
+    /// #76:四本册的 `dispatch_*_rm` 收成一份)。
+    fn dispatch_rm(&mut self, kind: crate::screens::CatalogKind) {
+        // 删谁:机器 / 订阅 / 钥匙三本取当前选中行;标签册的删除嵌套在表单流里,
+        // 目标由表单定型。取不到即收确认旗、按册留一句,不下发。
+        let Some(name) = kind.rm_target(self) else {
+            kind.rm_confirm_set(self, false);
+            self.push_log(kind.rm_missing_log());
+            return;
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("删除未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
+        // 与 register 落账段同一处点灯,回音到达时灭,见 `on_echo_rm` → `CatalogKind::absorb_rm`)。
+        kind.rm_confirm_set(self, false);
+        kind.rm_result_clear(self);
+        self.assembling = true;
+        let argv = kind.rm_cmd(self, &root, &name);
+        self.queue.push(argv);
+        kind.rm_consumed(self, &name, &root);
+    }
+
+    /// 返航:任一态 Esc 同义,状态清空不留半条记录(#76:四份 `cancel_*` 收成一份)。
+    /// 清状态那一半四本同一条(收流 + 复位表单 + 收删除确认旗),按册只剩那句
+    /// 日志的口径(`CatalogKind::cancel_log`)。
+    fn cancel(&mut self, kind: crate::screens::CatalogKind) {
+        kind.flow_mut(self).abandon();
+        kind.form_reset(self);
+        // 标签册的删除确认嵌套在表单流里(#54),返航连它一起收;其余三本在登记
+        // 流里那面旗恒 false,这一句对它们是空操作。
+        kind.rm_confirm_set(self, false);
+        self.push_log(kind.cancel_log());
+    }
+
+    /// 删除确认被收回(鼠标点任意处与键盘 Esc/q 同路):收旗,留一句「一个字节
+    /// 都没动」。四本册同一形状,差别只在数据仓根下那个文件名
+    /// (`CatalogKind::file`)。
+    fn dismiss_rm(&mut self, kind: crate::screens::CatalogKind) {
+        kind.rm_confirm_set(self, false);
+        self.push_log(format!("删除已取消:{} 一个字节都没动", kind.file()));
     }
 
     /// vps 落账闸(呈现口径):预审通过 = rc 0 且五道闸无 fail 且 data 可定型。
@@ -2223,41 +2326,6 @@ impl App {
             return false;
         };
         catalog::preaudit_passed(out, catalog::VpsSpec::audit(out).as_ref())
-    }
-
-    /// 返航:任一态 Esc 同义,状态清空不留半条记录。
-    pub fn cancel_vps_register(&mut self) {
-        self.vps_flow.abandon();
-        self.vps_form = catalog::new_form();
-        self.push_log("登记返航");
-    }
-
-    fn on_key_vps_rm_confirm(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => self.dispatch_vps_rm(),
-            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
-            _ => {}
-        }
-    }
-
-    /// 下发删除:argv 与在 shell 里敲的逐字相同(面板只决定何时递出去)。
-    fn dispatch_vps_rm(&mut self) {
-        let Some(name) = self.selected_vps_name() else {
-            self.vps_rm_confirm = false;
-            self.push_log("删除未下发:没有选中的机器");
-            return;
-        };
-        let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("删除未下发:{}", self.data_root_gate_msg()));
-            return;
-        };
-        self.vps_rm_confirm = false;
-        self.vps_rm_result = None;
-        // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
-        // 与 register 落账段同一处点灯,回音到达时灭,见 `on_echo_rm` → `CatalogKind::absorb_rm`)。
-        self.assembling = true;
-        self.queue.push(commands::vps_rm(&name, &root));
-        self.push_log(format!("删除已入队:vps rm {name} --root {root}"));
     }
 
     /// 读一次编目册(只读;编目不存在 = 空数组 rc 0,合法空态)。
@@ -2657,123 +2725,6 @@ impl App {
         self.vps_reverse.is_open()
     }
 
-    /// 标签册流程键位(表单 / 写在途 / 结论)。
-    fn on_key_tag_flow(&mut self, k: KeyEvent) {
-        match self.tag_flow.phase {
-            catalog::RegPhase::Form => match catalog::on_key_tag_form(&mut self.tag_form, k) {
-                catalog::FormAction::Submit => self.dispatch_tag_write(),
-                catalog::FormAction::Cancel => self.cancel_tag_flow(),
-                catalog::FormAction::Edited => {}
-            },
-            catalog::RegPhase::Commit => {
-                if matches!(k.code, KeyCode::Esc) {
-                    self.cancel_tag_flow();
-                }
-            }
-            // tag add 没有引擎确认闸,面板也不自己造一道(ADR-0009 §2):
-            // 写已随那一次下发完成,结论屏只有返航,没有「Enter 落账」段。
-            catalog::RegPhase::Review | catalog::RegPhase::Done => {
-                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    self.cancel_tag_flow();
-                }
-            }
-            catalog::RegPhase::PreAudit | catalog::RegPhase::Idle => {}
-        }
-    }
-
-    /// 下发标签册的写命令:`tag add`(无确认闸,表单 Enter 即下发)或
-    /// `tag rm`(面板加一道图形确认后才到这里)。幂等由**复用同一份 argv**
-    /// 保证——同一条命令重跑,tags.json 一个字节不变。
-    pub fn dispatch_tag_write(&mut self) {
-        if !self.tag_entry_enabled() {
-            self.push_log(format!("未下发:{}", self.tag_gate_hint()));
-            self.cancel_tag_flow();
-            return;
-        }
-        let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("未下发:{}", self.data_root_gate_msg()));
-            self.cancel_tag_flow();
-            return;
-        };
-        let spec = match catalog::spec_from_tag_form(&self.tag_form) {
-            Ok(s) => s,
-            Err(bad) => {
-                // 面板侧就拒(空标签名 / kind 不在已知集合),留表单可改,
-                // 不喂给引擎跑一趟。
-                self.push_log(format!("被拒:{},留表单可改", bad.join(";")));
-                return;
-            }
-        };
-        match self.tag_form.mode {
-            catalog::TagFormMode::Add => {
-                self.tag_flow.commit_sent();
-                self.assembling = true;
-                self.queue.push(spec.commit(&root));
-                self.push_log(format!(
-                    "挂标签已下发:tag add {}(追加合并、幂等,无确认闸;--root {})",
-                    spec.name, root
-                ));
-            }
-            catalog::TagFormMode::Rm => {
-                // 图形确认(ADR-0009 §2):面板只决定「什么时候递出去」,
-                // 下发的 argv 与在 shell 里敲的逐字相同。
-                self.tag_rm_confirm = true;
-                self.push_log(format!("删除确认:{}(Enter 确认,Esc/q 取消)", spec.name));
-            }
-        }
-    }
-
-    /// 摘引用 / 删标签确认键位。
-    fn on_key_tag_rm_confirm(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => self.dispatch_tag_rm(),
-            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
-            _ => {}
-        }
-    }
-
-    /// 下发 `tag rm`:引用行为空 = 删整个标签,带引用 = 只摘那几条。
-    fn dispatch_tag_rm(&mut self) {
-        let Ok(spec) = catalog::spec_from_tag_form(&self.tag_form) else {
-            self.tag_rm_confirm = false;
-            self.push_log("删除未下发:表单已不可定型(返航后从表单重来)");
-            return;
-        };
-        let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("删除未下发:{}", self.data_root_gate_msg()));
-            return;
-        };
-        self.tag_rm_confirm = false;
-        self.tag_rm_result = None;
-        // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
-        // 与 tag add 同一处点灯,回音到达时灭,见 `on_echo_rm` → `CatalogKind::absorb_rm`)。
-        self.assembling = true;
-        let refs = spec.refs.len();
-        self.queue
-            .push(commands::tag_rm(&spec.name, &spec.refs, &root));
-        // 表单的使命到此结束(确认即消费):收流并复位,下一趟 `d` 开的是一张
-        // 新表单——否则上一张引用行还摊在那儿,键会继续往里灌。
-        self.tag_flow.abandon();
-        self.tag_form = catalog::new_tag_form(catalog::TagFormMode::Add);
-        let scope = if refs == 0 {
-            "删整个标签".to_string()
-        } else {
-            format!("只摘 {refs} 条引用")
-        };
-        self.push_log(format!(
-            "删除已入队:tag rm {}({scope};--root {})",
-            spec.name, root
-        ));
-    }
-
-    /// 返航:任一态 Esc 同义,状态清空不留半条记录。
-    pub fn cancel_tag_flow(&mut self) {
-        self.tag_flow.abandon();
-        self.tag_rm_confirm = false;
-        self.tag_form = catalog::new_tag_form(catalog::TagFormMode::Add);
-        self.push_log("标签册返航");
-    }
-
     // ---- 编目册屏·订阅册(spec #50 工单 #56,ADR-0009) ----
 
     /// 订阅册的行数(ls 投影条数;没读到 = 0)。
@@ -2846,102 +2797,6 @@ impl App {
         self.push_log("subscription ls 已入队(只读,不写任何文件)");
     }
 
-    /// 订阅登记流程键位(表单 / 等回音 / 确认 / 落账在途 / 结果)。
-    fn on_key_sub_flow(&mut self, k: KeyEvent) {
-        match self.sub_flow.phase {
-            catalog::RegPhase::Form => match catalog::on_key_sub_form(&mut self.sub_form, k) {
-                catalog::FormAction::Submit => self.dispatch_sub_register(),
-                catalog::FormAction::Cancel => self.cancel_sub_register(),
-                catalog::FormAction::Edited => {}
-            },
-            catalog::RegPhase::PreAudit | catalog::RegPhase::Commit => {
-                if matches!(k.code, KeyCode::Esc) {
-                    self.cancel_sub_register();
-                }
-            }
-            catalog::RegPhase::Review => match k.code {
-                KeyCode::Enter => self.dispatch_sub_commit(),
-                KeyCode::Esc => self.cancel_sub_register(),
-                _ => {}
-            },
-            catalog::RegPhase::Done => {
-                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    self.cancel_sub_register();
-                }
-            }
-            catalog::RegPhase::Idle => {}
-        }
-    }
-
-    /// 下发预审(两段式第一段):不带 `--yes`,文件不落;**链接本体经 stdin
-    /// 喂入这一次**(喂入是一次性的,落账那一下要再喂一次)。
-    pub fn dispatch_sub_register(&mut self) {
-        if !self.sub_entry_enabled() {
-            self.push_log(format!("登记不下发:{}", self.sub_gate_hint()));
-            self.cancel_sub_register();
-            return;
-        }
-        let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("登记不下发:{}", self.data_root_gate_msg()));
-            self.cancel_sub_register();
-            return;
-        };
-        let spec = match catalog::spec_from_sub_form(&self.sub_form) {
-            Ok(s) => s,
-            Err(bad) => {
-                // 面板侧就拒(空名字 / 空 client / 到期日形状不对 / 本体没喂入),
-                // 留表单可改,不喂给引擎跑一趟。
-                self.push_log(format!("登记被拒:{},留表单可改", bad.join(";")));
-                return;
-            }
-        };
-        self.sub_flow.preaudit_sent();
-        let fed = spec.preaudit(&root);
-        let n = self.sub_form.body.len();
-        // 本体在面板侧的唯一副本在表单里(在途内存):预审这一下**克隆**一份喂
-        // 出去,表单里那份留到落账那一下再喂一次(两段式各喂一次,喂入是一次性
-        // 的)。喂出的副本随进程结束即弃;表单里那份随返航 / 落账完成即 drop。
-        self.fed_queue.push((fed, self.sub_form.body.clone()));
-        self.push_log(format!(
-            "登记预审已入队:subscription register --name {}(不带 --yes,文件不落;已喂入 {n} 字节)",
-            spec.name
-        ));
-    }
-
-    /// 落账(两段式第二段):图形确认后才可能到达——全流程唯一能产生 `--yes`
-    /// 的转换。重过三道闸(入口 / 数据仓根 / 预审结论),全过才下发并点亮写
-    /// 互斥;任何一道不过都不下发写命令。**本体再喂一次 stdin**。
-    pub fn dispatch_sub_commit(&mut self) {
-        if self.sub_flow.phase != catalog::RegPhase::Review || !self.sub_can_commit() {
-            self.push_log("落账未下发:预审未通过(四道闸有 fail 或退出码非 0)");
-            return;
-        }
-        if !self.sub_entry_enabled() {
-            self.push_log(format!("落账未下发:{}", self.sub_gate_hint()));
-            return;
-        }
-        let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("落账未下发:{}", self.data_root_gate_msg()));
-            return;
-        };
-        let Ok(spec) = catalog::spec_from_sub_form(&self.sub_form) else {
-            self.push_log("落账未下发:表单已不可定型(返航后从表单重来)");
-            return;
-        };
-        self.sub_flow.commit_sent();
-        self.assembling = true;
-        let fed = spec.commit(&root);
-        let n = self.sub_form.body.len();
-        // 本体在面板侧的唯一副本在表单里(在途内存):预审这一下**克隆**一份喂
-        // 出去,表单里那份留到落账那一下再喂一次(两段式各喂一次,喂入是一次性
-        // 的)。喂出的副本随进程结束即弃;表单里那份随返航 / 落账完成即 drop。
-        self.fed_queue.push((fed, self.sub_form.body.clone()));
-        self.push_log(format!(
-            "登记落账已入队:subscription register --name {} --yes(--root {};已再喂入 {n} 字节)",
-            spec.name, root
-        ));
-    }
-
     /// 订阅落账闸(呈现口径):预审通过 = rc 0 且四道闸无 fail 且 data 可定型。
     pub fn sub_can_commit(&self) -> bool {
         let Some(out) = self.sub_flow.result.as_ref() else {
@@ -2950,39 +2805,11 @@ impl App {
         catalog::preaudit_passed(out, catalog::SubscriptionSpec::audit(out).as_ref())
     }
 
-    /// 返航:任一态 Esc 同义,状态清空不留半条记录(在途本体随表单一起 drop)。
+    /// 订阅册返航(#76 收敛后的转口:实现只有一份 [`Self::cancel`]——四本册同一句
+    /// 「状态清空不留半条记录」,按册那点差别(在途本体随表单一起 drop)在
+    /// [`crate::screens::CatalogKind`] 查表成员上)。测试直接驱动它。
     pub fn cancel_sub_register(&mut self) {
-        self.sub_flow.abandon();
-        self.sub_form = crate::screens::new_sub_form();
-        self.push_log("登记返航(在途链接本体已 drop,面板侧不留副本)");
-    }
-
-    fn on_key_sub_rm_confirm(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => self.dispatch_sub_rm(),
-            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
-            _ => {}
-        }
-    }
-
-    /// 下发删除:argv 与在 shell 里敲的逐字相同(面板只决定何时递出去)。
-    fn dispatch_sub_rm(&mut self) {
-        let Some(name) = self.selected_sub_name() else {
-            self.sub_rm_confirm = false;
-            self.push_log("删除未下发:没有选中的订阅");
-            return;
-        };
-        let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("删除未下发:{}", self.data_root_gate_msg()));
-            return;
-        };
-        self.sub_rm_confirm = false;
-        self.sub_rm_result = None;
-        // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
-        // 与 register 落账段同一处点灯,回音到达时灭,见 `on_echo_rm` → `CatalogKind::absorb_rm`)。
-        self.assembling = true;
-        self.queue.push(commands::subscription_rm(&name, &root));
-        self.push_log(format!("删除已入队:subscription rm {name} --root {root}"));
+        self.cancel(crate::screens::CatalogKind::Subscription);
     }
 
     // ---- 编目册屏·钥匙册(spec #50 工单 #57,ADR-0009;机密纪律最严的一本) ----
@@ -3052,98 +2879,6 @@ impl App {
         self.push_log("key ls 已入队(只读,不写任何文件)");
     }
 
-    /// 钥匙登记流程键位(表单 / 等回音 / 确认 / 落账在途 / 结果)。
-    fn on_key_key_flow(&mut self, k: KeyEvent) {
-        match self.key_flow.phase {
-            catalog::RegPhase::Form => match catalog::on_key_key_form(&mut self.key_form, k) {
-                catalog::FormAction::Submit => self.dispatch_key_register(),
-                catalog::FormAction::Cancel => self.cancel_key_register(),
-                catalog::FormAction::Edited => {}
-            },
-            catalog::RegPhase::PreAudit | catalog::RegPhase::Commit => {
-                if matches!(k.code, KeyCode::Esc) {
-                    self.cancel_key_register();
-                }
-            }
-            catalog::RegPhase::Review => match k.code {
-                KeyCode::Enter => self.dispatch_key_commit(),
-                KeyCode::Esc => self.cancel_key_register(),
-                _ => {}
-            },
-            catalog::RegPhase::Done => {
-                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    self.cancel_key_register();
-                }
-            }
-            catalog::RegPhase::Idle => {}
-        }
-    }
-
-    /// 下发预审(两段式第一段):不带 `--yes`,文件不落;**钥匙本体经 stdin 喂入
-    /// 这一次**(喂入是一次性的,落账那一下要再喂一次)。
-    pub fn dispatch_key_register(&mut self) {
-        if !self.key_entry_enabled() {
-            self.push_log(format!("登记不下发:{}", self.key_gate_hint()));
-            self.cancel_key_register();
-            return;
-        }
-        let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("登记不下发:{}", self.data_root_gate_msg()));
-            self.cancel_key_register();
-            return;
-        };
-        let spec = match catalog::spec_from_key_form(&self.key_form) {
-            Ok(s) => s,
-            Err(bad) => {
-                // 面板侧就拒(空名字 / 轮换日形状不对 / 本体没喂入),留表单可改,
-                // 不喂给引擎跑一趟。
-                self.push_log(format!("登记被拒:{},留表单可改", bad.join(";")));
-                return;
-            }
-        };
-        self.key_flow.preaudit_sent();
-        let fed = spec.preaudit(&root);
-        let n = self.key_form.body.len();
-        // 本体在面板侧的唯一副本在表单里(在途内存):预审这一下**克隆**一份喂出去,
-        // 表单里那份留到落账那一下再喂一次(两段式各喂一次,喂入是一次性的)。
-        self.fed_queue.push((fed, self.key_form.body.clone()));
-        self.push_log(format!(
-            "登记预审已入队:key register --name {}(不带 --yes,文件不落;已喂入 {n} 字节)",
-            spec.name
-        ));
-    }
-
-    /// 落账(两段式第二段):图形确认后才可能到达——全流程唯一能产生 `--yes` 的
-    /// 转换。重过三道闸(入口 / 数据仓根 / 预审结论),全过才下发并点亮写互斥;
-    /// 任何一道不过都不下发写命令。**本体再喂一次 stdin**。
-    pub fn dispatch_key_commit(&mut self) {
-        if self.key_flow.phase != catalog::RegPhase::Review || !self.key_can_commit() {
-            self.push_log("落账未下发:预审未通过(三道闸有 fail 或退出码非 0)");
-            return;
-        }
-        if !self.key_entry_enabled() {
-            self.push_log(format!("落账未下发:{}", self.key_gate_hint()));
-            return;
-        }
-        let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("落账未下发:{}", self.data_root_gate_msg()));
-            return;
-        };
-        let Ok(spec) = catalog::spec_from_key_form(&self.key_form) else {
-            self.push_log("落账未下发:表单已不可定型(返航后从表单重来)");
-            return;
-        };
-        self.key_flow.commit_sent();
-        self.assembling = true;
-        let fed = spec.commit(&root);
-        let n = self.key_form.body.len();
-        self.fed_queue.push((fed, self.key_form.body.clone()));
-        self.push_log(format!(
-            "登记落账已入队:key register --name {} --yes(--root {};已再喂入 {n} 字节)",
-            spec.name, root
-        ));
-    }
-
     /// 钥匙落账闸(呈现口径):预审通过 = rc 0 且三道闸无 fail 且 data 可定型。
     pub fn key_can_commit(&self) -> bool {
         let Some(out) = self.key_flow.result.as_ref() else {
@@ -3152,39 +2887,11 @@ impl App {
         catalog::preaudit_passed(out, catalog::KeySpec::audit(out).as_ref())
     }
 
-    /// 返航:任一态 Esc 同义,状态清空不留半条记录(在途本体随表单一起 drop)。
+    /// 钥匙册返航(#76 收敛后的转口:实现只有一份 [`Self::cancel`]——四本册同一句
+    /// 「状态清空不留半条记录」,按册那点差别(在途本体随表单一起 drop)在
+    /// [`crate::screens::CatalogKind`] 查表成员上)。测试直接驱动它。
     pub fn cancel_key_register(&mut self) {
-        self.key_flow.abandon();
-        self.key_form = crate::screens::new_key_form();
-        self.push_log("登记返航(在途钥匙本体已 drop,面板侧不留副本)");
-    }
-
-    fn on_key_key_rm_confirm(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => self.dispatch_key_rm(),
-            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
-            _ => {}
-        }
-    }
-
-    /// 下发删除:argv 与在 shell 里敲的逐字相同(面板只决定何时递出去)。
-    fn dispatch_key_rm(&mut self) {
-        let Some(name) = self.selected_key_name() else {
-            self.key_rm_confirm = false;
-            self.push_log("删除未下发:没有选中的钥匙");
-            return;
-        };
-        let Some(root) = self.usable_data_root() else {
-            self.push_log(format!("删除未下发:{}", self.data_root_gate_msg()));
-            return;
-        };
-        self.key_rm_confirm = false;
-        self.key_rm_result = None;
-        // 写互斥(ADR-0009 §4:rm 是写动作,并入既有 assembling 语义;
-        // 与 register 落账段同一处点灯,回音到达时灭,见 `on_echo_rm` → `CatalogKind::absorb_rm`)。
-        self.assembling = true;
-        self.queue.push(commands::key_rm(&name, &root));
-        self.push_log(format!("删除已入队:key rm {name} --root {root}"));
+        self.cancel(crate::screens::CatalogKind::Key);
     }
 
     /// 轮换 NW_HOME:写进程环境(子进程继承)、持久化、顺手刷新 ls。
