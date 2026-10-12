@@ -169,9 +169,17 @@ impl Audit {
 /// 它的 `preaudit` 与 `commit` 是**同一份 argv**,且那一份本身就是写命令
 /// ——tag 没有「拟落账不落盘」的那一段。别为了套这个 trait 伪造一枚
 /// `--yes`:多一枚未知 flag 引擎直接 rc 3,那是改引擎语义。
+///
+/// 没有 `self` 接收者的三个方法(`title` / `audit` / `confirm_gate`)带
+/// `where Self: Sized`:它们是**命令组自己的静态属性**,按类型问、不按实例问
+/// (调用形状一字不变),加这一条只是为了把本 trait 变成 object safe——
+/// #76 起 `CatalogKind::spec_from_form` 要把四本册的规格收成同一份
+/// `Box<dyn RegisterSpec>` 交给调用方那一份骨架,四本册才不必各写一份分发。
 pub trait RegisterSpec {
     /// 表单标题(呈现层用)。
-    fn title() -> &'static str;
+    fn title() -> &'static str
+    where
+        Self: Sized;
 
     /// 预审段 argv:跑闸、拟落账,**文件不落**(无 `--yes`)。
     fn preaudit(&self, root: &str) -> Vec<String>;
@@ -179,8 +187,13 @@ pub trait RegisterSpec {
     /// 落账段 argv:只能由图形确认后的转换调用(带确认闸)。
     fn commit(&self, root: &str) -> Vec<String>;
 
+    /// 这一趟登记的**条目名**(日志口径:只报名字,不报本体)。
+    fn name(&self) -> &str;
+
     /// 回音拆成可摊开的预审结论;不可定型给 `None`。
-    fn audit(out: &EngineOutput) -> Option<Audit>;
+    fn audit(out: &EngineOutput) -> Option<Audit>
+    where
+        Self: Sized;
 
     /// 引擎这一组**有没有自己的确认闸**(`--yes`)。`true` = 有(vps /
     /// 外部源):预审段文件不落,面板的图形确认落在「预审通过 → 落账」
@@ -193,7 +206,10 @@ pub trait RegisterSpec {
     ///
     /// 谁在消费它:`render_tag_review` 的键位行按它决定画不画「Enter 落账」
     /// 段(tag add 无闸 → 只画返航段),测试钉两种实现的取值。不是死代码。
-    fn confirm_gate() -> bool {
+    fn confirm_gate() -> bool
+    where
+        Self: Sized,
+    {
         true
     }
 }
@@ -751,8 +767,7 @@ impl CatalogKind {
     pub fn start_rm(self, app: &mut App, name: String) {
         match self {
             CatalogKind::Vps | CatalogKind::Subscription | CatalogKind::Key => {
-                self.rm_confirm_set(app, true);
-                app.push_log(format!("删除确认:{name}(Enter 确认,Esc/q 取消)"));
+                self.raise_rm_confirm(app, &name);
             }
             CatalogKind::Tag => {
                 app.tag_rm_confirm = false;
@@ -767,6 +782,291 @@ impl CatalogKind {
                     "摘引用 / 删标签 {name}:引用留空 = 删整个标签,填 kind/条目 = 只摘那几条"
                 ));
             }
+        }
+    }
+
+    // ---- 册级命令下发查表(工单 #76:`dispatch_*` 十一份 + 八个键位处理器 +
+    //      四份 cancel 收成一份) ----
+    //
+    // 二十三个按册复制收成六个调用方入口(`App::dispatch_preaudit` /
+    // `dispatch_commit` / `dispatch_rm` / `on_key_flow` / `on_key_rm_confirm` /
+    // `App::cancel`,外加同形状的 `App::dismiss_rm`)。四本册各留一个 `cancel_*`
+    // 转口是给测试直接驱动用的(不改写测试),实现仍只有一份。
+    //
+    // 下面这一族把「表单怎么定型 / 表单键位 / 写命令递去哪条队列 / 有没有确认闸 /
+    // 表单 Enter 之后走哪条路 / 起删除确认 / 预审与落账两句日志 / 删除取谁 /
+    // 删除 argv / 删除下发后的收尾 / 返航口径」收成 `CatalogKind` 的成员。调用方
+    // (`App::dispatch_preaudit` / `dispatch_commit` / `dispatch_rm` /
+    // `on_key_flow` / `on_key_rm_confirm` / `App::cancel`)只写 `kind.xxx(app)`,
+    // **不再有第二处 `match kind` / `if kind ==`**:四本册同形的骨架(两道守卫 →
+    // 面板侧定型 → 按这一本的路由递出去)只有一份,按册差异(标签册没有确认闸且
+    // 删除嵌套在表单流里、订阅 / 钥匙两本本体经 stdin 喂入、各自的日志口径)
+    // 全落在这一族成员上。
+    //
+    // 加一条按册的下发关切 = 在这里加 / 改一个成员,不是往调用方再插一个分支。
+
+    /// 这一本的表单 → 登记规格(面板侧解析,不喂给引擎猜)。四本各问自己的
+    /// `spec_from_*`;统一收成 `Box<dyn RegisterSpec>` 是为了让调用方那一份
+    /// 骨架不分册(问 [`RegisterSpec::name`] 与两段式两个 argv 方法就够)。
+    pub fn spec_from_form(self, app: &App) -> Result<Box<dyn RegisterSpec>, Vec<String>> {
+        match self {
+            CatalogKind::Vps => {
+                spec_from_form(&app.vps_form).map(|s| Box::new(s) as Box<dyn RegisterSpec>)
+            }
+            CatalogKind::Tag => {
+                spec_from_tag_form(&app.tag_form).map(|s| Box::new(s) as Box<dyn RegisterSpec>)
+            }
+            CatalogKind::Subscription => {
+                spec_from_sub_form(&app.sub_form).map(|s| Box::new(s) as Box<dyn RegisterSpec>)
+            }
+            CatalogKind::Key => {
+                spec_from_key_form(&app.key_form).map(|s| Box::new(s) as Box<dyn RegisterSpec>)
+            }
+        }
+    }
+
+    /// 这一本登记表单的一个键(四本各问自己的 `on_key_*_form`;调用方
+    /// `App::on_key_flow` 的表单段只写这一句,不再分册)。
+    pub fn form_key(self, app: &mut App, k: crossterm::event::KeyEvent) -> FormAction {
+        match self {
+            CatalogKind::Vps => on_key_form(&mut app.vps_form, k),
+            CatalogKind::Tag => on_key_tag_form(&mut app.tag_form, k),
+            CatalogKind::Subscription => on_key_sub_form(&mut app.sub_form, k),
+            CatalogKind::Key => on_key_key_form(&mut app.key_form, k),
+        }
+    }
+
+    /// 引擎这一组**有没有自己的确认闸**(`--yes`;[`RegisterSpec::confirm_gate`]
+    /// 的册级转发,不在这里重述一遍答案)。`false` = 只有标签册:上游
+    /// `tag add` 追加合并、幂等,没有「覆盖」可确认,ADR-0009 §2 不许面板自己
+    /// 造一道。消费方两处:`App::on_key_flow` 的确认段认不认「Enter 落账」,
+    /// `App::dispatch_commit` 的落账闸认不认(标签册从表单 Enter 直接进写段)。
+    pub fn confirm_gate(self) -> bool {
+        match self {
+            CatalogKind::Vps => VpsSpec::confirm_gate(),
+            CatalogKind::Tag => TagSpec::confirm_gate(),
+            CatalogKind::Subscription => SubscriptionSpec::confirm_gate(),
+            CatalogKind::Key => KeySpec::confirm_gate(),
+        }
+    }
+
+    /// 表单 Enter 之后,这一本的写命令走哪条路。**按册差异是控制流**,所以它
+    /// 作为查表数据落在这一族成员上,不落进调用方的 if:机器 / 订阅 / 钥匙三本
+    /// 有两段式(第一段预审),标签册没有——`Add` 直接进写段,`Rm` 只起面板侧
+    /// 那道图形确认(它的删除嵌套在表单流里)。
+    pub fn write_route(self, app: &App) -> WriteRoute {
+        match self {
+            CatalogKind::Vps | CatalogKind::Subscription | CatalogKind::Key => WriteRoute::Preaudit,
+            CatalogKind::Tag => match app.tag_form.mode {
+                TagFormMode::Add => WriteRoute::Commit,
+                TagFormMode::Rm => WriteRoute::RmConfirm,
+            },
+        }
+    }
+
+    /// 起这一本的删除确认弹层(ADR-0009 §2:面板只决定「什么时候递出去」,下发的
+    /// argv 与在 shell 里敲的逐字相同)。**四本册同一句**:机器 / 订阅 / 钥匙三本
+    /// 由 `d` 键经 [`Self::start_rm`] 起到;标签册由表单 Enter 经
+    /// [`App::dispatch_preaudit`](crate::app::App::dispatch_preaudit) 起到——
+    /// 它的删除嵌套在表单流里,旗起时表单已在 Rm 态,所以这里**不碰表单**
+    /// (碰了就把操作者刚填的引用行抹了)。
+    pub fn raise_rm_confirm(self, app: &mut App, name: &str) {
+        self.rm_confirm_set(app, true);
+        app.push_log(format!("删除确认:{name}(Enter 确认,Esc/q 取消)"));
+    }
+
+    /// 把这一趟写命令递出去,并按这一本的机密纪律决定进哪条队列:订阅 / 钥匙
+    /// 两本的本体**只经 stdin 进**(ADR-0009 §3),argv 与本体一起进
+    /// `fed_queue`(喂入是一次性的,两段式各喂一次);机器 / 标签两本只进
+    /// `queue`。返回喂入的字节数(没喂 = `None`)——日志只报字节数,内容不进
+    /// 任何字符串。
+    pub fn dispatch_cmd(self, app: &mut App, argv: Vec<String>) -> Option<usize> {
+        let stdin = match self {
+            CatalogKind::Subscription => Some((app.sub_form.body.len(), app.sub_form.body.clone())),
+            CatalogKind::Key => Some((app.key_form.body.len(), app.key_form.body.clone())),
+            CatalogKind::Vps | CatalogKind::Tag => None,
+        };
+        match stdin {
+            Some((n, body)) => {
+                app.fed_queue.push((argv, body));
+                Some(n)
+            }
+            None => {
+                app.queue.push(argv);
+                None
+            }
+        }
+    }
+
+    /// 入口门 / 数据仓根不过时那句的开头(按册:机器 / 订阅 / 钥匙三本
+    /// 「登记不下发:」,标签册「未下发:」——它的写命令没有两段式,「登记」
+    /// 这个词不贴)。
+    pub fn dispatch_gate_prefix(self) -> &'static str {
+        match self {
+            CatalogKind::Vps | CatalogKind::Subscription | CatalogKind::Key => "登记不下发:",
+            CatalogKind::Tag => "未下发:",
+        }
+    }
+
+    /// 面板侧拒下(空名字 / 形状不合)那句的开头(按册:机器 / 订阅 / 钥匙三本
+    /// 「登记被拒:」,标签册「被拒:」)。
+    pub fn dispatch_reject_prefix(self) -> &'static str {
+        match self {
+            CatalogKind::Vps | CatalogKind::Subscription | CatalogKind::Key => "登记被拒:",
+            CatalogKind::Tag => "被拒:",
+        }
+    }
+
+    /// 预审 / 落账两句日志里的命令组名(按册:vps register /
+    /// subscription register / key register;标签册没有这两段,给它的写命令名
+    /// `tag add`)。
+    pub fn register_cmd(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "vps register",
+            CatalogKind::Tag => "tag add",
+            CatalogKind::Subscription => "subscription register",
+            CatalogKind::Key => "key register",
+        }
+    }
+
+    /// 预审段入队那句(按册:订阅 / 钥匙两本 argv 带 `--name`、且报本体喂入
+    /// 字节数,机器册两样都不带)。**标签册没有预审段**(`confirm_gate` 为
+    /// `false`,见 [`Self::write_route`]),这一臂对它永不成立。
+    pub fn preaudit_log(self, name: &str, fed: Option<usize>) -> String {
+        match self {
+            CatalogKind::Vps => format!("登记预审已入队:vps register {name}(不带 --yes,文件不落)"),
+            CatalogKind::Tag => format!("登记预审已入队:tag add {name}(追加合并、幂等,无确认闸)"),
+            CatalogKind::Subscription | CatalogKind::Key => {
+                let fed = fed.map_or_else(String::new, |n| format!(";已喂入 {n} 字节"));
+                format!(
+                    "登记预审已入队:{} --name {name}(不带 --yes,文件不落{fed})",
+                    self.register_cmd()
+                )
+            }
+        }
+    }
+
+    /// 落账段第一道闸不过那句(按册:预审摊开几道闸——机器五道 / 标签与订阅
+    /// 四道 / 钥匙三道)。**标签册不经落账段**(见 [`Self::confirm_gate`]),
+    /// 这一臂对它永不成立。
+    pub fn commit_gate_msg(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "落账未下发:预审未通过(五道闸有 fail 或退出码非 0)",
+            CatalogKind::Tag => "落账未下发:预审未通过(四道闸有 fail 或退出码非 0)",
+            CatalogKind::Subscription => "落账未下发:预审未通过(四道闸有 fail 或退出码非 0)",
+            CatalogKind::Key => "落账未下发:预审未通过(三道闸有 fail 或退出码非 0)",
+        }
+    }
+
+    /// 落账段入队那句(按册:机器册裸位置参数,订阅 / 钥匙两本 argv 带
+    /// `--name` 且报再喂入的字节数;标签册的那一句就是它的 `tag add` 写段——
+    /// 它没有确认闸,这一句由 [`Self::write_route`] 的 Commit 臂直接到达)。
+    pub fn commit_log(self, name: &str, root: &str, fed: Option<usize>) -> String {
+        match self {
+            CatalogKind::Vps => {
+                format!("登记落账已入队:vps register {name} --yes(--root {root})")
+            }
+            CatalogKind::Tag => {
+                format!("挂标签已下发:tag add {name}(追加合并、幂等,无确认闸;--root {root})")
+            }
+            CatalogKind::Subscription | CatalogKind::Key => {
+                let fed = fed.map_or_else(String::new, |n| format!(";已再喂入 {n} 字节"));
+                format!(
+                    "登记落账已入队:{} --name {name} --yes(--root {root}{fed})",
+                    self.register_cmd()
+                )
+            }
+        }
+    }
+
+    /// 这一次删除删谁(按册:机器 / 订阅 / 钥匙三本取当前选中行;#69 起经过滤后
+    /// 的可见列表映射回原始投影)。**标签册的删除嵌套在表单流里**,目标由表单
+    /// 定型——取不到即表单已不可定型(与另三本「没有选中行」同一形状:
+    /// 调用方收旗 + 按册留一句,不下发)。
+    pub fn rm_target(self, app: &App) -> Option<String> {
+        match self {
+            CatalogKind::Vps | CatalogKind::Subscription | CatalogKind::Key => {
+                self.selected_name(app)
+            }
+            CatalogKind::Tag => spec_from_tag_form(&app.tag_form).ok().map(|s| s.name),
+        }
+    }
+
+    /// 取不到删除目标那句(按册:三本「没有选中的<册名>」,标签册「表单已不可
+    /// 定型」)。
+    pub fn rm_missing_log(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "删除未下发:没有选中的机器",
+            CatalogKind::Tag => "删除未下发:表单已不可定型(返航后从表单重来)",
+            CatalogKind::Subscription => "删除未下发:没有选中的订阅",
+            CatalogKind::Key => "删除未下发:没有选中的钥匙",
+        }
+    }
+
+    /// 清这一本上一轮的 rm 回音(与 `b_rm_result` 同一张表;新一趟删除下发前
+    /// 清干净,旧结论不冒充本次)。
+    pub fn rm_result_clear(self, app: &mut App) {
+        match self {
+            CatalogKind::Vps => app.vps_rm_result = None,
+            CatalogKind::Tag => app.tag_rm_result = None,
+            CatalogKind::Subscription => app.sub_rm_result = None,
+            CatalogKind::Key => app.key_rm_result = None,
+        }
+    }
+
+    /// 这一本删除命令的 argv(与在 shell 里敲的逐字相同,面板只决定何时递出去)。
+    /// 标签册多一层:引用行为空 = 删整个标签,带引用 = 只摘那几条——引用从
+    /// 表单现取(纯函数,与 [`Self::rm_target`] 同一次定型)。
+    pub fn rm_cmd(self, app: &App, root: &str, name: &str) -> Vec<String> {
+        match self {
+            CatalogKind::Vps => crate::engine::commands::vps_rm(name, root),
+            CatalogKind::Tag => {
+                let refs = spec_from_tag_form(&app.tag_form)
+                    .map(|s| s.refs)
+                    .unwrap_or_default();
+                crate::engine::commands::tag_rm(name, &refs, root)
+            }
+            CatalogKind::Subscription => crate::engine::commands::subscription_rm(name, root),
+            CatalogKind::Key => crate::engine::commands::key_rm(name, root),
+        }
+    }
+
+    /// 删除下发后的收尾与那句日志。**标签册多两步**(确认即消费):收流并复位
+    /// 表单——否则上一张引用行还摊在那儿,键会继续往里灌;引用条数也在这里现取
+    /// (纯函数,表单到这一步之前没有被改过)。其余三本只打日志。
+    pub fn rm_consumed(self, app: &mut App, name: &str, root: &str) {
+        match self {
+            CatalogKind::Vps => app.push_log(format!("删除已入队:vps rm {name} --root {root}")),
+            CatalogKind::Tag => {
+                let refs = spec_from_tag_form(&app.tag_form)
+                    .map(|s| s.refs.len())
+                    .unwrap_or(0);
+                // 表单的使命到此结束(确认即消费)
+                app.tag_flow.abandon();
+                app.tag_form = new_tag_form(TagFormMode::Add);
+                let scope = if refs == 0 {
+                    "删整个标签".to_string()
+                } else {
+                    format!("只摘 {refs} 条引用")
+                };
+                app.push_log(format!("删除已入队:tag rm {name}({scope};--root {root})"));
+            }
+            CatalogKind::Subscription => {
+                app.push_log(format!("删除已入队:subscription rm {name} --root {root}"))
+            }
+            CatalogKind::Key => app.push_log(format!("删除已入队:key rm {name} --root {root}")),
+        }
+    }
+
+    /// 返航那句日志(按册:机器册「登记返航」;订阅 / 钥匙两本多说一句在途本体
+    /// 已 drop;标签册是「标签册返航」)。清状态那一半不走查表——四本同一条
+    /// (`App::cancel` 里 `abandon` + [`Self::form_reset`])。
+    pub fn cancel_log(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "登记返航",
+            CatalogKind::Tag => "标签册返航",
+            CatalogKind::Subscription => "登记返航(在途链接本体已 drop,面板侧不留副本)",
+            CatalogKind::Key => "登记返航(在途钥匙本体已 drop,面板侧不留副本)",
         }
     }
 
@@ -1282,6 +1582,20 @@ pub enum StartMode {
     Rm,
 }
 
+/// 表单 Enter 之后,这一本的写命令走哪条路(#76:按册差异是**控制流**,所以它
+/// 作为查表数据由 [`CatalogKind::write_route`] 给出,调用方那一份分发因此
+/// 不分册)。
+pub enum WriteRoute {
+    /// 两段式第一段(预审,不带 `--yes`,文件不落):机器 / 订阅 / 钥匙三本。
+    Preaudit,
+    /// 直接进写段:标签册的 `tag add`(上游没有 `--yes`,ADR-0009 §2 面板不
+    /// 自己造一道确认)。
+    Commit,
+    /// 面板侧的图形确认:标签册的 `tag rm`(删除嵌套在表单流里,表单 Enter 只
+    /// 起确认、不下发)。
+    RmConfirm,
+}
+
 /// 册内键位触发的动作(#66 查表表的取值)。`Act` 直接带这一本的落实方法
 /// ——按册差异就是「哪个方法」,这是数据,不是调用方的一个分支。
 /// [`Start`](CatalogAction::Start) 是 #76 收敛后的登记 / 删除入口:它**不带**
@@ -1363,6 +1677,10 @@ impl VpsSpec {
 impl RegisterSpec for VpsSpec {
     fn title() -> &'static str {
         "登记机器 · vps"
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn preaudit(&self, root: &str) -> Vec<String> {
@@ -1455,6 +1773,10 @@ impl TagSpec {
 impl RegisterSpec for TagSpec {
     fn title() -> &'static str {
         "挂标签 · tag"
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn preaudit(&self, root: &str) -> Vec<String> {
@@ -1606,6 +1928,10 @@ impl RegisterSpec for SubscriptionSpec {
         "登记订阅 · subscription"
     }
 
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn preaudit(&self, root: &str) -> Vec<String> {
         crate::engine::commands::subscription_register_preaudit(
             &self.name,
@@ -1667,6 +1993,10 @@ pub struct KeySpec {
 impl RegisterSpec for KeySpec {
     fn title() -> &'static str {
         "登记钥匙 · key"
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn preaudit(&self, root: &str) -> Vec<String> {
