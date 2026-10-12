@@ -37,6 +37,43 @@ pub enum Target {
     /// 点配方域建议命令键位行 = 切换只读选中态(#39,与键盘 `c` 同路;
     /// 面板不执行该命令,也不碰剪贴板——名字里没有 "copy" 就是因为没有复制)。
     ToggleSuggest,
+    /// 点正文键位行的「换册」段 = 按 `m` 轮转四本编目册(#67:鼠标只是叠加,
+    /// 与键盘 `cycle_catalog_kind` 同一路;不绑定具体键——段上文案由渲染与
+    /// 命中共用,点哪打哪)。
+    SwitchBook,
+    /// 点装配屏正文键位行的「中止」段 = 按 `x`(#71,补 #59 欠下的鼠标命中):
+    /// 在途 `nw up` 子进程**进程级真止**(与键盘 `abort_assembling` 完全同一路)。
+    /// 只在真有 up 在途(`as_running`)时由 `assemble_hits` 产出——不在场时不画
+    /// 也不给命中;与发射前浮层里的「Esc 返航」(`DismissPopup`)是两个语义,
+    /// 不共屏、不共话术。
+    Abort,
+    /// 点编目屏正文键位行的「Enter 反查」段 = 机器册选中行上按 `Enter`
+    /// (#70:反查上浮的鼠标触发,与键盘 `App::vps_reverse_lookup` 完全同路)。
+    /// **只机器册、且册体有条目(= 选中了一行)才由 `catalog_hits` 产出这一段**
+    /// ——订阅 / 钥匙册的条目不在 `TAG_REF_KINDS` 里,放一个注定只返回「没有」
+    /// 的动作是噪声(spec #65 §4:触发点只有一处)。
+    VpsReverse,
+    /// 点正文键位行的「过滤」段 = 按 `/` 进册内过滤输入态(#69:与键盘 `/`
+    /// 同一路,鼠标只是叠加;段上文案由渲染与命中共用,点哪打哪)。
+    CatalogFilter,
+    /// 点编目屏正文键位行的「g 取回」段 = 按 `g`(#73:补 #65 §6 延期的那处
+    /// 「屏上写着、鼠标点不到」)。与键盘 `g` **同一个函数、同一条后果链**——
+    /// 当前选中订阅 / 钥匙的建议命令(`nw subscription get …` / `nw key get …`)
+    /// 收进日志,
+    /// 屏上「按 g 收进日志」翻成「已按 g 收进日志」;不入队、不下发、不碰
+    /// 剪贴板(ADR-0009 §1:get 一律不代跑,上游才是唯一回显本体的出口)。
+    ///
+    /// **只订阅册 / 钥匙册的非空册体变体在场**(空册没有「取回哪一条」、在途
+    /// 变体整行换成浮层提示、机器册 / 标签册的条目没有本体可取)——在场条件
+    /// 由 [`catalog_key_parts`](crate::screens::catalog::catalog_key_parts)
+    /// 按 `CatalogKind` 查表决定,命中区不另推一份。边缘态(册已读到、数据仓根
+    /// 随后被撤)段仍在场,点下去复现键盘 `g` 的既有指路日志。
+    ///
+    /// **唯一与按键不同步的态**:册内过滤输入态(#69)里键入归输入态(敲 `g` 是
+    /// 往过滤框里写字),而鼠标点段照旧走取回——这是键位行**所有**可点段的共同
+    /// 边界(输入态只管键入,见 `catalog.rs` 反查段那条同口径测试),不是本段
+    /// 特有的分叉。
+    CatalogGet,
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -213,100 +250,35 @@ fn screen_hits(content: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect,
 /// 编目册屏命中区(#53 / #54 / #56 / #57):清单整块产行命中(点行 = 选中,
 /// 同 ↑/↓);登记浮层与删除确认弹层只产键位行两段(渲染 `catalog::render_catalog`
 /// 同一个 `popup_rect` 基准,弹层优先级高于册体)。屏虽叫 `Vps`,命中区
-/// 服务屏内四本册(机器 / 标签 / 订阅 / 钥匙),按 `app.catalog_kind` 分叉。
+/// 服务屏内四本册(机器 / 标签 / 订阅 / 钥匙)。
+///
+/// **四本册走同一条代码路径**(工单 #66):按册差异全部收在
+/// [`CatalogKind`](crate::screens::catalog::CatalogKind) 的查表成员上
+/// (`flow` / `can_commit` / `rm_confirm` / `len` / `row_lines`),本函数
+/// 没有第四份 `if kind == …`。加第五本册子只改查表,此处不动。
 fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     let kind = app.catalog_kind;
-    // 订阅册浮层:rm 确认弹层的键位行两段可点(其余态同手填浮层惰性)
-    if kind == crate::screens::catalog::CatalogKind::Subscription {
-        // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
-        if app.sub_flow.phase != crate::screens::catalog::RegPhase::Idle {
-            if app.sub_flow.phase == crate::screens::catalog::RegPhase::Review
-                && app.sub_can_commit()
-            {
-                let popup = popup_rect(
-                    inner,
-                    crate::screens::catalog::REG_W,
-                    crate::screens::catalog::REG_H,
-                );
-                if popup.width > 0 && popup.height > 0 {
-                    let key_y = popup.y + popup.height - 2;
-                    two_key_segments(popup, key_y, REG_KEY_REVIEW_COMMIT, RITUAL_KEY_RETURN, hits);
-                }
-            }
-            return;
+    // 反查上浮结果浮层(#70):**本屏弹层优先级最高的一层**——它在场时整块
+    // 正文只有一个「点任意处返航」命中区,底层清单行与键位行(含「换册」
+    // 「Enter 反查」两段)一段都不产:浮层吞点击、不穿透底层
+    // (spec #65 故事 37 / 50)。
+    //
+    // 命中区取**整块正文**而不是浮层矩形:规格钉的是「`Esc` 或任意处点击
+    // 关闭」(spec #65 §7),点浮层外的空白也算返航;只给浮层矩形会变成
+    // 「点外面没反应」,与规格原文相反。整块正文即浮层自己的命中区,底层
+    // 不另产——「只有浮层自己的命中」这条弹层纪律不变。
+    if app.vps_reverse_open() {
+        if inner.width > 0 && inner.height > 0 {
+            hits.push((inner, Target::DismissPopup));
         }
-        if app.sub_rm_confirm {
-            let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
-            if popup.width > 0 && popup.height > 0 {
-                let key_y = popup.y + popup.height - 2;
-                two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
-            }
-            return;
-        }
-        // 册体:订阅清单行命中(渲染每台 2 行,命中按条给整块)
-        let n = app.sub_len();
-        if n == 0 {
-            return;
-        }
-        push_sheet_rows(inner, n, kind.row_lines(), hits);
         return;
     }
-    if kind == crate::screens::catalog::CatalogKind::Key {
-        // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
-        if app.key_flow.phase != crate::screens::catalog::RegPhase::Idle {
-            if app.key_flow.phase == crate::screens::catalog::RegPhase::Review
-                && app.key_can_commit()
-            {
-                let popup = popup_rect(
-                    inner,
-                    crate::screens::catalog::REG_W,
-                    crate::screens::catalog::REG_H,
-                );
-                if popup.width > 0 && popup.height > 0 {
-                    let key_y = popup.y + popup.height - 2;
-                    two_key_segments(popup, key_y, REG_KEY_REVIEW_COMMIT, RITUAL_KEY_RETURN, hits);
-                }
-            }
-            return;
-        }
-        if app.key_rm_confirm {
-            let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
-            if popup.width > 0 && popup.height > 0 {
-                let key_y = popup.y + popup.height - 2;
-                two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
-            }
-            return;
-        }
-        // 册体:钥匙清单行命中(渲染每把 4 行,命中按条给整块)
-        let n = app.key_len();
-        if n == 0 {
-            return;
-        }
-        push_sheet_rows(inner, n, kind.row_lines(), hits);
-        return;
-    }
-    if kind == crate::screens::catalog::CatalogKind::Tag {
-        if app.tag_flow.phase != crate::screens::catalog::RegPhase::Idle {
-            return;
-        }
-        if app.tag_rm_confirm {
-            let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
-            if popup.width > 0 && popup.height > 0 {
-                let key_y = popup.y + popup.height - 2;
-                two_key_segments(popup, key_y, REG_KEY_RM_CONFIRM, RITUAL_KEY_RETURN, hits);
-            }
-            return;
-        }
-        let n = app.tag_len();
-        if n == 0 {
-            return;
-        }
-        push_sheet_rows(inner, n, kind.row_lines(), hits);
-        return;
-    }
-    if app.vps_flow.phase != crate::screens::catalog::RegPhase::Idle {
-        // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)
-        if app.vps_flow.phase == crate::screens::catalog::RegPhase::Review && app.vps_can_commit() {
+    // 登记浮层:只有确认态的键位行可点(其余态同手填浮层惰性)。
+    // 标签册的确认态没有「Enter 落账」段(`CatalogKind::can_commit` 恒 false,
+    // 上游 tag add 无确认闸),所以同一处条件对它自然不产段。
+    if kind.flow(app).phase != crate::screens::catalog::RegPhase::Idle {
+        if kind.flow(app).phase == crate::screens::catalog::RegPhase::Review && kind.can_commit(app)
+        {
             let popup = popup_rect(
                 inner,
                 crate::screens::catalog::REG_W,
@@ -319,7 +291,7 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         }
         return;
     }
-    if app.vps_rm_confirm {
+    if kind.rm_confirm(app) {
         let popup = popup_rect(inner, REG_INPUT_W, REG_INPUT_H);
         if popup.width > 0 && popup.height > 0 {
             let key_y = popup.y + popup.height - 2;
@@ -327,24 +299,68 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         }
         return;
     }
-    // 册体:机器清单行命中(渲染每台 4 行,命中按台给整块)
-    let n = app.vps_len();
-    if n == 0 {
-        return;
-    }
+    // 册体:清单行命中(渲染每条目占 `row_lines` 行,命中按条给整块)
+    // #69:只给「看得见的那一行」产命中——行数取可见行数(经过滤后的),
+    // 不过滤时 = 册体条数,与过去逐字等价;点第 i 个可见行 = 选中第 i 个
+    // 可见行(`on_mouse` 的 SelectRow 经 catalog_visible 映射回原始投影)。
+    let n = app.catalog_visible().len();
     push_sheet_rows(inner, n, kind.row_lines(), hits);
+
+    // 正文键位行的可点动作段(#67 接缝,#70/#69/#73 各加一段):段清单由
+    // `catalog::catalog_key_parts` 一处产出——渲染画的与命中测的逐字同源
+    // (ADR-0005)。
+    //
+    // **键位行钉在册体内层末行**(#73 补 #67 欠的那一半:几何真相只能有一处)。
+    // 末行是布局事实,不数正文行数:渲染侧把册体内容截到末行之前、欠量留空,
+    // 键位行恒在 `inner.y + inner.height - 1`——册体 1 条与 20 条,可点段的 y
+    // 同一个数(规格故事 7 / 验收「键位行钉末行」)。早先这里按
+    // `catalog_body_lines` 的行数推 y,行数一多键位行就被顶出可见区、命中区
+    // 整段消失,而渲染侧那一行也跟着漂——同一处几何两套算法。今天两边都只认
+    // 末行,不再有「第几行」的第二种推法。
+    //
+    // 行高必须真的有一行(内层被压成 0 行时什么都不产);段的列几何与裁剪仍由
+    // `key_line_segments` 按 `inner` 右界收口(放不下的整段不画也不给命中)。
+    let key_y = catalog_key_row(inner);
+    if inner.height > 0 {
+        let parts = crate::screens::catalog::catalog_key_parts(app);
+        for seg in key_line_segments(
+            inner,
+            key_y,
+            &parts,
+            crate::screens::catalog::CATALOG_KEY_GAP,
+        ) {
+            // 只画不点的提示段(`None`)不进命中区;可点动作段才给矩形。
+            if let Some(t) = seg.target {
+                hits.push((seg.rect, t));
+            }
+        }
+    }
+}
+
+/// 编目册屏**键位行**那一行的 y(#73:几何真相只能有一处)。
+///
+/// 键位行钉在册体内层**末行**,这一个数同时服务三处,谁都不自己算:
+/// 命中区取它铺段矩形([`catalog_hits`])、册体条目行命中不越它
+/// ([`push_sheet_rows`])、渲染把册体内容垫空 / 截到它之前
+/// (`catalog::render_catalog`)。册体内容长短因此影响不到键位行的位置。
+///
+/// 内层被压成 0 行时它仍回一个数(回绕到 `inner.y - 1`),调用方各自看
+/// `inner.height > 0`:没有行就没有键位行,也不产命中。
+pub(crate) fn catalog_key_row(inner: Rect) -> u16 {
+    inner.y + inner.height.saturating_sub(1)
 }
 
 /// 册体清单的行命中:首行是「当前是哪一本 + 编目路径」,末行是键位行,
 /// 中间每条目占 `per` 行(`CatalogKind::row_lines`,渲染与命中共用)。
 fn push_sheet_rows(inner: Rect, n: usize, per: u16, hits: &mut Vec<(Rect, Target)>) {
-    let rows = inner.height.saturating_sub(2);
+    let key_y = catalog_key_row(inner);
+    let rows = key_y.saturating_sub(inner.y + 1);
     if rows == 0 || per == 0 {
         return;
     }
     let mut y = inner.y + 1;
     for i in 0..n as u16 {
-        if y + per > inner.y + inner.height.saturating_sub(1) {
+        if y + per > key_y {
             break;
         }
         hits.push((
@@ -375,12 +391,26 @@ fn overview_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         ratatui::layout::Constraint::Length(4),
     ])
     .split(area);
-    let (cols, _cmd) = h_split2(rows[1], 68, 32);
+    let (cols, cmd) = h_split2(rows[1], 68, 32);
     let tbl = shrink_border(cols);
-    let Some(ls) = app.ls.as_ref() else {
-        return;
-    };
-    row_hits(tbl, 1, ls.profiles.len(), hits, Target::SelectRow);
+    if let Some(ls) = app.ls.as_ref() {
+        row_hits(tbl, 1, ls.profiles.len(), hits, Target::SelectRow);
+    }
+    // #68 指令栏第五条「浏览编目」可点:命中区 = NavTo(Vps),点它 = 按 `v`。
+    // 几何与 `render_overview`/`render_commands` 同一组 Layout(右栏 `Length(7)`
+    // 指令框)+ 同一个边框内缩,第 5 条落在内层第 5 行——不另写一份「键位行长
+    // 什么样」(ADR-0005 渲染与命中共用一份几何)。指令栏是动线不是能力表,
+    // 故常驻可点、与 ls 有无数据无关;放不下(紧凑到裁掉第 5 行)就不产命中。
+    let right = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(7),
+        ratatui::layout::Constraint::Min(3),
+    ])
+    .split(cmd);
+    let cmd_inner = shrink_border(right[0]);
+    if cmd_inner.height >= 5 {
+        let line = Rect::new(cmd_inner.x, cmd_inner.y + 4, cmd_inner.width, 1);
+        hits.push((line, Target::NavTo(Screen::Vps)));
+    }
 }
 
 /// 装配屏:装配运行中给 stderr 日志区产滚轮命中区(#21,几何与
@@ -388,25 +418,50 @@ fn overview_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
 /// 带边框、首行即数据;结果态/无日志区,不产目标。
 fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
     if app.assembling {
-        // 与 render_running_comfy/compact 同一个 Layout:七步栏/进度行
-        // 之外就是日志块,再缩一圈块边框(与 row_hits 的取内层同约定)。
-        let log = match class {
-            SizeClass::Comfy => ratatui::layout::Layout::horizontal([
-                ratatui::layout::Constraint::Length(14),
-                ratatui::layout::Constraint::Min(20),
-            ])
-            .split(area)[1],
-            SizeClass::Compact => ratatui::layout::Layout::vertical([
-                ratatui::layout::Constraint::Length(1),
-                ratatui::layout::Constraint::Min(3),
-            ])
-            .split(area)[1],
+        // 与 render_running_comfy/compact 同一个 Layout:七步栏/进度行 + 日志块
+        // + 末行键位行(可点「中止」段),再缩一圈块边框(与 row_hits 取内层同约定)。
+        // 渲染与命中共用这一组 Layout 常量——几何零分歧(ADR-0005)。
+        let (log, key_row) = match class {
+            SizeClass::Comfy => {
+                let rows = ratatui::layout::Layout::vertical([
+                    ratatui::layout::Constraint::Min(3),
+                    ratatui::layout::Constraint::Length(1),
+                ])
+                .split(area);
+                let log = ratatui::layout::Layout::horizontal([
+                    ratatui::layout::Constraint::Length(14),
+                    ratatui::layout::Constraint::Min(20),
+                ])
+                .split(rows[0])[1];
+                (log, rows[1])
+            }
+            SizeClass::Compact => {
+                let rows = ratatui::layout::Layout::vertical([
+                    ratatui::layout::Constraint::Length(1),
+                    ratatui::layout::Constraint::Min(3),
+                    ratatui::layout::Constraint::Length(1),
+                ])
+                .split(area);
+                (rows[1], rows[2])
+            }
         };
         let log = shrink_border(log);
         if log.width > 0 && log.height > 0 {
             // 方向由滚轮事件在分派时携带;命中区是纯几何,此处的值
             // 仅为满足 Target 形状(spec #15),不参与语义。
             hits.push((log, Target::ScrollLog(ScrollDir::Down)));
+        }
+        // 正文键位行的可点「中止」段(#71):段清单由 `assemble::assemble_key_parts`
+        // 一处产出——渲染画的与命中测的逐字同源(ADR-0005)。只在真有 up 在途
+        // (as_running)时 parts 非空;不在场时不画也不给命中。放不下(越出 key_row
+        // 右界)由 key_line_segments 收口——画不出的段不给点(#67 同款纪律)。
+        let parts = crate::screens::assemble::assemble_key_parts(app);
+        let gap = crate::screens::assemble::ASSEMBLE_KEY_GAP;
+        for seg in key_line_segments(key_row, key_row.y, &parts, gap) {
+            // 只画不点的提示段(None)不进命中区;可点动作段才给矩形。
+            if let Some(t) = seg.target {
+                hits.push((seg.rect, t));
+            }
         }
         return;
     }
@@ -645,6 +700,76 @@ fn two_key_segments(popup: Rect, y: u16, left: &str, right: &str, hits: &mut Vec
     }
 }
 
+/// 键位行**一段**的输入形状(#67 接缝的通用件,#70 加第三项):
+/// 段文案 + 命中目标 + 「这一段此刻是活的吗」。`target` 为 `None` 表示
+/// 「只画不点」的提示段(如动作说明),`Some` 表示可点动作段(点它 = 按对应
+/// 键);`live` 为 `false` 表示**这一段在场但当前不可用**(入口禁用态,#70
+/// 故事 39:禁用并指路)——仍然画、仍然给命中(点了照旧走同一条路、照旧
+/// 收口给人话),只是画成 dim,让操作者在点之前就看出「这台引擎干不了」。
+/// 提示段与可用动作段都传 `true`。
+pub type KeyPart<'a> = (&'a str, Option<Target>, bool);
+
+/// 正文键位行的**一段**(#67 通用接缝的第一件):一段文案 + 命中目标。
+/// `target` 为 `None` 表示「只画不点」的提示段(如动作说明),`Some` 表示可点
+/// 动作段(点它 = 按对应键)。`live` 同 [`KeyPart`] 的第三项(渲染据此选
+/// 禁用态)。渲染与命中共用同一份 `KeySegment` 清单——段宽
+/// 由 [`key_line_segments`] 按 `unicode_width` 量出,屏上画的和点得的逐字同源
+/// (ADR-0005:一处几何真相,不出现第二份「键位行长什么样」)。
+#[derive(Debug)]
+pub struct KeySegment {
+    /// 段文案(渲染照此画,命中也照此量宽——同一份字符串)。
+    pub text: String,
+    /// 命中目标;`None` = 只画不点。
+    pub target: Option<Target>,
+    /// 这一段此刻是活的吗;`false` = 在场但禁用(画 dim,仍给命中,点下去
+    /// 由动作自己收口给人话——#70 故事 39「入口禁用并指路」)。
+    pub live: bool,
+    /// 段在屏上的矩形(宽 = `unicode_width(text)`,高 1 行,贴 anchor 右界裁)。
+    pub rect: Rect,
+}
+
+/// 把一串 [`KeyPart`] 按 `gap` 从 `anchor.x` 左起铺成一行键位段
+/// (#67):generalise [`two_key_segments`](弹层两段)与 [`tab_cell`](紧凑屏 Tab)
+/// 的先例——段宽 = `unicode_width(文案)`(与渲染逐字同源),段间不重叠、不留
+/// 歧义区。**这是纯布局模型里的通用件:不绑定任何屏、不绑定任何键**,调用方
+/// 给什么 `(text, target, live)` 就铺什么;渲染按同一份 `parts` 画 `Span`,
+/// 命中按同一份取 `Some(target)` 段——一处真相。
+///
+/// 放不下就整段收口:任一段完整越出 `anchor` 右界(或空段)即到此为止,这一段
+/// 及后续**既不画也不给命中**(#67:66×50 下限内放不下就不画这段、也不给命中——
+/// 画出去点不中的段比不画更糟)。
+pub fn key_line_segments(
+    anchor: Rect,
+    y: u16,
+    parts: &[KeyPart<'_>],
+    gap: &str,
+) -> Vec<KeySegment> {
+    use unicode_width::UnicodeWidthStr;
+    let right = anchor.x.saturating_add(anchor.width);
+    let gap_w = u16::try_from(UnicodeWidthStr::width(gap)).unwrap_or(0);
+    let mut out = Vec::new();
+    let mut x = anchor.x;
+    for (i, (text, target, live)) in parts.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(gap_w);
+        }
+        let w = u16::try_from(UnicodeWidthStr::width(*text)).unwrap_or(0);
+        let end = x.saturating_add(w);
+        // 整段放不下(越出 anchor 右界 / 空段):这一段及后续都不画不命中。
+        if w == 0 || x >= right || end > right {
+            break;
+        }
+        out.push(KeySegment {
+            text: (*text).to_string(),
+            target: *target,
+            live: *live,
+            rect: Rect::new(x, y, w, 1),
+        });
+        x = end;
+    }
+    out
+}
+
 /// 登记浮层(#30 #31):几何与 `recipes::render_register_overlay` 同一组
 /// 常量、同一 `popup_rect` 居中基准。输入/等回音态鼠标惰性(同手填
 /// 浮层先例);kind 选项两行产 [`Target::SelectRow`] 选中 + 键位行两段
@@ -849,9 +974,11 @@ mod tests {
         let a = area(80, 30);
         let hits = hitmap(a, &app, size_class(a));
         check(&hits, a, "80×30");
+        // 只数导航轨里的 NavTo(宽 = NAV_WIDTH);概览指令栏第五条「浏览编目」也是
+        // NavTo(Vps)(#68),但它在正文右栏、宽 ≠ 导航轨,不计入「导航六屏」。
         let nav = hits
             .iter()
-            .filter(|(_, t)| matches!(t, Target::NavTo(_)))
+            .filter(|(r, t)| matches!(t, Target::NavTo(_)) && r.width == NAV_WIDTH)
             .count();
         assert_eq!(
             nav,
@@ -926,6 +1053,49 @@ mod tests {
         );
     }
 
+    /// #68:在整帧真显示里定位某子串的 (行, 列)(列按显示宽累计——frame_display
+    /// 已跳过宽字续格,字节偏移≠终端列,与命中区同一把尺)。
+    fn locate(frame: &str, needle: &str) -> (u16, u16) {
+        use unicode_width::UnicodeWidthChar;
+        for (y, line) in frame.split('\n').enumerate() {
+            if let Some(byte) = line.find(needle) {
+                let col: u16 = line[..byte]
+                    .chars()
+                    .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+                    .sum();
+                return (y as u16, col);
+            }
+        }
+        panic!("整帧里找不到「{needle}」");
+    }
+
+    /// #68 概览指令栏第五条「浏览编目」可点:命中区是 `NavTo(Vps)`,几何与渲染
+    /// 同源——点在帧上「浏览编目」所在行列必落进该命中区(点哪打哪,ADR-0005);
+    /// 常畅/紧凑两档都产、都不越界。指令栏是动线不是能力表,故与 ls 有无数据无关
+    /// (复用渲染同一组 `Layout::vertical([Length(7), Min(3)])` + 边框,不另写几何)。
+    #[test]
+    fn hitmap_概览指令栏第五条_浏览编目可点_两档同源() {
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let mut app = test_app();
+            app.screen = Screen::Overview;
+            let a = area(w, h);
+            let hits = hitmap(a, &app, size_class(a));
+            check(&hits, a, "{w}×{h}");
+            let frame = crate::testutil::frame_display(&app, w, h);
+            let (row, col) = locate(&frame, "浏览编目");
+            let hit = hits
+                .iter()
+                .find(|(r, _)| r.y == row && col >= r.x && col < r.x + r.width)
+                .map(|(_, t)| *t)
+                .unwrap_or_else(|| panic!("{w}×{h} 「浏览编目」行应有命中区"));
+            assert_eq!(
+                hit,
+                Target::NavTo(Screen::Vps),
+                "{w}×{h} 指令栏第五条 = 到编目屏"
+            );
+        }
+    }
+
     #[test]
     fn hitmap_紧凑态_66x50_也有导航与列表() {
         let mut app = test_app();
@@ -954,9 +1124,11 @@ mod tests {
         let mut app = test_app();
         let a = area(66, 50);
         let hits = hitmap(a, &app, size_class(a));
+        // 只取屏 Tab 条(y=1)的 NavTo;概览指令栏第五条「浏览编目」也是 NavTo(Vps)
+        // (#68),但它在正文右栏更低处(y≠1),不计入 Tab 条几何。
         let nav: Vec<_> = hits
             .iter()
-            .filter(|(_, t)| matches!(t, Target::NavTo(_)))
+            .filter(|(r, t)| matches!(t, Target::NavTo(_)) && r.y == 1)
             .collect();
         assert_eq!(
             nav.len(),
@@ -983,7 +1155,7 @@ mod tests {
         let hits2 = hitmap(a, &app, size_class(a));
         let x_after: u16 = hits2
             .iter()
-            .filter(|(_, t)| matches!(t, Target::NavTo(_)))
+            .filter(|(r, t)| matches!(t, Target::NavTo(_)) && r.y == 1)
             .map(|(r, _)| r.width)
             .sum();
         assert_eq!(x, x_after, "j/k 切屏不改变 Tab 条几何");
@@ -1164,8 +1336,7 @@ mod tests {
             .expect("命中行在渲染中在场");
         assert!(
             rendered.contains("web-search"),
-            "命中行 = 渲染清单首行:{}",
-            rendered
+            "命中行 = 渲染清单首行:{rendered}"
         );
         assert!(
             hits.iter()
@@ -1250,5 +1421,166 @@ mod tests {
                 .any(|(_, t)| matches!(t, Target::ScrollLog(_))),
             "闲置装配屏不产日志滚动区"
         );
+    }
+
+    /// #71 装配中止段命中区:只在真有 up 在途(`as_running`)时产出,与 stderr 日志
+    /// 滚动区同源于 `assemble_hits`(同一组 `Layout`——渲染与命中共用一份几何,
+    /// ADR-0005)。常畅(80×30)与紧凑(66×50)两档都在场、是 1 行可点段、不越界;
+    /// 在途标记一收敛(仍 assembling = 运行视图在场)即不产——点不到一个当前不
+    /// 存在的动作(规格故事 47)。
+    #[test]
+    fn hitmap_装配中止段_在途产出_闲置不产() {
+        let mut app = test_app();
+        app.screen = Screen::Assemble;
+        app.assembling = true;
+        app.as_running = true;
+        for (w, h) in [(80u16, 30u16), (66, 50u16)] {
+            let a = area(w, h);
+            let hits = hitmap(a, &app, size_class(a));
+            check(&hits, a, "{w}×{h}");
+            let r = first(&hits, |t| *t == Target::Abort)
+                .unwrap_or_else(|| panic!("{w}×{h} up 在途应有中止段命中区"));
+            assert!(r.height == 1, "{w}×{h} 中止段是 1 行可点段");
+        }
+        // 在途标记收敛(仍 assembling,运行视图在场):中止段不产命中区
+        app.as_running = false;
+        let a = area(80, 30);
+        assert!(
+            hitmap(a, &app, size_class(a))
+                .iter()
+                .all(|(_, t)| *t != Target::Abort),
+            "非 up 在途:中止段不产命中区"
+        );
+    }
+
+    // ---- #67 接缝的纯函数:`key_line_segments` 的段表分解与收口 ----
+    //
+    // 段表分解是被钉住的几何口径(规格故事 31):一行有哪些段、各多宽、哪段可点、
+    // 放不放得下——纯函数、可单测,不依赖任何屏状态。
+
+    /// 段按序铺开:段宽 = `unicode_width(文案)`,段 x = 行内累计显示宽,段间不
+    /// 重叠、不留歧义区;`target` 原样带着(`None` = 只画不点)。
+    #[test]
+    fn key_line_segments_按序铺开_段宽按unicode宽度量() {
+        let anchor = Rect::new(4, 9, 40, 1);
+        let parts: [KeyPart; 3] = [
+            ("  ↑/↓ 选", None, true),
+            ("g 取回", Some(Target::CatalogGet), true),
+            ("m 换册", Some(Target::SwitchBook), true),
+        ];
+        let segs = key_line_segments(anchor, 9, &parts, " ·");
+        assert_eq!(segs.len(), 3, "三段都放得下:{segs:?}");
+        // 第一段贴在 anchor 左界(含段内前导空格),后续段 = 上一段末 + gap 宽
+        assert_eq!(segs[0].rect.x, 4);
+        let gap = unicode_width::UnicodeWidthStr::width(" ·");
+        assert_eq!(
+            segs[1].rect.x,
+            segs[0].rect.x + segs[0].rect.width + gap as u16,
+            "段 x = 行内累计显示宽"
+        );
+        for s in &segs {
+            assert_eq!(
+                s.rect.width as usize,
+                unicode_width::UnicodeWidthStr::width(s.text.as_str()),
+                "段宽 = 文案显示宽({})",
+                s.text
+            );
+            assert_eq!(s.rect.y, 9, "段高 1 行,落在给定 y 上");
+        }
+        assert_eq!(segs[1].target, Some(Target::CatalogGet));
+        assert_eq!(segs[0].target, None, "提示段不带命中目标");
+    }
+
+    /// **整段可见才可点**(#67 纪律,#73 验收 8):任一段完整越出 anchor 右界,
+    /// 这一段及后续既不画也不给命中——放不下的段一个矩形都不产,不会出现
+    /// 「屏上半截、点得到另外半截」的半个命中。
+    ///
+    /// 为什么在纯函数上钉:四本册的键位行今天在 66×50 下限内都放得下(#69 收窄
+    /// 分隔后还剩余量,见 `过滤段四本册两档都放得下_渲染与命中共源`),所以在真
+    /// 尺寸上构造不出「g 段被裁」——这条纪律只能就着 anchor 宽度直接钉,否则
+    /// 将来键位行再长一截、或下限再降,裁切行为悄悄退化也没人红。
+    #[test]
+    fn key_line_segments_放不下整段收口_不给半个命中() {
+        // 「ab」(2)+ gap(1)+ 「cd」(2)+ gap(1)+ 「ef」(2)= 8 列,anchor 只给 6 列
+        let anchor = Rect::new(0, 0, 6, 1);
+        let parts: [KeyPart; 3] = [
+            ("ab", None, true),
+            ("cd", Some(Target::CatalogGet), true),
+            ("ef", None, true),
+        ];
+        let segs = key_line_segments(anchor, 0, &parts, " ");
+        assert_eq!(
+            segs.len(),
+            2,
+            "第三段越界:这一段及后续都不画不命中:{segs:?}"
+        );
+        assert_eq!(segs[1].rect.x, 3, "第二段仍整段在场");
+        assert_eq!(segs[1].rect.width, 2);
+        // 产出的矩形一个都不越界;第 5、6 两列(被收掉的第三段)没有任何命中
+        for s in &segs {
+            assert!(
+                s.rect.x + s.rect.width <= anchor.x + anchor.width,
+                "段不越出 anchor 右界:{s:?}"
+            );
+        }
+        assert!(
+            segs.iter().all(|s| s.rect.x + s.rect.width <= 5),
+            "被裁掉的那一列起无命中(不是半个命中):{segs:?}"
+        );
+        // 空段也到此为止(画不出东西的段不给命中)
+        let blank: [KeyPart; 2] = [("ab", None, true), ("", Some(Target::CatalogGet), true)];
+        assert_eq!(
+            key_line_segments(Rect::new(0, 0, 10, 1), 0, &blank, " ").len(),
+            1,
+            "空段不画不给命中"
+        );
+    }
+
+    /// 编目册键位行的段表(#73):订阅 / 钥匙册的非空册体变体带一个
+    /// `CatalogGet` 段,空册 / 在途 / 机器册 / 标签册一个都没有——段表是
+    /// 「这一段在不在场」的唯一真相,命中区只照它取矩形。
+    #[test]
+    fn 编目册段表_取回段按册按变体在场() {
+        let mut app = test_app();
+        app.screen = Screen::Vps;
+        app.catalog_kind = crate::screens::CatalogKind::Subscription;
+        let gets = |app: &App| -> usize {
+            crate::screens::catalog::catalog_key_parts(app)
+                .iter()
+                .filter(|(_, t, _)| *t == Some(Target::CatalogGet))
+                .count()
+        };
+        // 空册:没有条目就没有「取回哪一条」
+        assert_eq!(gets(&app), 0, "空册变体无取回段");
+        // 非空册体:恰好一段
+        app.sub_ls = Some(
+            serde_json::from_str(
+                r#"{"catalogPath":"/r/subscriptions.json","subscriptions":[{"name":"airport","kind":"subscription-url","client":"Mihomo","expires":"2099-03-01","status":"active","daysLeft":1}]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(gets(&app), 1, "订阅册非空册体恰一个取回段");
+        // 钥匙册同款
+        app.catalog_kind = crate::screens::CatalogKind::Key;
+        assert_eq!(gets(&app), 0, "换到钥匙册:订阅册的投影不跟过来");
+        app.key_ls = Some(
+            serde_json::from_str(
+                r#"{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"h","scopes":[],"rotatedAt":"2025-11-02"}]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(gets(&app), 1, "钥匙册非空册体恰一个取回段");
+        // 机器册 / 标签册:任何变体都没有
+        for kind in [
+            crate::screens::CatalogKind::Vps,
+            crate::screens::CatalogKind::Tag,
+        ] {
+            app.catalog_kind = kind;
+            assert_eq!(gets(&app), 0, "{kind:?} 册没有取回段");
+        }
+        // 在途变体:整行换成浮层提示
+        app.catalog_kind = crate::screens::CatalogKind::Subscription;
+        app.sub_rm_confirm = true;
+        assert_eq!(gets(&app), 0, "删除确认态无取回段");
     }
 }

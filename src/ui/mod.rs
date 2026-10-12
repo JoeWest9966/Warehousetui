@@ -251,8 +251,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Down,
     },
     HelpRow {
-        key: "a / h / l",
-        desc: "概览:跳 装配 / 健康 / 配方",
+        key: "a / h / l / v",
+        desc: "概览:跳 装配 / 健康 / 配方 / 编目",
         screen: Some(Screen::Overview),
         domain: None,
         mode: None,
@@ -416,8 +416,19 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('m'),
     },
     HelpRow {
+        key: "/",
+        desc: "编目:册内过滤(本地筛选,键入即筛;Esc 清词)",
+        screen: Some(Screen::Vps),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('/'),
+    },
+    HelpRow {
         key: "g",
-        desc: "编目:取回链接的命令(订阅册,只给建议)",
+        desc: "编目:取回链接(订阅册;g 段可点,只给建议)",
         screen: Some(Screen::Vps),
         domain: None,
         mode: None,
@@ -425,6 +436,28 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('g'),
+    },
+    HelpRow {
+        key: "g",
+        desc: "编目:取回钥匙(钥匙册;g 段可点,只给建议)",
+        screen: Some(Screen::Vps),
+        domain: None,
+        mode: None,
+        book: Some(crate::screens::CatalogKind::Key),
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('g'),
+    },
+    HelpRow {
+        key: "Enter",
+        desc: "编目:反查什么标签引用了选中的这台机器(只读)",
+        screen: Some(Screen::Vps),
+        domain: None,
+        mode: None,
+        book: Some(crate::screens::CatalogKind::Vps),
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Enter,
     },
     HelpRow {
         key: "Enter",
@@ -540,12 +573,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
 
 /// 鼠标章节正文:逐条对应 README「鼠标(默认开捕获)」已写全部条目——
 /// 点导航/Tab 切屏与点行选中、滚轮两用(移选中 / 翻装配 stderr 日志)、
-/// 发射仪式两段可点、浮层吞底层点击、捕获默认开的 Shift 代价、
-/// 以及 `--no-mouse` 与设置屏 `m` 两条逃逸。测试断言这些短语都在场。
+/// 发射仪式两段可点、装配运行中「x 中止」段可点(#71,补 #59 欠账)、取回段
+/// 可点(#73,补 #65 §6 延期的那处「屏上写着、鼠标点不到」)、浮层吞底层
+/// 点击、捕获默认开的 Shift 代价、以及 `--no-mouse` 与设置屏 `m` 两条逃逸。
+/// 测试断言这些短语都在场。
 pub(crate) const MOUSE_LINES: &[&str] = &[
     "点导航/Tab 切屏;点行 = 选中(同 ↑/↓)",
     "滚轮移选中;装配 stderr 日志可回看",
     "发射仪式「发射/返航」两段可点;浮层吞点击不穿透",
+    "装配运行中「x 中止」段可点 = 按 x 进程级真止",
+    "编目册键位行可点段:换册 / 过滤 / 反查(点它 = 按对应键)",
+    "取回段只订阅/钥匙册:点它 = 按 g(只收建议命令,不代跑)",
     "捕获默认开的代价:复制要按 Shift",
     "逃逸:--no-mouse / 设置屏 m 关(重启生效)",
 ];
@@ -713,10 +751,10 @@ mod tests {
 │  ▤ 配方  │││✗  desk       9f8e       2026-10-01  漂移  ││   发起装配…   (a) ││
 │  ▩ 编目  │││●  lab        a1b2       —           ok    ││   浏览配方     (l)││
 │  ✦ 设置  │││                                           ││   刷新 ls      (r)││
+│          │││                                           ││   浏览编目     (v)││
 │          │││                                           │└───────────────────┘│
 │          │││                                           │┌ 最近日志 ─────────┐│
 │          │││                                           ││驾驶舱已就绪       ││
-│          │││                                           ││                   ││
 │          │││                                           ││                   ││
 │          │││                                           ││                   ││
 │          │││                                           ││                   ││
