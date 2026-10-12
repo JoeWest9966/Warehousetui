@@ -2395,7 +2395,7 @@ impl App {
                     if echo_ok {
                         kind.run_ls(self);
                         self.push_log(format!(
-                            "登记写盘可能已完成:{}册已刷新,{} 走 PR + 家长审复核",
+                            "登记写盘可能已完成:{}已刷新,{} 走 PR + 家长审复核",
                             kind.write_refreshed_noun(),
                             kind.file()
                         ));
@@ -2808,6 +2808,7 @@ impl App {
     /// 订阅册返航(#76 收敛后的转口:实现只有一份 [`Self::cancel`]——四本册同一句
     /// 「状态清空不留半条记录」,按册那点差别(在途本体随表单一起 drop)在
     /// [`crate::screens::CatalogKind`] 查表成员上)。测试直接驱动它。
+    #[cfg(test)]
     pub fn cancel_sub_register(&mut self) {
         self.cancel(crate::screens::CatalogKind::Subscription);
     }
@@ -2890,6 +2891,7 @@ impl App {
     /// 钥匙册返航(#76 收敛后的转口:实现只有一份 [`Self::cancel`]——四本册同一句
     /// 「状态清空不留半条记录」,按册那点差别(在途本体随表单一起 drop)在
     /// [`crate::screens::CatalogKind`] 查表成员上)。测试直接驱动它。
+    #[cfg(test)]
     pub fn cancel_key_register(&mut self) {
         self.cancel(crate::screens::CatalogKind::Key);
     }
