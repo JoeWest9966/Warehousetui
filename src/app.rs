@@ -350,10 +350,17 @@ pub struct App {
     pub tag_ls_echo: Option<EngineOutput>,
     /// 反查在途(不拿上一轮结论冒充本次)。
     pub tag_ls_loading: bool,
-    /// 最近一次反查问的是哪一条(由回音 argv 推导:`None` = 列全部)。
-    /// 只为把「列全部 / 只列一个」这档差别显式画出来——操作者看得见自己
-    /// 问的是什么,不靠记性。
+    /// 最近一次反查问的是哪一条(**由下发时记下**:`run_tag_ls` 的入参,
+    /// `None` = 列全部)。只为把「列全部 / 只列一个」这档差别显式画出来——
+    /// 操作者看得见自己问的是什么,不靠记性。回音路由
+    /// ([`App::on_tag_echo`])只把它读回来,不再从 argv 重新推导:argv 里
+    /// `--root` 的值长得跟标签名一样,推导就会把「列全部」冒充成「反查
+    /// 一个叫 <根> 的标签」。
     pub tag_lookup: Option<String>,
+    /// 反查上浮状态(#70):机器册上一个键问「什么标签引用了这一条」。
+    /// **独立小状态,不并入 `assembling` 写互斥**(反查只读);三态两两可
+    /// 区分,见 [`crate::screens::catalog::VpsReverse`]。
+    pub vps_reverse: crate::screens::catalog::VpsReverse,
     /// 标签册选中行(↑/↓ 与鼠标点行同源)。
     pub tag_sel: usize,
     /// 摘引用 / 删标签确认浮层(ADR-0009 §2:上游 rm 没有 `--yes`,面板加
@@ -410,6 +417,17 @@ pub struct App {
     /// 过滤词输入态(#61,键 `/`):与 NW_HOME / 数据仓根手填同一级输入态,
     /// 键入即筛。只在配方屏在场时吞键(切屏即退输入态,过滤词保留)。
     pub rc_filter_on: bool,
+    /// 编目册册内过滤词(#69),**按册各留一份**:`[String; 4]` 以
+    /// [`CatalogKind::idx`](crate::screens::CatalogKind::idx) 为下标,换册时每本
+    /// 各留各的词(规格故事 24:机器册筛「gate」、切到钥匙册筛「deploy」,回头
+    /// 机器册还在「gate」上)。与 #61 五域 `rc_filter` 同源——**纯本地筛选**,
+    /// 只作用于面板已拿到的投影,不新增引擎调用、不改数据来源、不把关键词
+    /// 带进任何一条 argv。空串 = 不过滤(与过滤前逐字节相同)。
+    pub catalog_filter: [String; 4],
+    /// 编目册过滤输入态(#69,键 `/`):与 `rc_filter_on` 同一级顶层输入态
+    /// (优先于册内键位,但只在编目屏在场时吞键)。键入即筛;`Enter` 收词退
+    /// 输入态、`Esc` 清词。切屏即退输入态但留词(后果链与 #61 一字不差)。
+    pub catalog_filter_on: bool,
 
     /// 最近动作流水,概览屏右下「最近日志」。
     pub log: Vec<String>,
@@ -545,6 +563,7 @@ impl App {
             tag_ls_echo: None,
             tag_ls_loading: false,
             tag_lookup: None,
+            vps_reverse: crate::screens::catalog::VpsReverse::Idle,
             tag_sel: 0,
             tag_rm_confirm: false,
             tag_rm_result: None,
@@ -568,6 +587,8 @@ impl App {
             rc_bake_sel: false,
             rc_filter: String::new(),
             rc_filter_on: false,
+            catalog_filter: [String::new(), String::new(), String::new(), String::new()],
+            catalog_filter_on: false,
             log: vec!["驾驶舱已就绪".into()],
             queue: Vec::new(),
             pending_editor: false,
@@ -758,6 +779,7 @@ impl App {
             Target::NavTo(s) => {
                 self.screen = s;
                 self.rc_filter_on = false; // 点导航切屏同样退过滤输入态(#61)
+                self.catalog_filter_on = false; // 编目册过滤同理(#69)
             }
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
@@ -799,6 +821,29 @@ impl App {
             // 配方域建议命令取用(#39):与键盘 `c` 完全同路——只读选中态,
             // 面板不执行这条命令(ADR-0003:执行权留给操作者)。
             Target::ToggleSuggest => self.toggle_bake_suggest(),
+            // 点正文键位行的「换册」段(#67):与键盘 `m` 完全同路——四本编目册
+            // 按 CatalogKind::next() 轮转。鼠标只是叠加,不新增语义。
+            Target::SwitchBook => self.cycle_catalog_kind(),
+            // 点正文键位行的「中止」段(#71):与键盘 `x` 完全同路——进程级真止在途
+            // nw up 子进程,回选择器态,stderr 日志一行不清(不宣布成功也不假装失败)。
+            // 命中区只在真有 up 在途(as_running)时由 assemble_hits 产出,故此臂
+            // 到达即确有进程可止;滚轮分支不受理它(滚过中止段不点火)。
+            Target::Abort => self.abort_assembling(),
+            // 点正文键位行的「Enter 反查」段(#70):与机器册选中行上按 `Enter`
+            // 完全同路——只读地问「什么标签引用了这一条」。段只在机器册、且册体
+            // 有条目(= 选中了一行)时由 catalog_hits 产出,故到达即确有一台机器
+            // 可问;滚轮分支不受理它(滚过反查段不发起调用)。
+            Target::VpsReverse => self.vps_reverse_lookup(),
+            // 点正文键位行的「过滤」段(#69):与键盘 `/` 完全同路——进册内过滤
+            // 输入态。鼠标只是叠加,不新增语义。
+            Target::CatalogFilter => self.catalog_filter_on = true,
+            // 点正文键位行的「g 取回」段(#73):与键盘 `g` 同一个函数、同一条
+            // 后果链——当前册选中订阅 / 钥匙的建议命令收进日志,面板不代跑 get、
+            // 不入队、不碰剪贴板(ADR-0009 §1)。路由只有这一处,且分叉的是「哪个
+            // 册」而不是「哪条路径」:查 `CatalogKind::action` 同一张表(与
+            // `key_catalog` 同一个),所以鼠标与键盘不可能给出两种后果。(过滤输入态
+            // 里键入归输入态、鼠标照旧点得动,那是键位行所有可点段的共同边界。)
+            Target::CatalogGet => self.catalog_get(),
         }
     }
 
@@ -897,6 +942,12 @@ impl App {
         } else if self.as_confirm {
             self.as_confirm = false;
             self.push_log("发射取消");
+        } else if self.vps_reverse_open() {
+            // 反查上浮结果浮层返航(#70):只收状态,册体一行不改、机器册原选中行
+            // 原样在场——反查从头到尾不写 `vps_sel`(它在途时册体键位被吞、回音
+            // 落地只按当前册钳位),所以「回到原选中行」不需要一次恢复动作,只
+            // 需要不在返航时顺手改它。Esc 与点任意处走这一条同路(语义不漂移)。
+            self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
@@ -1138,6 +1189,16 @@ impl App {
             self.on_key_confirm(k);
             return;
         }
+        // 反查上浮结果浮层(#70):与帮助浮层同级的**顶层浮层**——它在场时吞键,
+        // 只有 Esc 返航;册体键位(↑/↓ / r / d / l / Enter / m)一个都不受理,
+        // 机器册原选中行因此原样不动(规格故事 37:返航后回到原选中行)。
+        // 与 `dismiss_popup` 同路:鼠标点任意处与键盘 Esc 一个后果。
+        if self.vps_reverse_open() {
+            if matches!(k.code, KeyCode::Esc) {
+                self.dismiss_popup();
+            }
+            return;
+        }
         // 浮层优先级:帮助浮层 > 发射确认 > 手填输入(NW_HOME / 数据仓根) > 指路屏/常屏(见 spec #9)
         if self.home_input {
             self.on_key_home_input(k);
@@ -1151,6 +1212,14 @@ impl App {
         // 但只在本屏在场时吞键——切屏即退输入态,过滤词保留可预期。
         if self.rc_filter_on && self.screen == Screen::Recipes {
             self.on_key_rc_filter(k);
+            return;
+        }
+        // 编目册册内过滤输入态(#69):与 `rc_filter_on` 同一级顶层输入态
+        // (优先于册内键位,但只在编目屏在场时吞键——切屏即退输入态,过滤词
+        // 按册保留)。插在 vps_flow / rm_confirm 守卫**之前**:它是顶层浮层,
+        // 与 `rc_filter` 同级,不与登记两段式混。
+        if self.catalog_filter_on && self.screen == Screen::Vps {
+            self.on_key_catalog_filter(k);
             return;
         }
         // 编目册登记两段式(#53):与外部源登记同级的浮层优先级,
@@ -1266,6 +1335,13 @@ impl App {
             KeyCode::Char('a') => self.screen = Screen::Assemble,
             KeyCode::Char('h') => self.screen = Screen::Health,
             KeyCode::Char('l') => self.screen = Screen::Recipes,
+            // #68:「家」直达第六屏(编目)。键取 `v`(屏枚举 `Screen::Vps` 首字母),
+            // 与既有 `a/h/l` 跳屏同构;屏上指令栏、帮助、README 三处同写 `v`
+            // (屏上看到的与我按下的是一回事,故事 5)。HUD 不写它——HUD 是壳级
+            // 提示栏,只有 j/k 切屏 / Enter 确认 / t 主题 / ? 帮助 / q 退出。
+            // 纯导航零引擎调用——册体到编目屏按 `l` 才读,门禁也按册各自给,
+            // 不在指令栏做禁用态。
+            KeyCode::Char('v') => self.screen = Screen::Vps,
             KeyCode::Down | KeyCode::Char('n') => {
                 if n > 0 {
                     self.ov_sel = (self.ov_sel + 1) % n;
@@ -1618,6 +1694,45 @@ impl App {
         }
     }
 
+    /// 编目册册内过滤输入态(#69,与 `on_key_rc_filter` 同一形态、同一后果链):
+    /// 键入分发归通用态机 [`input::on_key`](与两份手填 / 五域过滤同一条路),
+    /// 本函数只接过滤这一条的后果链。**纯本地**:改的只有当前册的过滤词一个
+    /// 字符串,不入队、不下发任何引擎命令、不把关键词写进别处。`Enter` 收词
+    /// 退输入态;`Esc/q` 取消并清空过滤词(两种退出都可预期);每改一个词选中
+    /// 回顶。按册各留一份:清的只是当前这一本的词。
+    fn on_key_catalog_filter(&mut self, k: KeyEvent) {
+        let action = input::on_key(self.catalog_filter_mut(), k);
+        match action {
+            InputAction::Submit => {
+                self.catalog_filter_on = false;
+                *self.catalog_kind.sel_mut(self) = 0;
+                let n = self.catalog_visible().len();
+                self.push_log(format!(
+                    "过滤词「{}」:{}册 {} 条命中(本地筛选,未入队)",
+                    self.catalog_filter().trim(),
+                    self.catalog_kind.label(),
+                    n
+                ));
+            }
+            InputAction::Cancel => {
+                self.clear_catalog_filter();
+                self.push_log("已清空过滤词:回到编目全量".to_string());
+            }
+            InputAction::Edited => {
+                *self.catalog_kind.sel_mut(self) = 0;
+            }
+            InputAction::Ignored => {}
+        }
+    }
+
+    /// 清空当前册过滤词并让选中回顶(#69):输入态 Cancel / Esc 共用一条后果链
+    /// (与 `clear_rc_filter` 同形状)。**只清当前这一本**——换册各留各的词。
+    fn clear_catalog_filter(&mut self) {
+        self.catalog_filter_mut().clear();
+        self.catalog_filter_on = false;
+        *self.catalog_kind.sel_mut(self) = 0;
+    }
+
     /// 数据仓根手填键位:与 NW_HOME 手填同一条通用态机
     /// ([`input::on_key`]),本函数只接数据仓根的后果链。
     fn on_key_data_input(&mut self, k: KeyEvent) {
@@ -1902,10 +2017,12 @@ impl App {
 
     /// 选中机器的名字(删除确认与键位行同源)。
     pub fn selected_vps_name(&self) -> Option<String> {
-        let d = self.vps_ls.as_ref()?;
-        d.machines
-            .get(self.vps_sel.min(d.machines.len().saturating_sub(1)))
-            .map(|m| m.name.clone())
+        // #69:登记 / 删除 / 反查都作用于「看得见的那一行」——下标经过滤后的
+        // 可见列表映射回原始投影。不过滤时 vis = 0..n,与过去的 `machines[sel]`
+        // 等价(投影按名排序,册体与选中同一口径)。
+        let sheet = self.catalog_sheet()?;
+        let i = *self.catalog_visible().get(self.vps_sel)?;
+        sheet.entries.get(i).map(|e| e.name.clone())
     }
 
     /// vps 入口门(#29 能力门 + #27 数据仓根,与外部源登记同两道、互不冒充):
@@ -1924,64 +2041,39 @@ impl App {
 
     /// 编目册屏键位:`m` 换册(机器 / 标签 / 订阅 / 钥匙);各册 r 登记 /
     /// ↑/↓ 选 / d 删除 / l 重读;订阅与钥匙册 `g` 只给取回建议命令、
-    /// 标签册 `Enter` 反查选中的这一条(#54 / #56 / #57)。
+    /// 标签册 `Enter` 反查选中的这一条(#54 / #56 / #57);`/` 册内过滤(#69)。
     fn key_catalog(&mut self, k: KeyEvent) {
         if let KeyCode::Char('m') = k.code {
             self.cycle_catalog_kind();
             return;
         }
-        if self.catalog_kind == catalog::CatalogKind::Subscription {
-            match k.code {
-                KeyCode::Char('r') if !self.assembling => self.start_sub_register(),
-                // 取回链接本体:只给建议命令,面板不代跑 get(ADR-0009 §1)
-                KeyCode::Char('g') => self.log_sub_get_suggest(),
-                KeyCode::Char('d') => self.start_sub_rm(),
-                KeyCode::Down => self.catalog_move(true),
-                KeyCode::Up => self.catalog_move(false),
-                KeyCode::Char('l') => self.run_sub_ls(),
-                _ => {}
+        // 册内过滤入口(#69):`/` 进过滤输入态(点正文「过滤」段同路,见
+        // `on_mouse` 的 `Target::CatalogFilter`)。与 #61 五域 `/` 同形:输入态
+        // 优先于册内动作键,键入即筛。
+        if let KeyCode::Char('/') = k.code {
+            self.catalog_filter_on = true;
+            return;
+        }
+        // Esc 一键回全量(#69):不在输入态时,按 Esc 清当前册过滤词并让选中回顶
+        // (输入态下 Esc 归 `on_key_catalog_filter` 的 Cancel,同一后果链)。
+        // 无过滤词时 Esc 什么都不做(与 #61 五域同口径)。
+        if let KeyCode::Esc = k.code {
+            if !self.catalog_filter().is_empty() {
+                self.clear_catalog_filter();
+                self.push_log("已清空过滤词:回到编目全量".to_string());
             }
             return;
         }
-        if self.catalog_kind == catalog::CatalogKind::Key {
-            match k.code {
-                KeyCode::Char('r') if !self.assembling => self.start_key_register(),
-                // 取回钥匙本体:只给建议命令,面板不代跑 get(ADR-0009 §1)
-                KeyCode::Char('g') => self.log_key_get_suggest(),
-                KeyCode::Char('d') => self.start_key_rm(),
-                KeyCode::Down => self.catalog_move(true),
-                KeyCode::Up => self.catalog_move(false),
-                KeyCode::Char('l') => self.run_key_ls(),
-                _ => {}
-            }
+        // 册内动作键(#66):**四本册同一处查表 + 同一处落实**。按册差异全在
+        // `CatalogKind::action` 那张表上(同一个键在不同册上可以落到不同
+        // 方法,也可以这一本没有这个键),这里不再有四份逐字重复的
+        // `match k.code`。加第五本册子 = 表里加行,本函数不动。
+        let Some(act) = self.catalog_kind.action(self, k.code) else {
             return;
-        }
-        if self.catalog_kind == catalog::CatalogKind::Tag {
-            match k.code {
-                KeyCode::Char('r') if !self.assembling => self.start_tag_add(),
-                KeyCode::Char('d') => self.start_tag_rm(),
-                // 反查这一条(带参 `tag ls <标签>`):本票主价值的第二个态
-                KeyCode::Enter => {
-                    let Some(name) = self.selected_tag_name() else {
-                        self.push_log("反查未下发:没有选中的标签(↑/↓ 先选一行)");
-                        return;
-                    };
-                    self.run_tag_ls(Some(&name));
-                }
-                KeyCode::Down => self.catalog_move(true),
-                KeyCode::Up => self.catalog_move(false),
-                KeyCode::Char('l') => self.run_tag_ls(None),
-                _ => {}
-            }
-            return;
-        }
-        match k.code {
-            KeyCode::Char('r') if !self.assembling => self.start_vps_register(),
-            KeyCode::Down => self.catalog_move(true),
-            KeyCode::Up => self.catalog_move(false),
-            KeyCode::Char('d') => self.start_vps_rm(),
-            KeyCode::Char('l') => self.run_vps_ls(),
-            _ => {}
+        };
+        match act {
+            catalog::CatalogAction::Move(down) => self.catalog_move(down),
+            catalog::CatalogAction::Act(f) => f(self),
         }
     }
 
@@ -2102,7 +2194,7 @@ impl App {
     }
 
     /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
-    fn start_vps_rm(&mut self) {
+    pub fn start_vps_rm(&mut self) {
         if self.assembling {
             self.push_log("装配进行中:删除与装配互斥,稍后再试");
             return;
@@ -2262,101 +2354,122 @@ impl App {
 
     // ---- 编目册屏·标签册(spec #50 工单 #54,ADR-0009) ----
 
+    /// 点键位行「g 取回」段 = 按 `g`(#73)。
+    ///
+    /// 走 [`catalog::CatalogKind::action`] **同一张表**(与 `key_catalog` 受理
+    /// `g` 的那一次查表同一个入口),由当前是哪一本决定落实方法:订阅册 →
+    /// [`App::log_sub_get_suggest`],钥匙册 → [`App::log_key_get_suggest`]。鼠标
+    /// 与键盘因此不可能给出两种后果,也不会有第二份「点下去发生什么」。
+    ///
+    /// 段只在订阅 / 钥匙册的非空册体变体在场(命中区的产地
+    /// [`catalog::catalog_key_parts`]),所以这一处到达即确有命令可取;表里查不到
+    /// (机器册 / 标签册没有 `g`)就什么都不做——不为鼠标补一条键盘也没有的路。
+    fn catalog_get(&mut self) {
+        if let Some(catalog::CatalogAction::Act(f)) = self
+            .catalog_kind
+            .action(self, crossterm::event::KeyCode::Char('g'))
+        {
+            f(self);
+        }
+    }
+
     /// 当前是哪一本(`m` 换册)。换册只改维度、不清另一本的投影——
     /// 四本各有自己的账,回来还在(不重跑、不轮询)。
     pub fn cycle_catalog_kind(&mut self) {
         self.catalog_kind = self.catalog_kind.next();
+        // 换册即离开机器册语境(#70):反查上浮是机器册独有的只读动作,换册
+        // 取消任何在途 / 在场的反查——不把机器册的结论顺带到别的册上,也不
+        // 在换册这种「别的动作」后顺手收敛一次回音。
+        self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
         let k = self.catalog_kind;
         self.push_log(format!(
             "换册:{}册({});{}",
             k.label(),
             k.file(),
-            match k {
-                catalog::CatalogKind::Tag => "按 l 反查全部标签(只读)",
-                catalog::CatalogKind::Key => "按 l 重读钥匙编目(只读,无本体槽、不印指纹)",
-                catalog::CatalogKind::Subscription => "按 l 重读订阅编目(只读,含到期三态)",
-                catalog::CatalogKind::Vps => "按 l 重读机器编目(只读)",
-            }
+            k.next_hint()
         ));
     }
 
     /// 编目册屏当前这一本的投影(四本各自的数据源汇到同一个
     /// `CatalogSheet`——列表件只有一份,见 `screens::catalog`)。
+    ///
+    /// 「四本各读哪个状态」那处匹配长在 [`catalog::CatalogKind::sheet`] 上
+    /// (#66:数据源形状本就不同,这一处匹配是全模块唯一 unavoidable 的
+    /// 一处,那就让它只存在于查表成员里,调用方不再各自分册)。
     pub fn catalog_sheet(&self) -> Option<crate::engine::CatalogSheet> {
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => self.vps_ls.as_ref().map(|d| d.sheet()),
-            catalog::CatalogKind::Tag => self
-                .tag_ls_echo
-                .as_ref()
-                .filter(|o| o.ok)
-                .and_then(|o| o.envelope.as_ref())
-                .and_then(|e| e.data_as::<crate::engine::TagLsData>())
-                .map(|d| d.sheet()),
-            catalog::CatalogKind::Subscription => self.sub_ls.as_ref().map(|d| d.sheet()),
-            catalog::CatalogKind::Key => self.key_ls.as_ref().map(|d| d.sheet()),
-        }
+        self.catalog_kind.sheet(self)
     }
 
     /// 反查回音的失败态(带参问错了名字 = rc 3 / 回音不可定型)。
     /// `None` = 没有失败态。**只标签册有这一态**:机器册的 `vps ls` 没有
     /// 位置参数,失败时只留日志(51 §6.11:两种语义不都画成空列表)。
+    /// 「只有一本册有」这条关切落在查表成员上(#66)。
     pub fn catalog_ls_error(&self) -> Option<&EngineOutput> {
-        if self.catalog_kind != catalog::CatalogKind::Tag {
-            return None;
-        }
-        let out = self.tag_ls_echo.as_ref()?;
-        let typed = out
-            .envelope
-            .as_ref()
-            .and_then(|e| e.data_as::<crate::engine::TagLsData>());
-        (typed.is_none() || !out.ok).then_some(out)
+        self.catalog_kind.ls_error(self)
     }
 
     /// 册体首行的口径词:机器册给册名,标签册把「列全部 / 只列一个」
     /// 这档差别显式画出来(51 §6.11:两种语义不都画成空列表)。
+    /// 查表成员 [`catalog::CatalogKind::scope_label`] 的一层转发(#66)。
     pub fn catalog_scope_label(&self) -> String {
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => "机器".to_string(),
-            catalog::CatalogKind::Tag => match self.tag_lookup.as_deref() {
-                Some(name) => format!("反查 {name}"),
-                None => "全部标签".to_string(),
-            },
-            catalog::CatalogKind::Subscription => "全部订阅".to_string(),
-            catalog::CatalogKind::Key => "全部钥匙".to_string(),
-        }
+        self.catalog_kind.scope_label(self)
     }
 
     /// 编目册当前这一本的选中行(↑/↓ 与鼠标点行同源)。
+    /// 查表成员 [`catalog::CatalogKind::sel`] 的一层转发(#66)。
     pub fn catalog_sel(&self) -> usize {
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => self.vps_sel,
-            catalog::CatalogKind::Tag => self.tag_sel,
-            catalog::CatalogKind::Subscription => self.sub_sel,
-            catalog::CatalogKind::Key => self.key_sel,
-        }
+        self.catalog_kind.sel(self)
+    }
+
+    /// 当前这一本的过滤词(#69,按册各留一份):取 `catalog_filter[idx]`。
+    /// 换册时每本各留各的词,靠 [`CatalogKind::idx`](crate::screens::CatalogKind::idx)
+    /// 取自己那一份——调用方不写 `match kind`。
+    pub fn catalog_filter(&self) -> &str {
+        &self.catalog_filter[self.catalog_kind.idx()]
+    }
+
+    /// 当前这一本过滤词的可写侧(输入态 [`Self::on_key_catalog_filter`] 键入用)。
+    fn catalog_filter_mut(&mut self) -> &mut String {
+        &mut self.catalog_filter[self.catalog_kind.idx()]
+    }
+
+    /// 当前这一本**可见行**在原始投影里的下标(#69 册内过滤,与 #61 五域
+    /// `rc_visible` 同一族口径,全册单一「看得见的那一行」真相源):无关键词时
+    /// 就是 `0..n` 全量同序(与过滤前逐字节相同,面板永不重排引擎输出);有关键词时
+    /// 按册在该行字段上做大小写不敏感包含匹配。只筛面板已拿到的投影——不新增
+    /// 引擎调用、不改数据来源、不把关键词带进任何命令。
+    pub fn catalog_visible(&self) -> Vec<usize> {
+        let Some(sheet) = self.catalog_sheet() else {
+            return Vec::new();
+        };
+        let q = self.catalog_filter().trim().to_lowercase();
+        (0..sheet.entries.len())
+            .filter(|&i| {
+                q.is_empty()
+                    || self
+                        .catalog_kind
+                        .match_fields(&sheet.entries[i])
+                        .iter()
+                        .any(|f| f.to_lowercase().contains(&q))
+            })
+            .collect()
     }
 
     /// 册级选中态的**单一查表**:当前是哪一本,就借出它自己的选中槽与行数
     /// (键位 ↑/↓、鼠标点行、滚轮移选中都走这一口,换册不串味)。
+    /// 行数取**可见行数**(#69:`catalog_sel` 是「看得见的那一行」在可见列表里
+    /// 的位置,↑/↓ / 点行 / 钳位都建立在 `catalog_sel ∈ [0, 可见行数)` 上;
+    /// 不过滤时可见行数 = 册体条数,与过去逐字等价)。
     /// 只读侧的同源口径是 [`App::catalog_sel`] / [`App::catalog_len`]。
     fn catalog_sel_mut(&mut self) -> (&mut usize, usize) {
-        let n = self.catalog_len();
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => (&mut self.vps_sel, n),
-            catalog::CatalogKind::Tag => (&mut self.tag_sel, n),
-            catalog::CatalogKind::Subscription => (&mut self.sub_sel, n),
-            catalog::CatalogKind::Key => (&mut self.key_sel, n),
-        }
+        let n = self.catalog_visible().len();
+        (self.catalog_kind.sel_mut(self), n)
     }
 
     /// 当前这一本的行数(只读侧;与 `catalog_sel_mut` 同一张表)。
+    /// 查表成员 [`catalog::CatalogKind::len`] 的一层转发(#66)。
     pub fn catalog_len(&self) -> usize {
-        match self.catalog_kind {
-            catalog::CatalogKind::Vps => self.vps_len(),
-            catalog::CatalogKind::Tag => self.tag_len(),
-            catalog::CatalogKind::Subscription => self.sub_len(),
-            catalog::CatalogKind::Key => self.key_len(),
-        }
+        self.catalog_kind.len(self)
     }
 
     /// 册级选中行钳回可见范围内(刷新后旧下标可能越界;四本册同一口径)。
@@ -2386,11 +2499,10 @@ impl App {
 
     /// 选中标签的名字(反查这一条 / 摘引用删标签同源)。
     pub fn selected_tag_name(&self) -> Option<String> {
+        // #69:同 `selected_vps_name`——经过滤后的可见列表映射回原始投影。
         let sheet = self.catalog_sheet()?;
-        sheet
-            .entries
-            .get(self.tag_sel.min(sheet.entries.len().saturating_sub(1)))
-            .map(|e| e.name.clone())
+        let i = *self.catalog_visible().get(self.tag_sel)?;
+        sheet.entries.get(i).map(|e| e.name.clone())
     }
 
     /// 标签册入口门(#29 能力门 + #27 数据仓根,与 vps 册同两道、互不冒充)。
@@ -2430,6 +2542,65 @@ impl App {
         };
         self.queue.push(argv);
         self.push_log(format!("tag ls 已入队({scope},只读不写任何文件)"));
+    }
+
+    /// 标签册 `l`:列全部标签(不带参的只读反查)。单独一个方法名,是为了让
+    /// [`catalog::CatalogKind::action`] 的键位表能把它当**数据**指过去
+    /// (#66:表里每一项都是「这个键在这一本上落到哪个方法」,不塞闭包、
+    /// 不在调用方留分支)。
+    pub fn run_tag_ls_all(&mut self) {
+        self.run_tag_ls(None);
+    }
+
+    /// 标签册 `Enter`:反查选中的这一条(带参 `tag ls <标签>`,本票主价值
+    /// 的第二个态)。没选中行 = 一行日志、不下发命令——与 `run_tag_ls`
+    /// 的门禁同一口径:面板不空手发命令,也不把「没选」画成一次反查。
+    pub fn tag_lookup_selected(&mut self) {
+        let Some(name) = self.selected_tag_name() else {
+            self.push_log("反查未下发:没有选中的标签(↑/↓ 先选一行)");
+            return;
+        };
+        self.run_tag_ls(Some(&name));
+    }
+
+    /// 反查上浮(#70 主入口,只读):机器册选中行上一个键(Enter)或点键位段,
+    /// 问「什么标签引用了这一条」。**门禁顺序与面板信任序一致**:先看
+    /// 数据仓根设没设、再看标签组能力可不可用,最后才发那一次只读
+    /// `nw tag ls`(无参全列);任缺一条给对应指路,**不发命令、不发在途**
+    /// (`tag_entry_enabled` 内部就是「先根后能力」,`tag_gate_hint` 按同序
+    /// 给各自的指路,互不冒充)。
+    ///
+    /// 反查是只读,**不并入 `assembling` 全局写互斥**;在途是独立小状态
+    /// (`vps_reverse`),不拿上一轮结论冒充本次。读法复用既有
+    /// [`run_tag_ls`](App::run_tag_ls) 落进标签册既有的 `tag_ls_echo`,再
+    /// 本地按 `<kind>/<条目>` 精确匹配推导——**不新增调用形状、不新增写
+    /// 路径、不动 `tags.json` 一个字节**。
+    pub fn vps_reverse_lookup(&mut self) {
+        // 门禁①+②:先数据仓根、再标签组能力(任一缺给各自指路,零引擎调用)。
+        if !self.tag_entry_enabled() {
+            self.push_log(format!("反查未下发:{}", self.tag_gate_hint()));
+            return;
+        }
+        let Some(_root) = self.usable_data_root() else {
+            self.push_log(format!("反查未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        // 选中行:机器册没选中(空册)不下发——面板不空手问,也不把「没选」
+        // 画成一次反查。
+        let Some(machine) = self.selected_vps_name() else {
+            self.push_log("反查未下发:没有选中的机器(↑/↓ 先选一行)");
+            return;
+        };
+        // 在途:清空上一轮结论(`run_tag_ls` 会把 `tag_ls_echo` 置 None),独立
+        // 小状态记住这次问的是哪台机器;回音落地时按它推导。
+        self.vps_reverse = crate::screens::catalog::VpsReverse::InFlight { machine };
+        self.run_tag_ls(None);
+    }
+
+    /// 反查结果浮层在不在场(只有 有 N 条 / 一条都没有 两态画;渲染 / 命中 /
+    /// 键位吞键共用这一判据)。
+    pub fn vps_reverse_open(&self) -> bool {
+        self.vps_reverse.is_open()
     }
 
     /// 发起挂标签:进表单态(Enter 即下发——上游没有 `--yes`,面板不自己
@@ -2598,24 +2769,60 @@ impl App {
         match out.args.get(1).map(String::as_str) {
             Some("ls") => {
                 self.tag_ls_loading = false;
-                let asked = out
-                    .args
-                    .iter()
-                    .skip(2)
-                    .find(|a| !a.starts_with("--"))
-                    .cloned();
+                // 问的是哪一条,读**下发时**记下的 [`App::tag_lookup`]
+                // (`run_tag_ls` 的入参,`None` = 列全部),不从回音 argv 重新推导。
+                // 早先这里写的是 `args.iter().skip(2).find(非 -- 开头)`,它会把
+                // `--root` 的**值**当成标签名:机器册反查(#70)发的正是不带参的
+                // `tag ls --root <根>`,于是「列全部标签」被冒充成「反查一个叫
+                // `/tmp` 的标签」——册头(`当前册 标签 · 反查 /tmp`)与日志
+                // (`反查完成(标签 /tmp:4 条,只读)`)两处都跟着错。一种状态冒充
+                // 另一种,正是铁律不许的事;记在下发处,回音只读回来。
+                let asked = self.tag_lookup.clone();
+                // 反查上浮在途(#70):机器册问「什么标签引用了这一条」——回音落地
+                // 时按在途记住的那台机器,从这次 fresh 标签册里就地按 `<kind>/<条目>`
+                // 精确匹配推导。**只在在途时收敛**:操作者已返航(Idle)/ 已看到
+                // 结论(Hits/Empty)时,迟到回音不重开、不覆盖;换册 / 切屏已把在途
+                // 清成 Idle,所以这里天然只对机器册生效。
+                let machine = match &self.vps_reverse {
+                    crate::screens::catalog::VpsReverse::InFlight { machine } => {
+                        Some(machine.clone())
+                    }
+                    _ => None,
+                };
+                // 「读到了」的判据(#70):**rc 0 且拆得出 TagLsData**。rc≠0 的
+                // 回音 `data` 仍可能是可定型形状,只凭「拆不拆得出型」判定就会把
+                // 「这次没读到」冒充成「一条标签引用都没有」——两态互相冒充,正是
+                // spec #65 铁律 4 钉死不许发生的事。契约守卫合成「需升级 nw」
+                // 由 `data_as` 的 None 分支接住(schema 不认识就拆不出型,绝不按旧
+                // 形状降级解析),rc 这一路单独立判。
                 match out
-                    .envelope
-                    .as_ref()
+                    .ok
+                    .then_some(out.envelope.as_ref())
+                    .flatten()
                     .and_then(|e| e.data_as::<crate::engine::TagLsData>())
                 {
                     Some(d) => {
                         let n = d.tags.len();
-                        if asked.is_some() {
-                            self.tag_lookup = asked.clone();
-                        }
+                        // 先算收敛结论(借用 d),再 move out 进 tag_ls_echo。
+                        let converged = machine.as_ref().map(|m| {
+                            let hits =
+                                crate::screens::catalog::tags_referring(&d.sheet(), "vps", m);
+                            (m.clone(), hits)
+                        });
                         self.tag_ls_echo = Some(out);
                         self.catalog_clamp();
+                        // 有 N 条 / 一条都没有:都是 rc 0 合法回音,只是命中数不同
+                        // ——两态可区分,不共用一个空列表。
+                        if let Some((m, hits)) = converged {
+                            self.vps_reverse = if hits.is_empty() {
+                                crate::screens::catalog::VpsReverse::Empty { machine: m }
+                            } else {
+                                crate::screens::catalog::VpsReverse::Hits {
+                                    machine: m,
+                                    tags: hits,
+                                }
+                            };
+                        }
                         let scope = match asked.as_deref() {
                             Some(name) => format!("标签 {name}:{n} 条"),
                             None => format!("全部标签:{n} 条"),
@@ -2624,9 +2831,16 @@ impl App {
                     }
                     None => {
                         // 带参问错了名字(rc 3)/ 回音不可定型:留证据,册体
-                        // 不画空列表(51 §6.11)
+                        // 不画空列表(51 §6.11)。反查上浮在途时这一态 = 「读不到」:
+                        // 转 Unreadable 走既有指路(日志),**绝不画成空列表**。
                         let h = out.headline().to_string();
                         self.tag_ls_echo = Some(out);
+                        if let Some(m) = machine {
+                            self.vps_reverse = crate::screens::catalog::VpsReverse::Unreadable {
+                                machine: m,
+                                reason: h.clone(),
+                            };
+                        }
                         self.push_log(format!("反查没结果:{h}"));
                     }
                 }
@@ -2733,10 +2947,10 @@ impl App {
 
     /// 选中订阅的名字(删除确认 / 取回建议命令同源)。
     pub fn selected_sub_name(&self) -> Option<String> {
-        let d = self.sub_ls.as_ref()?;
-        d.subscriptions
-            .get(self.sub_sel.min(d.subscriptions.len().saturating_sub(1)))
-            .map(|s| s.name.clone())
+        // #69:同 `selected_vps_name`——经过滤后的可见列表映射回原始投影。
+        let sheet = self.catalog_sheet()?;
+        let i = *self.catalog_visible().get(self.sub_sel)?;
+        sheet.entries.get(i).map(|e| e.name.clone())
     }
 
     /// 订阅册入口门(#29 能力门 + #27 数据仓根,与 vps / tag 册同两道、互不冒充)。
@@ -2921,7 +3135,7 @@ impl App {
     }
 
     /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
-    fn start_sub_rm(&mut self) {
+    pub fn start_sub_rm(&mut self) {
         if self.assembling {
             self.push_log("装配进行中:删除与装配互斥,稍后再试");
             return;
@@ -3086,10 +3300,10 @@ impl App {
 
     /// 选中钥匙的名字(删除确认 / 取回建议命令同源)。
     pub fn selected_key_name(&self) -> Option<String> {
-        let d = self.key_ls.as_ref()?;
-        d.keys
-            .get(self.key_sel.min(d.keys.len().saturating_sub(1)))
-            .map(|k| k.name.clone())
+        // #69:同 `selected_vps_name`——经过滤后的可见列表映射回原始投影。
+        let sheet = self.catalog_sheet()?;
+        let i = *self.catalog_visible().get(self.key_sel)?;
+        sheet.entries.get(i).map(|e| e.name.clone())
     }
 
     /// 钥匙册入口门(#29 能力门 + #27 数据仓根,与 vps / tag / subscription 册同两道)。
@@ -3270,7 +3484,7 @@ impl App {
     }
 
     /// 删除确认浮层(ADR-0009 §2:面板加一道图形确认,不改引擎语义)。
-    fn start_key_rm(&mut self) {
+    pub fn start_key_rm(&mut self) {
         if self.assembling {
             self.push_log("装配进行中:删除与装配互斥,稍后再试");
             return;
@@ -3605,12 +3819,14 @@ impl App {
         let i = (self.screen.index() + 1) % Screen::ALL.len();
         self.screen = Screen::ALL[i];
         self.rc_filter_on = false; // 切屏退过滤输入态(#61),过滤词留着回屏还在
+        self.catalog_filter_on = false; // 编目册过滤同理(#69):退输入态、留词
     }
 
     pub fn prev_screen(&mut self) {
         let i = (self.screen.index() + Screen::ALL.len() - 1) % Screen::ALL.len();
         self.screen = Screen::ALL[i];
         self.rc_filter_on = false;
+        self.catalog_filter_on = false;
     }
 
     pub fn cycle_theme(&mut self) {
@@ -4136,6 +4352,151 @@ mod tests {
         app.update(Message::Key(key('x')));
         assert_eq!(runner.abort_count(), 0, "没有 up 在途:一枪都不放");
         assert!(app.assembling, "登记落账的互斥不被装配中止键关掉");
+    }
+
+    // ---- #71 中止键 x 的正文动作段:点「中止」段 = 按 x 进程级真止 ----
+
+    /// 点装配屏正文键位行的「中止」段 = 按 `x`(#71,补 #59 欠下的鼠标命中):
+    /// 在途 `nw up` 子进程进程级真止(`FakeRunner::abort_count()` +1),面板回
+    /// 锁定集选择器态;stderr 日志一行不清——那是操作者判断「停在哪一步」的
+    /// 唯一依据,面板不宣布成功也不假装失败。与键盘 `x` 完全同一路
+    /// (`abort_assembling`),鼠标只是叠加、零键盘回归,不新增语义。
+    #[test]
+    fn 点中止段_等于按x_进程级真止_日志一行不清() {
+        let (runner, mut app) = up_inflight_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        // 在途互斥不变:点中止前再按 Enter 不开发射仪式(忙时不排队)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.as_confirm, "在途时不接第二次发射(互斥语义不变)");
+        let abort = hit_target(&app, |t| *t == Target::Abort);
+        click(&mut app, abort);
+        assert_eq!(
+            runner.abort_count(),
+            1,
+            "点中止段确有一次到达运行器(进程级那一枪,与按 x 同路)"
+        );
+        assert!(!app.assembling, "装配态灯灭");
+        assert!(!app.as_running, "在途标记收敛");
+        assert!(!app.as_confirm, "回选择器态(不是确认态)");
+        assert_eq!(
+            app.as_log,
+            vec!["铺骨架…".to_string(), "落组件…".to_string()],
+            "中止不清空既有 stderr 日志:那是判断停在哪一步的唯一依据"
+        );
+        assert_eq!(app.as_log_offset, 1, "滚轮偏移也不动");
+        assert!(app.as_result.is_none(), "不拿半个结果冒充结论");
+        // 人话:不宣布成功也不假装失败,只指路
+        let said = app.log.join("\n");
+        assert!(said.contains("装配已中止"), "留证据:{said}");
+        assert!(
+            said.contains("不宣布成功也不假装失败"),
+            "中止后状态不归面板裁决:{said}"
+        );
+        assert!(
+            said.contains("重跑同一条装配命令即可收敛") && said.contains("doctor"),
+            "收敛路由:重跑同一条命令 + 健康屏 doctor 复核:{said}"
+        );
+    }
+
+    /// 「中止」段常畅(80×30)与紧凑(66×50)两档都点得中;段文案由渲染与命中
+    /// 共用同一份字符串(`assemble::assemble_key_parts`),点哪打哪——命中行在
+    /// 整帧里必能找着「x 中止」(ADR-0005 渲染与命中同源,#67 接缝的同一形状;
+    /// 规格故事 52:换终端不断命中)。
+    #[test]
+    fn 中止段_常畅与紧凑两档都点得中_且段文案在屏上在场() {
+        for (w, h) in [(80u16, 30u16), (66, 50u16)] {
+            let (runner, mut app) = up_inflight_app();
+            app.size = Rect::new(0, 0, w, h);
+            app.splash = false; // 命中区不看 splash、渲染看:留着它 frame_display 只画 logo(同既有鼠标测试纪律)
+            let abort = hit_target(&app, |t| *t == Target::Abort);
+            let frame = crate::testutil::frame_display(&app, w, h);
+            let row = frame
+                .split('\n')
+                .nth(abort.y as usize)
+                .expect("命中行在渲染中在场");
+            assert!(row.contains("x 中止"), "{w}×{h} 键位行应画着中止段:{row}");
+            click(&mut app, abort);
+            assert_eq!(runner.abort_count(), 1, "{w}×{h} 点中止段进程级真止");
+            assert!(!app.as_running, "{w}×{h} 在途标记收敛");
+        }
+    }
+
+    /// 「中止」段只在真有 `up` 在途(`as_running`)时画得出、点得中(#71 票面 +
+    /// 规格故事 47):不在场时不画也不给命中——点到一个当前不存在的动作,比点不到
+    /// 更糟。在途标记一收敛,命中区与整帧的中止提示一并消失(块标题也不再带 `x`,
+    /// 话术单源在键位行上)。
+    #[test]
+    fn 中止段_只在up在途在场_闲置不画不命中() {
+        let (_r, mut app) = up_inflight_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.splash = false; // 命中区不看 splash、渲染看:留着它 frame_display 只画 logo
+                            // 真有 up 在途:画得出、点得中
+        let abort = hit_target(&app, |t| *t == Target::Abort);
+        let frame = crate::testutil::frame_display(&app, 80, 30);
+        let row = frame
+            .split('\n')
+            .nth(abort.y as usize)
+            .expect("命中行在渲染中在场");
+        assert!(row.contains("x 中止"), "up 在途:中止段画在键位行:{row}");
+        // 在途标记收敛(仍 assembling = 运行视图在场,但没有 up 在途):段不画、
+        // 命中区也没有、整帧再无中止提示
+        app.as_running = false;
+        assert!(
+            hitmap(app.size, &app, size_class(app.size))
+                .iter()
+                .all(|(_, t)| *t != Target::Abort),
+            "非 up 在途:中止段不产命中区(点不到一个当前不存在的动作)"
+        );
+        let frame = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            !frame.contains("x 中止"),
+            "非 up 在途:整帧无中止提示(块标题不再带 x,话术单源在键位行):{frame}"
+        );
+    }
+
+    /// 「中止」与「Esc 返航」是两个可点段、话术不互冒充(#71 票面 + 规格故事
+    /// 46/48):发射前(仪式浮层)可点的是「Esc 返航」——命令还没下发,点什么
+    /// 都什么都没发生(不碰运行器);发射后(运行视图)可点的是「x 中止」——在途
+    /// 子进程进程级真止。两个状态各产各的命中区,不共屏、不共话术。
+    #[test]
+    fn 中止与返航两段可点_话术不互冒充() {
+        // 发射前:仪式浮层只产「Enter 发射 / Esc 返航」两段,没有「中止」段
+        let (runner, mut app) = up_inflight_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.assembling = false; // 仪式在发射前:命令还没下发
+        app.as_running = false;
+        app.as_confirm = true;
+        let hits = hitmap(app.size, &app, size_class(app.size));
+        assert!(
+            hits.iter().any(|(_, t)| *t == Target::DismissPopup),
+            "发射前:「Esc 返航」段可点"
+        );
+        assert!(
+            hits.iter().all(|(_, t)| *t != Target::Abort),
+            "发射前:没有「中止」段(命令还没下发,没有进程可止)"
+        );
+        let back = hit_target(&app, |t| *t == Target::DismissPopup);
+        click(&mut app, back);
+        assert_eq!(runner.abort_count(), 0, "点返航 = 取消仪式,什么都没发生");
+        assert!(!app.as_confirm, "返航关仪式");
+        // 发射后:运行视图只产「x 中止」段,没有「返航」段(浮层没开)
+        let (runner2, mut app2) = up_inflight_app();
+        app2.size = Rect::new(0, 0, 80, 30);
+        let hits2 = hitmap(app2.size, &app2, size_class(app2.size));
+        assert!(
+            hits2.iter().any(|(_, t)| *t == Target::Abort),
+            "发射后:「x 中止」段可点"
+        );
+        assert!(
+            hits2.iter().all(|(_, t)| *t != Target::DismissPopup),
+            "发射后:没有「返航」段(浮层没开,返航归发射前)"
+        );
+        let abort = hit_target(&app2, |t| *t == Target::Abort);
+        click(&mut app2, abort);
+        assert_eq!(runner2.abort_count(), 1, "点中止 = 进程级真止");
     }
 
     // ---- #9 NW_HOME 手填输入(App 行为缝) ----
@@ -4915,6 +5276,93 @@ mod tests {
         assert_eq!(app.screen, Screen::Recipes, "右键不分派");
     }
 
+    // ---- #68 概览指令栏第五条「浏览编目」:一键到第六屏,点它也等于按键 ----
+
+    /// 在整帧真显示里定位某子串的终端 (列, 行)(列按显示宽累计,与命中区
+    /// 同一把尺;frame_display 已跳过宽字续格,故字节偏移≠列,须累宽)。
+    fn locate_col_row(app: &App, w: u16, h: u16, needle: &str) -> (u16, u16) {
+        use unicode_width::UnicodeWidthChar;
+        let frame = crate::testutil::frame_display(app, w, h);
+        for (y, line) in frame.split('\n').enumerate() {
+            if let Some(byte) = line.find(needle) {
+                let col: u16 = line[..byte]
+                    .chars()
+                    .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+                    .sum();
+                return (col, y as u16);
+            }
+        }
+        panic!("整帧里找不到「{needle}」({w}×{h})");
+    }
+
+    /// 键盘路:概览按 `v` 一键到第六屏(编目),且纯导航零引擎调用、不写流水。
+    /// 键位选 `v`(屏枚举 `Screen::Vps` 首字母)与既有 `a`/`h`/`l` 跳屏同构,
+    /// 全仓无 `Char('v')` 冲突;指令栏 / 帮助 / README 三处同写 `v`
+    /// (屏上=按下,#68 故事 5)。HUD 不写它:壳级提示栏只写 j/k、Enter、t、?、q。
+    #[test]
+    fn 概览_按v跳到编目屏_零引擎调用() {
+        let mut app = fake_app();
+        app.screen = Screen::Overview;
+        let (q, log) = (app.queue.len(), app.log.len());
+        app.update(Message::Key(key('v')));
+        assert_eq!(app.screen, Screen::Vps, "v 一键到第六屏(编目,屏内 m 换册)");
+        assert_eq!(app.queue.len(), q, "切屏零引擎调用:队列不长");
+        assert_eq!(app.log.len(), log, "纯导航不写流水");
+    }
+
+    /// 点路 == 键路:点帧上「浏览编目」所在行列 = 按 `v`,两档都中、都零调用。
+    /// 坐标取自整帧真显示(点哪打哪),不硬编码矩形——紧凑态 Tab 行让首行、
+    /// 竖导航列还正文,几何两支都由渲染同源算出(ADR-0005)。
+    #[test]
+    fn 概览_点浏览编目等于按v_常畅与紧凑两档都中_且不发调用() {
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let mut by_key = mouse_ls_app();
+            by_key.screen = Screen::Overview;
+            by_key.update(Message::Key(key('v')));
+
+            let mut by_click = mouse_ls_app();
+            by_click.screen = Screen::Overview;
+            by_click.splash = false;
+            by_click.size = Rect::new(0, 0, w, h);
+            let (col, row) = locate_col_row(&by_click, w, h, "浏览编目");
+            let q = by_click.queue.len();
+            by_click.update(Message::Mouse(mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                row,
+            )));
+            assert_eq!(
+                by_click.screen,
+                Screen::Vps,
+                "{w}×{h} 点指令栏第五条到编目屏"
+            );
+            assert_eq!(
+                by_click.screen, by_key.screen,
+                "{w}×{h} 点它 = 按 v(同一后果)"
+            );
+            assert_eq!(by_click.queue.len(), q, "{w}×{h} 点它零引擎调用");
+        }
+    }
+
+    /// 入口常驻可点:指令栏是动线不是能力表——数据仓根未设也不在指令栏做
+    /// 禁用态(#68 明确不做 gate);按册的能力门在编目屏内各自指路,语义不变。
+    #[test]
+    fn 概览_浏览编目入口常驻可点_不设数据仓根也到第六屏() {
+        let mut app = mouse_ls_app();
+        app.screen = Screen::Overview;
+        app.data_root = None; // 未设数据仓根
+        app.splash = false;
+        app.size = Rect::new(0, 0, 66, 50);
+        let (col, row) = locate_col_row(&app, 66, 50, "浏览编目");
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            row,
+        )));
+        assert_eq!(app.screen, Screen::Vps, "入口常驻可点:坏根也不禁用指令栏");
+        assert!(app.queue.is_empty(), "切屏零引擎调用(门禁在编目屏内按册给)");
+    }
+
     #[test]
     fn 点列表行选中_当前屏对应选中态() {
         let mut app = mouse_ls_app();
@@ -4975,6 +5423,9 @@ mod tests {
     fn catalog_four_books_app() -> App {
         let mut app = fake_app();
         app.size = Rect::new(0, 0, 80, 30);
+        // splash 必须先跳过:命中区不看 splash、渲染看——留着它会「点得到、
+        // 屏上没有」,正是 ADR-0005「渲染与命中同源」要防的那类分裂(#67)。
+        app.splash = false;
         app.screen = Screen::Vps;
         app.vps_ls = Some(serde_json::from_str(CAT_VPS_LS).unwrap());
         app.tag_ls_echo = Some(EngineOutput {
@@ -4988,6 +5439,18 @@ mod tests {
         });
         app.sub_ls = Some(serde_json::from_str(CAT_SUB_LS).unwrap());
         app.key_ls = Some(serde_json::from_str(CAT_KEY_LS).unwrap());
+        // 四本册的能力都记上:命中区与渲染用同一判据(`CatalogKind::capability`),
+        // 不记就会「册体一行不画、行命中区照产」——点得到、屏上没有,正是
+        // ADR-0005「渲染与命中同源」要防的那类分裂。
+        for cap in [
+            crate::engine::Capability::Vps,
+            crate::engine::Capability::Tag,
+            crate::engine::Capability::Subscription,
+            crate::engine::Capability::Key,
+        ] {
+            app.capabilities
+                .record(cap, crate::engine::Probe::Available);
+        }
         app
     }
 
@@ -5041,6 +5504,89 @@ mod tests {
         assert_eq!(app.vps_sel, 0, "订阅册滚轮不误写 vps_sel");
     }
 
+    // ---- #67 正文键位行命中接缝:点「换册」段 = 按 m ----
+
+    /// 点正文键位行的「换册」段 = 按 `m`:四本册按 `CatalogKind::next()` 既有
+    /// 顺序轮转(鼠标只是叠加,不新增语义,#67 承载的规格订正:可点动作段画在
+    /// **正文里**,不画在 HUD)。段文案由渲染与命中共用同一份字符串——点哪打哪。
+    #[test]
+    fn 点换册段_等于按m_四本册按既有顺序轮转() {
+        let mut app = catalog_four_books_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        let mut by_click = vec![app.catalog_kind];
+        for _ in 0..4 {
+            let sw = hit_target(&app, |t| *t == Target::SwitchBook);
+            click(&mut app, sw);
+            by_click.push(app.catalog_kind);
+        }
+        // 与连按四次 m 同一条轮转链(Vps → Tag → Subscription → Key → Vps)
+        let mut keyed = catalog_four_books_app();
+        keyed.size = Rect::new(0, 0, 80, 30);
+        let mut by_key = vec![keyed.catalog_kind];
+        for _ in 0..4 {
+            keyed.update(Message::Key(key('m')));
+            by_key.push(keyed.catalog_kind);
+        }
+        assert_eq!(by_click, by_key, "点换册段与按 m 逐帧同源");
+        assert_eq!(
+            by_click,
+            vec![
+                catalog::CatalogKind::Vps,
+                catalog::CatalogKind::Tag,
+                catalog::CatalogKind::Subscription,
+                catalog::CatalogKind::Key,
+                catalog::CatalogKind::Vps,
+            ],
+            "四本册按 next() 既有顺序轮转,不另造一套"
+        );
+    }
+
+    /// 「换册」段常畅(80×30)与紧凑(66×50)两档都点得中;段文案在屏上逐字在场
+    /// (渲染与命中共用同一份字符串量宽,点哪打哪)。
+    #[test]
+    fn 换册段_常畅与紧凑两档都点得中_且段文案在屏上在场() {
+        for (w, h) in [(80u16, 30u16), (66, 50u16)] {
+            let mut app = catalog_four_books_app();
+            app.size = Rect::new(0, 0, w, h);
+            let sw = hit_target(&app, |t| *t == Target::SwitchBook);
+            // 段文案与命中共用:渲染行里必能找着这段字符串,且它的起始列 = 命中矩形 x
+            let frame = crate::testutil::frame_display(&app, w, h);
+            let row = frame
+                .split('\n')
+                .nth(sw.y as usize)
+                .expect("命中行在渲染中在场");
+            assert!(row.contains("m 换册"), "{w}×{h} 键位行应画着换册段:{row}");
+            click(&mut app, sw);
+            assert_eq!(
+                app.catalog_kind,
+                catalog::CatalogKind::Tag,
+                "{w}×{h} 点换册段切到下一本"
+            );
+        }
+    }
+
+    /// 浮层打开时点底层不换册(spec #65 故事 50:浮层吞底层点击,弹层优先级);
+    /// 删除确认弹层在场时「换册」段不产命中区。
+    #[test]
+    fn 换册段_删除确认弹层打开时_点底层不换册() {
+        let mut app = catalog_four_books_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.vps_rm_confirm = true;
+        let hits = hitmap(app.size, &app, size_class(app.size));
+        assert!(
+            hits.iter().all(|(_, t)| *t != Target::SwitchBook),
+            "删除确认弹层打开:换册段不产命中区(弹层优先级,底层不穿透)"
+        );
+    }
+
+    /// 点顶栏 / HUD 行零状态变化(#16 钉住:HUD 是提示栏,永远不可点)。
+    ///
+    /// 快照字段刻意带上**编目册本轮新增的三个状态**(#65 评审第 10 条):
+    /// `catalog_kind` / `catalog_filter_on` / `vps_reverse`。它们在结构上今天
+    /// 不可能被这一下改到(`area_pad` 先把 HUD 整行从命中区切掉,任何 `*_hits`
+    /// 都在切过的区域上跑),但正因为切得干净,旧的快照元组**结构上就看不见
+    /// 编目屏上的回归**——而这正是本轮长出三个可点正文段的地方。带上这三个
+    /// 字段,将来看不见的回归才会真的红。
     #[test]
     fn 点空白不改状态_顶栏与hud行() {
         let mut app = mouse_ls_app();
@@ -5055,6 +5601,9 @@ mod tests {
             app.queue.len(),
             app.as_confirm,
             app.help,
+            app.catalog_kind,
+            app.catalog_filter_on,
+            app.vps_reverse.clone(),
         );
         // 顶栏(y=0)与 HUD(y=29)都不在命中区内(#16 钉住)
         app.update(Message::Mouse(mouse_at(
@@ -5077,6 +5626,9 @@ mod tests {
                 app.queue.len(),
                 app.as_confirm,
                 app.help,
+                app.catalog_kind,
+                app.catalog_filter_on,
+                app.vps_reverse.clone(),
             ),
             before,
             "点空白零变化"
@@ -5461,8 +6013,7 @@ mod tests {
         for cap in Capability::ALL {
             assert!(
                 argvs.contains(&cap.probe_args()),
-                "{:?} 探针必须经 spawn_engine 下发",
-                cap
+                "{cap:?} 探针必须经 spawn_engine 下发"
             );
         }
         // 无害性:探针不携带任何会动文件的旗标
@@ -5502,7 +6053,7 @@ mod tests {
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         feed_bootstrap(&mut app2, &tx2, &mut rx2);
         for cap in Capability::ALL {
-            assert!(app2.entry_enabled(cap), "齐备引擎下 {:?} 应放行", cap);
+            assert!(app2.entry_enabled(cap), "齐备引擎下 {cap:?} 应放行");
         }
         app2.splash = false;
         app2.screen = Screen::Settings;
@@ -6448,6 +6999,8 @@ mod tests {
         data_input: bool,
         rc_filter_on: bool,
         rc_filter: String,
+        catalog_filter_on: bool,
+        catalog_filter: [String; 4],
         pending_editor: bool,
         mouse_enabled: bool,
         nw_home: String,
@@ -6474,6 +7027,8 @@ mod tests {
             data_input: a.data_input,
             rc_filter_on: a.rc_filter_on,
             rc_filter: a.rc_filter.clone(),
+            catalog_filter_on: a.catalog_filter_on,
+            catalog_filter: a.catalog_filter.clone(),
             pending_editor: a.pending_editor,
             mouse_enabled: a.mouse_enabled,
             nw_home: a.nw_home.clone(),
@@ -6762,9 +7317,28 @@ mod tests {
     /// 鼠标章节覆盖 README「鼠标(默认开捕获)」已写全部条目:点导航/Tab 切屏与
     /// 点行选中、滚轮两用、发射仪式两段、浮层吞点击、Shift 放行复制、
     /// `--no-mouse` 与设置屏 `m` 两逃逸——每条都有短语在场。
+    ///
+    /// **反方向也钉(#65 评审第 4 条)**:册体画得出来的每一个**可点段**,章节
+    /// 与 README 鼠标小节两边都点名。旧版只查了「README 有的短语在不在章节
+    /// 里」这一个方向,于是 #69 给机器册加了 `/ 过滤` 段、#70 加了
+    /// `Enter 反查` 段,README 还停在「换册 / Enter 反查」两段,两边悄悄不
+    /// 一致也没人红。段名词从**画段的那三份常量**取
+    /// ([`crate::screens::catalog::CATALOG_SWITCH`] / `CATALOG_FILTER` /
+    /// `CATALOG_REVERSE`——`catalog_key_parts` 里全部 `Some(Target)` 的段都
+    /// 是它们),不另抄一份清单:将来加第四个可点段而文档没跟上,这条就红。
     #[test]
     fn 帮助鼠标章节_覆盖_readme_全部条目() {
+        use crate::screens::catalog::{
+            CATALOG_FILTER, CATALOG_GET, CATALOG_REVERSE, CATALOG_SWITCH,
+        };
         use crate::ui::MOUSE_LINES;
+        let readme = include_str!("../README.md");
+        // README 鼠标小节:从 `### 鼠标(默认开捕获)` 到下一个 `##` 标题之间
+        let section = readme
+            .split("### 鼠标(默认开捕获)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("README 应有「鼠标(默认开捕获)」小节");
         let joined = MOUSE_LINES.join("\n");
         for phrase in [
             "切屏",
@@ -6778,8 +7352,23 @@ mod tests {
             "Shift",
             "--no-mouse",
             "设置屏 m",
+            "编目",
+            "过滤",
         ] {
             assert!(joined.contains(phrase), "鼠标章节缺 README 条目 `{phrase}`");
+        }
+        // 反方向:画在屏上的每一个可点段,章节与 README 两边都点名
+        for seg in [CATALOG_SWITCH, CATALOG_FILTER, CATALOG_REVERSE, CATALOG_GET] {
+            // 段文案是 `m 换册` / `/ 过滤` / `Enter 反查`:名词取最后一段
+            let noun = seg.split_whitespace().last().unwrap_or(seg);
+            assert!(
+                joined.contains(noun),
+                "鼠标章节漏了可点段 `{seg}`(册体画得出来,章节却没写)"
+            );
+            assert!(
+                section.contains(noun),
+                "README 鼠标小节漏了可点段 `{seg}`(屏上点得中,README 却没写)"
+            );
         }
     }
 }

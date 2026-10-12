@@ -41,11 +41,11 @@ use ratatui::Frame;
 
 use crossterm::event::KeyCode;
 
-use crate::app::{App, DataRootCause};
+use crate::app::App;
 use crate::engine::{
     capability, capability::Capability, CatalogEntryView, CatalogGate, CatalogRef, CatalogSheet,
-    EngineOutput, KeyRegisterData, State, SubRegisterData, SubStatusCounts, TagAddData, VpsLsData,
-    VpsRegisterData,
+    EngineOutput, KeyRegisterData, State, SubRegisterData, SubStatusCounts, TagAddData, TagLsData,
+    VpsLsData, VpsRegisterData,
 };
 use crate::input::{self, InputAction};
 use crate::layout::{popup_rect, REG_INPUT_H, REG_INPUT_W};
@@ -292,6 +292,572 @@ impl CatalogKind {
             CatalogKind::Key => CatalogKind::Vps,
         }
     }
+
+    /// 这一本在「按册各留一份」状态数组里的下标(#69 册内过滤:编目过滤词是
+    /// `[String; 4]`,换册时每本各留各的词,靠这个下标取自己那一份;
+    /// 规格故事 24:机器册筛「gate」、切到钥匙册筛「deploy」,回头机器册
+    /// 还在「gate」上)。四本固定 0/1/2/3,与枚举声明序一致。
+    pub fn idx(self) -> usize {
+        match self {
+            CatalogKind::Vps => 0,
+            CatalogKind::Tag => 1,
+            CatalogKind::Subscription => 2,
+            CatalogKind::Key => 3,
+        }
+    }
+
+    // ---- 册级查表(工单 #66:按册差异只剩数据,不再有分支) ----
+    //
+    // 下面这一族把「这一本的登记流槽 / 删除确认旗 / 册体条数 / 选中槽 /
+    // 落账闸 / 投影数据源 / 空册文案 / 附述行 / 边界表述 / 键位行 / 浮层 /
+    // 册内键位表」收成 `CatalogKind` 的成员。**调用方不再写第四份
+    // `if kind == …`**:命中区(`layout::catalog_hits`)、册内键位路由
+    // (`App::key_catalog`)、渲染(`render_catalog` / `catalog_key_parts`)与
+    // `App` 的册级访问器各只剩一处公共代码路径,四本册走同一条。
+    //
+    // 加一条只在一本册上成立的关切 = 在这里加一个成员(那一本给真值,
+    // 其余三本给 `false` / 空 / `None`),不是往调用方再插一个分支——
+    // 第五本册子来时同样只改这一处。测试
+    // `只属一两本的关切_按册各按一次_表外一本都不多发` 钉住这条口径。
+
+    /// 这一本的登记流槽(两段式 / 无确认闸两种形态,四本各一份)。
+    pub fn flow(self, app: &App) -> &RegisterFlow {
+        match self {
+            CatalogKind::Vps => &app.vps_flow,
+            CatalogKind::Tag => &app.tag_flow,
+            CatalogKind::Subscription => &app.sub_flow,
+            CatalogKind::Key => &app.key_flow,
+        }
+    }
+
+    /// 这一本的删除确认弹层是否打开(ADR-0009 §2:面板加一道图形确认,
+    /// 不改引擎语义;四本各一面旗)。
+    pub fn rm_confirm(self, app: &App) -> bool {
+        match self {
+            CatalogKind::Vps => app.vps_rm_confirm,
+            CatalogKind::Tag => app.tag_rm_confirm,
+            CatalogKind::Subscription => app.sub_rm_confirm,
+            CatalogKind::Key => app.key_rm_confirm,
+        }
+    }
+
+    /// 这一本册体的条数(没读到 = 0;与 [`Self::sel`] 同一张表)。
+    pub fn len(self, app: &App) -> usize {
+        match self {
+            CatalogKind::Vps => app.vps_len(),
+            CatalogKind::Tag => app.tag_len(),
+            CatalogKind::Subscription => app.sub_len(),
+            CatalogKind::Key => app.key_len(),
+        }
+    }
+
+    /// 这一本的选中行(↑/↓ 与鼠标点行同源;四本各一个槽,换册不串味)。
+    pub fn sel(self, app: &App) -> usize {
+        match self {
+            CatalogKind::Vps => app.vps_sel,
+            CatalogKind::Tag => app.tag_sel,
+            CatalogKind::Subscription => app.sub_sel,
+            CatalogKind::Key => app.key_sel,
+        }
+    }
+
+    /// 这一本的选中槽(可写侧;键位 ↑/↓、鼠标点行、滚轮移选中都走这一口)。
+    pub fn sel_mut(self, app: &mut App) -> &mut usize {
+        match self {
+            CatalogKind::Vps => &mut app.vps_sel,
+            CatalogKind::Tag => &mut app.tag_sel,
+            CatalogKind::Subscription => &mut app.sub_sel,
+            CatalogKind::Key => &mut app.key_sel,
+        }
+    }
+
+    /// 这一本的登记确认态是否放行落账。**标签册恒 `false`**:上游
+    /// `tag add` 没有确认闸(追加合并、幂等),ADR-0009 §2 不许面板自己造
+    /// 一道——所以标签册的确认屏没有「Enter 落账」段可点,这一条就是那道闸。
+    pub fn can_commit(self, app: &App) -> bool {
+        match self {
+            CatalogKind::Vps => app.vps_can_commit(),
+            CatalogKind::Tag => false,
+            CatalogKind::Subscription => app.sub_can_commit(),
+            CatalogKind::Key => app.key_can_commit(),
+        }
+    }
+
+    /// 反查回音的失败态(带参问错了名字 = rc 3 / 回音不可定型)。
+    /// `None` = 没有失败态。**只标签册有这一态**:机器册的 `vps ls` 没有
+    /// 位置参数,失败时只留日志(51 §6.11:两种语义不都画成空列表)。
+    /// 「只有一本册成立」是一条按册关切,所以它落在查表成员上(#66):
+    /// 其余三本恒 `None`,调用方不再写 `if kind != Tag`。
+    pub fn ls_error(self, app: &App) -> Option<&EngineOutput> {
+        if self != CatalogKind::Tag {
+            return None;
+        }
+        let out = app.tag_ls_echo.as_ref()?;
+        let typed = out.envelope.as_ref().and_then(|e| e.data_as::<TagLsData>());
+        (typed.is_none() || !out.ok).then_some(out)
+    }
+
+    /// 册体首行的口径词:机器册给册名,标签册把「列全部 / 只列一个」
+    /// 这档差别显式画出来(51 §6.11:两种语义不都画成空列表)。
+    pub fn scope_label(self, app: &App) -> String {
+        match self {
+            CatalogKind::Vps => "机器".to_string(),
+            CatalogKind::Tag => match app.tag_lookup.as_deref() {
+                Some(name) => format!("反查 {name}"),
+                None => "全部标签".to_string(),
+            },
+            CatalogKind::Subscription => "全部订阅".to_string(),
+            CatalogKind::Key => "全部钥匙".to_string(),
+        }
+    }
+
+    /// 换到这一本时,日志里那一句「接下来按 l 做什么」(各本只读调用的
+    /// 口径不同:标签册是反查、钥匙册明示无本体槽、订阅册含到期三态)。
+    pub fn next_hint(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "按 l 重读机器编目(只读)",
+            CatalogKind::Tag => "按 l 反查全部标签(只读)",
+            CatalogKind::Subscription => "按 l 重读订阅编目(只读,含到期三态)",
+            CatalogKind::Key => "按 l 重读钥匙编目(只读,无本体槽、不印指纹)",
+        }
+    }
+
+    /// 这一本的投影(四本各自的数据源汇到同一个 [`CatalogSheet`])。
+    ///
+    /// **这是全模块唯一一处「四本各读哪个状态」的匹配**:四本的数据源
+    /// 形状本就不同(`Option<VpsLsData>` / 回音 envelope / `Option<SubLsData>`
+    /// / `Option<KeyLsData>`),没法再拆成更小的查表——那就让这一处匹配
+    /// 长在 [`CatalogKind`] 上,调用方(`App::catalog_sheet` 及渲染)只写
+    /// `kind.sheet(app)`,不再各自 `match self.catalog_kind`。
+    pub fn sheet(self, app: &App) -> Option<CatalogSheet> {
+        match self {
+            CatalogKind::Vps => app.vps_ls.as_ref().map(|d| d.sheet()),
+            CatalogKind::Tag => app
+                .tag_ls_echo
+                .as_ref()
+                .filter(|o| o.ok)
+                .and_then(|o| o.envelope.as_ref())
+                .and_then(|e| e.data_as::<TagLsData>())
+                .map(|d| d.sheet()),
+            CatalogKind::Subscription => app.sub_ls.as_ref().map(|d| d.sheet()),
+            CatalogKind::Key => app.key_ls.as_ref().map(|d| d.sheet()),
+        }
+    }
+
+    /// 这一本的一条条目**参与过滤的字段**(#69,与 #61 五域 `domain_row_fields`
+    /// 同一族口径):按册取该行在列表与明细里出现过的文本。**只收引擎真给了的
+    /// 字段**,缺字段 / 占位符「——」一律不入匹配面——不猜、不拿「——」冒充
+    /// 可检索内容(规格 §3「每册一份可匹配字段」)。机器 = 名/地址/登录/备注;
+    /// 标签 = 名/引用;订阅 = 名/应用/到期日;钥匙 = 名/主机/作用域/轮换日。
+    /// 落在查表成员上(#66 模式):调用方(`App::catalog_visible`)只写
+    /// `kind.match_fields(e)`,不再有四份按册匹配分支。
+    pub fn match_fields(self, e: &CatalogEntryView) -> Vec<String> {
+        let mut v = vec![e.name.clone()];
+        match self {
+            CatalogKind::Vps => {
+                for a in &e.addrs {
+                    v.push(a.label.clone());
+                    v.push(a.addr.clone());
+                }
+                for l in &e.logins {
+                    v.push(l.user.clone());
+                    v.push(l.key_ref.clone());
+                }
+                if let Some(n) = e.note.as_deref().filter(|s| !s.is_empty()) {
+                    v.push(n.to_string());
+                }
+            }
+            CatalogKind::Tag => {
+                for r in &e.refs {
+                    v.push(r.label());
+                }
+            }
+            CatalogKind::Subscription => {
+                if let Some(c) = e.client.as_deref().filter(|s| !s.is_empty()) {
+                    v.push(c.to_string());
+                }
+                if let Some(x) = e
+                    .expires
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    v.push(x.to_string());
+                }
+            }
+            CatalogKind::Key => {
+                if let Some(h) = e.host.as_deref().filter(|s| !s.is_empty()) {
+                    v.push(h.to_string());
+                }
+                v.extend(e.scopes.iter().cloned());
+                if let Some(r) = e
+                    .rotated_at
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    v.push(r.to_string());
+                }
+            }
+        }
+        v
+    }
+
+    /// 册体「还没读到」的一句话(合法空态之前的第三态:一次 ls 都没成功过)。
+    /// 四本各一句——按册查表,渲染不再 `match kind` 四回。
+    pub fn unread_line(self) -> &'static str {
+        match self {
+            CatalogKind::Vps => "  编目册还没读到:按 r 登记,或先刷新(回概览按 r 重读五域)。",
+            CatalogKind::Tag => "  还没反查过:按 l 列全部标签(只读),按 r 挂第一个标签。",
+            CatalogKind::Subscription => "  订阅册还没读到:按 l 重读(只读),按 r 登记第一条订阅。",
+            CatalogKind::Key => "  钥匙册还没读到:按 l 重读(只读),按 r 登记第一把钥匙。",
+        }
+    }
+
+    /// 册体「合法空态」的两行:`(标题, 下一步)`。引擎给了空数组 = 册子
+    /// 存在而里面没有条目(文件不存在也是这一态),与「还没读到」分开说
+    /// (三态不共用一个空列表)。
+    pub fn empty_lines(self) -> [&'static str; 2] {
+        match self {
+            CatalogKind::Vps => [
+                "  编目里还没有机器(合法空态:vps.json 不存在 = 空册)。",
+                "  按 r 登记第一台(两段式:预审摊开五道闸 → 图形确认才落账)。",
+            ],
+            CatalogKind::Tag => [
+                "  编目里还没有标签(合法空态:tags.json 不存在 = 空册)。",
+                "  按 r 挂第一个标签(追加合并、幂等、无确认闸,Enter 即下发)。",
+            ],
+            CatalogKind::Subscription => [
+                "  编目里还没有订阅(合法空态:subscriptions.json 不存在 = 空册)。",
+                "  按 r 登记第一条(两段式:链接本体只经 stdin 进,Enter 预审摊开四道闸)。",
+            ],
+            CatalogKind::Key => [
+                "  编目里还没有钥匙(合法空态:keys.json 不存在 = 空册)。",
+                "  按 r 登记第一把(两段式:钥匙本体只经 stdin 进,Enter 预审摊开三道闸)。",
+            ],
+        }
+    }
+
+    /// 册体清单之外、**只属于某一本**的附述行(订阅册的到期三态汇总与
+    /// 取回链接建议;钥匙册的取回钥匙建议)。机器册与标签册没有这一族
+    /// 关切,给空——所以渲染侧不再有 `if kind == Subscription` /
+    /// `if kind == Key` 两段。
+    pub fn extra_lines(self, app: &App, w: usize, p: &Palette) -> Vec<Line<'static>> {
+        match self {
+            CatalogKind::Subscription => {
+                let mut out = Vec::new();
+                if let Some(s) = self.sheet(app) {
+                    if !s.entries.is_empty() {
+                        out.extend(sub_summary_lines(&sub_status_counts(&s), w, p));
+                    }
+                }
+                out.extend(sub_get_lines(app, w, p));
+                out
+            }
+            CatalogKind::Key => key_get_lines(app, w, p),
+            CatalogKind::Vps | CatalogKind::Tag => Vec::new(),
+        }
+    }
+
+    /// 这一本的边界表述(ADR-0009 §5:编目条目绝不进配方 / 锁定集 /
+    /// bundle / 装配命令)。**机器册没有这一句**(vps 条目不进派这条纪律
+    /// 由装配屏那边守),给 `None` = 不画行——渲染侧不再 `match kind`。
+    pub fn boundary(self) -> Option<&'static str> {
+        match self {
+            CatalogKind::Vps => None,
+            CatalogKind::Tag => Some(TAG_BOUNDARY),
+            CatalogKind::Subscription => Some(SUB_BOUNDARY),
+            CatalogKind::Key => Some(KEY_BOUNDARY),
+        }
+    }
+
+    /// 空册时的册内键位行**段清单**(与鼠标命中区同文案同序;四本各一组)。
+    /// 给段而不是给一整行字符串,好让 #67 的可点「换册」段接在末段——渲染
+    /// 与命中共用同一份段清单,一处真相。新增第五本册只加一行。
+    ///
+    /// 机器册空册态与有条目态同一口径(#65 评审第 8 条):`q` 在编目册册体上
+    /// 是壳级「退出」(`on_key` 的 `Char('q') => quit`),**不是返航**——`keys_body`
+    /// 已按这条收窄成裸 `Esc`,空册态却还写着 `Esc/q 返航`,同一块屏上两个态
+    /// 对同一个键说两样话。这里跟上:`Esc`(语义同册体,清当前册过滤词;
+    /// 空册没词时它不出声,但至少不虚指一个 quit 键当返航)。
+    ///
+    /// 另三本的空册态仍写 `Esc/q 返航`,是另一件既有事:它们的 `keys_body`
+    /// 根本不给 Esc 提示段(整行没有它),所以本册内并不自相矛盾;要跨四本
+    /// 统一口径得连册体一起动,那是另一条工单,不夹在本评审里。
+    ///
+    /// 段的第三项是 `KeyPart` 的命中目标:`None` = 只画不点的提示段,
+    /// `Some(..)` = 可点动作段。**空册变体一个可点段都没有**——册里没有条目,
+    /// 「取回哪一条」无从问起(#73 验收:空册变体没有取回命中目标)。
+    pub fn keys_empty(self) -> &'static [crate::layout::KeyPart<'static>] {
+        match self {
+            CatalogKind::Vps => &[("  r 登记机器", None, true), ("Esc", None, true)],
+            CatalogKind::Tag => &[
+                ("  l 反查全部", None, true),
+                ("r 挂标签", None, true),
+                ("Esc/q 返航", None, true),
+            ],
+            CatalogKind::Subscription => &[
+                ("  r 登记订阅", None, true),
+                ("l 重读", None, true),
+                ("Esc/q 返航", None, true),
+            ],
+            CatalogKind::Key => &[
+                ("  r 登记钥匙", None, true),
+                ("l 重读", None, true),
+                ("Esc/q 返航", None, true),
+            ],
+        }
+    }
+
+    /// 册体有条目时的册内键位行**段清单**(常态)。
+    ///
+    /// 机器册这一段在 #70 收窄过两处,好让「Enter 反查」可点段在 66×50 的
+    /// 紧凑态也放得下(#67 的纪律:放不下就不画也不给命中,而规格故事 52 要求
+    /// 新命中区两档都算得对):`↑/↓ 选机器` → `↑/↓ 选`(选哪一本 HUD 已说),
+    /// `Esc/q 返航` → `Esc 返航`(**`q` 在册体上是退出面板,不是返航**——旧文案
+    /// 把两个语义混成一句;浮层里的 `Esc/q 返航` 仍两键都认,那句不动)。
+    ///
+    /// 「Enter 反查」**不写在这里**:它是可点动作段,由 `catalog_key_parts`
+    /// 按「只机器册 + 有选中行」现拼(提示段与可点段在一处汇合,渲染与命中
+    /// 共用同一份清单);写进这张静态表就会在订阅 / 钥匙册上也画出一个点不动
+    /// 的段,也会在空册上问一台不存在的机器。
+    ///
+    /// #69 合入后再收窄第三处:`Esc 返航` → `Esc`。#69 的 `/ 过滤`、#70 的
+    /// `Enter 反查`、#67 的 `m 换册` 三个可点段在机器册键位行同场,且三段的
+    /// 点击命中都在 80×30 / 66×50 两档钉死;不把这段提示再收一档,紧凑态下
+    /// `/ 过滤` 会被整段裁掉、点不到(#69 的过滤行为就不完整)。册体上 `Esc`
+    /// 只做「清当前册过滤词」(见 `key_catalog`),裸 `Esc` 足够提示这个键、语义
+    /// 也不虚,故只留键名、去掉「返航」二字。
+    ///
+    /// **`g 取回` 段挂在本表里**(#73):段文案与命中目标
+    /// (`Some(Target::CatalogGet)`)都由这一行查表数据带着——订阅 / 钥匙册两行
+    /// 各一个,机器册 / 标签册两行没有(它们的条目没有本体可取,
+    /// `CatalogKind::action` 里也没有 `g` 这一行)。
+    /// 于是「这一段可不可点」与「这个键在这一本上有没有动作」是同一张表的同一
+    /// 行,`catalog_key_parts` 不为本票加 `if kind ==` 分叉(#66 查表纪律);点下去
+    /// 走 [`App::log_sub_get_suggest`] / [`App::log_key_get_suggest`],与按 `g`
+    /// 逐字节同一条路。
+    pub fn keys_body(self) -> &'static [crate::layout::KeyPart<'static>] {
+        use crate::layout::Target;
+        match self {
+            CatalogKind::Vps => &[
+                ("  ↑/↓ 选", None, true),
+                ("r 登记", None, true),
+                ("d 删除", None, true),
+                ("Esc", None, true),
+            ],
+            CatalogKind::Tag => &[
+                ("  ↑/↓ 选", None, true),
+                ("Enter 反查", None, true),
+                ("l 全部", None, true),
+                ("r 挂标签", None, true),
+                ("d 摘/删", None, true),
+            ],
+            // #69 后续:订阅 / 钥匙册的 `g 取回命令` 收窄成 `g 取回`(#69 的
+            // 鼠标过滤入口要在 66×50 下限内也放得下,两本册的键位行本来就最长;
+            // 「取回」二字已够提示这个键,全句建议命令就在册体下一行摊着)。
+            // #73:这一段现在挂 Target::CatalogGet——点它 = 按 `g`。
+            CatalogKind::Subscription => &[
+                ("  ↑/↓ 选订阅", None, true),
+                ("r 登记", None, true),
+                (CATALOG_GET, Some(Target::CatalogGet), true),
+                ("d 删除", None, true),
+                ("l 重读", None, true),
+            ],
+            CatalogKind::Key => &[
+                ("  ↑/↓ 选钥匙", None, true),
+                ("r 登记", None, true),
+                (CATALOG_GET, Some(Target::CatalogGet), true),
+                ("d 删除", None, true),
+                ("l 重读", None, true),
+            ],
+        }
+    }
+
+    /// 这一本此刻该画哪个浮层;`None` = 画册体。
+    ///
+    /// **两种浮层同时在场时谁盖谁,也是查表数据不是调用方的 if**:机器册
+    /// 让登记表单在上,其余三本让 rm 确认在上——因为标签册的 rm 确认
+    /// 嵌套在表单流里(表单 Enter 才出现),`on_key` 的受理次序是更里层
+    /// 的先收;订阅 / 钥匙册同形。这一条的次序与 `on_key` 逐字对齐,
+    /// 否则会出现「键被 A 收、屏上画的是 B」。
+    pub fn overlay(self, app: &App) -> Option<OverlayForm> {
+        let order = match self {
+            CatalogKind::Vps => [OverlayForm::Register, OverlayForm::RmConfirm],
+            CatalogKind::Tag | CatalogKind::Subscription | CatalogKind::Key => {
+                [OverlayForm::RmConfirm, OverlayForm::Register]
+            }
+        };
+        order.into_iter().find(|f| self.overlay_on(*f, app))
+    }
+
+    /// 这个形态的浮层,这一本此刻在不在场(与形态无关,四本同一口径)。
+    fn overlay_on(self, form: OverlayForm, app: &App) -> bool {
+        match form {
+            OverlayForm::Register => self.flow(app).phase != RegPhase::Idle,
+            OverlayForm::RmConfirm => self.rm_confirm(app),
+        }
+    }
+
+    /// 画这个形态的浮层(四本各一套画法,骨架同一件:同一个
+    /// [`popup_rect`] 基准、同一套阶段,差别全在呈现)。
+    pub fn draw_overlay(self, form: OverlayForm, frame: &mut Frame, area: Rect, app: &App) {
+        match (self, form) {
+            (CatalogKind::Vps, OverlayForm::Register) => render_register_overlay(frame, area, app),
+            (CatalogKind::Vps, OverlayForm::RmConfirm) => render_rm_confirm(frame, area, app),
+            (CatalogKind::Tag, OverlayForm::Register) => render_tag_overlay(frame, area, app),
+            (CatalogKind::Tag, OverlayForm::RmConfirm) => render_tag_rm_confirm(frame, area, app),
+            (CatalogKind::Subscription, OverlayForm::Register) => {
+                render_sub_overlay(frame, area, app)
+            }
+            (CatalogKind::Subscription, OverlayForm::RmConfirm) => {
+                render_sub_rm_confirm(frame, area, app)
+            }
+            (CatalogKind::Key, OverlayForm::Register) => render_key_overlay(frame, area, app),
+            (CatalogKind::Key, OverlayForm::RmConfirm) => render_key_rm_confirm(frame, area, app),
+        }
+    }
+
+    /// 册内一个键落在这一本上触发什么(#66:按册差异查表化)。
+    ///
+    /// **四本册走同一条键位路径**:`key_catalog` 只有一处查表 + 一处
+    /// 落实,不再有四份逐字重复的 `match k.code`。按册差异全在这张表里
+    /// ——同一个键在不同册上可以落到不同动作(`l` = 重读 / 列全部;
+    /// `g` = 订阅/钥匙册的取回命令建议;`Enter` = 只有标签册反查选中的
+    /// 这一条),也可以这一本根本没有这个键(机器册没有 `g`、没有
+    /// `Enter` 反查),表里就不写那一行 = 这个键在这一本上无事可做。
+    ///
+    /// `r` 的写互斥也在这张表上:装配在途时机器册 / 订阅册 / 钥匙册的
+    /// `r` 行不成立(与既有的 `if !self.assembling` 守卫同一口径),
+    /// 落空即「这个键此刻无事可做」。第五本册子来时只加行,不改调用方。
+    pub fn action(self, app: &App, k: KeyCode) -> Option<CatalogAction> {
+        use CatalogAction::{Act, Move};
+        match (self, k) {
+            // ↑/↓ 选行:四本同一口(不是按册差异,但同表驱动,四本走一条路)
+            (_, KeyCode::Down) => Some(Move(true)),
+            (_, KeyCode::Up) => Some(Move(false)),
+            // r 登记 / 挂标签:两段式(带确认闸)与无确认闸两种形态,各本自己的方法
+            (CatalogKind::Vps, KeyCode::Char('r')) if !app.assembling => {
+                Some(Act(App::start_vps_register))
+            }
+            (CatalogKind::Tag, KeyCode::Char('r')) if !app.assembling => {
+                Some(Act(App::start_tag_add))
+            }
+            (CatalogKind::Subscription, KeyCode::Char('r')) if !app.assembling => {
+                Some(Act(App::start_sub_register))
+            }
+            (CatalogKind::Key, KeyCode::Char('r')) if !app.assembling => {
+                Some(Act(App::start_key_register))
+            }
+            // d 删除:机器 / 订阅 / 钥匙三本进 rm 确认弹层;标签册的删除
+            // 嵌套在表单流里(摘引用 / 删整个标签两态),是另一条路
+            (CatalogKind::Vps, KeyCode::Char('d')) => Some(Act(App::start_vps_rm)),
+            (CatalogKind::Tag, KeyCode::Char('d')) => Some(Act(App::start_tag_rm)),
+            (CatalogKind::Subscription, KeyCode::Char('d')) => Some(Act(App::start_sub_rm)),
+            (CatalogKind::Key, KeyCode::Char('d')) => Some(Act(App::start_key_rm)),
+            // l 重读册体 / 列全部标签:四本各一次只读调用,argv 同形
+            (CatalogKind::Vps, KeyCode::Char('l')) => Some(Act(App::run_vps_ls)),
+            (CatalogKind::Tag, KeyCode::Char('l')) => Some(Act(App::run_tag_ls_all)),
+            (CatalogKind::Subscription, KeyCode::Char('l')) => Some(Act(App::run_sub_ls)),
+            (CatalogKind::Key, KeyCode::Char('l')) => Some(Act(App::run_key_ls)),
+            // g 取回本体的建议命令:只订阅册与钥匙册有(投影里有本体槽的
+            // 两本;ADR-0009 §1 面板不代跑 get)。机器册 / 标签册没有这一行
+            (CatalogKind::Subscription, KeyCode::Char('g')) => Some(Act(App::log_sub_get_suggest)),
+            (CatalogKind::Key, KeyCode::Char('g')) => Some(Act(App::log_key_get_suggest)),
+            // Enter 反查选中的这一条:标签册反查选中的那条标签(#54 旧态);
+            // 机器册反查「什么标签引用了这一条」(#70 上浮——只机器册的条目可打
+            // 标签,见 TAG_REF_KINDS;订阅 / 钥匙册的条目不在其内,不提供)。
+            (CatalogKind::Vps, KeyCode::Enter) => Some(Act(App::vps_reverse_lookup)),
+            (CatalogKind::Tag, KeyCode::Enter) => Some(Act(App::tag_lookup_selected)),
+            _ => None,
+        }
+    }
+}
+
+/// 反查上浮**命中一条标签**(#70):标签名 + 它引用的 `<kind>/<条目>` 清单
+/// (原样,指针不是密钥;结果呈现只印这些,绝不印机密本体)。
+///
+/// 只由纯函数 [`tags_referring`] 产出——匹配口径集中在这一处,不散进
+/// 渲染 / 回音路由里,好被单测钉住。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagHit {
+    pub name: String,
+    pub refs: Vec<crate::engine::CatalogRef>,
+}
+
+/// 反查上浮的**匹配纯函数**(#70:本轮最该被钉住的口径,spec #65 故事 41 /
+/// 验收第 5 条)。一台机器被哪些标签引用?按 `<kind>/<条目>` **精确匹配**
+/// (kind 与条目两侧都原样比对),**绝不做子串包含**——否则一台叫 `gate` 的
+/// 机器会和一条引用 `skill/gate` 的标签互相串味。
+///
+/// 输入是**标签册的投影**(`nw tag ls` 无参全列落进 `tag_ls_echo` 后的
+/// [`CatalogSheet`]:每条目是一个标签,`refs` 是它引用的 `<kind>/<条目>`
+/// 清单)。`kind` 取自 [`crate::engine::commands::TAG_REF_KINDS`],机器册
+/// 条目恒 `vps`。输出保持引擎的确定性排序(面板不重排)。
+pub fn tags_referring(sheet: &CatalogSheet, kind: &str, id: &str) -> Vec<TagHit> {
+    sheet
+        .entries
+        .iter()
+        .filter(|e| e.refs.iter().any(|r| r.kind == kind && r.id == id))
+        .map(|e| TagHit {
+            name: e.name.clone(),
+            refs: e.refs.clone(),
+        })
+        .collect()
+}
+
+/// 反查上浮状态(#70):机器册上一个键(Enter)或点键位段,问「什么标签引用了
+/// 这一条」。**独立小状态,不并入 `assembling` 全局写互斥**(反查是只读,
+/// 不占写闸);在途不拿上一轮结论冒充本次,迟到回音不收敛任何状态(操作者
+/// 已返航 = Idle 时,回音落地不重开浮层)。
+///
+/// **三态两两可区分**(spec #65 故事 33 / 铁律 4:不共用一个空列表):
+/// [`Hits`](VpsReverse::Hits) 有 N 条 / [`Empty`](VpsReverse::Empty) 一条都
+/// 没有 / [`Unreadable`](VpsReverse::Unreadable) 读不到(rc≠0 / 契约守卫 /
+/// 数据仓根 / 能力)。「读不到」不进结果浮层——它走既有指路(日志),只
+/// [`Hits`](VpsReverse::Hits) / [`Empty`](VpsReverse::Empty) 画薄浮层。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum VpsReverse {
+    /// 闲置:没有反查在场。
+    #[default]
+    Idle,
+    /// 在途:已下发只读 `nw tag ls`(无参全列),等回音。此刻**不呈现任何
+    /// 结论**(`tag_ls_echo` 已被清空),屏上只有机器册本体。
+    InFlight { machine: String },
+    /// 有 N 条标签命中(列标签名 + 各自引用)。
+    Hits { machine: String, tags: Vec<TagHit> },
+    /// 一条标签引用都没有(明说 + 给「去挂第一个标签」的下一步)。
+    Empty { machine: String },
+    /// 读不到(rc≠0 / 契约守卫合成「需升级 nw」):带一句人话理由,走既有
+    /// 指路(日志),**不画成空列表**。
+    Unreadable { machine: String, reason: String },
+}
+
+impl VpsReverse {
+    /// 结果浮层在不在场(只有 有 N 条 / 一条都没有 两态画浮层;在途 / 闲置 /
+    /// 读不到 都不画)。渲染与命中区共用这一判据——点哪打哪(ADR-0005)。
+    pub fn is_open(&self) -> bool {
+        matches!(self, VpsReverse::Hits { .. } | VpsReverse::Empty { .. })
+    }
+}
+
+/// 册内浮层的两种形态(登记流 / rm 确认;弹层优先级高于册体)。
+/// 渲染与命中区都只认这两个形态,不认「哪一本」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OverlayForm {
+    /// 两段式登记流(表单 / 预审在途 / 摊开闸结论 / 落账在途 / 结论)。
+    Register,
+    /// 删除前的图形确认(ADR-0009 §2:面板加一道,不改引擎语义)。
+    RmConfirm,
+}
+
+/// 册内键位触发的动作(#66 查表表的取值)。`Act` 直接带这一本的落实方法
+/// ——按册差异就是「哪个方法」,这是数据,不是调用方的一个分支。
+pub enum CatalogAction {
+    /// ↑/↓ 移选中(`true` = 向下;到界绕回,见 `App::catalog_move`)。
+    Move(bool),
+    /// 这一本对这一键的落实(登记 / 删除 / 重读 / 取回命令 / 反查)。
+    Act(fn(&mut App)),
 }
 
 /// 一本册子的条目明细画法:名字行右侧的弱化后缀(机器册给端口,标签册
@@ -1221,17 +1787,72 @@ impl VpsForm {
 /// (只随宽度折行,不引新断点、不缩放字号):当前是哪一本 + 编目路径 +
 /// 清单 + 键位行;登记与删除各是一个浮层。
 ///
-/// **册体行序是命中区的几何基准**(`layout::catalog_hits` 按 `row_lines()`
+/// **册体行序是命中区的几何基准**(`layout::catalog_hits` 按 `row_lines()
 /// 逐条铺),所以「当前是哪一本」与编目路径合并在首行,不另起一行——
-/// 多一行就整体错位,点哪打哪就断了。
+/// 多一行就整体错位,点哪打哪就断了。**末行归键位行**(#73):册体条目
+/// 永远铺不到末行,键位行也永远钉在末行。
 pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     let kind = app.catalog_kind;
     let block = body(app, "机器写 · 永不手改");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let w = inner.width.saturating_sub(2) as usize;
+    let w = body_text_width(inner);
 
+    let mut lines = catalog_body_lines(app, w);
+    // 键位行钉在册体内层**末行**(#73 补 #67 欠的那一半):册体内容超量就截到
+    // 末行之前(与册体行同一个 `clip` 纪律——截断,不折行;折行会多占一行,
+    // 末行几何即失真),欠量垫空行补到末行之前。于是键位行的 y 只由 `inner`
+    // 的几何决定,册体 1 条与 20 条它都在同一行(规格故事 7)。命中侧
+    // (`layout::catalog_hits`)按同一个末行算矩形——一处几何真相。
+    // 行数取「到键位行为止」的那一个数:与命中侧同一个 `catalog_key_row`。
+    lines.resize(
+        crate::layout::catalog_key_row(inner).saturating_sub(inner.y) as usize,
+        Line::from(String::new()),
+    );
+    lines.push(key_line(inner, &catalog_key_parts(app), p));
+    frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
+
+    // 浮层:登记 / 删除确认(弹层优先级高于册体;骨架同一件)。
+    // 画哪个、谁盖谁都在 `CatalogKind::overlay` 这张表上(#66),本函数不再分册。
+    if let Some(form) = kind.overlay(app) {
+        kind.draw_overlay(form, frame, area, app);
+    }
+    // 反查上浮结果浮层(#70):机器册上一个键问「什么标签引用了这一条」的结论
+    // (有 N 条 / 一条都没有两态)。薄浮层,不是新屏、不是新册;几何与命中区
+    // 共用 `vps_reverse_popup_rect`。换册已把状态清成 Idle,所以这本就画在
+    // 机器册上。
+    if app.vps_reverse_open() {
+        render_vps_reverse_popup(frame, area, app);
+    }
+}
+
+/// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
+/// 烤进锁定集等于每次改标签重烤一次派——面板不提供任何这样的入口。
+const TAG_BOUNDARY: &str = "  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)";
+
+/// 编目册正文行的**宽度预算**(#65 评审第 6 条)。`render_catalog` 与
+/// 册体行命中区(`layout::catalog_hits` 里 `push_sheet_rows` 的列宽)都按这一个
+/// 函数问「正文行按多宽算」——早先两边各写一遍(渲染 `inner.width - 2`、命中区
+/// `inner.width`),同一块屏上两个数。收成一处:哪天真要改预算,两边一起变。
+///
+/// #73 起它**不再参与键位行的行号**:键位行钉在册体内层末行(见
+/// [`render_catalog`]),行号只由 `inner` 的高度决定,与正文有多少行无关。早先
+/// 命中区要靠「数正文行数」推键位行的 y,而这个行数又依赖这里的宽度预算
+/// (`clip` 截断、从不折行,所以两边的行数才一致)——一条为几何服务的隐性
+/// 依赖,如今随末行钉住一起消失。
+pub(crate) fn body_text_width(inner: Rect) -> usize {
+    inner.width.saturating_sub(2) as usize
+}
+
+/// 编目册**正文行**(键位行之前的一切:标题 + 册体 + 各册附加行)。
+/// #67 抽出供渲染与命中测试共用。
+///
+/// #73 起它的行数**只服务渲染**(册体内容截到末行之前,见
+/// [`render_catalog`]):命中区不再数它——键位行的 y 是末行,一处布局事实。
+pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
+    let p = &app.palette;
+    let kind = app.catalog_kind;
     let mut lines: Vec<Line> = Vec::new();
     // 引擎没有这一本的能力:入口禁用并指路(既有门控语义不变,面板不自造替代品)
     if !app.capabilities.enabled(kind.capability()) {
@@ -1246,20 +1867,59 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.data_root_cause().is_some() {
         lines.extend(data_root_signpost(app));
     } else {
+        // 册内过滤态(#69):标题显「命中/总数」——被过滤空在标题层就与册体
+        // 真空 / 还没读到可区分(规格故事 19)。不过滤时 count 段为空,与过滤前
+        // 逐字节相同(面板永不重排引擎输出,故事 18/30)。
+        let filtering = !app.catalog_filter().trim().is_empty();
+        let count = if filtering {
+            format!(" · 命中 {}/{}", app.catalog_visible().len(), kind.len(app))
+        } else {
+            String::new()
+        };
+        // 过滤态多出 count 段,路径按同一总预算再让一截,整行不因过滤而溢宽。
+        let path_budget =
+            w.saturating_sub(20 + unicode_width::UnicodeWidthStr::width(count.as_str()));
         lines.push(Line::from(Span::styled(
             format!(
-                "  当前册 {} · {} · 编目 {}",
+                "  当前册 {} · {} · 编目 {}{}",
                 kind.label(),
                 app.catalog_scope_label(),
                 clip(
                     &app.catalog_sheet()
                         .map(|s| s.catalog_path)
                         .unwrap_or_else(|| "—".into()),
-                    w.saturating_sub(20)
-                )
+                    path_budget
+                ),
+                count
             ),
             p.dim(),
         )));
+        // 反查上浮的第三态「读不到」(#70 规格验收 3 / 故事 34):rc≠0 或契约
+        // 守卫合成「需升级 nw」。机器册这一本没有带参反查态(`catalog_ls_error`
+        // 恒 None),若不在这里给一句人话,操作者按了 Enter 屏上一个字都不变,
+        // 只会当成「面板没反应」。走既有指路的同一套措辞(不新造一套话),
+        // 并且**绝不画成空列表**——「这次没读到」与「一条标签引用都没有」是
+        // 两件事,话不许互相冒充(spec #65 铁律 4)。册体与选中行原样在场:
+        // 反查从头到尾不写 `vps_sel`,读不到也不该把册体收走。
+        //
+        // **只在机器册画**(`kind == CatalogKind::Vps`):反查上浮是机器册独有
+        // 的动作,换册(`cycle_catalog_kind`)会把 `vps_reverse` 清回 Idle,所以
+        // 今天别三本册上这条指路本来就画不出来。但把不变量写在**用它的这一处**
+        // 本地,而不是靠调用方在远处复位:将来哪条路径换了册却忘了清
+        // `vps_reverse`,画出来的会是机器册的指路摊在标签 / 订阅 / 钥匙册上——
+        // 一态冒充另一态。
+        if kind == CatalogKind::Vps {
+            if let VpsReverse::Unreadable { reason, .. } = &app.vps_reverse {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ 反查没结果:{}", clip(reason, w.saturating_sub(12))),
+                    p.warn().bold(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  标签册这次没读到,不是「一条标签引用都没有」;册体与选中行原样不动。",
+                    p.dim(),
+                )));
+            }
+        }
         // 反查回音的终态(#54):问错了名字(rc 3)/ 合法空态 / 有内容,
         // 三者互不冒充——都画成「空列表」会丢掉「这个名字不存在」的信息
         // (51 §6.11)。机器册没有带参反查这一态,`catalog_ls_error` 恒 None。
@@ -1278,211 +1938,228 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
                 p.dim(),
             )));
         } else {
-            match app.catalog_sheet() {
-                None => lines.push(Line::from(Span::styled(
-                    match kind {
-                        CatalogKind::Vps => {
-                            "  编目册还没读到:按 r 登记,或先刷新(回概览按 r 重读五域)。"
-                        }
-                        CatalogKind::Tag => {
-                            "  还没反查过:按 l 列全部标签(只读),按 r 挂第一个标签。"
-                        }
-                        CatalogKind::Subscription => {
-                            "  订阅册还没读到:按 l 重读(只读),按 r 登记第一条订阅。"
-                        }
-                        CatalogKind::Key => {
-                            "  钥匙册还没读到:按 l 重读(只读),按 r 登记第一把钥匙。"
-                        }
-                    },
-                    p.dim(),
-                ))),
+            match kind.sheet(app) {
+                None => lines.push(Line::from(Span::styled(kind.unread_line(), p.dim()))),
                 Some(s) if s.entries.is_empty() => {
-                    lines.push(Line::from(Span::styled(
-                        match kind {
-                            CatalogKind::Vps => {
-                                "  编目里还没有机器(合法空态:vps.json 不存在 = 空册)。"
-                            }
-                            CatalogKind::Tag => {
-                                "  编目里还没有标签(合法空态:tags.json 不存在 = 空册)。"
-                            }
-                            CatalogKind::Subscription => {
-                                "  编目里还没有订阅(合法空态:subscriptions.json 不存在 = 空册)。"
-                            }
-                            CatalogKind::Key => {
-                                "  编目里还没有钥匙(合法空态:keys.json 不存在 = 空册)。"
-                            }
-                        },
-                        p.text(),
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        match kind {
-                            CatalogKind::Vps => {
-                                "  按 r 登记第一台(两段式:预审摊开五道闸 → 图形确认才落账)。"
-                            }
-                            CatalogKind::Tag => {
-                                "  按 r 挂第一个标签(追加合并、幂等、无确认闸,Enter 即下发)。"
-                            }
-                            CatalogKind::Subscription => {
-                                "  按 r 登记第一条(两段式:链接本体只经 stdin 进,Enter 预审摊开四道闸)。"
-                            }
-                            CatalogKind::Key => {
-                                "  按 r 登记第一把(两段式:钥匙本体只经 stdin 进,Enter 预审摊开三道闸)。"
-                            }
-                        },
-                        p.dim(),
-                    )));
+                    // 合法空态两态可区分:标题(正文色)+ 下一步(弱化)
+                    let [title, next] = kind.empty_lines();
+                    lines.push(Line::from(Span::styled(title, p.text())));
+                    lines.push(Line::from(Span::styled(next, p.dim())));
                 }
-                Some(s) => lines.extend(catalog_sheet_lines(
-                    &s,
-                    w,
-                    app.catalog_sel(),
-                    p,
-                    kind.detail(),
-                )),
-            }
-        }
-        // 订阅册(工单 #56):到期三态汇总一行 + 取回链接的建议命令(面板不代跑
-        // get,ADR-0009 §1)。**投影里没有链接槽**,册体任何一行都不出现本体。
-        if kind == CatalogKind::Subscription {
-            if let Some(s) = app.catalog_sheet() {
-                if !s.entries.is_empty() {
-                    lines.extend(sub_summary_lines(&sub_status_counts(&s), w, p));
+                Some(s) => {
+                    // 册内过滤(#69):只画「看得见的那一行」——下标经
+                    // `catalog_visible` 映射回原始投影。无关键词时 vis = 0..n
+                    // 全量同序,与过滤前逐字节相同。
+                    let vis = app.catalog_visible();
+                    if vis.is_empty() {
+                        // 关键词把条目全筛掉了:与「册体本来是空的」两态可
+                        // 区分,给改词 / 清过滤的下一步,绝不共用一个空列表。
+                        lines.extend(filter_empty_lines(app, s.entries.len(), p));
+                    } else {
+                        lines.extend(catalog_sheet_lines(
+                            &s,
+                            &vis,
+                            w,
+                            app.catalog_sel(),
+                            p,
+                            kind.detail(),
+                        ));
+                    }
                 }
             }
-            lines.extend(sub_get_lines(app, w, p));
         }
-        // 钥匙册(工单 #57):取回钥匙本体的建议命令(面板不代跑 get,ADR-0009 §1)。
-        // **投影里没有本体槽、也不印指纹**,册体任何一行都不出现本体。
-        if kind == CatalogKind::Key {
-            lines.extend(key_get_lines(app, w, p));
-        }
-        // 边界表述(ADR-0009 §5):编目条目绝不进配方 / 锁定集 / bundle / 装配
-        // 命令,面板侧不提供任何把它烤进去的入口(各本一句,同一条纪律)。
-        match kind {
-            CatalogKind::Tag => {
-                lines.push(Line::from(Span::styled(clip(TAG_BOUNDARY, w), p.dim())))
-            }
-            CatalogKind::Subscription => {
-                lines.push(Line::from(Span::styled(clip(SUB_BOUNDARY, w), p.dim())))
-            }
-            CatalogKind::Key => {
-                lines.push(Line::from(Span::styled(clip(KEY_BOUNDARY, w), p.dim())))
-            }
-            CatalogKind::Vps => {}
+        // 只属于某一本的附述行(订阅册的到期三态汇总 + 取回链接建议;
+        // 钥匙册的取回钥匙建议)。机器册 / 标签册没有这一族关切,
+        // `CatalogKind::extra_lines` 给空——渲染侧不再有两段 `if kind ==`。
+        // ADR-0009 §1:面板不代跑 get;两本的投影都没有本体槽。
+        lines.extend(kind.extra_lines(app, w, p));
+        // 边界表述(ADR-0009 §5):编目条目绝不进配方 / 锁定集 / bundle /
+        // 装配命令,面板侧不提供任何把它烤进去的入口(各本一句,同一条
+        // 纪律;机器册没有这一句)。
+        if let Some(b) = kind.boundary() {
+            lines.push(Line::from(Span::styled(clip(b, w), p.dim())));
         }
     }
-    let _ = cause_line(app);
-    lines.push(Line::from(Span::styled(catalog_keys(app), p.dim())));
-    frame.render_widget(Paragraph::new(lines).style(p.surface()), inner);
-
-    // 浮层:登记 / 删除确认(弹层优先级高于册体;四本各一套,骨架同一件)
-    if kind == CatalogKind::Subscription {
-        // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先。
-        if app.sub_rm_confirm {
-            render_sub_rm_confirm(frame, area, app);
-        } else if app.sub_flow.phase != RegPhase::Idle {
-            render_sub_overlay(frame, area, app);
-        }
-        return;
-    }
-    if kind == CatalogKind::Key {
-        // rm 确认与登记浮层各按阶段画一个;面板加的那道图形确认优先(同订阅册)。
-        if app.key_rm_confirm {
-            render_key_rm_confirm(frame, area, app);
-        } else if app.key_flow.phase != RegPhase::Idle {
-            render_key_overlay(frame, area, app);
-        }
-        return;
-    }
-    if kind == CatalogKind::Tag {
-        // rm 确认嵌套在表单流里(表单 Enter 才出现),弹层优先级高于表单
-        // (同 `on_key` 的受理次序:更里层的浮层先收键)。
-        if app.tag_rm_confirm {
-            render_tag_rm_confirm(frame, area, app);
-        } else if app.tag_flow.phase != RegPhase::Idle {
-            render_tag_overlay(frame, area, app);
-        }
-        return;
-    }
-    if app.vps_flow.phase != RegPhase::Idle {
-        render_register_overlay(frame, area, app);
-    } else if app.vps_rm_confirm {
-        render_rm_confirm(frame, area, app);
-    }
+    lines
 }
 
-/// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
-/// 烤进锁定集等于每次改标签重烤一次派——面板不提供任何这样的入口。
-const TAG_BOUNDARY: &str = "  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)";
+/// 键位行可点段之间(以及段内各项之间)的分隔串:渲染与命中共用同一份,
+/// 段宽按 `unicode_width` 量——一处真相,点哪打哪。
+///
+/// #69 收窄到 **2 列**(`" ·"`,原为 3 列的 `" · "`):订阅 / 钥匙两本册的
+/// 键位行在 66×50 下限(正文 64 列)内放不下 `m 换册` + `/ 过滤` 两段,于是
+/// 鼠标过滤入口只在机器册有、键盘 `/` 却四本册都能按(故事 29 要的是两边
+/// 都能用)。gap 是这一个常量、渲染与命中共用,收窄它不丢任何一段文案,
+/// 只把分隔从「空格·空格」改成「·空格」。收窄后四本册两档都放得下,还剩
+/// ≥2 列余量(见 `过滤段四本册两档都放得下_渲染与命中共源`)。
+pub(crate) const CATALOG_KEY_GAP: &str = " ·";
 
-/// 数据仓根三态的一行说明(能力可用而根不可用时给人话;根就绪时给空)。
-fn cause_line(app: &App) -> String {
-    match app.data_root_cause() {
-        Some(DataRootCause::Unset) => {
-            "  数据仓根未设:去设置屏按 d 录入(面板不拿当前目录兜底)。".into()
-        }
-        Some(DataRootCause::Unavailable) => {
-            "  数据仓根不可用:目录不存在或不可读,去设置屏按 d 重设。".into()
-        }
-        _ => String::new(),
+/// 键位行末段的「换册」可点文案(#67):点它 = 按 `m` 轮转四本册。渲染画这个
+/// 串、命中测这个串的宽,同一份字符串;段可点(accent 高亮),与键盘 `m` 同路。
+pub(crate) const CATALOG_SWITCH: &str = "m 换册";
+
+/// 键位行「Enter 反查」可点文案(#70):点它 = 机器册选中行上按 `Enter`
+/// (`App::vps_reverse_lookup`)。渲染画这个串、命中测这个串的宽,同一份
+/// 字符串——点哪打哪(ADR-0005)。
+///
+/// **只机器册给这一段**:`TAG_REF_KINDS` 的已知集合是 `skill` / `extension`
+/// / `vps`,四本册里只有机器册的条目可打标签;订阅 / 钥匙册放这个动作注定
+/// 只返回「没有」,是噪声(spec #65 §4:触发点只有一处)。
+pub(crate) const CATALOG_REVERSE: &str = "Enter 反查";
+
+/// 键位行「过滤」可点文案(#69):点它 = 按 `/` 进册内过滤输入态。与
+/// [`CATALOG_SWITCH`] 同一份接缝——渲染画这个串、命中测这个串的宽,
+/// 段可点(accent 高亮),与键盘 `/` 同路(点哪打哪)。
+pub(crate) const CATALOG_FILTER: &str = "/ 过滤";
+
+/// 键位行「g 取回」可点文案(#73):点它 = 按 `g`——当前选中订阅 / 钥匙的
+/// **建议命令**收进日志,执行权留给操作者(ADR-0009 §1:面板不代跑 get,
+/// 上游才是唯一回显本体的出口)。渲染画这个串、命中测这个串的宽,同一份
+/// 字符串——点哪打哪(ADR-0005)。
+///
+/// 与 [`CATALOG_SWITCH`] / [`CATALOG_REVERSE`] / [`CATALOG_FILTER`] 不同的
+/// 是产地:那三段由 [`catalog_key_parts`] 现拼(它们的在场条件跨册推得到),
+/// 本段的文案与命中目标都写在 [`CatalogKind::keys_body`] 的订阅 / 钥匙两行里
+/// ——「这一段可不可点」与「`g` 这个键在这一本上有没有动作」是同一张表的
+/// 同一行(#66 查表纪律,#73 不为它加 `if kind ==` 分叉)。
+pub(crate) const CATALOG_GET: &str = "g 取回";
+
+/// 编目册键位行的**段清单**(#67 通用接缝的第一个用户):提示段只画不点
+/// (`None`),末段「换册」可点(`Some(SwitchBook)`)。渲染与命中测试共用这
+/// 同一份清单——段文案与段宽一处真相。
+///
+/// 册级键位行按 kind 查表(#66):「在途」「空册」「有条目」三个判定与三组段
+/// 清单全在 `CatalogKind` 成员上(`flow` / `rm_confirm` / `len` /
+/// `keys_empty` / `keys_body`),本函数不再有第四份 `match app.catalog_kind`
+/// ——键位行画的和命中区算的走同一口,不可能各说各话。
+///
+/// **规格订正(#67 承载)**:可点动作段画在**正文里**,不画在 HUD——命中区模型
+/// 历来把顶栏与 HUD 整行切在外面(spec #15/#16)。在途浮层/删除确认态换册键被
+/// 浮层受理(`m` 到不了 `key_catalog`),键位行只留浮层提示、不画可点段。
+///
+/// **浮层态的 `Esc/q 返航` 是有意两键都写**(#65 评审第 8 条:这一处与册体
+/// 态口径不同,理由键在这儿,别再当成遗漏):登记流 / 删除确认浮层在场时,
+/// `on_key` 先把键交给浮层那层(`RegState` 非 Idle 走 `on_key_reg_flow`、
+/// `as_confirm` 走确认分支),`Esc` 与 `q` **都**收敛浮层
+/// (`cancel_register` / `dismiss_popup`),壳级的 `q => quit` 那一次判定排
+/// 在更后面,根本轮不到。所以这一态写两键不是虚指。册体态反过来:
+/// `q` 直接 quit、`Esc` 只清过滤词,故 `keys_body` 收窄成裸 `Esc`(机器册)、
+/// 另三本干脆不给 Esc 段。
+///
+/// 第三项 `live`(#70 故事 39):「这一段此刻是活的吗」。**只有反查段会传
+/// `false`**——门禁是 `App::tag_entry_enabled`(数据仓根优先、再看标签组
+/// 能力),与 `App::vps_reverse_lookup` 进门那一个判据同一个,不另推一份;
+/// 过不了时这一条**照画、照给命中**(禁用并指路:点下去仍走
+/// `vps_reverse_lookup`,仍给人话、仍零引擎调用),只是画成 dim。其余段
+/// (提示段与其余可点段)一律 `true`。
+///
+/// `g 取回` 段(#73)**不在这里现拼**:它的文案与命中目标跟着
+/// [`CatalogKind::keys_body`] 的订阅 / 钥匙两行走(见 [`CATALOG_GET`]),本函数
+/// 只把查表结果原样搬进段清单——「这一段在不在场」= 「`g` 这个键在这一本上
+/// 有没有动作」,一处真相,不为鼠标复制第二份在场条件。
+pub(crate) fn catalog_key_parts(app: &App) -> Vec<crate::layout::KeyPart<'static>> {
+    use crate::layout::Target;
+    let kind = app.catalog_kind;
+    if kind.flow(app).phase != RegPhase::Idle || kind.rm_confirm(app) {
+        return vec![("  Enter 确认", None, true), ("Esc/q 返航", None, true)];
     }
-}
-
-/// 编目册键位行(与鼠标命中区同文案同序)。
-/// 册级键位行**按 kind 查表**(四本册各一组;在途浮层与空册各换一句,
-/// 三态形状相同)。新增第五本册只加一行——册级状态不再复制四份 if-else
-/// (双轴评审发现 9:Mysterious Name,catalog_keys 曾用四条 if)。
-fn catalog_keys(app: &App) -> &'static str {
-    const IN_FLOW: &str = "  Enter 确认 · Esc/q 返航 ";
-    let (in_flow, empty, empty_line, line) = match app.catalog_kind {
-        CatalogKind::Vps => (
-            app.vps_flow.phase != RegPhase::Idle || app.vps_rm_confirm,
-            app.vps_len() == 0,
-            "  r 登记机器 · Esc/q 返航 ",
-            "  ↑/↓ 选机器 · r 登记 · d 删除 · Esc/q 返航 ",
-        ),
-        CatalogKind::Tag => (
-            app.tag_flow.phase != RegPhase::Idle || app.tag_rm_confirm,
-            app.tag_len() == 0,
-            "  l 反查全部 · r 挂标签 · m 换册 · Esc/q 返航 ",
-            "  ↑/↓ 选 · Enter 反查 · l 全部 · r 挂标签 · d 摘/删 · m 换册 ",
-        ),
-        CatalogKind::Subscription => (
-            app.sub_flow.phase != RegPhase::Idle || app.sub_rm_confirm,
-            app.sub_len() == 0,
-            "  r 登记订阅 · l 重读 · m 换册 · Esc/q 返航 ",
-            "  ↑/↓ 选订阅 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
-        ),
-        CatalogKind::Key => (
-            app.key_flow.phase != RegPhase::Idle || app.key_rm_confirm,
-            app.key_len() == 0,
-            "  r 登记钥匙 · l 重读 · m 换册 · Esc/q 返航 ",
-            "  ↑/↓ 选钥匙 · r 登记 · g 取回命令 · d 删除 · l 重读 · m 换册 ",
-        ),
-    };
-    if in_flow {
-        IN_FLOW
-    } else if empty {
-        empty_line
+    // 查表即段清单:提示段(`None`)与可点动作段(`Some(..)`)都在表里,
+    // 本函数不再把整行拆成「只画不点」的一等公民。#66 收敛成的查表纪律
+    // 不为任何一票回退成 `if kind ==`。
+    let mut parts: Vec<crate::layout::KeyPart<'static>> = if kind.len(app) == 0 {
+        kind.keys_empty().to_vec()
     } else {
-        line
+        kind.keys_body().to_vec()
+    };
+    // 反查上浮触发段(#70):只机器册、且册体有条目(= 选中了一行)才给。
+    // 判据与 `keys_body` / `keys_empty` 的分岔同一个——空册没有「选中的这一
+    // 条」可问,面板不空手问,也不画一个点下去只得到一行指路的段。
+    if kind == CatalogKind::Vps && kind.len(app) > 0 {
+        // 门禁过不了:段仍在场、仍可点(指路照旧发生),画成 dim(#70 故事 39
+        // 「入口禁用并指路」)。判据与 `App::vps_reverse_lookup` 进门那一个
+        // 同一个 `tag_entry_enabled`,不在这儿另推一份。
+        parts.push((
+            CATALOG_REVERSE,
+            Some(Target::VpsReverse),
+            app.tag_entry_enabled(),
+        ));
     }
+    parts.push((CATALOG_SWITCH, Some(Target::SwitchBook), true));
+    // 册内过滤入口(#69):有条目可筛时才给这一段(空册没东西可筛,给了反而
+    // 误导)。点它 = 按 `/`,与键盘同一路;空册键位行(`keys_empty`)不带它。
+    if kind.len(app) > 0 {
+        parts.push((CATALOG_FILTER, Some(Target::CatalogFilter), true));
+    }
+    parts
+}
+
+/// 把段清单画成一行 `Line`(渲染侧):**可用**可点段 accent 加粗,提示段与
+/// **禁用态**可点段(#70 故事 39)都 dim;段间用 [`CATALOG_KEY_GAP`] 连接。
+/// 与命中侧
+/// 编目册键位行的**渲染**(#67/#69/#70):段清单 `parts` 由
+/// [`catalog_key_parts`] 一处产出,渲染与命中测试共用。
+///
+/// #69 修一处「渲染与命中不同源」的隐患:键位行若直接铺全部段、靠终端
+/// 裁尾,会在「段放不下」时画出一截点不到的残段(如紧凑态标签册的 `· / `),
+/// 而命中侧 [`crate::layout::key_line_segments`] 早就是「放不下整段收口、
+/// 这一段及后续既不画也不给命中」。两边口径一旦分叉,就破了 ADR-0005「渲染
+/// 与命中同源」。故渲染也走同一份 [`crate::layout::key_line_segments`]:
+/// 放得下的段才画、放不下的段两厢都不出现——屏上没有的段,鼠标也点不到,
+/// 点哪打哪。
+///
+/// #69 后续(本工单)把「放不下」这件事在四本册 × 两档内**做没了**:键位行
+/// 分隔收窄到 2 列 + 订阅 / 钥匙册 `g 取回命令` → `g 取回` 之后,`m 换册`
+/// 与 `/ 过滤` 在 66×50 下限内都放得下(见
+/// `过滤段四本册两档都放得下_渲染与命中共源`)。收口纪律本身留着——它管的是
+/// 「更窄的终端 / 将来更长的键位行」,不是现在这四行。
+///
+/// #70 故事 39 的**禁用态**:`live == false` 的可点段画成 dim(与提示段同色,
+/// 不再 accent 加粗),段本身照画、命中区照给——操作者在点之前就看出
+///「这台引擎干不了」,点下去仍由动作自己收口给人话(`App::vps_reverse_lookup`
+/// 的门禁指路)。不按能力把这一段收掉:那会把机器册的键位行耦合到另一本册
+/// 的能力上(#66 刚刚拆掉的耦合),规格要的也是「禁用并指路」而不是「消失」。
+fn key_line(inner: Rect, parts: &[crate::layout::KeyPart<'_>], p: &Palette) -> Line<'static> {
+    // 与命中侧同一 anchor(`inner`)、同一 gap:逐字同源。y 只进命中矩形,
+    // 渲染不取矩形,传 0 即可。
+    let segs = crate::layout::key_line_segments(inner, 0, parts, CATALOG_KEY_GAP);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, seg) in segs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(CATALOG_KEY_GAP, p.dim()));
+        }
+        let style = match (seg.target.is_some(), seg.live) {
+            (true, true) => p.accent().bold(), // 可用动作段
+            (true, false) => p.dim(),          // #70 禁用态:在场、可点,但不加强调
+            _ => p.dim(),                      // 提示段
+        };
+        spans.push(Span::styled(seg.text.clone(), style));
+    }
+    Line::from(spans)
 }
 
 /// **编目册列表件**(#53 骨架第二件):按投影字段渲染,遵循确定性排序。
 /// 缺字段显式「——」,不自造、不补全;ref 原样呈现(指针不是密钥),
 /// 摘要不印 ref 与 addr。后三本册子只换 `CatalogSheet` 的数据源与
 /// [`EntryDetail`](条目明细画法),不换列表件。
+///
+/// #69 册内过滤:`vis` 是「看得见的那一行」在原始投影里的下标(
+/// [`App::catalog_visible`] 的产出),本件只画 `vis` 指到的那些条目、按
+/// `vis` 的顺序;选中高亮按**可见位置** `pos == sel`。无关键词时 `vis` =
+/// `0..n` 全量同序,画出来的与过滤前逐字节相同(面板永不重排引擎输出)。
 pub fn catalog_sheet_lines(
     sheet: &CatalogSheet,
+    vis: &[usize],
     width: usize,
     sel: usize,
     p: &Palette,
     detail: EntryDetail,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    for (i, e) in sheet.entries.iter().enumerate() {
-        let on = i == sel;
+    for (pos, &i) in vis.iter().enumerate() {
+        let Some(e) = sheet.entries.get(i) else {
+            continue;
+        };
+        let on = pos == sel;
         let (suffix, rows) = detail(e, width.saturating_sub(12), p);
         let mut head = vec![Span::raw(format!(
             "  {} {}",
@@ -1497,6 +2174,26 @@ pub fn catalog_sheet_lines(
         out.extend(rows);
     }
     out
+}
+
+/// 册内过滤把条目全筛掉了的指路(#69,照 `recipes::ListEmptyCause` 的范式:
+/// 一个概念一个拼写,与「册体本来是空的」「还没读到」三态两两可区分,绝不
+/// 共用一个空列表)。标题(warn 色,与合法空态的正文色区分)+ 两句下一步:
+/// 事实(「q」在 total 条里没命中)+ 出路(改词 / 清过滤)。`total` 是册体
+/// 原始条数(分母),让操作者知道是「被筛掉了」而不是「本来就没有」。
+fn filter_empty_lines(app: &App, total: usize, p: &Palette) -> Vec<Line<'static>> {
+    let q = app.catalog_filter().trim();
+    vec![
+        Line::from(Span::styled(
+            format!("  {}册无命中", app.catalog_kind.label()),
+            p.warn(),
+        )),
+        Line::from(Span::styled(
+            format!("  「{q}」在 {total} 条里没有命中。"),
+            p.dim(),
+        )),
+        Line::from(Span::styled("  按 / 改词 · Esc 清空过滤", p.dim())),
+    ]
 }
 
 /// 机器册的条目明细:名字行后缀给端口,之下给 地址 / 登录 / 备注
@@ -1910,7 +2607,103 @@ fn render_rm_confirm(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// 到期三态 → **结果四态**(不新造一套状态词):`active` = Pass、
+/// 反查命中标签的**引用一行**(`kind/id` 逐条,空数组 = 「——」):与标签册
+/// 明细的 [`CatalogEntryView::ref_line`](crate::engine::CatalogEntryView::ref_line)
+/// 同一拼法——面板不为浮层另造一种引用文案(一处真相)。
+///
+/// **只印指针,不印机密本体**:标签引用恒是 `<kind>/<条目>` 形式的指针,
+/// 密钥本体只经 stdin 进、投影里根本没有(ADR-0009 §1)。
+fn tag_hit_ref_line(refs: &[crate::engine::CatalogRef]) -> String {
+    if refs.is_empty() {
+        return "——".to_string();
+    }
+    refs.iter()
+        .map(|r| r.label())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// 反查上浮结果浮层的矩形(#70):**渲染与命中区共用这一处几何**(ADR-0005):
+/// 一处真相,点哪打哪)。高按命中数现算——标题 1 行 + 命中标签 N 行 + 收口
+/// 1 行 + 上下边框 2 行;「一条都没有」是固定 3 行内容。`None` = 没有可画
+/// 的浮层(在途 / 闲置 / 读不到都不画薄浮层;读不到走既有指路)。
+pub(crate) fn vps_reverse_popup_rect(area: Rect, app: &App) -> Option<Rect> {
+    let content = match &app.vps_reverse {
+        VpsReverse::Hits { tags, .. } => tags.len() + 2, // 标题 + N 标签 + 收口
+        VpsReverse::Empty { .. } => 3,                   // 标题 + 下一步 + 收口
+        _ => return None,
+    };
+    let h = u16::try_from(content).unwrap_or(u16::MAX).saturating_add(2); // +上下边框
+    let popup = popup_rect(area, REVERSE_W, h);
+    (popup.width > 0 && popup.height > 0).then_some(popup)
+}
+
+/// 反查上浮结果浮层(#70):一层薄浮层(不是新屏、不是新册),几何与命中区
+/// 同一个 [`vps_reverse_popup_rect`]。三态里画得出的两态在这里:
+/// [`Hits`](VpsReverse::Hits) 列标签名 + 各自引用;
+/// [`Empty`](VpsReverse::Empty) 明说「没有标签引用这一条」+ 给「去挂第一个
+/// 标签」的下一步。第三态「读不到」不进这里——它走既有指路(日志),**绝不
+/// 画成空列表**。
+///
+/// **只印引用(`kind/id` 指针),不印任何机密本体**——与面板其余部分同纪律
+/// (ADR-0009 §1:指针不是密钥;反查看不到、也不该看到密钥本体)。`Esc` 或
+/// 任意点击关闭(命中区见 `layout::catalog_hits`),回到机器册原选中行。
+fn render_vps_reverse_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(popup) = vps_reverse_popup_rect(area, app) else {
+        return;
+    };
+    let p = &app.palette;
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    match &app.vps_reverse {
+        VpsReverse::Hits { machine, tags } => {
+            lines.push(Line::from(Span::styled(
+                format!("  {} 个标签引用了 {machine}", tags.len()),
+                p.text().bold(),
+            )));
+            for t in tags {
+                lines.push(Line::from(vec![
+                    Span::raw("  ▸ "),
+                    Span::styled(clip(&t.name, 18), p.accent().bold()),
+                    Span::raw("  "),
+                    Span::styled(
+                        clip(&tag_hit_ref_line(&t.refs), inner_w.saturating_sub(24)),
+                        p.dim(),
+                    ),
+                ]));
+            }
+        }
+        VpsReverse::Empty { machine } => {
+            lines.push(Line::from(Span::styled(
+                format!("  没有标签引用 {machine}"),
+                p.text().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  下一步:在机器册按 r 挂第一个标签(追加合并、幂等、无确认闸)。",
+                p.dim(),
+            )));
+        }
+        _ => return,
+    }
+    lines.push(Line::from(Span::styled("  Esc 或点击任意处关闭", p.dim())));
+    let budget = popup.height.saturating_sub(2) as usize;
+    lines.truncate(budget);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(
+                        " 反查 · 什么标签引用了这一条 ",
+                        p.accent().bold(),
+                    )),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
 /// `expiring` = Warn、`expired` = Fail;回音缺 `status` 字段 = 第四态 Skip
 /// (「没这道标记」,显式「——」不猜)。三态本身仍是引擎的原词
 /// (active / expiring / expired,上游 `status.go` 的三个取值),面板只做
@@ -3569,6 +4362,12 @@ pub fn new_tag_form(mode: TagFormMode) -> TagForm {
 pub const REG_W: u16 = 80;
 pub const REG_H: u16 = 17;
 
+/// 反查上浮结果浮层的宽(#70):一层**薄浮层**(不是新屏、不是新册),与
+/// 登记浮层同一个 [`popup_rect`] 基准;高按命中数现算(见
+/// [`vps_reverse_popup_rect`]),渲染与命中共用这一处几何——点哪打哪
+/// (ADR-0005)。
+pub const REVERSE_W: u16 = 56;
+
 /// 编目册的删除确认键位行几何(渲染与命中共用)。
 pub fn rm_confirm_rect(area: Rect) -> Rect {
     popup_rect(area, REG_INPUT_W, REG_INPUT_H)
@@ -3582,8 +4381,10 @@ pub fn selected_name(sheet: &VpsLsData, sel: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crate::app::Screen;
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use ratatui::Terminal;
 
     /// 常畅态 / 紧凑态两档都成立(#53 验收):不引新断点、不缩放字号,
@@ -3608,8 +4409,9 @@ mod tests {
             let s = crate::testutil::frame_display(&app, w, h);
             assert!(s.contains("编目"), "{w}×{h} 册体应在场");
             assert!(s.contains("gate"), "{w}×{h} 机器名应在场");
-            // 键位行钉在册体末行(两档同文案)
-            assert!(s.contains("选机器"), "{w}×{h} 键位行应在场:{s}");
+            // 键位行钉在册体末行(两档同文案);#70 起机器册这一行还带可点的
+            // 「Enter 反查」段(只机器册有,见 `catalog_key_parts`)
+            assert!(s.contains("Enter 反查"), "{w}×{h} 键位行应在场:{s}");
             // 不溢出:每行显示宽不超终端宽
             for ln in s.lines() {
                 assert!(
@@ -3731,7 +4533,14 @@ mod tests {
             crate::theme::ThemeKind::Warehouse,
             crate::term::ColorCap::Truecolor,
         );
-        let lines = catalog_sheet_lines(&sheet, 60, 0, &p, vps_detail_rows);
+        let lines = catalog_sheet_lines(
+            &sheet,
+            &(0..sheet.entries.len()).collect::<Vec<_>>(),
+            60,
+            0,
+            &p,
+            vps_detail_rows,
+        );
         let text: String = lines
             .iter()
             .map(|l| {
@@ -4120,16 +4929,23 @@ mod tests {
             crate::term::ColorCap::Truecolor,
         );
         let text = |detail: EntryDetail| -> String {
-            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            catalog_sheet_lines(
+                &sheet,
+                &(0..sheet.entries.len()).collect::<Vec<_>>(),
+                60,
+                0,
+                &p,
+                detail,
+            )
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         // 同一份投影,两个画法:机器册给端口/地址/登录/备注,标签册给引用
         let vps = text(vps_detail_rows);
@@ -4740,16 +5556,23 @@ mod tests {
             crate::term::ColorCap::Truecolor,
         );
         let text = |detail: EntryDetail| -> String {
-            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            catalog_sheet_lines(
+                &sheet,
+                &(0..sheet.entries.len()).collect::<Vec<_>>(),
+                60,
+                0,
+                &p,
+                detail,
+            )
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         let sub = text(sub_detail_rows);
         assert!(sub.contains("应用 Mihomo"), "订阅册:{sub}");
@@ -5264,16 +6087,23 @@ mod tests {
             crate::term::ColorCap::Truecolor,
         );
         let text = |detail: EntryDetail| -> String {
-            catalog_sheet_lines(&sheet, 60, 0, &p, detail)
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            catalog_sheet_lines(
+                &sheet,
+                &(0..sheet.entries.len()).collect::<Vec<_>>(),
+                60,
+                0,
+                &p,
+                detail,
+            )
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
         };
         let key = text(key_detail_rows);
         assert!(key.contains("kind github-key"), "钥匙册:{key}");
@@ -5379,5 +6209,2710 @@ mod tests {
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(s.contains("入口禁用"), "{s}");
         assert!(s.contains("缺的是引擎能力"), "{s}");
+    }
+
+    // ---- 工单 #70:反查上浮(机器册上一个键问「什么标签引用了这一条」) ----
+
+    /// 反查匹配**纯函数**的口径(#70 验收第 5 条,spec #65 故事 41):同时存在
+    /// 一台叫 `gate` 的机器与一条引用 `skill/gate` 的标签(名字也叫 gate)时,
+    /// 反查机器只返回 `vps/gate` 那条引用——kind 与条目两侧都**精确比对**,
+    /// 一条 `skill/gate` 不会因为条目名撞车被算进来;`vps/gateway` 也不会因
+    /// 子串包含被算进来。这一个函数就是本轮最该被钉住的口径。
+    #[test]
+    fn 反查匹配纯函数_gate机器不串skill_gate_只认vps_gate精确() {
+        // 标签册投影:web 引用 vps/gate(真命中);gate 引用 skill/gate(条目撞车,
+        // kind 不同,不命中);edge 引用 vps/gateway(子串,不命中)。
+        let data: crate::engine::TagLsData = serde_json::from_str(
+            r#"{"catalogPath":"/r/tags.json","tags":[
+                {"name":"web","refs":[{"kind":"vps","id":"gate"}]},
+                {"name":"gate","refs":[{"kind":"skill","id":"gate"}]},
+                {"name":"edge","refs":[{"kind":"vps","id":"gateway"}]}
+            ]}"#,
+        )
+        .unwrap();
+        let sheet = data.sheet();
+        let hits = crate::screens::catalog::tags_referring(&sheet, "vps", "gate");
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["web"],
+            "只有真正引用 vps/gate 的 web 命中;skill/gate 与 vps/gateway 都不算"
+        );
+        assert_eq!(
+            hits[0].refs,
+            vec![crate::engine::CatalogRef {
+                kind: "vps".into(),
+                id: "gate".into()
+            }],
+            "命中标签带上各自引用(原样,指针不是密钥)"
+        );
+    }
+
+    /// 反查匹配纯函数:一台机器可被多个标签引用,全部返回且保持引擎的确定性
+    /// 排序(面板不重排);一个都不引时给空(由调用方画成「一条都没有」)。
+    #[test]
+    fn 反查匹配纯函数_多标签命中保序_零命中给空() {
+        let data: crate::engine::TagLsData = serde_json::from_str(
+            r#"{"catalogPath":"/r/tags.json","tags":[
+                {"name":"prod","refs":[{"kind":"vps","id":"gate"}]},
+                {"name":"bare","refs":[]},
+                {"name":"edge","refs":[{"kind":"vps","id":"gate"},{"kind":"vps","id":"bare"}]}
+            ]}"#,
+        )
+        .unwrap();
+        let sheet = data.sheet();
+        let hits = crate::screens::catalog::tags_referring(&sheet, "vps", "gate");
+        assert_eq!(
+            hits.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            vec!["edge", "prod"],
+            "两个引用 vps/gate 的标签都命中,保持投影(确定性排序后)的顺序"
+        );
+        assert!(
+            crate::screens::catalog::tags_referring(&sheet, "vps", "ghost").is_empty(),
+            "没有标签引用 ghost:零命中给空(调用方画成「一条都没有」)"
+        );
+    }
+
+    // ---- 工单 #70:反查上浮的行为测试(公开缝:update(Key/Mouse) 驱动) ----
+    //
+    // 全部走在公开缝上:`App::update(Message::Key / Message::Mouse)` 驱动一个
+    // `FakeRunner`,断言落在 `frame_display` 帧、`app.log` 人话行、选中下标、
+    // `hitmap()` 命中目标与 `FakeRunner::call_argvs()` / `abort_count()` 探针上
+    // ——不断言私有函数签名、不断言内部字段名。上面的 `反查匹配纯函数_*` 钉纯
+    // 函数口径,这一族钉「一个键问下去之后操作者看见什么、引擎收到什么」。
+
+    /// 反查上浮的**三标签夹具**(#70 规格验收 1):prod / edge / pi 三条都
+    /// 引用 `vps/gate`(各自引用原样在场);另放一条**名字也叫 gate** 的标签,
+    /// 它引用的是 `skill/gate`——条目名撞车,反查机器时不该被算进来(纯函数
+    /// 那一族已钉口径,这里在帧上复核)。prod 多带一条 `skill/dr` 引用,用来
+    /// 钉「命中标签的**各自**引用原样上场,不只印名字」。
+    const TAG_LS_GATE3: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[{"name":"prod","refs":[{"kind":"vps","id":"gate"},{"kind":"skill","id":"dr"}]},{"name":"edge","refs":[{"kind":"vps","id":"gate"}]},{"name":"pi","refs":[{"kind":"vps","id":"gate"}]},{"name":"gate","refs":[{"kind":"skill","id":"gate"}]}]}}"#;
+
+    /// 反查上浮的**机器册夹具**(#70):gate 带一条登录指针 `$DEPLOY_KEY`
+    /// (用来钉「结果不印机密本体」——投影里就只有指针,面板也不该多印),
+    /// 另留一台 bare(零标签,给「一条都没有」那一态)。
+    const REVERSE_MACHINES: &str = r#"[{"name":"gate","ips":[{"label":"home","addr":"10.0.0.1"}],"port":22,"logins":[{"user":"root","ref":"$DEPLOY_KEY"}],"note":"门口"},{"name":"bare","ips":[],"port":0,"logins":[]}]"#;
+
+    /// 标签册 **rc 3** 回音(#70 规格验收 3 / 故事 34:读不到,不是空结果)。
+    /// 刻意让 `data` 仍是**可定型**的形状(`TagLsData` 拆得出来)——这正是
+    /// 最容易蒙混过关的那一种:只凭「拆不拆得出型」判定,就会把「这次没读到」
+    /// 画成「一条标签引用都没有」,两态互相冒充(spec #65 铁律 4)。
+    const TAG_LS_RC3: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"tags.json 读不到:数据仓根下没有这个文件","hint":"先 nw tag add <标签> --ref <kind>/<条目> 挂一个","details":{"catalogPath":"/r/tags.json"}}],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[]}}"#;
+
+    /// 契约守卫合成「需升级 nw」的回音(#70 读不到第三态):schema 面板不认识,
+    /// `data_as` 拆不出型——绝不按旧形状降级解析,也不画成空列表。
+    const TAG_LS_GUARD: &str = r#"{"schema":"nw/tag-ls.v9","nw":"9.9.9","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[]}}"#;
+
+    /// 建一本就绪的机器册(#70 反查上浮的行为夹具)。`machines` 是 VpsLsData
+    /// 的 machines JSON 数组;`rules` 是 FakeRunner 的回放规则——反查只读走
+    /// `tag ls` 无参全列,把标签册夹具喂在这里;`root` = 数据仓根(`None` =
+    /// 未设);`tag_cap` = 标签组能力可不可用。后两个参数让**门禁两态**可分别
+    /// 自造:门禁顺序钉死「先根、再能力、最后才发那一次只读调用」,任缺一条
+    /// 给各自指路且**一次引擎调用都不发**。
+    ///
+    /// 返回 runner 是为了探针:`call_argvs()` 是「发没发命令」唯一可观察的
+    /// 证据(FakeRunner 只记 argv、绝不存 stdin 本体,守「面板侧不留副本」铁律)。
+    fn reverse_app(
+        machines: &str,
+        rules: &[(&str, i32, &str)],
+        root: Option<&str>,
+        tag_cap: bool,
+    ) -> (std::sync::Arc<crate::engine::FakeRunner>, crate::app::App) {
+        let ls = format!(r#"{{"catalogPath":"/r/vps.json","machines":{machines}}}"#);
+        let mut all: Vec<(&str, i32, &str)> = vec![("vps ls", 0, ls.as_str())];
+        all.extend_from_slice(rules);
+        let runner = std::sync::Arc::new(crate::engine::FakeRunner::new(&all));
+        let mut app = crate::app::App::with_runner(runner.clone());
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        if tag_cap {
+            app.capabilities.record(
+                crate::engine::Capability::Tag,
+                crate::engine::Probe::Available,
+            );
+        }
+        app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
+        app.data_root = root.map(str::to_string);
+        (runner, app)
+    }
+
+    /// 反查上浮两门俱开的就绪机器册(上面各族的行为夹具都走这一档)。
+    fn reverse_ready(
+        machines: &str,
+        rules: &[(&str, i32, &str)],
+    ) -> (std::sync::Arc<crate::engine::FakeRunner>, crate::app::App) {
+        // 数据仓根钉成临时目录:门禁第一道(根)因此确确过得去,第二道(能力)
+        // 由 `tag_cap` 另造。不钉就会随跑测试那台机器的配置漂,门禁测不准。
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        reverse_app(machines, rules, Some(&root), true)
+    }
+
+    /// 反查上浮在机器册选中行上的键盘触发(规格故事 31):Enter 问「什么标签
+    /// 引用了这一条」。抽出来是因为四族测试都要走这一下,而这一下必须与
+    /// 鼠标触发完全同路(见 `反查触发段_有鼠标命中_点它等于按键`)。
+    fn 反查这台(app: &mut crate::app::App) {
+        tap(app, KeyCode::Enter);
+    }
+
+    /// 直接灌一条 `tag ls` 回音(不经 FakeRunner):用来造「迟到的第二条回音」
+    /// ——它确确实实是一次引擎回音(带 argv、带回音信封),只是落在操作者
+    /// 已返航之后。`data` 是 TagLsData 的 data 面 JSON,`rc` 是退出码。
+    fn feed_tag_echo(app: &mut crate::app::App, data: &str, rc: i32) {
+        let env = format!(
+            r#"{{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":{ok},"errors":[],"warnings":[],"data":{data}}}"#,
+            ok = rc == 0
+        );
+        let out = crate::engine::EngineOutput {
+            args: vec![
+                "tag".into(),
+                "ls".into(),
+                "--root".into(),
+                std::env::temp_dir().to_string_lossy().to_string(),
+            ],
+            exit_code: crate::engine::ExitCode::from_number(rc),
+            ok: rc == 0,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(&env).ok(),
+            raw_stdout: env,
+            parse_error: None,
+        };
+        app.update(crate::app::Message::Engine(
+            crate::engine::EngineEvent::Finished(Box::new(out)),
+        ));
+    }
+
+    /// 规格验收 1 / 故事 32:一台挂了 3 个标签的机器,三个标签名与各自引用
+    /// **都在帧上**;条目名撞车的 `skill/gate` 不混进来。
+    #[test]
+    fn 反查_三个标签与各自引用都在帧上() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 投影按名排序:首行 bare,第二行才是 gate
+        assert_eq!(app.catalog_sel(), 1, "选中 gate");
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        for name in ["prod", "edge", "pi"] {
+            assert!(s.contains(name), "标签 {name} 应在浮层里:{s}");
+        }
+        assert!(s.contains("3 个标签引用了 gate"), "命中条数明说:{s}");
+        assert!(s.contains("skill/dr"), "prod 的另一条引用原样在场:{s}");
+        assert!(s.contains("Esc 或点击任意处关闭"), "收口给返航路:{s}");
+        // 在途的那一次只读调用确有一次到达运行器,形状与 nw tag ls 契约一致
+        assert_eq!(
+            _r.call_argvs(),
+            vec![vec![
+                "tag".to_string(),
+                "ls".to_string(),
+                "--root".to_string(),
+                std::env::temp_dir().to_string_lossy().to_string()
+            ]],
+            "反查复用既有的 tag ls 无参全列(不新增调用形状)"
+        );
+    }
+
+    /// 规格验收 2 / 故事 33:一台没有标签的机器,**明说**「没有标签引用这一
+    /// 条」并给「去挂第一个标签」的下一步——与「有 N 条」两态可区分,绝不
+    /// 共用一个空列表。
+    #[test]
+    fn 反查_一条标签都没有_明说并给下一步() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        assert_eq!(app.catalog_sel(), 0, "投影按名排序:首行 bare");
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("没有标签引用 bare"), "明说一条都没有:{s}");
+        assert!(s.contains("挂第一个标签"), "给下一步:{s}");
+        assert!(!s.contains("个标签引用了"), "不是有 N 条那一态:{s}");
+    }
+
+    /// 规格验收 5 / 故事 41 的**帧上层**:同时存在一台叫 `gate` 的机器与一条
+    /// 叫 `gate` 的技能标签时,反查机器只摊开引用 `vps/gate` 的那几条——帧上
+    /// 出现 `skill/gate` 就是匹配退化成了子串包含(纯函数那一族钉口径,这一
+    /// 条钉「口径真的走到了屏上」)。
+    #[test]
+    fn 反查_机器与技能同名_帧上只有vps_gate的引用() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 投影按名排序:首行 bare,第二行才是 gate
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("3 个标签引用了 gate"), "只数出三条:{s}");
+        assert!(
+            !s.contains("skill/gate"),
+            "引用 skill/gate 的那条标签不上屏(同名不串味):{s}"
+        );
+        assert!(!s.contains("4 个标签"), "不是四条:同名的那条没被算进来:{s}");
+    }
+
+    /// 规格验收 3 / 故事 34:标签册回 rc 3,**走指路、不画成空列表**。
+    /// rc 3 的 `data` 仍是可定型形状——只看「拆不拆得出型」就会把它当成
+    /// 合法空册,于是「这次没读到」冒充「一条标签引用都没有」。帧上因此既
+    /// 没有「没有标签引用」那套话,也没有「挂第一个标签」的下一步;指路
+    /// 落在日志行里(人话原文 + 说清不是空结果)。
+    #[test]
+    fn 反查_标签册回rc3_走指路不画成空列表() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 3, TAG_LS_RC3)]);
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            s.contains("反查没结果"),
+            "帧上给指路,不是一片空白(按了 Enter 屏上没动静 = 当成面板没反应):{s}"
+        );
+        assert!(
+            s.contains("不是「一条标签引用都没有」"),
+            "说清读不到与没打过标签是两件事:{s}"
+        );
+        assert!(
+            !s.contains("没有标签引用"),
+            "rc 3 是读不到,绝不是「一条都没有」:{s}"
+        );
+        assert!(
+            !s.contains("挂第一个标签"),
+            "读不到不给挂标签的下一步(那会把没读到骗成没打过标签):{s}"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查没结果")),
+            "指路同时落在日志人话里:{:?}",
+            app.log
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("tags.json 读不到")),
+            "引擎的原文证据在场,不替它改写:{:?}",
+            app.log
+        );
+    }
+
+    /// 规格验收 3 的另一半:契约守卫合成「需升级 nw」(schema 面板不认识)
+    /// 同样走指路,不画成空列表。这一路 `data_as` 拆不出型,与 rc 3 那一
+    /// 路形状不同,但落到操作者眼里必须是同一件事:**没读到**。
+    #[test]
+    fn 反查_契约守卫需升级nw_走指路不画成空列表() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GUARD)]);
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("反查没结果"), "帧上给指路,不画成空列表:{s}");
+        assert!(!s.contains("没有标签引用"), "读不到不是空列表:{s}");
+        assert!(
+            app.log.iter().any(|l| l.contains("反查没结果")),
+            "指路落在日志人话里:{:?}",
+            app.log
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("需升级 nw")),
+            "说清是两端 schema 没对齐,不是数据没了:{:?}",
+            app.log
+        );
+    }
+
+    /// 规格验收 4 / 故事 40:数据仓根**未设**时给数据仓根指路(帧上 + 日志),
+    /// 且**一次引擎调用都没发**。夹具里明明摆着能答对的 `tag ls` 回放规则,
+    /// 所以「没发」不是夹具答不上,是面板自己没收口。
+    #[test]
+    fn 反查门禁_数据仓根未设_指路且零引擎调用() {
+        let (runner, mut app) =
+            reverse_app(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)], None, true);
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "根未设:一条 argv 都不发(探针是空的):{:?}",
+            runner.call_argvs()
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查未下发")),
+            "日志给指路:{:?}",
+            app.log
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("数据仓根未设"), "帧上也给人话:{s}");
+        assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
+    }
+
+    /// 规格验收 4 / 故事 39:标签组能力不可用时给能力指路(缺的是引擎能力,
+    /// 不是面板坏了),同样**零引擎调用**。数据仓根这一道是过的——所以这一
+    /// 条钉的是第二道门真的在管事,不是被第一道顺手挡掉的。
+    #[test]
+    fn 反查门禁_标签组能力不可用_指路且零引擎调用() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            Some(&root),
+            false,
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "能力不可用:一条 argv 都不发:{:?}",
+            runner.call_argvs()
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("缺的是引擎能力")),
+            "说清缺的是引擎能力,不是面板坏了:{:?}",
+            app.log
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
+    }
+
+    /// 故事 39 的**鼠标那一侧**(「反查要求标签组能力可用,缺能力时入口禁用并
+    /// 指路」):标签组能力缺席时「Enter 反查」段**照画、照给命中**,画成 dim
+    /// (禁用态);点它仍走 `App::vps_reverse_lookup` 的同一条门禁——给人话、
+    /// 一次引擎调用都不发。
+    ///
+    /// 与 [`反查门禁_标签组能力不可用_指路且零引擎调用`] 同一夹具、同一结论,
+    /// 这一条只补键盘那一侧没覆盖的三件事:① 帧上真的有这一段(不是收掉了);
+    /// ② 命中区真的有矩形,且矩形正是帧上这一段所在的那几列(点哪打哪);
+    /// ③ 点下去仍然零调用、仍然给指路。禁用态的颜色不在这条里断言
+    /// (`frame_display` 只拚符号、不带样式),由渲染侧 `key_line` 的分叉承载。
+    #[test]
+    fn 反查段_标签组能力缺席_段照画点得中_指路且零调用() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            Some(&root),
+            false, // 标签组能力缺席(数据仓根这一道是过的)
+        );
+        tap(&mut app, KeyCode::Down); // 选中 gate:这一段只在册体有条目时给
+        assert!(
+            !app.tag_entry_enabled(),
+            "夹具确确落在门禁不过那一侧(缺的是标签组能力)"
+        );
+        // ① 帧上在场:禁用 ≠ 消失(规格要的是「禁用并指路」)
+        let f = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            f.contains("Enter 反查"),
+            "能力缺席也画这一段(画成禁用态):{f}"
+        );
+        // ② 命中区在场,且矩形就是帧上这一段所在的几列(同一份段清单,ADR-0005)
+        let size = Rect::new(0, 0, 80, 30);
+        app.size = size;
+        let hit = crate::layout::hitmap(size, &app, crate::layout::size_class(size))
+            .into_iter()
+            .find(|(_, t)| matches!(t, crate::layout::Target::VpsReverse))
+            .map(|(r, _)| r)
+            .expect("能力缺席:反查段仍应有命中区(禁用并指路)");
+        let row = f.lines().nth(hit.y as usize).expect("命中行在渲染中在场");
+        let byte = row.find("Enter 反查").expect("帧上找得着这一段");
+        let col: u16 = row[..byte]
+            .chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+            .sum();
+        assert!(
+            hit.x <= col && col < hit.x + hit.width,
+            "段起始列 {col} 落在命中矩形 {}..{} 内(点哪打哪)",
+            hit.x,
+            hit.x + hit.width
+        );
+        // ③ 点下去:同一条门禁、同一条指路、零引擎调用
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::VpsReverse)
+        });
+        assert!(
+            runner.call_argvs().is_empty(),
+            "点禁用态段也一条 argv 都不发:{:?}",
+            runner.call_argvs()
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查未下发")),
+            "点了仍给指路:{:?}",
+            app.log
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
+    }
+
+    /// 规格验收 4 的**门禁顺序**:根未设与能力不可用同时在场时,**根那句赢**
+    /// (与面板其余入口同一信任序:先根、再能力),并且仍然是零引擎调用。
+    /// 两条指路措辞互不冒充——操作者该先去设根,而不是先被告知去升级 nw。
+    #[test]
+    fn 反查门禁_根与能力双缺_根那句赢且零调用() {
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            None,
+            false,
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "两道门都不过:更是一条都不发:{:?}",
+            runner.call_argvs()
+        );
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("反查未下发"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(line.contains("五域读不到数据仓"), "根那句赢:{line}");
+        assert!(
+            !line.contains("缺的是引擎能力"),
+            "不让能力那句抢在前面(两条指路互不冒充):{line}"
+        );
+        assert!(
+            !line.contains("升级所配 nw"),
+            "能力那句的下一步也不出现:{line}"
+        );
+    }
+
+    /// 规格验收 6 / 故事 38:反查**只在机器册**提供。订阅册与钥匙册的条目
+    /// 不在 `TAG_REF_KINDS` 里,在那里放这个键注定只返回「没有」——所以同一
+    /// 个 `Enter` 在这两本上**无事可做**:不开浮层、不入在途、不排队一条
+    /// `tag ls`。这里把两道门都开到过得去(根设了、tag 能力记成可用), 钉的
+    /// 就是「没有这一行」而不是「门挡掉了」。
+    #[test]
+    fn 反查边界_订阅册与钥匙册上同一个键不做反查() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        for (name, mk) in [
+            (
+                "订阅",
+                sub_app
+                    as fn(
+                        &[(&str, i32, &str)],
+                    )
+                        -> (crate::app::App, std::sync::Arc<crate::engine::FakeRunner>),
+            ),
+            ("钥匙", key_app),
+        ] {
+            let (mut app, runner) = mk(&[]);
+            app.data_root = Some(root.clone());
+            app.capabilities.record(
+                crate::engine::Capability::Tag,
+                crate::engine::Probe::Available,
+            );
+            tap(&mut app, KeyCode::Char('l')); // 先把册体读出来(有行可选)
+            feed(&mut app);
+            let before = runner.call_argvs();
+            tap(&mut app, KeyCode::Down);
+            tap(&mut app, KeyCode::Enter);
+            assert!(!app.vps_reverse_open(), "{name}册上 Enter 不开反查浮层");
+            assert_eq!(
+                runner.call_argvs(),
+                before,
+                "{name}册上 Enter 不下发任何命令(连 tag ls 都不排)"
+            );
+        }
+    }
+
+    /// 规格验收 8 / 故事 42:反查**复用既有的只读调用形状**——队里那一条
+    /// argv 逐字节就是 `nw tag ls --root <根>`(无参全列)。不新增调用形状、
+    /// 不新增写路径,`tags.json` 因此一个字节都不会被碰。
+    #[test]
+    fn 反查_复用既有只读调用_队里argv逐字节是tag_ls_root() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        assert_eq!(
+            app.queue.last().cloned(),
+            Some(vec![
+                "tag".to_string(),
+                "ls".to_string(),
+                "--root".to_string(),
+                root.clone()
+            ]),
+            "无参全列 + 只认 --root:与既有的 nw tag ls 逐字节同形"
+        );
+        assert!(
+            app.queue
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("tag")
+                    || a.get(1) == Some(&"ls".to_string())),
+            "反查这一路只有只读的 ls,没有任何写路径:{:?}",
+            app.queue
+        );
+    }
+
+    /// 规格验收 9 / 故事 43:反查结果**不印密钥引用、不印机密本体**。机器册
+    /// 帧上本来就有 `$DEPLOY_KEY` 这个指针(那是登录槽的 ref,指针不是密钥),
+    /// 所以断言要更严:浮层里只准出现 `<kind>/<条目>` 形式的标签引用,不准
+    /// 出现任何 `$` 引用、任何形如地址/端口的本体。
+    #[test]
+    fn 反查结果_不印密钥引用不印机密本体() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        // 浮层那一块(取「反查 · 什么标签引用了这一条」到收口行之间)
+        let popup: String = s
+            .lines()
+            .skip_while(|l| !l.contains("反查 · 什么标签引用了这一条"))
+            .take_while(|l| !l.contains("Esc 或点击任意处关闭"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(popup.contains("prod"), "浮层确凿在场:{popup}");
+        assert!(!popup.contains('$'), "浮层不印任何 $ 引用:{popup}");
+        assert!(!popup.contains("10.0.0.1"), "浮层不印地址本体:{popup}");
+        assert!(!popup.contains(":22"), "浮层不印端口:{popup}");
+        assert!(!popup.contains("门口"), "浮层不印备注:{popup}");
+        assert!(!popup.contains("root"), "浮层不印登录名:{popup}");
+    }
+
+    /// 规格验收 11:反查是**只读**,不并入 `assembling` 全局写互斥。按下去
+    /// 之后 `assembling` 必须还是灭的——否则在途的一次反查会把登记 / 装配
+    /// 一路全挡住(那是写闸,不是读闸)。
+    #[test]
+    fn 反查_是只读_不点亮assembling写互斥() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        assert!(!app.assembling, "起初没有写在途");
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        assert!(!app.assembling, "反查在途不点亮写互斥(只读,不占写闸)");
+        assert_eq!(app.queue.len(), 1, "确有一次只读调用排队");
+        feed(&mut app);
+        assert!(!app.assembling, "反查落地也不点亮写互斥");
+        // 反证:写互斥亮着(装配在途)时反查照样问得动。若把反查并进
+        // `assembling`,这一下就会被互斥语挡掉,队里一条都不多。
+        tap(&mut app, KeyCode::Esc); // 先返航,否则结果浮层吞键
+        app.assembling = true;
+        反查这台(&mut app);
+        assert_eq!(app.queue.len(), 1, "装配在途也问得动(只读不占写闸)");
+    }
+
+    /// 规格验收 7 / 故事 36:反查**在途期间不拿上一轮结论冒充本次**。第一轮
+    /// 问 bare 得到「一条都没有」,返航后换一台机器再问——在途那一刻屏上既
+    /// 没有第一轮的结论,也没有本轮的回音(还没到)。`run_tag_ls` 因此把上一
+    /// 轮的回音清空:留着它,「在途」就会长得像「有结果」。
+    #[test]
+    fn 反查_在途不拿上一轮结论冒充本次() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        反查这台(&mut app); // 第一轮:bare
+        feed(&mut app);
+        let a = crate::testutil::frame_display(&app, 80, 30);
+        assert!(a.contains("没有标签引用 bare"), "第一轮落地:{a}");
+        tap(&mut app, KeyCode::Esc); // 返航回机器册(选中行不动)
+        tap(&mut app, KeyCode::Down); // 换一台机器问
+        反查这台(&mut app); // 第二轮:在途
+        let b = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!b.contains("没有标签引用 bare"), "在途不摆上一轮的结论:{b}");
+        assert!(
+            !b.contains("个标签引用了"),
+            "在途也不摆本轮(回音还没到):{b}"
+        );
+    }
+
+    /// 规格验收 7 的另一半:操作者已返航(Idle)之后,**迟到的回音不收敛任何
+    /// 状态、不重开浮层**。这一条回音确确实实是一次引擎回音,只是落在操作
+    /// 者已经看完走了之后——幽灵重开一个旧结果比不开更糟。
+    #[test]
+    fn 反查_迟到回音不重开浮层() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "先落地");
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.vps_reverse_open(), "返航");
+        // 迟到的第二条 tag ls 回音:同一台机器、另一份标签册
+        feed_tag_echo(
+            &mut app,
+            r#"{"catalogPath":"/r/tags.json","tags":[{"name":"late","refs":[{"kind":"vps","id":"gate"}]}]}"#,
+            0,
+        );
+        assert!(
+            !app.vps_reverse_open(),
+            "迟到回音不重开浮层(已返航 = 这一轮已经结束)"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("个标签引用了"), "迟到回音不上屏:{s}");
+        assert!(!s.contains("late"), "迟到回音里的标签名也不上屏:{s}");
+    }
+
+    /// 规格验收 10 / 故事 44:反查触发段**有鼠标命中**,且点它 = 在机器册
+    /// 选中行上按 `Enter`(两条路给同一件事:同一条 argv、同一次在途)。
+    /// 段文案由渲染与命中共用(`catalog_key_parts` 一处产出),点哪打哪。
+    #[test]
+    fn 反查触发段_有鼠标命中_点它等于按键() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 选中 gate
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("Enter 反查"), "段在键位行上画着:{s}");
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::VpsReverse)
+        });
+        assert_eq!(
+            app.queue.last().cloned(),
+            Some(vec![
+                "tag".to_string(),
+                "ls".to_string(),
+                "--root".to_string(),
+                std::env::temp_dir().to_string_lossy().to_string()
+            ]),
+            "点段与按 Enter 下同一条只读 argv"
+        );
+        // 与键盘那条路逐字节同路
+        let (_r2, mut app2) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app2, KeyCode::Down);
+        反查这台(&mut app2);
+        assert_eq!(app.queue, app2.queue, "鼠标与键盘两条路一条 argv");
+    }
+
+    /// 规格验收 10 / 故事 37:结果浮层 `Esc` 或**任意处点击**都关,且关掉
+    /// 之后回到机器册**原选中行**。反查从头到尾不写 `vps_sel`,所以「回到
+    /// 原选中行」不需要一次恢复动作,只需要不在返航时顺手改它——这条钉的
+    /// 正是「没顺手改」。
+    #[test]
+    fn 反查浮层_键盘与任意点击都关_回到机器册原选中行() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        let sel = app.catalog_sel();
+        assert_eq!(sel, 1, "选中 gate");
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "浮层在场");
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.vps_reverse_open(), "Esc 返航");
+        assert_eq!(app.catalog_sel(), sel, "Esc 后选中行原样");
+        // 再开一次:点浮层外的空白也算返航(规格 §7:任意处点击关闭)
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "再开一次");
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::DismissPopup)
+        });
+        assert!(!app.vps_reverse_open(), "点任意处返航");
+        assert_eq!(app.catalog_sel(), sel, "点任意处后选中行仍原样");
+    }
+
+    /// 规格验收 10 的弹层纪律 / 故事 50:浮层打开时**底层不产命中**——清单
+    /// 行与键位行三个可点段(反查 / 换册 / 过滤)一段都不给,点击不穿透。
+    /// 命中的整个正文只有一个「点任意处返航」。
+    #[test]
+    fn 反查浮层_弹层优先级_底层清单行与键位段都不产命中() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open());
+        app.size = Rect::new(0, 0, 80, 30);
+        let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+        assert!(
+            hits.iter()
+                .any(|(_, t)| matches!(t, crate::layout::Target::DismissPopup)),
+            "浮层自己给一个「点任意处返航」:{hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .all(|(_, t)| !matches!(t, crate::layout::Target::SelectRow(_))),
+            "底层清单行不产命中(点不到被浮层盖住的那一行)"
+        );
+        assert!(
+            hits.iter().all(|(_, t)| !matches!(
+                t,
+                crate::layout::Target::VpsReverse
+                    | crate::layout::Target::SwitchBook
+                    | crate::layout::Target::CatalogFilter
+            )),
+            "键位行三个可点段都不产命中"
+        );
+    }
+
+    /// #69 与 #70 合用(规格故事 27):过滤收窄到一台机器之后,反查点的是
+    /// **看得见的那一台**——被滤掉的 bare 不该被问到,浮层点名的必须是 gate。
+    /// 选中 / 鼠标 / 反查全部经过可见下标映射回原始投影,同一口径。
+    #[test]
+    fn 反查与册内过滤合用_浮层点名看得见的那一台() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        过滤敲词(&mut app, "gate"); // 只留 gate(bare 被滤掉)
+        assert_eq!(app.catalog_visible().len(), 1, "收窄到一台");
+        反查这台(&mut app);
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("3 个标签引用了 gate"), "点名看得见的那一台:{s}");
+        assert!(!s.contains("没有标签引用"), "滤掉的 bare 不被问到:{s}");
+    }
+
+    /// 两档响应式(#70 验收的常畅 / 紧凑):80×30 与 66×50(外加 100×40)下,
+    /// 触发段与结果浮层都画得出来,且**没有一行超宽**。紧凑态放不下整段时
+    /// 渲染与命中同源收口(屏上没有的段,鼠标也点不到)。浮层盖住键位行是
+    /// 弹层纪律,所以「关着看段、开着看浮层」分两次量。
+    #[test]
+    fn 反查浮层与触发段_常畅与紧凑两档都渲染不溢出() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        for (w, h) in [(80u16, 30u16), (66, 50), (100, 40)] {
+            // 关着:触发段在键位行上,且没有浮层
+            let closed = crate::testutil::frame_display(&app, w, h);
+            assert!(
+                closed.contains("Enter 反查"),
+                "{w}×{h} 触发段应在场:{closed}"
+            );
+            assert!(
+                !closed.contains("什么标签引用了这一条"),
+                "{w}×{h} 没问就不起浮层:{closed}"
+            );
+            for ln in closed.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 关着也有行超宽:{ln}"
+                );
+            }
+            // 开着:结果浮层在场(它盖住键位行是弹层纪律,不是漏画)
+            反查这台(&mut app);
+            feed(&mut app);
+            let open = crate::testutil::frame_display(&app, w, h);
+            assert!(
+                open.contains("3 个标签引用了 gate"),
+                "{w}×{h} 结果浮层应在场:{open}"
+            );
+            assert!(
+                open.contains("Esc 或点击任意处关闭"),
+                "{w}×{h} 收口行应在场:{open}"
+            );
+            for ln in open.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 开着也有行超宽:{ln}"
+                );
+            }
+            tap(&mut app, KeyCode::Esc);
+        }
+    }
+
+    // ---- 工单 #70 的两处「要当场钉住」的边界 ----
+
+    /// 规格验收 7 的第三面:在途时**换册**(`m`)把在途清成 Idle,迟到的
+    /// `tag ls` 回音于是不收敛任何状态。它问的那台机器已经不在场,面板不替
+    /// 一个走了的问题留一个幽灵结果——「迟到回音不收敛」这条纪律因此不只
+    /// 返航一条路,换册 / 切屏同样算。
+    #[test]
+    fn 反查_在途时换册_迟到回音不收敛任何状态() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        反查这台(&mut app); // 在途
+        assert_eq!(app.queue.len(), 1, "确有一次只读调用在队里");
+        tap(&mut app, KeyCode::Char('m')); // 翻到标签册
+        assert_eq!(
+            app.catalog_kind,
+            CatalogKind::Tag,
+            "换册成功(在途不是写闸,挡不住换册)"
+        );
+        assert!(!app.vps_reverse_open(), "换册即收在途");
+        // 迟到的 tag ls 回音落地:标签册照常读进来,但反查浮层不开
+        feed(&mut app);
+        assert!(!app.vps_reverse_open(), "迟到回音不重开浮层");
+        assert_eq!(app.tag_len(), 4, "标签册照常呈现(只读回音没被丢)");
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains("什么标签引用了这一条"), "屏上没有反查浮层:{s}");
+    }
+
+    /// 规格验收 12 / #62 立过的双向对齐(帮助不写幽灵键、README 不漏键):
+    /// 机器册的 `Enter`(反查上浮)在 `HELP_ROWS` 里挂在机器册那一行、说明写
+    /// 的是「什么标签引用了这一条」,在 README 的编目键位列里也在场。这一条
+    /// 不新造对照机制,只是把 #70 这一个键接进既有的双向对齐——免得反查上浮
+    /// 落成「屏上有个键,两处文档都没有」。顺带把那一行派发下去:实现里真有
+    /// 一条真实分支,不是幽灵键。
+    #[test]
+    fn 反查键_帮助浮层与readme都对齐_派发确有一次只读调用() {
+        use crate::ui::HELP_ROWS;
+        let row = HELP_ROWS
+            .iter()
+            .find(|r| r.book == Some(CatalogKind::Vps) && r.code == KeyCode::Enter)
+            .expect("机器册的 Enter(反查上浮)应在帮助对照表里");
+        assert!(
+            row.desc.contains("什么标签引用了"),
+            "说明写的是反查上浮这一件事:{}",
+            row.desc
+        );
+        let readme = include_str!("../../README.md");
+        let line = readme
+            .lines()
+            .find(|l| l.starts_with("| 编目 "))
+            .expect("README 六屏表应有编目一行");
+        assert!(line.contains("`Enter`"), "编目键位列应有 Enter:{line}");
+        assert!(line.contains("反查"), "并说清它是反查:{line}");
+        // 帮助那一行派发下去:实现里真有一条只读分支
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down);
+        app.update(crate::app::Message::Key(KeyEvent::new(
+            row.code,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.queue.len(),
+            1,
+            "帮助列的 Enter 派发下去确有一次只读 tag ls"
+        );
+    }
+
+    /// 反查触发段**只机器册有命中**。`TAG_REF_KINDS` 的已知集合是
+    /// `skill` / `extension` / `vps`,四本册里只有机器册的条目可打标签;
+    /// 订阅册与钥匙册的条目不在其内,放一个注定只返回「没有」的动作是噪声
+    /// (spec #65 §4:触发点只有一处)。标签册的 `Enter` 是另一件事(#54 反查
+    /// 选中的那条标签),它的键位行也写着「Enter 反查」四个字,但那是**只画
+    /// 不点的提示段**,不给命中——所以这一条只认命中区,不认帧上有没有那四
+    /// 个字(认字就会把标签册的提示段误判成触发段)。
+    #[test]
+    fn 反查触发段_只机器册给命中_另三本连段都不给() {
+        for (name, kind) in [
+            ("机器", CatalogKind::Vps),
+            ("标签", CatalogKind::Tag),
+            ("订阅", CatalogKind::Subscription),
+            ("钥匙", CatalogKind::Key),
+        ] {
+            let mut app = book(name);
+            assert_eq!(app.catalog_kind, kind, "{name}册");
+            app.size = Rect::new(0, 0, 80, 30);
+            let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+            let has = hits
+                .iter()
+                .any(|(_, t)| matches!(t, crate::layout::Target::VpsReverse));
+            assert_eq!(
+                has,
+                kind == CatalogKind::Vps,
+                "{name}册:反查触发段的有无={has}"
+            );
+        }
+    }
+
+    /// 反查结果浮层与编目过滤输入态**同时在场**时,`Esc` 归谁?答案:浮层是
+    /// 更上一层(与帮助 / 发射确认同级的顶层浮层),所以 **Esc 先收浮层**,
+    /// 过滤输入态与刚敲的过滤词原样留着。反过来会让操作者卡在一个二选一里:
+    /// 要么还被浮层蒙着就丢了刚敲的词,要么为了清词先手动关浮层。
+    /// 这条把次序钉住,免得以后有人把浮层守卫挪到过滤守卫后面去。
+    #[test]
+    fn 反查浮层与过滤输入态同时在场_先收浮层_过滤词不丢() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        tap(&mut app, KeyCode::Down); // 选中 gate
+        tap(&mut app, KeyCode::Char('/')); // 进过滤输入态
+        tap(&mut app, KeyCode::Char('g'));
+        tap(&mut app, KeyCode::Char('a')); // 过滤词「ga」(只留 gate)
+        assert!(app.catalog_filter_on, "输入态在场");
+        // 输入态下点键位行的反查段:可点段不收输入态管(输入态只管键入)
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::VpsReverse)
+        });
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "浮层开起来了");
+        assert!(app.catalog_filter_on, "过滤输入态还在");
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.vps_reverse_open(), "Esc 先收浮层(更上一层先收)");
+        assert!(app.catalog_filter_on, "过滤输入态不退:它不在这一层");
+        assert_eq!(app.catalog_filter(), "ga", "刚敲的过滤词不丢");
+        // 再按一次 Esc 才归输入态那一层(清词 + 退输入态)
+        tap(&mut app, KeyCode::Esc);
+        assert!(!app.catalog_filter_on, "第二次 Esc 才退输入态");
+        assert_eq!(app.catalog_filter(), "", "第二次 Esc 清词");
+    }
+
+    /// 回归(#65 评审第 3 条):机器册反查(#70)发的是**不带参**的
+    /// `tag ls --root <根>`,所以切到标签册时册头必须说「列全部标签」。
+    /// 早先回音路由从 argv 重新推导「问的是哪一条」
+    /// (`skip(2).find(非 -- 开头)`),它把 `--root` 的**值**当成了标签名:
+    /// 册头写「当前册 标签 · 反查 /tmp」、日志写「反查完成(标签 /tmp:4 条,
+    /// 只读)」——「列全部标签」被冒充成「反查一个叫 /tmp 的标签」,一种
+    /// 状态冒充另一种。下面两条把册头与日志两处都钉住:带的只能是
+    /// `run_tag_ls` 下发时记下的那个入参(`None` = 列全部)。
+    #[test]
+    fn 反查后切到标签册_册头与日志都说全部标签_不把数据仓根当标签名() {
+        let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        反查这台(&mut app);
+        feed(&mut app);
+        assert!(app.vps_reverse_open(), "反查结论先在场");
+        tap(&mut app, KeyCode::Esc); // 先收浮层(它在场时吞册体键)
+        tap(&mut app, KeyCode::Char('m')); // 机器册 → 标签册
+        let root = app.usable_data_root().unwrap_or_default();
+        assert_eq!(
+            app.catalog_scope_label(),
+            "全部标签",
+            "不带参反查 = 列全部:册头别把数据仓根 {root} 当成标签名"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            s.contains("当前册 标签 · 全部标签 ·"),
+            "帧上册头同口径(下面两帧 golden 就钉在这一行):{s}"
+        );
+        assert!(
+            !s.contains(&format!("反查 {root}")),
+            "册头不出现「反查 <数据仓根>」:{s}"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("反查完成(全部标签:")),
+            "日志同口径:列全部,不是一个叫 {root} 的标签:{:?}",
+            app.log.first()
+        );
+        assert!(
+            app.log
+                .iter()
+                .all(|l| !l.contains(&format!("标签 {root}:"))),
+            "日志不把数据仓根 {root} 当成标签名:{:?}",
+            app.log.first()
+        );
+    }
+
+    /// 机器册键位行三个态的 `Esc` 口径一致(#65 评审第 8 条):`q` 在编目册册体上
+    /// 是壳级 quit(`on_key` 的 `Char('q') => quit`),**不是返航**——`keys_body`
+    /// 已为此收窄成裸 `Esc`,空册态却还写着 `Esc/q 返航`,同一块屏两个态对同一
+    /// 个键说两样话。这条把「册体态 / 空册态都不许把 `q` 当返航、浮层态两键
+    /// 都认」钉住:谁再把 `Esc/q 返航` 写回册体或空册的段清单,这里就红。
+    ///
+    /// 浮层态是**有意**两键都写:登记流 / 删除确认在场时 `on_key` 先把键交给浮层
+    /// 那层,`Esc` 与 `q` 都收敛浮层,壳级 quit 那次判定排在更后面、根本轮不到
+    /// (详见 `catalog_key_parts` 的注释)。
+    #[test]
+    fn 机器册键位行_esc口径三态一致_册体与空册都不把q当返航() {
+        // ① 有条目(册体态):`Esc`,且不出现 `q 返航`
+        let mut app = book("机器");
+        let body = crate::testutil::frame_display(&app, 110, 30);
+        let body_line = body
+            .lines()
+            .find(|l| l.contains("↑/↓ 选"))
+            .expect("册体态键位行在场")
+            .to_string();
+        assert!(body_line.contains("Esc"), "册体态给 Esc 提示:{body_line}");
+        assert!(
+            !body_line.contains("q 返航"),
+            "册体态不把 q 当返航(q 是壳级退出):{body_line}"
+        );
+        // ② 空册态:同一个口径
+        let mut empty =
+            crate::app::App::with_runner(std::sync::Arc::new(crate::engine::FakeRunner::new(&[(
+                "vps ls",
+                0,
+                r#"{"catalogPath":"/r/vps.json","machines":[]}"#,
+            )])));
+        empty.splash = false;
+        empty.screen = crate::app::Screen::Vps;
+        empty.catalog_kind = CatalogKind::Vps;
+        empty.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        empty.vps_ls =
+            Some(serde_json::from_str(r#"{"catalogPath":"/r/vps.json","machines":[]}"#).unwrap());
+        empty.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        assert_eq!(empty.catalog_len(), 0, "确实是空册");
+        let ef = crate::testutil::frame_display(&empty, 110, 30);
+        let empty_line = ef
+            .lines()
+            .find(|l| l.contains("r 登记机器"))
+            .expect("空册态键位行在场")
+            .to_string();
+        assert!(empty_line.contains("Esc"), "空册态给 Esc 提示:{empty_line}");
+        assert!(
+            !empty_line.contains("q 返航"),
+            "空册态与册体态同一口径,不把 q 当返航:{empty_line}"
+        );
+        // ③ 浮层态:两键都认(这一处与册体态口径不同,理由见 catalog_key_parts)
+        tap(&mut app, KeyCode::Char('r'));
+        let of = crate::testutil::frame_display(&app, 110, 30);
+        assert!(
+            of.contains("Esc/q 返航"),
+            "浮层态 Esc 与 q 都收敛浮层,两句都写:{of}"
+        );
+    }
+
+    /// 键位行的**行号**与它的**命中矩形**钉在同一处(#65 评审第 6 条):命中区用
+    /// `catalog_body_lines` 的行数推出键位行的 y,渲染用同一份行数把键位行画到
+    /// 那一行。这一条从行为上再钉一道——命中矩形落在的那一行,渲染出来的行里
+    /// **真的带着键位段**。谁再把两边的宽度预算拆开(渲染一个数、命中另一个数),
+    /// 键位行就会整体错一行,这条就红。
+    ///
+    /// 顺带钉三档:常畅 80×30、紧凑 66×50、宽 110×30(三段可点段都放得下的那一档)。
+    #[test]
+    fn 键位行命中矩形那一行_渲染出来真的带着键位段() {
+        for (w, h) in [(80u16, 30u16), (66, 50), (110, 30)] {
+            let mut app = book("机器");
+            let size = Rect::new(0, 0, w, h);
+            app.size = size;
+            let hits = crate::layout::hitmap(size, &app, crate::layout::size_class(size));
+            let rows: Vec<u16> = hits
+                .iter()
+                .filter(|(_, t)| {
+                    matches!(
+                        t,
+                        crate::layout::Target::SwitchBook
+                            | crate::layout::Target::CatalogFilter
+                            | crate::layout::Target::VpsReverse
+                    )
+                })
+                .map(|(r, _)| r.y)
+                .collect();
+            assert!(!rows.is_empty(), "{w}×{h} 机器册键位行应有可点段:{hits:?}");
+            assert!(
+                rows.iter().all(|&y| y == rows[0]),
+                "{w}×{h} 可点段应同一行:{rows:?}"
+            );
+            let f = crate::testutil::frame_display(&app, w, h);
+            let line = f.lines().nth(rows[0] as usize).unwrap_or_default();
+            assert!(
+                line.contains(CATALOG_SWITCH),
+                "{w}×{h} 命中矩形那一行渲染出来真的带着键位段:{line}"
+            );
+        }
+    }
+
+    // ---- 工单 #66:四本册整帧 golden(逐字节) ----
+    //
+    // 本票是**纯重构**:操作者感知不到任何变化。上面四条
+    // `*_屏_常畅与紧凑两档都渲染不溢出` 只钉「在场」(contains),钉不住
+    // 「没变」;这一族把整帧显示内容逐字节钉住,按册各一份、常畅(80×30)与
+    // 紧凑(66×50)两档各一份——按册分叉收敛成查表成员之后,任何一本的
+    // 文案 / 行序 / 行数 / 折列漂了一个字节,这里就红。
+    //
+    // **期望值的来历(不止一句「本票之前」,每一次刷新都记在这儿)**:
+    // 基线 = 第 8 轮 tip `bb19d70` + 工单 #66(同一夹具、同一尺寸,人工逐行
+    // 核对;#66 确是纯重构,基线帧与 `bb19d70` 逐字节相同)。基线之后有过四
+    // 次**真实的用户可见变化**,每次都刷新过期望,差都记在各自工单里:
+    //   · #67(合入点 `42eb955`):机器册键位行末尾多出可点的 `m 换册` 段;
+    //   · #69(`8f676fc`):机器册键位行再多 `/ 过滤` 段(另三本放不下,段就
+    //     不画也不给命中——那一版的取舍由本工单推翻,见下一条);
+    //   · #70(`31f069d`):机器册键位行 `↑/↓ 选机器`→`↑/↓ 选`、
+    //     `Esc/q 返航`→`Esc`,并多出 `Enter 反查` 段;
+    //   · 本票 #65 评审第 3 条:标签册册头把 `反查 /tmp` 改回 `全部标签`
+    //     (那一行原是把 `--root` 的值错当成标签名,见 `App::on_tag_echo`);
+    //   · **本工单(#69 后续 / #70 评审第 5 条)**:键位行分隔
+    //     `CATALOG_KEY_GAP` 由 3 列收窄到 2 列(`" · "` → `" ·"`),订阅 /
+    //     钥匙册 `g 取回命令` → `g 取回`,于是 `/ 过滤` 在四本册 × 两档内都
+    //     放得下(此前只有机器册画得出、点得着)。八帧全部重刷,每帧差的就是
+    //     键位行这一行,逐字节对过;帧上其余部分与上一次刷新逐字节相同。
+    //   · **#73**:键位行钉在册体内层**末行**(此前随册体内容长短漂:内容一多
+    //     就被顶出可见区,键位行整行消失、命中区也跟着不产)。八帧全部重刷,
+    //     每帧差的**只是键位行这一行的位置**——段文案一个字节都没动(订阅 /
+    //     钥匙册的 `g 取回` 段本轮才挂上命中目标,屏上文字与刷新前逐字相同),
+    //     逐字节对过;帧上其余部分与上一次刷新逐字节相同。
+    //   · **ADR-0009 Q5(scopes 报值)随第 8 轮分支并入**:`949643b` 把钥匙册
+    //     作用域行从「只报条数」改成「原样逐条报」(第 9 轮册内过滤按 scope 的
+    //     值匹配之后显出的一处不一致:能按一个只看得到条数的字段过滤)。该提交
+    //     落在第 8 轮分支上,本分支(第 9 轮)的钥匙册两帧期望还是旧句,合并后
+    //     **只有这一行红**。两帧重刷,差的就只有作用域这一行(`2 条` →
+    //     `repo · read:org`),逐字节对过;帧上其余部分与上一次刷新逐字节相同。
+    // 除上面记下的几处,其余六帧自 #66 基线以来一个字节都没动过——所以
+    // 「基线 + 六次有记账的刷新」就是这一族期望值的全部来历,没有第七次,
+    // 也没有哪一次是悄悄回填的。
+    //
+    // 修订纪律同 `ui::tests::golden_常畅态_80x30_整帧逐字节`:若既有渲染面
+    // 发生真实回归而改期望,必须与该回归同一次提交并说明——不许为过测试回填。
+
+    /// 四本册各就绪一个 app(夹具 / splash / 只读 ls 回音全部钉死),
+    /// 整帧 golden 与「四本册走同一条键位路径」共用。
+    ///
+    /// 场景钉死到不随机器与测试次序漂:数据仓根显式钉成临时目录(否则
+    /// golden 字节与键位测试跟着跑测试那台机器的配置漂,建议命令里带
+    /// `--root <根>`)、NW_HOME 显式钉成 `/nw`(顶栏那一行;别的测试会经
+    /// `apply_nw_home` 写进程环境,不钉就随执行次序漂)。理由同
+    /// `ui::tests::golden_常畅态_80x30_整帧逐字节` 的头注:环境噪声不算回归。
+    fn book_apps() -> Vec<(&'static str, crate::app::App)> {
+        let vps = {
+            let ls = r#"{"catalogPath":"/r/vps.json","machines":[{"name":"gate","ips":[{"label":"home","addr":"10.0.0.1"}],"port":22,"logins":[{"user":"root","ref":"$DEPLOY_KEY"}],"note":"门口"},{"name":"bare","ips":[],"port":0,"logins":[]}]}"#;
+            let mut app = crate::app::App::with_runner(std::sync::Arc::new(
+                crate::engine::FakeRunner::new(&[("vps ls", 0, ls)]),
+            ));
+            app.splash = false;
+            app.screen = crate::app::Screen::Vps;
+            app.capabilities.record(
+                crate::engine::Capability::Vps,
+                crate::engine::Probe::Available,
+            );
+            app.vps_ls = Some(serde_json::from_str(ls).unwrap());
+            app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+            app.nw_home = "/nw".into(); // 顶栏 NW_HOME 也钉死(别的测试会写进程环境)
+            app
+        };
+        let mut tag = tag_app(&[("tag ls", 0, TAG_LS_ALL)]);
+        tag.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        tag.nw_home = "/nw".into();
+        tap(&mut tag, KeyCode::Char('l'));
+        feed(&mut tag);
+        let (mut sub, _r) = sub_app(&[("subscription ls", 0, SUB_LS_ALL)]);
+        sub.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        sub.nw_home = "/nw".into();
+        tap(&mut sub, KeyCode::Char('l'));
+        feed(&mut sub);
+        let (mut key, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        key.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        key.nw_home = "/nw".into();
+        tap(&mut key, KeyCode::Char('l'));
+        feed(&mut key);
+        vec![("机器", vps), ("标签", tag), ("订阅", sub), ("钥匙", key)]
+    }
+
+    /// 按册名取一本就绪的册(四本册同一套就绪口径)。
+    fn book(name: &str) -> crate::app::App {
+        book_apps()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, a)| a)
+            .expect("四本册之一")
+    }
+
+    /// 整帧逐字节比对(got 与 want 一上一下,漂一个字节就红)。
+    fn assert_book_frame(app: &crate::app::App, w: u16, h: u16, want: &str) {
+        assert_eq!(
+            crate::testutil::frame_display(app, w, h),
+            want,
+            "{w}×{h} 整帧渲染发生变化(见本族测试头注的修订纪律)"
+        );
+    }
+    /// 机器册 80×30 整帧 golden(基线 `bb19d70` + #66;此后 #67 加 `m 换册`、#69 加 `/ 过滤`、#70 改 `Esc` 并加 `Enter 反查`)。
+    const VPS_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
+│  ▸ 概览  ││  当前册 机器 · 机器 · 编目 /r/vps.json                           │
+│  ⚙ 装配  ││  ▸ bare  端口 0                                                  │
+│  ✚ 健康  ││    地址 ——                                                       │
+│  ▤ 配方  ││    登录 ——                                                       │
+│▸ ▩ 编目  ││    备注 ——                                                       │
+│  ✦ 设置  ││    gate  端口 22                                                 │
+│          ││    地址 home=10.0.0.1                                            │
+│          ││    登录 root→$DEPLOY_KEY                                         │
+│          ││    备注 门口                                                     │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││  ↑/↓ 选 ·r 登记 ·d 删除 ·Esc ·Enter 反查 ·m 换册 ·/ 过滤         │
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+    /// 机器册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
+    const VPS_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
+  ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
+┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
+│  当前册 机器 · 机器 · 编目 /r/vps.json                         │
+│  ▸ bare  端口 0                                                │
+│    地址 ——                                                     │
+│    登录 ——                                                     │
+│    备注 ——                                                     │
+│    gate  端口 22                                               │
+│    地址 home=10.0.0.1                                          │
+│    登录 root→$DEPLOY_KEY                                       │
+│    备注 门口                                                   │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│  ↑/↓ 选 ·r 登记 ·d 删除 ·Esc ·Enter 反查 ·m 换册 ·/ 过滤       │
+└────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
+    /// 标签册 80×30 整帧 golden(基线 `bb19d70` + #66;#65 评审第 3 条把册头 `反查 /tmp` 改回 `全部标签`)。
+    const TAG_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
+│  ▸ 概览  ││  当前册 标签 · 全部标签 · 编目 /r/tags.json                      │
+│  ⚙ 装配  ││  ▸ bare                                                          │
+│  ✚ 健康  ││    引用 ——                                                       │
+│  ▤ 配方  ││    pi                                                            │
+│▸ ▩ 编目  ││    引用 skill/o/r/deep-research · vps/gate                       │
+│  ✦ 设置  ││  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)      │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││  ↑/↓ 选 ·Enter 反查 ·l 全部 ·r 挂标签 ·d 摘/删 ·m 换册 ·/ 过滤   │
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+    /// 标签册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
+    const TAG_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
+  ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
+┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
+│  当前册 标签 · 全部标签 · 编目 /r/tags.json                    │
+│  ▸ bare                                                        │
+│    引用 ——                                                     │
+│    pi                                                          │
+│    引用 skill/o/r/deep-research · vps/gate                     │
+│  边界:标签绝不进配方/锁定集/bundle/装配(不提供烤进去的入口)    │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│  ↑/↓ 选 ·Enter 反查 ·l 全部 ·r 挂标签 ·d 摘/删 ·m 换册 ·/ 过滤 │
+└────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
+    /// 订阅册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动)。
+    const SUB_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
+│  ▸ 概览  ││  当前册 订阅 · 全部订阅 · 编目 /r/subscriptions.json             │
+│  ⚙ 装配  ││  ▸ airport  应用 Mihomo                                          │
+│  ✚ 健康  ││    到期 2099-03-01  ✓ active  剩 26000 天                        │
+│  ▤ 配方  ││    forever  应用 Surge                                           │
+│▸ ▩ 编目  ││    到期 永不过期  ✓ active  剩余 ——                              │
+│  ✦ 设置  ││    gone  应用 Mihomo                                             │
+│          ││    到期 2020-01-01  ✗ expired  剩 -2000 天                       │
+│          ││    soon  应用 Clash                                              │
+│          ││    到期 2099-03-04  警 expiring  剩 3 天                         │
+│          ││  汇总 2 active · 1 expiring · 1 expired                          │
+│          ││  三态按 UTC 在读取时算、永不写进文件;只标记不治理(过期不改退出   │
+│          ││  取回链接(面板不代跑,按 g 收进日志):                             │
+│          ││nw subscription get --name airport --root /tmp | jq -r .data.url  │
+│          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
+│          ││  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发重   │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││  ↑/↓ 选订阅 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤      │
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+    /// 订阅册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
+    const SUB_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
+  ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
+┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
+│  当前册 订阅 · 全部订阅 · 编目 /r/subscriptions.json           │
+│  ▸ airport  应用 Mihomo                                        │
+│    到期 2099-03-01  ✓ active  剩 26000 天                      │
+│    forever  应用 Surge                                         │
+│    到期 永不过期  ✓ active  剩余 ——                            │
+│    gone  应用 Mihomo                                           │
+│    到期 2020-01-01  ✗ expired  剩 -2000 天                     │
+│    soon  应用 Clash                                            │
+│    到期 2099-03-04  警 expiring  剩 3 天                       │
+│  汇总 2 active · 1 expiring · 1 expired                        │
+│  三态按 UTC 在读取时算、永不写进文件;只标记不治理(过期不改退   │
+│  取回链接(面板不代跑,按 g 收进日志):                           │
+│nw subscription get --name airport --root /tmp | jq -r .data.u  │
+│  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
+│  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发   │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│  ↑/↓ 选订阅 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤    │
+└────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
+    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动)。
+    const KEY_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.2 · nw 探测中 · 测试注入  │  NW_H
+┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
+│  ▸ 概览  ││  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                      │
+│  ⚙ 装配  ││  ▸ ci  kind github-key                                           │
+│  ✚ 健康  ││    主机 ghe.internal                                             │
+│  ▤ 配方  ││    作用域 未声明(0 条)                                           │
+│▸ ▩ 编目  ││    轮换日 2025-11-02                                             │
+│  ✦ 设置  ││    deploy  kind github-key                                       │
+│          ││    主机 github.com                                               │
+│          ││    作用域 repo · read:org                                        │
+│          ││    轮换日 2026-01-15                                             │
+│          ││  取回钥匙(面板不代跑,按 g 收进日志):                             │
+│          ││nw key get --name ci --root /tmp | jq -r .data.key                │
+│          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
+│          ││  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供烤  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││                                                                  │
+│          ││  ↑/↓ 选钥匙 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤      │
+└──────────┘└──────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
+    const KEY_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
+  ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
+┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
+│  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                    │
+│  ▸ ci  kind github-key                                         │
+│    主机 ghe.internal                                           │
+│    作用域 未声明(0 条)                                         │
+│    轮换日 2025-11-02                                           │
+│    deploy  kind github-key                                     │
+│    主机 github.com                                             │
+│    作用域 repo · read:org                                      │
+│    轮换日 2026-01-15                                           │
+│  取回钥匙(面板不代跑,按 g 收进日志):                           │
+│nw key get --name ci --root /tmp | jq -r .data.key              │
+│  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
+│  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供  │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│                                                                │
+│  ↑/↓ 选钥匙 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤    │
+└────────────────────────────────────────────────────────────────┘
+ j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
+
+    /// 机器册整帧 golden:常畅 80×30 与紧凑 66×50 两档各一份,逐字节钉住
+    /// (#66 验收第 1 条:纯重构,零用户可见变化——基线 `bb19d70` + #66;
+    /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
+    #[test]
+    fn 机器册整帧golden_两档golden() {
+        let app = book("机器");
+        assert_book_frame(&app, 80, 30, VPS_80X30);
+        assert_book_frame(&app, 66, 50, VPS_66X50);
+    }
+
+    /// 标签册整帧 golden:常畅 80×30 与紧凑 66×50 两档各一份,逐字节钉住
+    /// (#66 验收第 1 条:纯重构,零用户可见变化——基线 `bb19d70` + #66;
+    /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
+    #[test]
+    fn 标签册整帧golden_两档golden() {
+        let app = book("标签");
+        assert_book_frame(&app, 80, 30, TAG_80X30);
+        assert_book_frame(&app, 66, 50, TAG_66X50);
+    }
+
+    /// 订阅册整帧 golden:常畅 80×30 与紧凑 66×50 两档各一份,逐字节钉住
+    /// (#66 验收第 1 条:纯重构,零用户可见变化——基线 `bb19d70` + #66;
+    /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
+    #[test]
+    fn 订阅册整帧golden_两档golden() {
+        let app = book("订阅");
+        assert_book_frame(&app, 80, 30, SUB_80X30);
+        assert_book_frame(&app, 66, 50, SUB_66X50);
+    }
+
+    /// 钥匙册整帧 golden:常畅 80×30 与紧凑 66×50 两档各一份,逐字节钉住
+    /// (#66 验收第 1 条:纯重构,零用户可见变化——基线 `bb19d70` + #66;
+    /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
+    #[test]
+    fn 钥匙册整帧golden_两档golden() {
+        let app = book("钥匙");
+        assert_book_frame(&app, 80, 30, KEY_80X30);
+        assert_book_frame(&app, 66, 50, KEY_66X50);
+    }
+
+    /// 四本册走同一条键位路径(#66 验收第 4 条):对四本册各驱动一次**相同**
+    /// 的键序列(`l` 重读 → `↓` → `↑`),断言回音形状同形——
+    /// ① 每本都只下发一条只读 argv,形状都是 `<组> ls --root <根>`;
+    /// ② 每本都只多一行日志,都带「已入队」+「只读」+「不写任何文件」;
+    /// ③ 选中行增量相同(`↓` = +1、`↑` = −1,与行数无关);
+    /// ④ 帧上「当前是哪一本」与册内键位行都在,两档都不溢宽。
+    ///
+    /// 收敛之前这四段是四份逐字重复的分叉(每本一条 `if kind ==`),改一本
+    /// 漏三本是常态;收敛之后四本册同一条代码路径。谁再把某一本单独拆出去
+    /// (在调用方插一个 `if kind ==`),这条就红。
+    #[test]
+    fn 四本册同一键序列_回音与日志同形() {
+        for (label, mut app) in book_apps() {
+            let root = app.usable_data_root().unwrap_or_default();
+            let group = match label {
+                "机器" => "vps",
+                "标签" => "tag",
+                "订阅" => "subscription",
+                _ => "key",
+            };
+            let log_before = app.log.len();
+            // ① l:一条只读 argv,形状同形
+            tap(&mut app, KeyCode::Char('l'));
+            let argv = app.queue.last().cloned().unwrap_or_default();
+            assert_eq!(argv.len(), 4, "{label}册 ls 的 argv 四段");
+            assert_eq!(argv[0], group, "{label}册 ls 打到自己的组");
+            assert_eq!(argv[1], "ls", "{label}册 ls 是只读子命令");
+            assert_eq!(argv[2], "--root", "{label}册 ls 只认 --root(不猜目录)");
+            assert_eq!(argv[3], root, "{label}册 ls 的根是就绪的数据仓根");
+            // ② 一行日志,同一形状(四本措辞各有各的限定词,形状不变)
+            assert_eq!(app.log.len(), log_before + 1, "{label}册 l 只留一行日志");
+            let line = app.log.first().cloned().unwrap_or_default(); // 最新一行在前
+            assert!(line.contains("ls 已入队"), "{label}册日志说清入队:{line}");
+            assert!(line.contains("只读"), "{label}册日志说清只读:{line}");
+            assert!(
+                line.contains("不写任何文件"),
+                "{label}册日志说清不写:{line}"
+            );
+            feed(&mut app);
+            // ③ ↑/↓ 选中增量与行数无关(到界绕回是另一条口径,这里只测增量)
+            let sel0 = app.catalog_sel();
+            tap(&mut app, KeyCode::Down);
+            assert_eq!(app.catalog_sel(), sel0 + 1, "{label}册 ↓ 下移一行");
+            tap(&mut app, KeyCode::Up);
+            assert_eq!(app.catalog_sel(), sel0, "{label}册 ↑ 上移一行");
+            // ④ 帧上两样都在:当前是哪一本 + 册内键位行
+            for (w, h) in [(80u16, 30u16), (66, 50)] {
+                let f = crate::testutil::frame_display(&app, w, h);
+                assert!(
+                    f.contains(&format!("当前册 {label}")),
+                    "{label}册 {w}×{h} 报出当前册"
+                );
+                assert!(
+                    f.lines()
+                        .any(|ln| ln.contains("Esc/q 返航") || ln.contains("m 换册")),
+                    "{label}册 {w}×{h} 键位行在场:{f}"
+                );
+                for ln in f.lines() {
+                    assert!(
+                        unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                        "{label}册 {w}×{h} 有行超宽:{ln}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 「一条只在一本册上成立的关切,落在查表成员上即生效」(#66 验收第 5 条)。
+    ///
+    /// 钉两件真事,不靠口头约定:`g`(取回本体的建议命令)只属于订阅册与
+    /// 钥匙册——投影里有本体槽的两本(ADR-0009 §1 面板不代跑 get);
+    /// `Enter`(反查)属于标签册与机器册——标签册带参反查选中的那条(#54)、
+    /// 机器册无参列全部再本地精确匹配「什么标签引用了这一条」(#70;`vps`
+    /// 在 `TAG_REF_KINDS` 里,机器条目可打标签)。订阅 / 钥匙册的条目不在
+    /// `TAG_REF_KINDS` 里,没有这一关切。对四本册各按一次:有这一关切的给
+    /// 各人话的一行(标签册入队 / 机器册门禁指路),没有的这一关切的两本
+    /// **一个字节都不多打**。谁把这一条挪出查表成员、或往调用方插一个
+    /// `if kind ==`,这条测试就红。
+    #[test]
+    fn 只属一两本的关切_按册各按一次_表外一本都不多发() {
+        for (label, mut app) in book_apps() {
+            let log_before = app.log.len();
+            let sheet_before = app.catalog_len();
+            let sel_before = app.catalog_sel();
+            // g:只有订阅册 / 钥匙册有这一条关切
+            tap(&mut app, KeyCode::Char('g'));
+            let has_g = matches!(label, "订阅" | "钥匙");
+            if has_g {
+                // 两行:建议命令 + 「get 是上游唯一回显本体的出口」那句纪律注
+                assert_eq!(app.log.len(), log_before + 2, "{label}册 g 留两行");
+                // 日志最新在前:先入队的是建议命令那一行,纪律注压在它上面
+                let line = app.log.get(1).cloned().unwrap_or_default();
+                assert!(
+                    line.starts_with(if label == "订阅" {
+                        "取回链接"
+                    } else {
+                        "取回钥匙"
+                    }),
+                    "{label}册 g 给的是自己那一本的取回建议:{line}"
+                );
+                assert!(
+                    app.log[0].contains("上游唯一回显本体的出口"),
+                    "{label}册 g 同时留一句纪律注:{s}",
+                    s = app.log[0]
+                );
+            } else {
+                assert_eq!(
+                    app.log.len(),
+                    log_before,
+                    "{label}册没有 g 这一关切:一字不多打"
+                );
+            }
+            assert!(app.queue.is_empty(), "{label}册 g 只给命令文案,不下发");
+            // g 是纯读关切:册体与选中一个字节都不动(四本同一口径)
+            assert_eq!(app.catalog_len(), sheet_before, "{label}册 g 不改册体");
+            assert_eq!(app.catalog_sel(), sel_before, "{label}册 g 不改选中");
+            // Enter 反查:标签册(#54 旧态)与机器册(#70 上浮)都有这一关切,
+            // 但两本读法不同——标签册带参反查选中的那条,机器册无参列全部再
+            // 本地按 `<kind>/<条目>` 精确匹配。订阅 / 钥匙册的条目不在
+            // TAG_REF_KINDS 里,没有这一关切(表外一本都不多发)。
+            tap(&mut app, KeyCode::Enter);
+            if label == "标签" {
+                let argv = app.queue.last().cloned().unwrap_or_default();
+                assert_eq!(argv[0], "tag", "标签册 Enter 走 tag 组");
+                assert_eq!(argv[1], "ls", "标签册 Enter 是只读反查");
+                assert_eq!(argv[2], "bare", "反查选中的这一条(排序后首行)");
+                assert_eq!(argv[3], "--root", "反查只认 --root");
+                assert_eq!(
+                    app.log.len(),
+                    log_before + 1,
+                    "标签册 Enter 只留一行入队日志"
+                );
+                // 在途清空上一轮结论是 #54 既定语义(不拿旧结论冒充本次),
+                // 不是这两键「改了册体内容」——回音到达才重新摊开。
+                assert_eq!(app.catalog_len(), 0, "反查在途不拿上一轮结论冒充本次");
+            } else if label == "机器" {
+                // 机器册反查(#70 上浮):本夹具只记了 vps 能力、没记 tag 能力,
+                // 所以门禁在「标签组能力」这道上指路——**一次引擎调用都不发**,
+                // 只留一行人话。门禁顺序与 zero-call 由 #70 专测钉,这里只证
+                // 「这一本确有 Enter 关切」(不再是 #66 时的「Enter 无声」)。
+                assert!(app.queue.is_empty(), "机器册反查门不过:零引擎调用");
+                assert_eq!(
+                    app.log.len(),
+                    log_before + 1,
+                    "机器册 Enter 反查门不过留一行指路"
+                );
+                assert_eq!(app.catalog_len(), sheet_before, "机器册反查门不过不改册体");
+                assert_eq!(app.catalog_sel(), sel_before, "机器册反查门不过不改选中");
+            } else {
+                assert!(
+                    app.queue.is_empty(),
+                    "{label}册没有 Enter 反查:一个字节都不多打"
+                );
+                assert_eq!(
+                    app.log.len(),
+                    log_before + 2 * usize::from(has_g),
+                    "{label}册 Enter 无声"
+                );
+                assert_eq!(app.catalog_len(), sheet_before, "{label}册册体原样");
+                assert_eq!(app.catalog_sel(), sel_before, "{label}册选中原样");
+            }
+        }
+    }
+
+    /// `catalog_filter: [String; 4]` 与 `CatalogKind::idx()` 的耦合钉在这儿
+    /// (#65 评审第 9 条):第五本册子若只给 `idx()` 加了第 5 个下标、却忘了把
+    /// 数组放宽成 5,`catalog_filter()[idx]` 就是一次**运行期索引 panic**,不是
+    /// 编译错误——编译期一处都不红,单测跑到那一本才炸。这条按换册环(`next()`)
+    /// 把每一本都走一遍,断言每本的 `idx()` 都落在那只数组的长度里;顺带钉各本
+    /// 占的槽两两不同(重槽 = 两本册子共用一个过滤词,规格故事 24「按册各留一份」
+    /// 就破了)。走环而不写死四本清单,是为了第五本真来时这条自己会长。
+    #[test]
+    fn 每本册的idx都落进过滤词数组_且各本不重槽() {
+        let slots =
+            crate::app::App::with_runner(std::sync::Arc::new(crate::engine::FakeRunner::new(&[])))
+                .catalog_filter
+                .len();
+        let mut seen: Vec<usize> = Vec::new();
+        let mut k = CatalogKind::Vps;
+        for _ in 0..slots {
+            let i = k.idx();
+            assert!(
+                i < slots,
+                "{} 册的 idx()={i} 超出过滤词数组长度 {slots}:加第五本册子时要把 `catalog_filter: [String; N]` 一起放宽",
+                k.label()
+            );
+            assert!(!seen.contains(&i), "{} 册与别的册重槽(idx={i})", k.label());
+            seen.push(i);
+            k = k.next();
+        }
+        assert_eq!(seen.len(), slots, "换册环一圈走过的册数 = 数组长度");
+    }
+
+    // ---- #69 册内过滤:四本册都能 `/` 过滤,纯本地筛选(与 #61 五域同源同形) ----
+    //
+    // 全部走在公开缝上:`App::update(Message::Key/Mouse)` 驱动、经 FakeRunner
+    // 回放,断言落在 frame_display 帧、可观察状态后果(catalog_visible /
+    // catalog_sel / selected_*_name / catalog_filter)、命中区(FakeRunner 的
+    // call_argvs 探针)上——不断言私有签名或字段名。每本册用 book_apps() 的
+    // 就绪态,vps 另用直接灌 vps_ls 的 vps_book 便于自造条数。
+
+    /// 建一本就绪的机器册:machines 是 VpsLsData 的 machines JSON 数组。
+    /// 直接灌 vps_ls(不下发命令),FakeRunner 只为 `/ 过滤` 后的 `l` 刷新备用。
+    fn vps_book(machines: &str) -> crate::app::App {
+        let ls = format!(r#"{{"catalogPath":"/r/vps.json","machines":{machines}}}"#);
+        let mut app = crate::app::App::with_runner(std::sync::Arc::new(
+            crate::engine::FakeRunner::new(&[("vps ls", 0, ls.as_str())]),
+        ));
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
+        app
+    }
+
+    /// 进过滤输入态、敲词、收词(走真实键路,与 #61 filter_type 同一条)。连敲多
+    /// 词先 Esc 清掉上一轮(过滤词按册各留一份,这里只清当前这本;不在输入态时
+    /// Esc 才走清词路,与 #61 口径一致)。
+    fn 过滤敲词(app: &mut crate::app::App, q: &str) {
+        if !app.catalog_filter().is_empty() {
+            tap(app, KeyCode::Esc);
+        }
+        tap(app, KeyCode::Char('/'));
+        for c in q.chars() {
+            tap(app, KeyCode::Char(c));
+        }
+        tap(app, KeyCode::Enter);
+    }
+
+    /// 左键点中某命中目标(坐标取自布局模型,点哪拿哪;与渲染同源)。
+    fn 点中(
+        app: &mut crate::app::App,
+        w: u16,
+        h: u16,
+        pred: impl Fn(&crate::layout::Target) -> bool,
+    ) {
+        app.size = Rect::new(0, 0, w, h);
+        let r = crate::layout::hitmap(app.size, app, crate::layout::size_class(app.size))
+            .into_iter()
+            .find(|(_, t)| pred(t))
+            .map(|(r, _)| r)
+            .expect("该目标应有命中区");
+        app.update(crate::app::Message::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.x + r.width / 2,
+            row: r.y + r.height / 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    /// 喂一条 vps ls 回音(走 on_vps_echo → catalog_clamp,即 `l` 刷新的收敛路径;
+    /// FakeRunner 每次回放同一 fixture,故自造回音面来验「刷新后选中钳回可见行数」)。
+    fn feed_vps_echo(app: &mut crate::app::App, machines: &str) {
+        let data = format!(r#"{{"catalogPath":"/r/vps.json","machines":{machines}}}"#);
+        let env = format!(
+            r#"{{"schema":"nw/vps-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{data}}}"#
+        );
+        let out = crate::engine::EngineOutput {
+            args: vec!["vps".into(), "ls".into(), "--root".into(), "/tmp".into()],
+            exit_code: crate::engine::ExitCode::from_number(0),
+            ok: true,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(&env).ok(),
+            raw_stdout: env,
+            parse_error: None,
+        };
+        app.update(crate::app::Message::Engine(
+            crate::engine::EngineEvent::Finished(Box::new(out)),
+        ));
+    }
+
+    /// 规格验收 1 / 故事 18:过滤收窄后再放宽,册体回到与过滤前**逐字节同序**
+    /// (无关键词时 vis = 0..n 全量同序,面板永不重排引擎输出)。
+    #[test]
+    fn 过滤收窄再放宽_册体回到逐字节同序() {
+        let mut app = book("机器");
+        let before = crate::testutil::frame_display(&app, 80, 30);
+        过滤敲词(&mut app, "gate");
+        let narrowed = crate::testutil::frame_display(&app, 80, 30);
+        assert_ne!(
+            narrowed, before,
+            "收窄后册体确实变了(bare 被滤掉、标题多命中数)"
+        );
+        assert!(narrowed.contains("命中 1/2"), "收窄显命中/总数:{narrowed}");
+        assert!(!narrowed.contains("bare"), "收窄后 bare 不在场:{narrowed}");
+        // Esc 清词放宽:册体回到与过滤前逐字节同序
+        tap(&mut app, KeyCode::Esc);
+        let after = crate::testutil::frame_display(&app, 80, 30);
+        assert_eq!(after, before, "清空过滤后册体与过滤前逐字节同序");
+    }
+
+    /// 规格验收 5 / 故事 20-21:过滤空与「册体本来是空的」两态可区分,各有不同
+    /// 文案与下一步,互不冒充(绝不共用一个空列表)。
+    #[test]
+    fn 过滤空与册体本来空_两态可区分_互不冒充() {
+        // 册体本来空:0 台机器
+        let empty = vps_book("[]");
+        let f_empty = crate::testutil::frame_display(&empty, 80, 30);
+        assert!(
+            f_empty.contains("编目里还没有机器"),
+            "册体真空的措辞:{f_empty}"
+        );
+        assert!(
+            !f_empty.contains("无命中"),
+            "册体真空不冒充过滤空:{f_empty}"
+        );
+        // 过滤空:有条目但被全筛掉
+        let mut filtered = book("机器");
+        过滤敲词(&mut filtered, "不存在的关键词");
+        let f_filtered = crate::testutil::frame_display(&filtered, 80, 30);
+        assert!(f_filtered.contains("无命中"), "过滤空的措辞:{f_filtered}");
+        assert!(f_filtered.contains("没有命中"), "过滤空给事实:{f_filtered}");
+        assert!(
+            f_filtered.contains("按 / 改词"),
+            "过滤空给改词出路:{f_filtered}"
+        );
+        assert!(
+            f_filtered.contains("Esc 清空过滤"),
+            "过滤空给清滤出路:{f_filtered}"
+        );
+        assert!(
+            !f_filtered.contains("编目里还没有"),
+            "过滤空不冒充册体真空:{f_filtered}"
+        );
+    }
+
+    /// 规格验收 3 / 故事 16:大小写不敏感匹配。
+    #[test]
+    fn 过滤大小写不敏感() {
+        let mut app = book("机器"); // gate / bare
+        过滤敲词(&mut app, "GATE");
+        assert_eq!(app.catalog_visible().len(), 1, "全大写关键词命中小写名");
+        assert_eq!(app.selected_vps_name().as_deref(), Some("gate"));
+        过滤敲词(&mut app, "GaTe");
+        assert_eq!(app.catalog_visible().len(), 1, "混合大小写同样命中");
+    }
+
+    /// 规格验收 3 / 故事 17:占位符「——」与引擎未给出的字段不参与匹配——bare
+    /// 没有 ips/logins/note,明细画「——」,但按「——」过滤不该命中它。
+    #[test]
+    fn 占位符与缺字段不参与匹配() {
+        let mut app = book("机器"); // gate(有字段) / bare(全缺 → 明细画 ——)
+        过滤敲词(&mut app, "——");
+        assert_eq!(
+            app.catalog_visible().len(),
+            0,
+            "「——」不冒充可检索内容:bare 的缺字段不入匹配面"
+        );
+        assert!(app.selected_vps_name().is_none(), "无可见行");
+    }
+
+    /// 规格验收 4 / 故事 15(硬验收):过滤全程 FakeRunner 收到的 argv 里**不含
+    /// 关键词**。过滤是纯本地筛选,不打新命令;唯一那条 `l` 只读 argv 也不含词。
+    #[test]
+    fn 过滤全程_下发argv不含过滤词() {
+        let ls = r#"{"catalogPath":"/r/vps.json","machines":[{"name":"gate","ips":[],"port":0,"logins":[]},{"name":"bare","ips":[],"port":0,"logins":[]}]}"#;
+        let runner = std::sync::Arc::new(crate::engine::FakeRunner::new(&[("vps ls", 0, ls)]));
+        let mut app = crate::app::App::with_runner(runner.clone());
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        // 真刷新一次:入队并回放,让 FakeRunner 记到一条 argv
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        let before = runner.call_argvs().len();
+        assert_eq!(before, 1, "刷新只打过一条只读 argv");
+        // 过滤敲词(纯本地):不应再打任何命令
+        过滤敲词(&mut app, "gate");
+        let argvs = runner.call_argvs();
+        assert_eq!(argvs.len(), before, "过滤是纯本地,不打新命令");
+        for a in &argvs {
+            assert!(
+                !a.iter().any(|s| s.contains("gate")),
+                "没有任何一条下发 argv 含过滤词:{a:?}"
+            );
+        }
+    }
+
+    /// 规格验收 6 / 故事 22:Esc 清词并让选中回顶。
+    #[test]
+    fn 逃逸键清词并让选中回顶() {
+        let machines = r#"[{"name":"gate-a","ips":[],"port":0,"logins":[]},{"name":"gate-b","ips":[],"port":0,"logins":[]},{"name":"gate-c","ips":[],"port":0,"logins":[]}]"#;
+        let mut app = vps_book(machines);
+        过滤敲词(&mut app, "gate");
+        assert_eq!(app.catalog_visible().len(), 3, "三条都含 gate");
+        tap(&mut app, KeyCode::Down);
+        tap(&mut app, KeyCode::Down);
+        assert_eq!(app.catalog_sel(), 2, "选中挪到第 3 个可见行");
+        tap(&mut app, KeyCode::Esc); // 清词 + 回顶
+        assert_eq!(app.catalog_filter(), "", "Esc 清空过滤词");
+        assert_eq!(app.catalog_sel(), 0, "Esc 让选中回顶");
+        assert_eq!(app.catalog_visible().len(), 3, "清词后回到全量");
+    }
+
+    /// 规格验收 6 / 故事 23:切屏退输入态但留词。输入态里唯一能绕开吞键守卫的
+    /// 是鼠标点导航——点它切屏并退输入态,过滤词留着;切回编目屏词还在、仍生效。
+    #[test]
+    fn 输入态里点导航切屏_退输入态留词() {
+        let mut app = book("机器");
+        tap(&mut app, KeyCode::Char('/'));
+        for c in "gate".chars() {
+            tap(&mut app, KeyCode::Char(c));
+        }
+        assert!(app.catalog_filter_on, "在输入态");
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::NavTo(Screen::Overview))
+        });
+        assert_eq!(app.screen, Screen::Overview, "点导航切到概览");
+        assert!(!app.catalog_filter_on, "切屏退输入态");
+        assert_eq!(app.catalog_filter(), "gate", "过滤词留着");
+        // 切回编目屏:词还在、仍生效(gate 命中 1)
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::NavTo(Screen::Vps))
+        });
+        assert_eq!(app.screen, Screen::Vps);
+        assert_eq!(app.catalog_filter(), "gate", "切回编目屏过滤词还在");
+        assert_eq!(app.catalog_visible().len(), 1, "过滤词仍生效");
+    }
+
+    /// 规格验收 6 / 故事 23(键路):收词退输入态后,壳级切屏(j/k)不碰过滤词,
+    /// 绕回编目屏词仍生效——与 #61 五域同一条后果链。
+    #[test]
+    fn 切屏留词_绕回编目仍生效() {
+        let mut app = book("机器");
+        过滤敲词(&mut app, "gate");
+        assert!(!app.catalog_filter_on, "收词后已退输入态");
+        tap(&mut app, KeyCode::Char('j')); // Vps → Settings
+        assert_ne!(app.screen, Screen::Vps, "切走");
+        assert!(!app.catalog_filter_on, "切屏后退输入态");
+        tap(&mut app, KeyCode::Char('k')); // Settings → Vps
+        assert_eq!(app.screen, Screen::Vps, "绕回编目屏");
+        assert_eq!(app.catalog_filter(), "gate", "过滤词没被切屏清掉");
+        assert_eq!(app.catalog_visible().len(), 1, "过滤词仍生效");
+    }
+
+    /// 规格验收 6 / 故事 24:换册(m)过滤词按册各留各的——机器册筛「gate」、切到
+    /// 钥匙册筛「deploy」、回头机器册还在「gate」上。
+    #[test]
+    fn 换册各留各的词() {
+        let mut app = book("机器"); // [gate, bare]
+                                    // 同一本 app 再装钥匙册数据(机器册已在场)
+        let key_ls = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"ghe.internal","scopes":[],"rotatedAt":"2025-11-02"},{"name":"deploy","kind":"github-key","host":"github.com","scopes":["repo"],"rotatedAt":"2026-01-15"}]}}"#;
+        let key_echo = crate::engine::EngineOutput {
+            args: vec!["key".into(), "ls".into(), "--root".into(), "/tmp".into()],
+            exit_code: crate::engine::ExitCode::from_number(0),
+            ok: true,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(key_ls).ok(),
+            raw_stdout: key_ls.to_string(),
+            parse_error: None,
+        };
+        app.update(crate::app::Message::Engine(
+            crate::engine::EngineEvent::Finished(Box::new(key_echo)),
+        ));
+        app.capabilities.record(
+            crate::engine::Capability::Key,
+            crate::engine::Probe::Available,
+        );
+        // 机器册筛 gate
+        过滤敲词(&mut app, "gate");
+        assert_eq!(app.catalog_filter(), "gate");
+        assert_eq!(app.catalog_visible().len(), 1);
+        // 切到钥匙册(Vps→Tag→Sub→Key)
+        for _ in 0..3 {
+            tap(&mut app, KeyCode::Char('m'));
+        }
+        assert_eq!(app.catalog_kind, CatalogKind::Key, "切到钥匙册");
+        assert_eq!(app.catalog_filter(), "", "钥匙册各留各的词:起初空");
+        // 钥匙册筛 deploy
+        过滤敲词(&mut app, "deploy");
+        assert_eq!(app.catalog_filter(), "deploy");
+        assert_eq!(app.catalog_visible().len(), 1, "deploy 命中 1 把钥匙");
+        // 切回机器册:`next()` 的环在 Key → Vps 处合上,所以从钥匙册回机器册
+        // 只要**一次** `m`(Vps→Tag→Sub→Key 三步、Key→Vps 一步,环不是对称的)。
+        tap(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.catalog_kind, CatalogKind::Vps, "切回机器册");
+        assert_eq!(app.catalog_filter(), "gate", "回头机器册还在 gate 上");
+        assert_eq!(app.catalog_visible().len(), 1, "gate 过滤仍生效");
+    }
+
+    /// 规格验收 6 / 故事 25:刷新(l)后选中钳回可见行数内(不越界、不指向看不见的行)。
+    #[test]
+    fn 刷新后_选中钳回可见行数内() {
+        let machines = r#"[{"name":"gate-a","ips":[],"port":0,"logins":[]},{"name":"gate-b","ips":[],"port":0,"logins":[]},{"name":"gate-c","ips":[],"port":0,"logins":[]}]"#;
+        let mut app = vps_book(machines);
+        过滤敲词(&mut app, "gate");
+        assert_eq!(app.catalog_visible().len(), 3);
+        tap(&mut app, KeyCode::Down);
+        tap(&mut app, KeyCode::Down);
+        assert_eq!(app.catalog_sel(), 2, "选中在可见位 2");
+        // 刷新回音只剩 gate-a 含 gate(其余换名):可见数塌到 1,选中必须钳回 0
+        feed_vps_echo(
+            &mut app,
+            r#"[{"name":"gate-a","ips":[],"port":0,"logins":[]},{"name":"solo","ips":[],"port":0,"logins":[]}]"#,
+        );
+        assert_eq!(app.catalog_visible().len(), 1, "刷新后只剩 gate-a 含 gate");
+        assert_eq!(app.catalog_sel(), 0, "选中钳回可见行数内");
+    }
+
+    /// 规格验收 7 / 故事 27:过滤态下删除作用于「看得见的那一行」——滤到只剩
+    /// gate(原始下标 1),按 d 起的删除确认点名 gate,不是被滤掉的 bare。
+    #[test]
+    fn 过滤态下_删除作用于看得见的那一行() {
+        let mut app = book("机器"); // 排序后 [bare(0), gate(1)]
+        过滤敲词(&mut app, "gate");
+        assert_eq!(app.catalog_visible(), vec![1], "只剩 gate(原始下标 1)可见");
+        tap(&mut app, KeyCode::Char('d'));
+        assert!(app.vps_rm_confirm, "d 起删除确认");
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate"),
+            "删除确认点名看得见的 gate,不是被滤掉的 bare"
+        );
+        let f = crate::testutil::frame_display(&app, 80, 30);
+        assert!(f.contains("gate"), "删除确认框点名 gate:{f}");
+    }
+
+    /// 规格验收 7 / 故事 26:过滤态下鼠标点行与键盘同一本账——点可见第 i 行 =
+    /// 选中可见第 i 行(下标经 catalog_visible 映射回原始数组)。
+    #[test]
+    fn 过滤态下_鼠标点行作用于看得见的那一行() {
+        let machines = r#"[{"name":"aaa","ips":[],"port":0,"logins":[]},{"name":"gate-x","ips":[],"port":0,"logins":[]},{"name":"gate-y","ips":[],"port":0,"logins":[]}]"#;
+        let mut app = vps_book(machines); // 排序后 [aaa(0), gate-x(1), gate-y(2)]
+        过滤敲词(&mut app, "gate"); // 可见 [1, 2]
+        assert_eq!(app.catalog_visible(), vec![1, 2]);
+        // 点可见第 1 行 = 原始下标 1 的 gate-x(不是原始下标 0 的 aaa)
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::SelectRow(0))
+        });
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate-x"),
+            "点可见第 1 行"
+        );
+        // 点可见第 2 行 = 原始下标 2 的 gate-y
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::SelectRow(1))
+        });
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate-y"),
+            "点可见第 2 行"
+        );
+        // 键盘从第 2 行按 ↑ 也回可见第 1 行(键鼠同一本账)
+        tap(&mut app, KeyCode::Up);
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate-x"),
+            "↑ 与点行同一本账"
+        );
+    }
+
+    /// 规格验收 8 / 故事 28:过滤态是输入态——期间动作键(m 换册 / d 删除 /
+    /// r 登记 / j 切屏)不生效,只当字符进过滤缓冲;与 #61 五域同一形态。
+    #[test]
+    fn 过滤态是输入态_期间动作键不生效() {
+        let mut app = book("机器");
+        tap(&mut app, KeyCode::Char('/')); // 进输入态
+        assert!(app.catalog_filter_on);
+        for c in ['m', 'd', 'r', 'j'] {
+            tap(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.catalog_kind, CatalogKind::Vps, "输入态里 m 不换册");
+        assert!(!app.vps_rm_confirm, "输入态里 d 不起删除确认");
+        assert_eq!(app.screen, Screen::Vps, "输入态里 j 不切屏(壳级键也被吞)");
+        assert_eq!(app.catalog_filter(), "mdrj", "动作键在输入态只进过滤缓冲");
+    }
+
+    /// 规格验收 9 / 故事 29:过滤入口有鼠标命中,点中 = 按 `/`。机器册键位行够短,
+    /// `/ 过滤` 段在常畅(80×30)与紧凑(66×50)两档都放得下、都点得中。
+    #[test]
+    fn 过滤入口段_点中等于按斜杠_机器册两档可点() {
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let mut app = book("机器");
+            app.size = Rect::new(0, 0, w, h);
+            let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+            assert!(
+                hits.iter()
+                    .any(|(_, t)| *t == crate::layout::Target::CatalogFilter),
+                "{w}×{h} 过滤段应有命中区"
+            );
+            assert!(
+                crate::testutil::frame_display(&app, w, h).contains("/ 过滤"),
+                "{w}×{h} 屏上也该画出这一段(点哪打哪)"
+            );
+            点中(&mut app, w, h, |t| {
+                *t == crate::layout::Target::CatalogFilter
+            });
+            assert!(app.catalog_filter_on, "{w}×{h} 点过滤段 = 进输入态(同按 /)");
+        }
+    }
+
+    /// 帧上某一行的**显示列**(列按显示宽累计——`frame_display` 已跳过宽字
+    /// 续格,字节偏移 ≠ 终端列,与命中区同一把尺)。
+    fn display_col(row: &str, byte: usize) -> u16 {
+        use unicode_width::UnicodeWidthChar;
+        row[..byte]
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+            .sum()
+    }
+
+    /// 规格验收 9 / 故事 29 + ADR-0005「渲染与命中同源」:鼠标过滤入口
+    /// **四本册、两档都在场**。#69 只给机器册做成了这件事——`key_line_segments`
+    /// 的「放不下整段收口」把标签 / 订阅 / 钥匙三本册的 `/ 过滤` 整段收掉
+    /// (键位行太长),于是键盘 `/` 四本册都能按、鼠标却只有机器册点得着;
+    /// 旧版这条测试把那个取舍当既成事实钉着(#69 后续:#70 评审把它判成
+    /// 「该补齐的 parity」,工单已批准)。
+    ///
+    /// 现在键位行在 66×50 下限(正文 64 列)内放得下全部段:分隔
+    /// [`CATALOG_KEY_GAP`] 由 3 列收窄到 2 列(` · ` → ` ·`,一个常量、渲染与
+    /// 命中共用,不丢任何一段文案),订阅 / 钥匙册的 `g 取回命令` 再收窄成
+    /// `g 取回`(全句建议命令就在册体下一行摊着)。
+    ///
+    /// 这一条钉四件事:① 四本册 × 两档都画得出 `/ 过滤`、都有命中矩形;
+    /// ② 渲染行与命中矩形逐字同源(段起始列 == 矩形 x,段右界 == 矩形右界);
+    /// ③ 键位行右侧**至少留 1 列余量**(不是恰好贴边框赌出来的);
+    /// ④ 一段提示段 / 动作段都没被收掉(#67 的收口纪律仍在,只是够宽到不用收)。
+    #[test]
+    fn 过滤段四本册两档都放得下_渲染与命中共源() {
+        for name in ["机器", "标签", "订阅", "钥匙"] {
+            for (w, h) in [(80u16, 30u16), (66, 50)] {
+                let mut app = book(name);
+                app.size = Rect::new(0, 0, w, h);
+                let size = Rect::new(0, 0, w, h);
+                let f = crate::testutil::frame_display(&app, w, h);
+                let hits = crate::layout::hitmap(size, &app, crate::layout::size_class(size));
+                // ① 过滤段与换册段都在场、都有命中矩形,且同一行
+                let filt = hits
+                    .iter()
+                    .find(|(_, t)| *t == crate::layout::Target::CatalogFilter)
+                    .map(|(r, _)| *r)
+                    .unwrap_or_else(|| panic!("{name} {w}×{h} 过滤段应有命中区"));
+                let sw = hits
+                    .iter()
+                    .find(|(_, t)| *t == crate::layout::Target::SwitchBook)
+                    .map(|(r, _)| *r)
+                    .unwrap_or_else(|| panic!("{name} {w}×{h} 换册段应有命中区"));
+                assert_eq!(filt.y, sw.y, "{name} {w}×{h} 两段同一行(键位行)");
+                let row = f.lines().nth(filt.y as usize).expect("命中行在渲染中在场");
+                assert!(
+                    row.contains(CATALOG_FILTER),
+                    "{name} {w}×{h} 屏上应画出过滤段:{row}"
+                );
+                assert!(
+                    row.contains(CATALOG_SWITCH),
+                    "{name} {w}×{h} 屏上应画出换册段:{row}"
+                );
+                // ② 渲染与命中共源:段起始列 == 矩形 x,段右界 == 矩形右界
+                let byte = row.find(CATALOG_FILTER).expect("帧上有过滤段");
+                let col = display_col(row, byte);
+                assert_eq!(
+                    col, filt.x,
+                    "{name} {w}×{h} 渲染段起始列 == 命中矩形 x(点哪打哪)"
+                );
+                assert_eq!(
+                    col + u16::try_from(unicode_width::UnicodeWidthStr::width(CATALOG_FILTER))
+                        .unwrap(),
+                    filt.x + filt.width,
+                    "{name} {w}×{h} 渲染段右界 == 命中矩形右界(同为 unicode_width 量出的宽)"
+                );
+                // ③ 至少 1 列余量:过滤段右侧第一个格子是空白,不是边框
+                let after = &row[byte + CATALOG_FILTER.len()..];
+                assert!(
+                    after.starts_with(' '),
+                    "{name} {w}×{h} 键位行右侧至少留 1 列余量:{row}"
+                );
+                // ④ 一段都没被收掉:段清单里每一段(提示段 + 动作段)都在这一行上
+                for (text, _t, _live) in catalog_key_parts(&app) {
+                    assert!(
+                        row.contains(text),
+                        "{name} {w}×{h} 段「{text}」被收掉了(放不下就整段收口,#67):{row}"
+                    );
+                }
+                // 点中 = 按 /(键盘那条路见输入态测试)
+                点中(&mut app, w, h, |t| {
+                    *t == crate::layout::Target::CatalogFilter
+                });
+                assert!(
+                    app.catalog_filter_on,
+                    "{name} {w}×{h} 点过滤段 = 进输入态(同按 /)"
+                );
+            }
+        }
+    }
+
+    /// 规格验收 10:过滤态在两档(80×30 / 66×50)整帧渲染不溢宽;过滤空态同。
+    #[test]
+    fn 过滤态两档渲染不溢宽() {
+        let mut app = book("机器");
+        过滤敲词(&mut app, "gate");
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let f = crate::testutil::frame_display(&app, w, h);
+            assert!(f.contains("命中 1/2"), "{w}×{h} 标题显命中/总数:{f}");
+            for ln in f.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 有行超宽:{ln}"
+                );
+            }
+        }
+        // 过滤空态两档也不溢宽
+        过滤敲词(&mut app, "zzz-不存在");
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let f = crate::testutil::frame_display(&app, w, h);
+            assert!(f.contains("无命中"), "{w}×{h} 过滤空态在场:{f}");
+            for ln in f.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 过滤空态有行超宽:{ln}"
+                );
+            }
+        }
+    }
+
+    /// 规格验收 1 / 故事 10-13:每册按各自的可匹配字段过滤(机器 名/地址/登录/
+    /// 备注;标签 名/引用;订阅 名/应用/到期日;钥匙 名/主机/作用域/轮换日)。
+    #[test]
+    fn 四本册各自按可匹配字段过滤() {
+        // 机器册:地址 / 登录 / 备注
+        let mut vps = book("机器"); // gate(10.0.0.1, root→$DEPLOY_KEY, 门口) / bare
+        过滤敲词(&mut vps, "10.0.0.1"); // 地址
+        assert_eq!(vps.catalog_visible().len(), 1, "机器册按地址过滤");
+        过滤敲词(&mut vps, "$DEPLOY_KEY"); // 登录 key_ref
+        assert_eq!(vps.catalog_visible().len(), 1, "机器册按登录过滤");
+        过滤敲词(&mut vps, "门口"); // 备注
+        assert_eq!(vps.catalog_visible().len(), 1, "机器册按备注过滤");
+        assert_eq!(vps.selected_vps_name().as_deref(), Some("gate"));
+        // 标签册:引用
+        let mut tag = book("标签"); // pi(引用 deep-research / vps/gate) / bare
+        过滤敲词(&mut tag, "deep-research");
+        assert_eq!(tag.catalog_visible().len(), 1, "标签册按引用 id 过滤");
+        过滤敲词(&mut tag, "vps/gate");
+        assert_eq!(tag.catalog_visible().len(), 1, "标签册按引用 kind/id 过滤");
+        // 订阅册:应用 / 到期日
+        let mut sub = book("订阅"); // airport/soon(Mihomo/Clash, 2099) ...
+        过滤敲词(&mut sub, "Mihomo");
+        assert_eq!(
+            sub.catalog_visible().len(),
+            2,
+            "订阅册按应用过滤(airport+gone)"
+        );
+        过滤敲词(&mut sub, "2099");
+        assert_eq!(sub.catalog_visible().len(), 2, "订阅册按到期日过滤");
+        // 钥匙册:主机 / 作用域 / 轮换日
+        let mut key = book("钥匙"); // ci(ghe.internal) / deploy(github.com, [repo], 2026-01-15)
+        过滤敲词(&mut key, "github.com");
+        assert_eq!(key.catalog_visible().len(), 1, "钥匙册按主机过滤");
+        过滤敲词(&mut key, "repo");
+        assert_eq!(key.catalog_visible().len(), 1, "钥匙册按作用域过滤");
+        过滤敲词(&mut key, "2026-01");
+        assert_eq!(key.catalog_visible().len(), 1, "钥匙册按轮换日过滤");
+    }
+
+    // ---- #73 取回键 g 的正文动作段:点「g 取回」段 = 按 g ----
+    //
+    // 全部走在公开缝上:`App::update(Message::Key / Message::Mouse)` 双路驱动,
+    // 断言落在渲染帧、日志行、屏上「已按 g 收进日志」、命中区清单、FakeRunner
+    // 收到的 argv 与调用计数上——不断言私有字段名、不断言内部方法名。「点 = 按」
+    // 在本族里是**逐条比对**的:两条路各跑一遍,日志行一上一下对,不是各说各话。
+
+    /// 就绪一本订阅册:册体有条目、数据仓根可用(临时目录)、订阅组能力记上。
+    /// FakeRunner 随 App 一起返回——「零调用」那条验收要对着它数 argv。
+    fn sub_book() -> (crate::app::App, std::sync::Arc<crate::engine::FakeRunner>) {
+        let (mut app, runner) = sub_app(&[("subscription ls", 0, SUB_LS_ALL)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        (app, runner)
+    }
+
+    /// 自造一本订阅册(`entries` 是 subscriptions JSON 数组):「键位行钉末行」要
+    /// 册体 1 条与册体多条两种内容量各来一次,夹具自造条数最直白。
+    fn sub_book_entries(entries: &str) -> crate::app::App {
+        let ls = format!(r#"{{"catalogPath":"/r/subscriptions.json","subscriptions":{entries}}}"#);
+        let mut app = crate::app::App::with_runner(std::sync::Arc::new(
+            crate::engine::FakeRunner::new(&[("subscription ls", 0, ls.as_str())]),
+        ));
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.catalog_kind = CatalogKind::Subscription;
+        app.capabilities.record(
+            crate::engine::Capability::Subscription,
+            crate::engine::Probe::Available,
+        );
+        app.sub_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
+        app
+    }
+
+    /// 把一本就绪的订阅 / 钥匙册换成「册体一条都没有」的**合法空态**(规格验收 3
+    /// 的空册变体:段清单该退成 `keys_empty`,`g 取回` 段不在场)。
+    fn 置空册(app: &mut crate::app::App, json: &str) {
+        match app.catalog_kind {
+            CatalogKind::Subscription => app.sub_ls = Some(serde_json::from_str(json).unwrap()),
+            CatalogKind::Key => app.key_ls = Some(serde_json::from_str(json).unwrap()),
+            _ => unreachable!("本族只测订阅 / 钥匙册"),
+        }
+    }
+
+    /// 「g 取回」段的命中矩形(从布局模型取,点哪拿哪;`app.size` 须先钉好)。
+    fn get_rect(app: &crate::app::App) -> Rect {
+        crate::layout::hitmap(app.size, app, crate::layout::size_class(app.size))
+            .into_iter()
+            .find(|(_, t)| *t == crate::layout::Target::CatalogGet)
+            .map(|(r, _)| r)
+            .expect("该册此刻应有 g 取回命中段")
+    }
+
+    /// 帧上某一行从第 `col` **显示列**起的那一小截(按显示列切,不按字符下标——
+    /// 行里有中文,一字两列;命中矩形量的是显示列,两边必须同一把尺)。
+    fn 帧行截取(line: &str, col: u16, n: usize) -> String {
+        use unicode_width::UnicodeWidthChar;
+        let mut out = String::new();
+        let mut w = 0usize;
+        for ch in line.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
+            if w >= col as usize + n {
+                break;
+            }
+            if w >= col as usize {
+                out.push(ch);
+            }
+            w += cw;
+        }
+        out
+    }
+
+    /// 日志里**最新**一条「取回链接」行(按一次 `g` 收两行:命令 + 一句纪律;
+    /// `push_log` 是头插,最新在前,所以取第一个命中)。
+    fn 最后一条取回日志(app: &crate::app::App) -> String {
+        app.log
+            .iter()
+            .find(|l| l.contains("取回链接"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn 点g取回段_等于按g_日志逐条相同且零调用() {
+        for (w, h) in [(80u16, 30u16), (66, 50u16)] {
+            let (mut clicked, r1) = sub_book();
+            let (mut keyed, _r2) = sub_book();
+            clicked.size = Rect::new(0, 0, w, h);
+            let before = r1.call_argvs();
+            点中(&mut clicked, w, h, |t| {
+                *t == crate::layout::Target::CatalogGet
+            });
+            tap(&mut keyed, KeyCode::Char('g'));
+            assert_eq!(clicked.log, keyed.log, "{w}×{h} 点 g 段与按 g 日志逐条相同");
+            assert!(clicked.sub_get_logged, "{w}×{h} 屏上该翻成已收进日志");
+            let f = crate::testutil::frame_display(&clicked, w, h);
+            assert!(f.contains("已按 g 收进日志"), "{w}×{h} 屏上文案翻转:{f}");
+            assert!(
+                clicked.queue.is_empty() && clicked.fed_queue.is_empty(),
+                "{w}×{h} 不入队、不下发"
+            );
+            assert_eq!(
+                r1.call_argvs(),
+                before,
+                "{w}×{h} 点击路径零引擎调用(argv 逐条相同)"
+            );
+            assert_eq!(r1.stdin_feed_count(), 0, "{w}×{h} 没有真实子进程被拉起喂入");
+        }
+    }
+
+    /// 规格验收 2 / 故事 17:再点一次 = 再按一次——日志再收,不报错、不静默。
+    #[test]
+    fn 再点一次g段_等于再按一次g() {
+        let (mut clicked, _r) = sub_book();
+        let (mut keyed, _r) = sub_book();
+        clicked.size = Rect::new(0, 0, 80, 30);
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogGet
+        });
+        tap(&mut keyed, KeyCode::Char('g'));
+        let once = clicked.log.len();
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogGet
+        });
+        tap(&mut keyed, KeyCode::Char('g'));
+        assert_eq!(
+            clicked.log.len(),
+            once + 2,
+            "再点一次再收两行(命令 + 一句纪律),不是静默无后果"
+        );
+        assert_eq!(clicked.log, keyed.log, "连点与连按逐条相同");
+    }
+
+    /// 规格验收 3 / 故事 9-11 / 31:段的在场条件 = 键位行变体条件,由
+    /// `CatalogKind` 查表一处决定——只有订阅 / 钥匙册的**非空、非在途**变体带
+    /// `g 取回` 可点段;空册变体、在途变体(登记浮层 / 删除确认)、机器册、标签册
+    /// 的任何变体都没有取回命中目标。
+    #[test]
+    fn g取回段_只在订阅与钥匙册的非空非在途变体在场() {
+        // 非空册体:两本各恰好一段,且没有禁用态(边缘态也照点、照给指路)
+        for (name, mut app) in [("订阅", book("订阅")), ("钥匙", book("钥匙"))] {
+            app.size = Rect::new(0, 0, 80, 30);
+            let segs: Vec<_> = catalog_key_parts(&app)
+                .into_iter()
+                .filter(|(_, t, _)| *t == Some(crate::layout::Target::CatalogGet))
+                .collect();
+            assert_eq!(segs.len(), 1, "{name}册应恰好一个 g 取回段:{segs:?}");
+            assert_eq!(segs[0].0, CATALOG_GET, "{name}册段文案与屏上同源");
+            assert!(segs[0].2, "{name}册 g 段没有禁用态");
+        }
+        // 机器册 / 标签册:有条目也没有(它们的条目没有本体可取)
+        for (name, app) in [("机器", book("机器")), ("标签", book("标签"))] {
+            assert!(
+                catalog_key_parts(&app)
+                    .iter()
+                    .all(|(_, t, _)| *t != Some(crate::layout::Target::CatalogGet)),
+                "{name}册任何变体都不该有取回命中目标"
+            );
+        }
+        // 空册变体(合法空态):段清单退成 keys_empty
+        for (name, mut app, empty) in [
+            (
+                "订阅",
+                book("订阅"),
+                r#"{"catalogPath":"/r/subscriptions.json","subscriptions":[]}"#,
+            ),
+            (
+                "钥匙",
+                book("钥匙"),
+                r#"{"catalogPath":"/r/keys.json","keys":[]}"#,
+            ),
+        ] {
+            置空册(&mut app, empty);
+            let f = crate::testutil::frame_display(&app, 80, 30);
+            assert!(f.contains("编目里还没有"), "{name}册空态在场:{f}");
+            assert!(
+                catalog_key_parts(&app)
+                    .iter()
+                    .all(|(_, t, _)| *t != Some(crate::layout::Target::CatalogGet)),
+                "{name}册空册变体没有取回命中目标"
+            );
+        }
+        // 在途变体:登记浮层 / 删除确认浮层在场,整行换成浮层提示、无可点段
+        for (name, mut app) in [("订阅", book("订阅")), ("钥匙", book("钥匙"))] {
+            tap(&mut app, KeyCode::Char('r'));
+            assert!(
+                catalog_key_parts(&app)
+                    .iter()
+                    .all(|(_, t, _)| *t != Some(crate::layout::Target::CatalogGet)),
+                "{name}册登记浮层态没有取回命中目标"
+            );
+            let f = crate::testutil::frame_display(&app, 80, 30);
+            assert!(f.contains("Enter 确认"), "{name}册在途键位行:{f}");
+            tap(&mut app, KeyCode::Esc);
+            tap(&mut app, KeyCode::Char('d'));
+            assert!(
+                catalog_key_parts(&app)
+                    .iter()
+                    .all(|(_, t, _)| *t != Some(crate::layout::Target::CatalogGet)),
+                "{name}册删除确认态没有取回命中目标"
+            );
+        }
+    }
+
+    /// 规格验收 4 / 故事 3:点段与段之间的空白不触发任何动作——日志不新增、状态不翻。
+    #[test]
+    fn 点g段之间的空白_无任何后果() {
+        let (mut app, _r) = sub_book();
+        app.size = Rect::new(0, 0, 80, 30);
+        let g = get_rect(&app);
+        let before_log = app.log.len();
+        // g 段左侧那一列正是段间分隔(`CATALOG_KEY_GAP` = " ·")所在的空白
+        app.update(crate::app::Message::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: g.x - 1,
+            row: g.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.log.len(), before_log, "点段间空白不新增日志");
+        assert!(!app.sub_get_logged, "点段间空白不翻状态");
+    }
+
+    /// 规格验收 5 / 故事 25:边缘态(册已读到、数据仓根随后被撤)——段仍在场,点击
+    /// 复现键盘 `g` 的既有指路日志(「取回链接未给出:…」):不画成死人、也不给半条命令。
+    #[test]
+    fn 边缘态_数据仓根被撤_段仍在场_点击复现键盘g的指路() {
+        let (mut clicked, _r) = sub_book();
+        let (mut keyed, _r) = sub_book();
+        clicked.data_root = None;
+        keyed.data_root = None;
+        clicked.size = Rect::new(0, 0, 80, 30);
+        let g = get_rect(&clicked);
+        assert!(
+            crate::testutil::frame_display(&clicked, 80, 30).contains(CATALOG_GET),
+            "数据仓根被撤后段仍在场"
+        );
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogGet
+        });
+        tap(&mut keyed, KeyCode::Char('g'));
+        assert_eq!(clicked.log, keyed.log, "边缘态点击与按键逐条相同");
+        assert!(
+            clicked.log.iter().any(|l| l.contains("取回链接未给出")),
+            "既有指路复现:{:?}",
+            clicked.log.last()
+        );
+        assert!(!clicked.sub_get_logged, "命令没给出就不标记已收");
+        assert!(clicked.queue.is_empty(), "仍是一个字节都不下发");
+        assert!(g.width > 0, "段有宽度(不是空壳)");
+    }
+
+    /// 规格验收 6 / 故事 18:换选中行(`↑/↓` 与鼠标点行两条路各一次)后点 g——
+    /// 命令跟着新选中行变,点击拿到的永远是屏上那一条。
+    #[test]
+    fn 换选中行后点g_命令跟着新选中行变() {
+        // 路一:键盘 ↑/↓
+        let (mut app, _r) = sub_book();
+        app.size = Rect::new(0, 0, 80, 30);
+        点中(&mut app, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogGet
+        });
+        assert!(
+            最后一条取回日志(&app).contains("--name airport"),
+            "默认选中第一条:{:?}",
+            最后一条取回日志(&app)
+        );
+        tap(&mut app, KeyCode::Down);
+        点中(&mut app, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogGet
+        });
+        assert!(
+            最后一条取回日志(&app).contains("--name forever"),
+            "↓ 后拿新选中那条:{:?}",
+            最后一条取回日志(&app)
+        );
+        // 路二:鼠标点行
+        let (mut app2, _r) = sub_book();
+        app2.size = Rect::new(0, 0, 80, 30);
+        点中(&mut app2, 80, 30, |t| {
+            matches!(t, crate::layout::Target::SelectRow(2))
+        });
+        点中(&mut app2, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogGet
+        });
+        assert!(
+            最后一条取回日志(&app2).contains("--name gone"),
+            "鼠标点行后拿那一行:{:?}",
+            最后一条取回日志(&app2)
+        );
+    }
+
+    /// 故事 29:册内过滤(#69)不悄悄改动这一段的在场条件——过滤筛掉的只是册体
+    /// 行、不是这个动作。筛到一格不剩时 g 段仍在场,点它与按 `g` 同后果(同一条
+    /// 既有指路:没有可见的选中行,命令给不出)。
+    #[test]
+    fn 册内过滤到空_g段仍在场_点击与按键同后果() {
+        let (mut clicked, _r) = sub_book();
+        let (mut keyed, _r) = sub_book();
+        过滤敲词(&mut clicked, "zzz-不存在");
+        过滤敲词(&mut keyed, "zzz-不存在");
+        clicked.size = Rect::new(0, 0, 80, 30);
+        let g = get_rect(&clicked);
+        let f = crate::testutil::frame_display(&clicked, 80, 30);
+        assert!(f.contains("册无命中"), "册体确实被筛空:{f}");
+        assert!(f.contains(CATALOG_GET), "筛到空,g 段仍在场:{f}");
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogGet
+        });
+        tap(&mut keyed, KeyCode::Char('g'));
+        assert_eq!(clicked.log, keyed.log, "筛到空:点击与按键逐条相同");
+        assert!(
+            clicked.log.iter().any(|l| l.contains("取回链接未给出")),
+            "给不出命令时走既有指路:{:?}",
+            clicked.log.first()
+        );
+        assert_eq!(g.height, 1, "g 段是 1 行可点段");
+    }
+
+    /// 规格验收 7 / 故事 7:键位行钉在册体内层**末行**——册体 1 条与册体多条两种
+    /// 内容量下,g 段命中矩形的 y 相等,且那一行渲染出来真的带着 g 段、紧贴册体
+    /// 下边框(不再随内容漂,也不再被内容顶出可见区)。
+    #[test]
+    fn 键位行钉末行_册体一条与多条_g段同一行() {
+        let one = r#"[{"name":"airport","kind":"subscription-url","client":"Mihomo","expires":"2099-03-01","status":"active","daysLeft":26000}]"#;
+        let many = format!(
+            "[{}]",
+            (0..20)
+                .map(|i| format!(
+                    r#"{{"name":"s{i:02}","kind":"subscription-url","client":"Mihomo","expires":"2099-03-01","status":"active","daysLeft":26000}}"#
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut ys: Vec<(String, u16)> = Vec::new();
+        for (label, mut app) in [
+            ("1 条", sub_book_entries(one)),
+            ("20 条", sub_book_entries(&many)),
+        ] {
+            app.size = Rect::new(0, 0, 80, 30);
+            let g = get_rect(&app);
+            ys.push((label.to_string(), g.y));
+            let f = crate::testutil::frame_display(&app, 80, 30);
+            let row = f.lines().nth(g.y as usize).unwrap_or_default();
+            assert_eq!(
+                帧行截取(row, g.x, unicode_width::UnicodeWidthStr::width(CATALOG_GET)),
+                CATALOG_GET,
+                "{label} 命中矩形那一行、那一列渲染出来就是 g 段:{row}"
+            );
+            let below = f.lines().nth(g.y as usize + 1).unwrap_or_default();
+            assert!(
+                below.contains('└'),
+                "{label} 键位行紧贴册体下边框(= 内层末行):{below}"
+            );
+        }
+        assert_eq!(
+            ys[0].1, ys[1].1,
+            "册体内容长短不影响键位行的 y(1 条与 20 条同一行):{ys:?}"
+        );
+    }
+
+    /// 规格验收 8 / 故事 5-6 / 33:两档(80×30 / 66×50)都点得中;段在屏上的起始
+    /// 列 = 命中矩形 x(渲染与命中共用同一份段表量宽),整段在场才可点。
+    #[test]
+    fn g段_两档都点得中_屏上那一列就是命中矩形() {
+        for (w, h) in [(80u16, 30u16), (66, 50u16)] {
+            let (mut app, _r) = sub_book();
+            app.size = Rect::new(0, 0, w, h);
+            let g = get_rect(&app);
+            let f = crate::testutil::frame_display(&app, w, h);
+            let row = f.lines().nth(g.y as usize).unwrap_or_default();
+            assert_eq!(
+                帧行截取(row, g.x, unicode_width::UnicodeWidthStr::width(CATALOG_GET)),
+                CATALOG_GET,
+                "{w}×{h} 段整段在场(不是半个命中):{row}"
+            );
+            点中(&mut app, w, h, |t| *t == crate::layout::Target::CatalogGet);
+            assert!(app.sub_get_logged, "{w}×{h} 点得中");
+            assert!(
+                最后一条取回日志(&app).contains("nw subscription get --name airport"),
+                "{w}×{h} 拿到当前选中那条的建议命令:{:?}",
+                最后一条取回日志(&app)
+            );
+        }
+    }
+
+    /// 规格验收 9 / 故事 14:装配态下点 g 段与按 `g` 同后果——`g` 是只读,不受
+    /// 装配互斥约束(键盘侧本就无 `assembling` 守卫,鼠标同口径)。
+    #[test]
+    fn 装配态下点g段_与按g同后果() {
+        let (mut clicked, r1) = sub_book();
+        let (mut keyed, _r) = sub_book();
+        clicked.assembling = true;
+        keyed.assembling = true;
+        clicked.size = Rect::new(0, 0, 80, 30);
+        let before = r1.call_argvs();
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogGet
+        });
+        tap(&mut keyed, KeyCode::Char('g'));
+        assert_eq!(clicked.log, keyed.log, "装配态下两条路逐条相同");
+        assert!(clicked.sub_get_logged, "装配态下照旧收进日志");
+        assert!(
+            clicked.queue.is_empty(),
+            "装配态也不入队(只读,不碰装配互斥)"
+        );
+        assert_eq!(r1.call_argvs(), before, "装配态点击仍然零调用");
+    }
+
+    /// 故事 19:钥匙册各在各的键位行、各取各的命令——点「g 取回」拿到的是
+    /// `nw key get …`,与按 `g` 同路;屏显上永不出现钥匙本体。
+    #[test]
+    fn 钥匙册点g段_拿到key_get建议命令且不现本体() {
+        let (mut app, runner) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        app.size = Rect::new(0, 0, 80, 30);
+        let before = runner.call_argvs();
+        点中(&mut app, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogGet
+        });
+        assert!(app.key_get_logged, "g 把钥匙建议命令收进日志");
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("nw key get --name ci --root")),
+            "建议命令收进日志可取用:{:?}",
+            app.log.last()
+        );
+        assert!(app.queue.is_empty(), "队列里没有 key get");
+        assert_eq!(runner.call_argvs(), before, "点击路径零引擎调用");
+        let f = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!f.contains("ghp_"), "屏显永不出现钥匙本体:{f}");
     }
 }
