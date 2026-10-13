@@ -166,11 +166,6 @@ impl UpgradePhase {
         )
     }
 
-    /// 等一个「继续」确认的状态(计划摊开着)。
-    pub fn awaits_confirm(&self) -> bool {
-        matches!(self, UpgradePhase::Plan { .. })
-    }
-
     /// 屏上该说的那一句(结论态的人话)。
     pub fn headline(&self) -> &'static str {
         match self {
@@ -185,22 +180,26 @@ impl UpgradePhase {
     }
 }
 
-/// 从 install.sh 的输出行里取 sha256 校验结论:`sha256 校验通过(<hash>)`。
-/// 取不到(那一行还没来 / 格式变了)→ `None`,面板不猜、不补一个哈希。
-pub fn sha256_from_line(line: &str) -> Option<String> {
-    let key = "sha256 校验通过(";
+/// 从 install.sh 的输出行里抠一个值:找 `key`,取其后的文本,到 `stop` 认的
+/// 那个字符为止。两个呈现面的解析共用这一处——「在哪之后截到哪」是同一件
+/// 事,抄两份就会漂(且两份都只该被外部行为测试钉,不该被脚本内部形状钉)。
+///
+/// 取不到(那一行还没来 / 格式变了)→ `None`,面板不猜、不补一个值。
+fn value_after(line: &str, key: &str, stop: fn(char) -> bool) -> Option<String> {
     let i = line.find(key)? + key.len();
     let rest = &line[i..];
-    Some(rest[..rest.find(')')?].to_string())
+    Some(rest[..rest.find(stop)?].to_string())
+}
+
+/// 从 install.sh 的输出行里取 sha256 校验结论:`sha256 校验通过(<hash>)`。
+pub fn sha256_from_line(line: &str) -> Option<String> {
+    value_after(line, "sha256 校验通过(", |c| c == ')')
 }
 
 /// 从 install.sh 的输出行里取**解析后的**版本号:`安装 nwt v<版本> …`。
 /// 操作者填 `latest` 时,屏上该说清最终装的是哪一版(故事 14:可复现)。
 pub fn installed_version_from_line(line: &str) -> Option<String> {
-    let key = "安装 nwt v";
-    let i = line.find(key)? + key.len();
-    let rest = &line[i..];
-    Some(rest[..rest.find(|c: char| c.is_whitespace())?].to_string())
+    value_after(line, "安装 nwt v", char::is_whitespace)
 }
 
 /// 干跑 argv:只拿计划,不下载、不落盘。`--prefix` 指**真正的落点父目录**,
@@ -389,7 +388,12 @@ pub async fn run(
         }
         (code, tail)
     };
-    let _ = std::fs::remove_file(&script);
+    // 收尾收**整个临时目录**:脚本、暂存目录、以及失败路径下已下载的资产都
+    // 在它下面。只删脚本文件会把 `nwt-upgrade-*/` 连 stage/ 一起留在 /tmp
+    // (失败路径上那可能是整个已下载的二进制),那是每次自升级漏一坨垃圾。
+    if let Some(dir) = script.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
     let outcome = if code == 0 {
         UpgradeOutcome {
             exit_code: 0,
@@ -525,9 +529,15 @@ mod tests {
     // ---- 双出口同源:嵌进来的就是仓库那一份 ----
 
     #[test]
-    fn 嵌进来的脚本_就是仓库那一份_先校验后安装的次序在场() {
-        // 纪律的同源不是口号:sha256 闸与资产命名都在这份字节里,且
-        // **校验排在拷贝之前**——先校验后安装,与 install.sh 同序。
+    fn 嵌进来的脚本_就是仓库那一份_三道纪律的字面都在场() {
+        // 纪律的同源不是口号:sha256 闸、资产命名、私有仓凭证口径三样都得
+        // 在这份字节里——否则「双出口同一套校验」就是空话。
+        //
+        // **只断言在场,不断言脚本内部的次序**。「先校验后安装」是 install.sh
+        // 的内部实现形状(闸排在拷贝之前),它该由 fixture 三路测试从外部钉:
+        // 错 sha256 时旧文件逐字节不变,那才是操作者能观察到的行为。在这儿
+        // 抠 `find("verify_checksum")` 与字面 `cp` 的先后,等于把测试绑到
+        // 脚本的函数名上——脚本一改名(行为没变)这里就假红。
         assert!(
             INSTALL_SH.contains("verify_checksum"),
             "嵌进来的脚本必须带 sha256 闸"
@@ -540,11 +550,6 @@ mod tests {
             INSTALL_SH.contains("GH_TOKEN:-${GITHUB_TOKEN:-}"),
             "私有仓凭证口径同源"
         );
-        let verify = INSTALL_SH.find("verify_checksum").expect("闸在场");
-        let cp = INSTALL_SH
-            .find("cp \"$WORK/$BIN_NAME\"")
-            .expect("安装动作在场");
-        assert!(verify < cp, "先校验后安装:闸必须排在拷贝之前");
     }
 
     // ---- 脚本输出面的两个纯函数(呈现用,不重算) ----

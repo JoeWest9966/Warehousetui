@@ -63,6 +63,12 @@ pub fn render(frame: &mut Frame, app: &App) {
     let _ = p;
 }
 
+/// 自升级浮层进度区之外占掉的行数:标题句 / 「过程原文」小标 / 互斥说明
+/// 三行非进度内容,外加上下各留一行呼吸。内层高度扣掉它才是「画得下几行
+/// install.sh 原文」——这个数同时是 ↑/↓ 翻看的钳位上界。改它会改浮层的
+/// 可见行数,所以它是个有名字的常量而不是散在算式里的字面量。
+const UPGRADE_CHROME: usize = 6;
+
 /// 自升级浮层(#121):全屏叠加层,六态两两可区分(版本输入 / 干跑在途 /
 /// 计划摊开 / 真跑在途 / 完成 / 失败)。几何与命中区共用 `layout::upgrade_*`
 /// ——渲染与「点任意处关」永不分歧(ADR-0005)。
@@ -114,7 +120,10 @@ fn render_upgrade(frame: &mut Frame, area: Rect, app: &App) {
                 p.dim(),
             )));
             let inner = crate::layout::upgrade_inner(area);
-            let view = (inner.height as usize).saturating_sub(6);
+            // 进度区可见行数 = 内层高度扣掉非进度的那几行:标题句 1 +「过程
+            // 原文」小标 1 + 互斥说明 1 + 上下各留 1 行呼吸。扣掉它们才数得
+            // 出「画得下几行原文」——这个数同时是 ↑/↓ 翻看的钳位上界。
+            let view = (inner.height as usize).saturating_sub(UPGRADE_CHROME);
             let max_off = app.upgrade_log.len().saturating_sub(view);
             let off = app.upgrade_offset.min(max_off);
             for l in app.upgrade_log.iter().skip(off).take(view) {
@@ -731,7 +740,10 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         prep: Prep::Shell,
         code: KeyCode::Char('u'),
         modifiers: KeyModifiers::NONE,
-        write: false,
+        // 自升级要落盘(换面板自己的二进制),所以它是**写**动作:装配态下
+        // 命令面板不透出它(规格故事 9:不许从面板绕过装配互斥)。设置屏
+        // 直接按 U 仍会被 `App::open_upgrade` 的闸拒掉并留证据。
+        write: true,
     },
     HelpRow {
         key: "m",
@@ -841,6 +853,7 @@ pub(crate) const MOUSE_LINES: &[&str] = &[
     "编目册键位行可点段:换册 / 过滤 / 反查(点它 = 按对应键)",
     "取回段只订阅/钥匙册:点它 = 按 g(只收建议命令,不代跑)",
     "删除段四本册可点 = 按 d(先确认;标签册是「d 摘/删」)",
+    "自升级浮层点任意处关 = 按 Esc(在途点不动,其余动作已锁)",
     "捕获默认开的代价:复制要按 Shift",
     "逃逸:--no-mouse / 设置屏 m 关(重启生效)",
 ];

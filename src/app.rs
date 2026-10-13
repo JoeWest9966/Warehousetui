@@ -1200,7 +1200,13 @@ impl App {
                     self.push_log("装配回音已丢弃(已中止:半个结果不算结论)");
                     return;
                 }
-                self.assembling = false;
+                // 升级在途时 up 回音**不碰互斥灯**(#121):自升级点的是同一盏
+                // `assembling`,若让 up 的回音在这儿无条件熄灯,升级过程的锁
+                // 会被一笔不相干的装配回音解开。互斥由升级自己收敛
+                // (`on_upgrade` 的 Finished 臂),两条路各归各。
+                if !self.upgrade.in_flight() {
+                    self.assembling = false;
+                }
                 self.as_running = false;
                 let ok = out.ok;
                 // 收尾态词四态可区分(#117):日志与通知同源,一处算
@@ -1525,6 +1531,13 @@ impl App {
     /// 呼出自升级浮层:版本输入态,预填 `latest`(操作者可改成钉版本)。
     /// 只在设置屏在场(`key_settings` 的 `u` 臂),所以这里不再判屏。
     pub fn open_upgrade(&mut self) {
+        // 写互斥(ADR-0009 §4):装配进行中不接自升级,反之亦然——自升级要换
+        // 的是面板自己的二进制,与装配同样是「落盘」那一族。文案照抄
+        // `start_register` / `CatalogKind::start` 那一族,不另造一套说法。
+        if self.assembling {
+            self.push_log("装配进行中:自升级与装配互斥,稍后再试");
+            return;
+        }
         if self.upgrade.in_flight() {
             self.push_log("升级进行中:等这一趟跑完再开下一趟");
             return;
@@ -1544,8 +1557,38 @@ impl App {
         self.upgrade = UpgradePhase::Idle;
     }
 
-    /// 自升级浮层的键位:版本输入态收键入,计划态收确认,结论态只收离开。
-    /// 在途态**一个键都不收**(除日志翻看)——升级期间其余动作已锁。
+    /// 起一趟升级(干跑 / 真跑共用这一处,按 `dry_run` 分):清进度、点全局
+    /// 写互斥、入队。两段同形的入队块收成一份——「点互斥灯 + 清进度 + 入队」
+    /// 是一个动作,抄两遍就会漂。
+    ///
+    /// 互斥说明:点 `assembling` 那盏全局写互斥灯(规格「与装配态同款互斥
+    /// 思路」),其余写入口的既有闸自然兜住。**不点 `as_running`**——那是
+    /// up 在途的专有灯,`x` 中止键不误杀升级。
+    fn begin_upgrade(&mut self, version: Option<String>, dry_run: bool) {
+        let label = version.clone().unwrap_or_else(|| "latest".into());
+        self.upgrade = if dry_run {
+            UpgradePhase::Planning { version: label }
+        } else {
+            UpgradePhase::Running { version: label }
+        };
+        self.upgrade_log.clear();
+        self.upgrade_offset = 0;
+        self.assembling = true;
+        self.upgrade_queue.push(UpgradeRequest {
+            version,
+            target: std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("nwt")),
+            dry_run,
+        });
+        self.push_log(if dry_run {
+            "自升级:正在取安装计划(零下载、零落盘)".to_string()
+        } else {
+            "自升级:下载 → sha256 校验 → 落盘(校验不过旧二进制一个字节都不动)".to_string()
+        });
+    }
+
+    /// 自升级浮层的键位:版本输入态收键入(归通用输入态机),计划态收确认,
+    /// 结论态只收离开。**在途态一个键都不收**(除 ↑/↓ 翻进度)——升级期间
+    /// 其余动作已锁,面板不假装能收回一个已经发出去的下载。
     fn on_key_upgrade(&mut self, k: KeyEvent) {
         // 在途:只有 ↑/↓ 翻进度(与装配 stderr 日志同源),别的都不受理。
         if self.upgrade.in_flight() {
@@ -1561,53 +1604,24 @@ impl App {
             return;
         }
         match &mut self.upgrade {
-            UpgradePhase::Version { buf } => match k.code {
-                KeyCode::Enter => {
+            // 版本输入:键入分发归**通用单行输入态机** `input::on_key`——与
+            // NW_HOME / 数据仓根手填、配方过滤、册内过滤同一条路。手搓
+            // `Char(c) => buf.push(c)` 会绕过它的两道纪律:CONTROL 组合键
+            // 被当普通字符(在版本缓冲里塞一个 `p`)、缓冲无 `BUF_CAP` 上限。
+            UpgradePhase::Version { buf } => match input::on_key(buf, k) {
+                InputAction::Submit => {
                     let v = buf.trim().to_string();
-                    let version = (!v.is_empty() && v != "latest")
-                        .then_some(v)
-                        .filter(|s: &String| !s.is_empty());
-                    self.upgrade = UpgradePhase::Planning {
-                        version: version.clone().unwrap_or_else(|| "latest".into()),
-                    };
-                    self.upgrade_log.clear();
-                    self.upgrade_offset = 0;
-                    // 点全局写互斥:升级期间其余写入口的既有闸自然兜住
-                    // (规格「与装配态同款互斥思路」)。as_running 不点——
-                    // 那是 up 在途的专有灯,x 中止键不误杀升级。
-                    self.assembling = true;
-                    self.upgrade_queue.push(UpgradeRequest {
-                        version,
-                        target: std::env::current_exe()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("nwt")),
-                        dry_run: true,
-                    });
-                    self.push_log("自升级:正在取安装计划(零下载、零落盘)");
+                    let version = (!v.is_empty() && v != "latest").then_some(v);
+                    self.begin_upgrade(version, true);
                 }
-                KeyCode::Esc | KeyCode::Char('q') => self.dismiss_upgrade(),
-                KeyCode::Backspace => {
-                    buf.pop();
-                }
-                KeyCode::Char(c) => buf.push(c),
-                _ => {}
+                InputAction::Cancel => self.dismiss_upgrade(),
+                InputAction::Edited | InputAction::Ignored => {}
             },
             UpgradePhase::Plan { version } => match k.code {
                 // 计划已摊开(版本 / 资产 / 校验文件 / 落点):确认才真跑。
                 KeyCode::Enter => {
                     let v = version.clone();
-                    self.upgrade = UpgradePhase::Running { version: v.clone() };
-                    self.upgrade_log.clear();
-                    self.upgrade_offset = 0;
-                    self.assembling = true;
-                    self.upgrade_queue.push(UpgradeRequest {
-                        version: (v != "latest").then_some(v),
-                        target: std::env::current_exe()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("nwt")),
-                        dry_run: false,
-                    });
-                    self.push_log(
-                        "自升级:下载 → sha256 校验 → 落盘(校验不过旧二进制一个字节都不动)",
-                    );
+                    self.begin_upgrade((v != "latest").then_some(v), false);
                 }
                 KeyCode::Esc | KeyCode::Char('q') => self.dismiss_upgrade(),
                 _ => {}
@@ -1733,8 +1747,17 @@ impl App {
             return;
         };
         let code = row.code;
+        let mods = row.modifiers;
+        // 跨屏条目(设置屏的 U、机器册的 Enter 反查…)不在当前屏根本没有分支:
+        // 先切到那一屏再派发,否则操作者在概览屏执行「U 自升级」会得到
+        // 零反馈(`key_settings` 根本不到场)。壳级行 `screen` 为 None,不切。
+        if let Some(target) = row.screen {
+            self.screen = target;
+        }
         self.close_cmd_panel();
-        self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        // 修饰键照登记表带(#119):唯一带 CONTROL 的行是 Ctrl+P 自己,按 NONE
+        // 回放会派发成裸 `p`(概览屏的 ↑ 别名),那是一次静默的语义漂移。
+        self.on_key(KeyEvent::new(code, mods));
     }
 
     fn screen_key(&mut self, k: KeyEvent) {
@@ -4466,6 +4489,11 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    /// Ctrl+P:命令面板的呼出键(唯一带 CONTROL 修饰键的登记行)。
+    fn ctrl_p() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
+    }
+
     #[test]
     fn u键_呼出与收起_版本输入态预填latest_归零不留半句() {
         let mut app = settings_app();
@@ -4492,6 +4520,151 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert_eq!(app.upgrade, UpgradePhase::Idle, "Esc 收起");
+    }
+
+    #[test]
+    fn 装配在途按u_被写互斥拒_留证据且面板也不透出它() {
+        // 写互斥(ADR-0009 §4 / 规格故事 9):自升级要落盘,与装配同一族。
+        // 两条路都要被拒——设置屏直接按 U,以及命令面板里搜到它。
+        let mut app = settings_app();
+        app.assembling = true;
+        app.update(Message::Key(keyc('u')));
+        assert_eq!(app.upgrade, UpgradePhase::Idle, "装配在途不给开自升级");
+        assert!(
+            app.log.iter().any(|l| l.contains("自升级与装配互斥")),
+            "拒绝留证据:{:?}",
+            app.log.first()
+        );
+        // 面板路:装配态下写动作整批收起,U 是其中之一
+        let offered = crate::ui::commands::offered(&app);
+        assert!(
+            !offered.iter().any(|r| r.code == KeyCode::Char('u')),
+            "装配态下面板不透出 U:{:?}",
+            offered.iter().map(|r| r.key).collect::<Vec<_>>()
+        );
+        assert_eq!(crate::ui::commands::hidden_write_count(&app), 5);
+    }
+
+    #[test]
+    fn 面板里执行跨屏条目_先切到那一屏再派发() {
+        // 规格故事 9 的执行面:面板执行 = 「搜到并按下那个键」。跨屏条目
+        // (U 在设置屏)不在当前屏根本没有分支,所以先切屏再派发——否则
+        // 操作者在概览屏执行「U 自升级」会得到零反馈。
+        let mut app = fake_app();
+        app.splash = false;
+        app.screen = Screen::Overview;
+        app.update(Message::Key(ctrl_p()));
+        assert!(app.cmd_open, "面板开着");
+        for c in "自升级".chars() {
+            app.update(Message::Key(keyc(c)));
+        }
+        let n = app.cmd_results_len();
+        assert!(n > 0, "搜得到自升级:{n}");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.screen, Screen::Settings, "跨屏条目先切屏");
+        assert!(app.upgrade.is_open(), "切过去后浮层真的开了");
+    }
+
+    #[test]
+    fn 面板里执行ctrl_p条目_带的修饰键照登记表() {
+        // 唯一带 CONTROL 的登记行恰是 Ctrl+P 自己:按 NONE 回放会派发成
+        // 裸 `p`(概览屏的 ↑ 别名)——一次静默的语义漂移。
+        let mut app = fake_app();
+        app.splash = false;
+        app.screen = Screen::Overview;
+        app.update(Message::Key(ctrl_p()));
+        for c in "命令面板".chars() {
+            app.update(Message::Key(keyc(c)));
+        }
+        // 选中「命令面板」那一条自己(它不是首行,按名字定位)
+        let idx = crate::ui::commands::offered(&app)
+            .iter()
+            .position(|r| r.code == KeyCode::Char('p'))
+            .expect("搜得到命令面板自己");
+        assert!(
+            crate::ui::commands::offered(&app)[idx]
+                .modifiers
+                .contains(KeyModifiers::CONTROL),
+            "登记表里它带 CONTROL"
+        );
+        app.cmd_sel = idx;
+        // 执行它 = 「按下 Ctrl+P 那一个键」。修饰键照登记表带,所以派发的
+        // 是 Ctrl+P(壳级开关面板),**不是**裸 `p`——后者在概览屏是 ↑ 的
+        // 别名,那会是一次静默的语义漂移。这里钉的就是「别名没被触发」:
+        // 面板先被 `close_cmd_panel` 收起,再被派发的 Ctrl+P 重新打开,
+        // 而选中行一动不动。
+        let sel = app.ov_sel;
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.ov_sel, sel,
+            "没有偷偷触发 ↑ 别名:{sel} → {}",
+            app.ov_sel
+        );
+    }
+
+    #[test]
+    fn up回音落地_不熄升级在途的互斥灯() {
+        // 升级点的是同一盏 `assembling`;一笔不相干的 up 回音不该把它解开
+        // (互斥由升级自己收敛)。
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.upgrade.in_flight(), "干跑在途");
+        assert!(app.assembling, "升级点了互斥灯");
+        // 另一笔 up 回音到达:不动互斥灯
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["up".into(), "--lock".into(), "9f8e".into()],
+                exit_code: crate::engine::ExitCode::Ok,
+                ok: true,
+                stderr_tail: vec![],
+                envelope: None,
+                raw_stdout: String::new(),
+                parse_error: None,
+            },
+        ))));
+        assert!(app.assembling, "up 回音不熄升级的互斥灯");
+        // 升级自己收敛:Finished 才灭
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 0,
+                reason: String::new(),
+            },
+        )));
+        assert!(!app.assembling, "升级自己收敛互斥");
+    }
+
+    #[test]
+    fn 版本输入态_ctrl组合键不当字符_缓冲无上限由输入态机把着() {
+        // 版本输入归通用输入态机 `input::on_key`:CONTROL 组合键被过滤掉,
+        // 缓冲有 `BUF_CAP` 上限——手搓 `Char(c) => push(c)` 两条都失守。
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest"),
+            "Ctrl+p 不往版本缓冲里塞字符:{:?}",
+            app.upgrade
+        );
+        // 普通字符照旧进缓冲
+        type_str(&mut app, "0.4.0");
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest0.4.0"),
+            "键入照旧:{:?}",
+            app.upgrade
+        );
     }
 
     #[test]

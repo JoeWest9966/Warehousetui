@@ -380,7 +380,7 @@ mod tests {
         let writes: Vec<&str> = all.iter().filter(|r| r.write).map(|r| r.key).collect();
         assert_eq!(
             writes,
-            vec!["Enter", "r", "r", "d"],
+            vec!["Enter", "r", "r", "d", "U"],
             "登记表里的写动作:{writes:?}"
         );
 
@@ -397,12 +397,12 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(gated.len() < all.len(), "收起了写动作,条数该变少");
-        assert_eq!(hidden_write_count(&app), 4, "该说清收起了几条");
+        assert_eq!(hidden_write_count(&app), 5, "该说清收起了几条");
 
         // 屏上给得出说明,不是静默消失
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(
-            s.contains("装配中收起 4 个写动作"),
+            s.contains("装配中收起 5 个写动作"),
             "提示行说明收起原因:{s}"
         );
         // 收敛后写动作回来(互斥是装配态专属,不是永久过滤)

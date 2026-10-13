@@ -156,7 +156,7 @@ apt install gcc-aarch64-linux-gnu mingw-w64 zip
 - Windows:编译运行级(spec #10 的 R3 决定),无 installer、无自动安装;手动 zip。**v0.2.0 起产物是 gnu 目标**(交叉工具链所限),与 v0.1.0 的 msvc 产物功能等价、无外部 DLL 依赖。
 - **macOS 预编译暂缺(v0.2.0 起)**:无 Apple 设备,两个 mac 包产不出来;install.sh 对 Darwin 直接给出「请源码构建」的明路(不撞 404)。等有 Mac 再补,命名契约不变。
 - 无代码签名/公证(macOS notarization、Windows Authenticode):V1 不做,靠 sha256 校验兜底。
-- 无自更新命令(`nwt self-update`):保持 ADR-0003 精神,面板不自改。
+- 无 `nwt self-update` **引擎命令**:ADR-0003「面板不代跑引擎命令」的边界不变。但面板自身二进制由设置屏 `U` 经 install.sh 同一道 sha256 闸替换(见上文「双出口」)——自改走的是脚本同一道闸,不是面板自己另造一套。
 - **仓库私有时匿名安装必然 404**:release 资产与 `raw.githubusercontent.com` 的 install.sh 对匿名请求都返回 404(私有仓库行为)。`curl | sh` 一行装的前提是**仓库公开**;保持私有则用 `gh release download`(带凭证),或给 install.sh 加 token 认证通道(未实现)。
 - **glibc 基线 2.41(v0.2.0 linux 包)**:v0.1.0 的 linux 包构建于 ubuntu-24.04(glibc 2.39);v0.2.0 起在本机(Debian 13)构建,基线升到 2.41,老发行版运行会报 `GLIBC_2.41 not found`。需要更宽兼容时用更老的构建机重打这两个 linux 包(命名不变)。
 - 包管理器分发(Homebrew / Scoop / AUR):后续票据。
