@@ -79,7 +79,14 @@ cargo test --all-targets     # 单测:契约解析 / 发现策略 / 六屏快照
 cargo build --release
 ```
 
-本仓不跑 CI(无 GitHub Actions;跨平台测试在本地进行)。改动合入前,上面四项在开发机上跑齐即闸门——注意两条只在特定平台暴露的回归历史:建议命令测试的 OS 临时目录长度依赖(macOS/Windows 红)、discover 测试在装有真 `nw` 的机器上会红(环境测试,非缺陷)。
+本仓不跑 CI(GitHub Actions 被账号级计费挡住全部 job,业主裁定不付钱,见 [docs/release.md](./docs/release.md));闸门在本地,两条路任选:
+
+- **自动(推荐)**:`git config core.hooksPath githooks` 启用 `githooks/pre-push`——每次 push 前自动跑齐上面四项,红了就挡住(恢复默认:`git config --unset core.hooksPath`)
+- **手动**:改动合入前,上面四项在开发机上跑齐即闸门
+
+已知的**环境性红**(非缺陷)用 `NWT_SKIP_GATE=1 git push ...` 逃逸:discover 测试在装有真 `nw` 的机器上会红。另注意一条只在特定平台暴露的回归历史:建议命令测试的 OS 临时目录长度依赖(macOS/Windows 红)。
+
+发布是同一套闸门的另一面:`scripts/release.sh <版本>` 一条命令跑完 [docs/release.md](./docs/release.md) 的七步(本地闸门 → 打 tag → 三平台交叉构建 → 打包校验 → `gh release create` → 核对),`--dry-run` 先体检。
 
 ## 文档
 

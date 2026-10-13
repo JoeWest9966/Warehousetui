@@ -4,6 +4,8 @@ nwt 的发布面:**本地构建 → 打 `v*` tag → `gh release create` 手动�
 
 > 状态:v0.1.0 由 Action 发布(历史记录见底部);**v0.2.0、v0.3.0 均为手动发布**,流程即下文。
 
+**下面七步已由 [`scripts/release.sh`](../scripts/release.sh) 一条命令跑完**(工单 #84):`scripts/release.sh 0.4.0` 顺序走 check → gate → tag → build → pack → publish → verify,`--dry-run` 只体检、`--from <step>` 失败续跑、`--skip-gate` 跳过闸门。脚本**只执行本文定死的契约,不新造契约**;本文仍是事实源,两边对不上以本文为准、并去改脚本。
+
 ## 发布流程(手动)
 
 1. **本地闸门**(开发机上跑齐四项,替代原 CI 三平台):
@@ -61,7 +63,31 @@ nwt 的发布面:**本地构建 → 打 `v*` tag → `gh release create` 手动�
    `--generate-notes` 之后按需 `gh release edit v0.2.0 --notes-file` 补平台状态说明(macOS 缺席必须写,别让用户撞 404)。
 7. **核对 + 记账**:`gh release view v0.2.0` 对资产表;带凭证下载全部资产跑 `sha256sum -c`;在「发布记录」登记一行。
 
-## 资产命名(三处同源的契约)
+脚本对应关系:`scripts/release.sh <版本>` 的 check(第 1 步前置 + 版本三处一致 + tag 未占用 + 工具链)/ gate(第 1 步)/ tag(第 3 步)/ build(第 4 步)/ pack(第 5 步)/ publish(第 6 步)/ verify(第 7 步)。publish 前有一条铁闸:**HEAD 必须等于 origin/main 的当前 tip**——`gh release create` 在 tag 不存在时把 tag 建在远端 main tip 上,不等就说明「标签源码 ≠ 二进制源码」,脚本直接拒发。
+
+## 本地闸门:pre-push 钩子(CI 空位的日常补位)
+
+原 CI 的活日常由 `githooks/pre-push` 在 push 前干(启用一次,恢复默认见注释):
+
+```bash
+git config core.hooksPath githooks      # 启用
+# git config --unset core.hooksPath    # 恢复 .git/hooks 默认
+```
+
+钩子跑齐 README「开发」节那四项(fmt / clippy / test / build),红了就挡住 push。已知的**环境性红**(非缺陷)用 `NWT_SKIP_GATE=1 git push ...` 逃逸:discover 测试在装有真 `nw` 的机器上会红。发布时的 `scripts/release.sh` gate 步跑同一套,两边不许分成两套口径。
+
+## 自托管 runner(可选,未接线)
+
+**自托管 runner 不烧 Actions 分钟、也不受 spending limit 管**——账号级计费挡的是 GitHub 托管 runner,不是这个。想在 GitHub 上也看到绿勾可以挂一台(开发机上常驻一个进程):repo → Settings → Actions → Runners → New self-hosted runner,按给出的两条命令装并跑;然后从历史恢复工作流、只留 Linux 一条:
+
+```bash
+git show 1b9eeeb:.github/workflows/ci.yml > .github/workflows/ci.yml
+# 再把 runs-on 改成 [self-hosted, linux],矩阵只留 linux x86_64
+```
+
+**未接线的原因**:业主裁定不走 Action;且没注册 runner 时这些 job 不会秒失败、而是**一直排队**,比没有更吵。真要挂,先把 CI 观感需求和「常驻一个进程」的代价摆到桌面上再定。
+
+## 资产命名(四处同源的契约)
 
 | 平台 | 资产 | v0.2.0 状态 |
 |---|---|---|
@@ -77,7 +103,7 @@ nwt 的发布面:**本地构建 → 打 `v*` tag → `gh release create` 手动�
 - **只出 windows x86_64**:Windows 是「编译可运行」级支持([spec #10](https://github.com/JoeWest9966/Warehousetui/issues/10) 钉死的 R3 决定;ADR-0002 只定技术栈、不涉支持级),不为它出全矩阵。
 - `checksums.txt` 用 `sha256sum` 双列格式,unix 上可直接 `sha256sum -c` 验。
 
-**契约同步要求**:本文「发布流程」的打包命令、install.sh 的请求名、`checksums.txt` 的条目名,三处同源。改命名必须三处一起改,并更新上表——这是 install.sh 能装对版本的唯一保证。
+**契约同步要求**:本文「发布流程」的打包命令、install.sh 的请求名、`checksums.txt` 的条目名、`scripts/release.sh` 的 `PKG_*` 常量,四处同源。改命名必须四处一起改,并更新上表——这是 install.sh 能装对版本的唯一保证。
 
 ## 用户侧校验
 
