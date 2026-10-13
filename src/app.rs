@@ -368,6 +368,14 @@ pub struct App {
     /// 待扫 slug 队列(工单 #114):键位处理器没有 tx,只排队;主循环
     /// 取出后跑只读 `gh api`,回音经扫描通道回流。
     pub scan_pending: Vec<String>,
+    /// 作者侧脚手架表单流(spec #95 工单 #110,含首套模板):与登记两段式
+    /// 同级的顶层浮层——表单 → 拟落账预览 → 图形确认 → datarepo 写侧原子
+    /// 落盘。与规格无关的骨架(#111 extension 复用);规格自己的表单在
+    /// [`scaffold_form`](Self::scaffold_form)。
+    pub scaffold_flow: crate::screens::ScaffoldFlow,
+    /// skill 脚手架表单(名称 / 描述 / 触发词 + 模板起步开关)。#111 追加
+    /// extension 表单时,在此旁添一份并让表单流按 kind 分派。
+    pub scaffold_form: crate::screens::SkillForm,
     /// 编目册屏(#53):vps 两段式登记流(与命令组无关的骨架件)。
     pub vps_flow: crate::screens::RegisterFlow,
     /// vps 登记表单(名字 / 若干条地址 / 端口 / 若干条登录 / 备注)。
@@ -612,6 +620,8 @@ impl App {
             reg_scan_sel: 0,
             reg_scan_slug: None,
             scan_pending: Vec::new(),
+            scaffold_flow: crate::screens::ScaffoldFlow::default(),
+            scaffold_form: crate::screens::SkillForm::default(),
             vps_flow: crate::screens::RegisterFlow::new(),
             vps_form: crate::screens::new_form(),
             vps_ls: None,
@@ -882,12 +892,23 @@ impl App {
             // kind 选择屏的「Enter 预审」段同款(入队不带 --yes 的 register);
             // 确认屏「Enter 落账」段(#31,闸放行时才产此目标)同路入队
             // 带 --yes 的落账——与键盘 Enter 一个后果,语义不许漂移。
-            Target::Activate => match self.reg_state {
-                RegState::KindPick => self.dispatch_register(),
-                RegState::Review if self.reg_can_commit() => self.dispatch_register_commit(),
-                RegState::PreScanPick => self.reg_pick_confirm(),
-                _ => self.launch_selected_lock(),
-            },
+            Target::Activate => {
+                // 脚手架拟落账预览态(#110):点「Enter 落盘」段 = 图形确认落盘
+                // (与键盘 Enter 同路,仍过数据仓根闸)。脚手架与登记两段式互斥,
+                // 故预览态在场时不会落到下面的登记分支。
+                if self.scaffold_flow.phase == crate::screens::ScaffoldPhase::Review {
+                    self.dispatch_scaffold_confirm();
+                } else {
+                    match self.reg_state {
+                        RegState::KindPick => self.dispatch_register(),
+                        RegState::Review if self.reg_can_commit() => {
+                            self.dispatch_register_commit()
+                        }
+                        RegState::PreScanPick => self.reg_pick_confirm(),
+                        _ => self.launch_selected_lock(),
+                    }
+                }
+            }
             // 帮助「任意处关」与仪式「Esc 返航」:与键盘 Esc 同一路
             // (日志区左键无动作,翻看归上面的滚轮分支)。
             Target::DismissPopup => self.dismiss_popup(),
@@ -1059,6 +1080,9 @@ impl App {
             // 读的是打开那一刻的落点快照(`recipes::LandingTrace`),返航不顺手
             // 改 rc_sel/rc_domain。Esc 与点任意处走这一条同路(语义不漂移)。
             self.rc_landing = None;
+        } else if self.scaffold_flow.in_flight() {
+            // 脚手架浮层(#110):鼠标点任意处与键盘 Esc/q 同路返航(结论态即关闭)。
+            self.cancel_scaffold();
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
@@ -1428,6 +1452,13 @@ impl App {
                 return;
             }
             RegState::Idle => {}
+        }
+        // 作者侧脚手架表单流(#110):与登记两段式同级的顶层浮层——表单 /
+        // 拟落账预览 / 结论任一态在场即吞键,只有本流的键受理(Enter 提交 /
+        // 落盘、Esc/q 返航),壳级切屏/主题一个都不穿透(浮层优先级同登记)。
+        if self.scaffold_flow.in_flight() {
+            self.on_key_scaffold(k);
+            return;
         }
         match k.code {
             KeyCode::Char('q') if !self.assembling => self.quit = true,
@@ -1849,6 +1880,10 @@ impl App {
             // 外部源域登记入口(#30):两道门在 start_register 里把守,
             // 不可用时只留一句指路,不进流程。
             KeyCode::Char('r') if self.rc_domain == Domain::Sources => self.start_register(),
+            // 作者侧 skill 脚手架(#110):组件域 `n` 发起——与外部源域 `r` 同构
+            // (入口门在 start_scaffold 里把守:装配互斥 / 流程不重入 / 数据仓根
+            // 就绪,不可用只留指路)。skill 是组件(CONTEXT),落进数据仓 skills/。
+            KeyCode::Char('n') if self.rc_domain == Domain::Components => self.start_scaffold(),
             // 反向溯源(#115):Enter 看选中组件/外部源铺进派后的落点 —— 纯只读
             // 呈现,不读派目录、不发引擎命令(落点规则是上游 external-sources.md
             // 的只读知识,面板不另造)。无落点语义的域静默不摆(open_landing 三道门)。
@@ -2447,6 +2482,130 @@ impl App {
                     .collect(),
             });
         catalog::preaudit_passed(out, audit.as_ref())
+    }
+
+    // ---- 作者侧脚手架表单流(spec #95 工单 #110,ADR-0010) ----
+
+    /// 组件域 `n` 发起 skill 脚手架:三道门(装配互斥 / 流程不重入 / 数据仓根
+    /// 就绪)过后进表单态。数据仓根不可用**统一指路、不开流程**——写侧连
+    /// 构造都不该发生(ADR-0010 §5)。
+    pub fn start_scaffold(&mut self) {
+        if self.assembling {
+            // 写互斥(ADR-0010 §5):脚手架与装配不同时进行。
+            self.push_log("装配进行中:脚手架与装配互斥,稍后再试");
+            return;
+        }
+        if self.reg_state != RegState::Idle || self.scaffold_flow.in_flight() {
+            return; // 登记 / 脚手架流程进行中不重入
+        }
+        if self.data_root_cause().is_some() {
+            self.push_log(format!("脚手架入口:{}", self.data_root_gate_msg()));
+            return;
+        }
+        self.scaffold_form = crate::screens::SkillForm::default();
+        self.scaffold_flow.begin();
+        self.push_log("新建 skill 脚手架:填名称/描述/触发词,Enter 拟落账预览,Esc/q 放弃");
+    }
+
+    /// 脚手架浮层键位:表单态转口规格自己的键入分发;预览态 Enter 落盘 /
+    /// Esc·q 返航;结论态 Esc·q 关闭。壳级键一个都不穿透(浮层优先级)。
+    fn on_key_scaffold(&mut self, k: KeyEvent) {
+        use crate::screens::{FormAction, ScaffoldPhase};
+        match self.scaffold_flow.phase {
+            ScaffoldPhase::Form => {
+                match crate::screens::on_key_skill_form(&mut self.scaffold_form, k) {
+                    FormAction::Submit => self.scaffold_submit(),
+                    FormAction::Cancel => self.cancel_scaffold(),
+                    FormAction::Edited => {}
+                }
+            }
+            ScaffoldPhase::Review => match k.code {
+                KeyCode::Enter => self.dispatch_scaffold_confirm(),
+                KeyCode::Esc | KeyCode::Char('q') => self.cancel_scaffold(),
+                _ => {}
+            },
+            ScaffoldPhase::Done => {
+                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.cancel_scaffold();
+                }
+            }
+            ScaffoldPhase::Idle => {}
+        }
+    }
+
+    /// 表单 Enter:面板侧字段校验(对齐上游 validate 对 SKILL.md 的检查)
+    /// → 写侧 `plan` 拟落账(**一个字节都不落**)→ 进预览态摊开。字段不合法
+    /// 拦在表单里留可改;写侧校验(空 / 重复目标 / 路径)不过也留表单。
+    fn scaffold_submit(&mut self) {
+        use crate::datarepo::write::DataRepo;
+        use crate::screens::ScaffoldSpec;
+        let writes = match self.scaffold_form.planned_writes() {
+            Ok(w) => w,
+            Err(reasons) => {
+                self.push_log(format!("脚手架被拒:{},留表单可改", reasons.join(";")));
+                return;
+            }
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("脚手架不下发:{}", self.data_root_gate_msg()));
+            self.cancel_scaffold();
+            return;
+        };
+        match DataRepo::new(&root).plan(writes) {
+            Ok(plan) => {
+                self.scaffold_flow.enter_review(plan);
+                self.push_log("拟落账就绪:审阅路径与内容,Enter 落盘,Esc 返航");
+            }
+            Err(e) => {
+                // 写侧校验失败(面板侧已拦过一层,这里双证):留表单可改。
+                self.push_log(format!("拟落账被拒:{},留表单可改", e.why()));
+            }
+        }
+    }
+
+    /// 图形确认(键盘 Enter / 鼠标点「Enter 落盘」段)后才可能到达——全流程
+    /// 唯一真正写盘的转换。走 datarepo 写侧 `commit`(逐文件 tmp + rename
+    /// 原子落盘)。落盘失败是磁盘 / 权限问题,留预览态说清,不冒充成功。
+    fn dispatch_scaffold_confirm(&mut self) {
+        use crate::datarepo::write::DataRepo;
+        use crate::screens::ScaffoldPhase;
+        if self.scaffold_flow.phase != ScaffoldPhase::Review {
+            return;
+        }
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("落盘未下发:{}", self.data_root_gate_msg()));
+            return;
+        };
+        let Some(plan) = self.scaffold_flow.plan.clone() else {
+            return;
+        };
+        match DataRepo::new(&root).commit(&plan) {
+            Ok(receipt) => {
+                let n = receipt.written.len();
+                self.scaffold_flow.enter_done(receipt);
+                self.push_log(format!(
+                    "skill 骨架已写入数据仓:{n} 个文件(原子落盘,改动走 git PR + 家长审)"
+                ));
+            }
+            Err(e) => {
+                let why = e.why();
+                self.scaffold_flow.fail(why.clone());
+                self.push_log(format!("落盘失败:{why}"));
+            }
+        }
+    }
+
+    /// 返航:任一态 Esc/q 同义。已落盘(结论态)说「完成」,否则说「一个字节
+    /// 都没落」——两态不互冒充。键盘与鼠标点任意处同路(经 `dismiss_popup`)。
+    fn cancel_scaffold(&mut self) {
+        let done = self.scaffold_flow.phase == crate::screens::ScaffoldPhase::Done;
+        self.scaffold_flow.abandon();
+        self.scaffold_form = crate::screens::SkillForm::default();
+        self.push_log(if done {
+            "脚手架完成:关闭预览(改动在数据仓,走 git PR 审)".to_string()
+        } else {
+            "脚手架返航:一个字节都没落".to_string()
+        });
     }
 
     // ---- 编目册屏·vps(spec #50 工单 #53,ADR-0009) ----

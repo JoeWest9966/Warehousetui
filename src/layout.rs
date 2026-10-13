@@ -176,6 +176,12 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         register_hits(body, class, app, &mut hits);
         return hits;
     }
+    // 作者侧脚手架浮层(#110):与登记两段式同级的顶层浮层——表单态对鼠标惰性
+    // (键位-only),预览态只产键位行命中,结论态点任意处返航(弹层优先级)。
+    if app.scaffold_flow.in_flight() {
+        scaffold_hits(body, class, app, &mut hits);
+        return hits;
+    }
     match class {
         SizeClass::Comfy => {
             comfy_shell(body, &mut hits);
@@ -738,6 +744,20 @@ pub const REG_REVIEW_H: u16 = 24;
 pub const REG_DONE_W: u16 = 76;
 pub const REG_DONE_H: u16 = 20;
 
+/// 脚手架拟落账预览屏键位行的左段(#110 落盘段,与 [`REG_KEY_REVIEW_COMMIT`]
+/// 同法):渲染(`scaffold::render_scaffold_review`)与命中(`scaffold_hits`)
+/// 同一份文案。右段复用 [`RITUAL_KEY_RETURN`]。
+pub const SCAFFOLD_KEY_COMMIT: &str = "  Enter 落盘 ";
+
+/// 脚手架三个浮层的尺寸(#110):渲染与命中同一组常量,几何零分歧;
+/// `popup_rect` 的收窄规则两边同用(紧凑态 66 宽下自动收窄)。
+pub const SCAFFOLD_FORM_W: u16 = 64;
+pub const SCAFFOLD_FORM_H: u16 = 14;
+pub const SCAFFOLD_REVIEW_W: u16 = 76;
+pub const SCAFFOLD_REVIEW_H: u16 = 24;
+pub const SCAFFOLD_DONE_W: u16 = 64;
+pub const SCAFFOLD_DONE_H: u16 = 12;
+
 /// 发射仪式浮层:与 `render_launch_ritual` 同尺寸、在**正文区**内居中;
 /// 底部键位行按渲染同一文案对半分——「Enter 发射」段给
 /// [`Target::Activate`](点=入队 up),「Esc 返航」段给
@@ -969,6 +989,41 @@ fn register_hits(
                 hits.push((popup, Target::DismissPopup));
             }
         }
+    }
+}
+
+/// 脚手架浮层命中(#110):表单态对鼠标惰性(同登记输入态——键入归键盘);
+/// 拟落账预览态键位行两段(「Enter 落盘」→ Activate 落盘,「Esc 返航」→
+/// Dismiss);结论态点任意处 = 返航。几何与 `scaffold::render_scaffold_*`
+/// 同一组常量同一 `popup_rect`,点哪打哪。
+fn scaffold_hits(
+    body: Rect,
+    class: SizeClass,
+    app: &crate::app::App,
+    hits: &mut Vec<(Rect, Target)>,
+) {
+    use crate::screens::ScaffoldPhase;
+    let Some(content) = popup_content(body, class) else {
+        return;
+    };
+    match app.scaffold_flow.phase {
+        // 表单态:纯键入,鼠标惰性(点浮层不误触底层,也不分派任何命中)。
+        ScaffoldPhase::Form => {}
+        ScaffoldPhase::Review => {
+            let popup = popup_rect(content, SCAFFOLD_REVIEW_W, SCAFFOLD_REVIEW_H);
+            if popup.width == 0 || popup.height == 0 {
+                return;
+            }
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(popup, key_y, SCAFFOLD_KEY_COMMIT, RITUAL_KEY_RETURN, hits);
+        }
+        ScaffoldPhase::Done => {
+            let popup = popup_rect(content, SCAFFOLD_DONE_W, SCAFFOLD_DONE_H);
+            if popup.width > 0 && popup.height > 0 {
+                hits.push((popup, Target::DismissPopup));
+            }
+        }
+        ScaffoldPhase::Idle => {}
     }
 }
 
