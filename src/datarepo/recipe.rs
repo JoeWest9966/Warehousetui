@@ -15,13 +15,19 @@
 //! 其余顶层块**原样保留**(逐行),序列项里的未知子字段也以「键 + 原样值」保藏。
 //! 目标是「往返不丢未知字段」,不是通用 YAML 引擎。
 //!
-//! ## 预跑 validate 的暂存落点
+//! ## 预跑暂存文件的落点(ADR-0010 §1 第四类:窄准许面)
 //! 引擎 `validate --recipe <路径>` 只读文件、无 stdin,且从配方路径
 //! `filepath.Dir(filepath.Dir(abs))` 自推仓根(上游 `internal/validate`)。要让
 //! 跨文件检查(catalog.json / 组件引用)真跑,暂存文件必须在配方的**同目录**;
 //! 于是暂存到 `recipe.yaml` 的兄弟隐藏文件,validate 完即删。暂存写经写侧
 //! `plan`+`commit`(原子、走同一条缝),删除是 scratch 清理;被写回的
 //! `recipe.yaml` 本身仍只在图形确认后落。
+//!
+//! 这是**确认前的一次写盘**,ADR-0010 §1 为它单开一行窄准许面(隐藏名、确定名、
+//! 跑完即清、返航 / 换根也清),四条约束由
+//! [`tests::暂存档_正常失败返航三径都清干净`] 与
+//! [`tests::暂存档_换根也按当初那个根清`] 钉死。落点由 [`ScratchSlot`] 持
+//! (它记住暂存时那个根),壳层连「根 + 相对路径」都不拼。
 
 use crate::datarepo::write::{self, DataRepo, PlannedWrite, RepoRelPath, WritePlan, WriteReceipt};
 
@@ -583,11 +589,17 @@ pub fn plan_writeback(
 }
 
 /// 预跑暂存文件的相对路径:配方文件的兄弟隐藏名(同目录 ⇒ 引擎自推同一仓根)。
-pub fn scratch_rel(recipe_rel: &str) -> String {
-    match recipe_rel.rsplit_once('/') {
+///
+/// 为什么必须在同目录:引擎 `validate --recipe <路径>` 从配方路径
+/// `filepath.Dir(filepath.Dir(abs))` 自推仓根(上游 `internal/validate`),
+/// 跨文件检查(catalog.json / 组件引用)要的是**同一个仓根**——挪出数据仓
+/// 这些检查就失效,那预跑等于只跑了个形态面(见 ADR-0010 §1 第四类)。
+pub fn scratch_rel(recipe_rel: &str) -> Result<RepoRelPath, write::RepoRelPathError> {
+    let raw = match recipe_rel.rsplit_once('/') {
         Some((dir, _)) => format!("{dir}/{SCRATCH_FILE}"),
         None => SCRATCH_FILE.to_string(),
-    }
+    };
+    RepoRelPath::new(&raw)
 }
 
 /// 预跑暂存文件名(隐藏):既是 scratch 的名字,也是引擎回音路由的判据——
@@ -605,21 +617,56 @@ pub fn is_prerun_argv(args: &[String]) -> bool {
 pub fn stage_for_validate(
     repo: &DataRepo,
     doc: &RecipeDoc,
-    scratch_rel: &str,
+    scratch_rel: &RepoRelPath,
 ) -> Result<(), String> {
-    let rel = RepoRelPath::new(scratch_rel).map_err(|e| e.why())?;
     let content = doc.serialize();
     let plan = repo
-        .plan(vec![PlannedWrite::text(rel, &content)])
+        .plan(vec![PlannedWrite::text(scratch_rel.clone(), &content)])
         .map_err(|e| e.why())?;
     repo.commit(&plan).map_err(|e| e.why())?;
     Ok(())
 }
 
 /// 清掉预跑暂存文件(scratch 清理,不是写回)。
-pub fn clear_staged(repo: &DataRepo, scratch_rel: &str) {
-    if let Ok(rel) = RepoRelPath::new(scratch_rel) {
-        let _ = std::fs::remove_file(repo.root_path().join(rel.as_str()));
+pub fn clear_staged(repo: &DataRepo, scratch_rel: &RepoRelPath) {
+    let _ = std::fs::remove_file(repo.abs_path(scratch_rel));
+}
+
+/// 预跑暂存档的落点:**哪个数据仓根** + 哪个相对路径,以及「清掉它」这一动作。
+///
+/// 记住**暂存时那个句柄**而不是「当前设置里的根」:操作者中途换过数据仓根,
+/// 残档也要从旧根清掉——否则「确认前一个字节都不落」在换根这一刻漏一个洞
+/// (ADR-0010 §1 第四类:跑完即清、返航 / 换根也清)。
+#[derive(Clone, Debug)]
+pub struct ScratchSlot {
+    repo: DataRepo,
+    rel: RepoRelPath,
+}
+
+impl ScratchSlot {
+    /// 暂存编辑态(写侧原子落,同一条缝),拿回落点。
+    pub fn stage(repo: &DataRepo, doc: &RecipeDoc, recipe_rel: &str) -> Result<Self, String> {
+        let rel = scratch_rel(recipe_rel).map_err(|e| e.why())?;
+        stage_for_validate(repo, doc, &rel)?;
+        Ok(Self {
+            repo: repo.clone(),
+            rel,
+        })
+    }
+
+    /// 暂存档在数据仓根之下的相对路径(隐藏、确定名)。
+    pub fn rel(&self) -> &RepoRelPath {
+        &self.rel
+    }
+
+    /// 给引擎 argv 的绝对路径(外部进程只认路径;壳层不自己拼)。
+    pub fn abs(&self) -> String {
+        self.repo.abs_path(&self.rel)
+    }
+
+    /// 清掉暂存档(scratch 清理,不是写回)。正常 / 失败 / 返航 / 换根都走它。
+    pub fn clear(&self) {
+        clear_staged(&self.repo, &self.rel);
     }
 }
 
@@ -770,15 +817,16 @@ metadata:\n  owner: me\nlabels:\n  tier: prod\n";
         fs::write(root.join("recipes/research-desk/recipe.yaml"), SAMPLE).unwrap();
         let r = repo(&root);
         let doc = load(&r, "recipes/research-desk/recipe.yaml").unwrap();
-        let scratch = scratch_rel("recipes/research-desk/recipe.yaml");
-        assert_eq!(scratch, "recipes/research-desk/.nwt-validate.yaml");
-        stage_for_validate(&r, &doc, &scratch).unwrap();
-        // 暂存在场,内容 = 编辑态序列化;recipe.yaml 原样不动
-        assert!(root.join(&scratch).exists(), "暂存文件在场");
+        let slot = ScratchSlot::stage(&r, &doc, "recipes/research-desk/recipe.yaml").unwrap();
         assert_eq!(
-            fs::read_to_string(root.join(&scratch)).unwrap(),
-            doc.serialize()
+            slot.rel.as_str(),
+            "recipes/research-desk/.nwt-validate.yaml",
+            "暂存落点 = 配方同目录的隐藏固定名"
         );
+        // 暂存在场,内容 = 编辑态序列化;recipe.yaml 原样不动
+        let at = root.join(slot.rel.as_str());
+        assert!(at.exists(), "暂存文件在场");
+        assert_eq!(fs::read_to_string(&at).unwrap(), doc.serialize());
         assert_eq!(
             fs::read_to_string(root.join("recipes/research-desk/recipe.yaml")).unwrap(),
             SAMPLE,
@@ -788,8 +836,97 @@ metadata:\n  owner: me\nlabels:\n  tier: prod\n";
         assert!(!root
             .join("recipes/research-desk/.nwt-validate.yaml.nwt-tmp")
             .exists());
-        clear_staged(&r, &scratch);
-        assert!(!root.join(&scratch).exists(), "validate 完即清");
+        slot.clear();
+        assert!(!at.exists(), "validate 完即清");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 窄准许面的四条约束之一「跑完即清」的三条径:正常回音落地、预跑未过
+    /// (失败)、返航——三条都走 [`ScratchSlot::clear`](super::ScratchSlot::clear),
+    /// 暂存档一个字节都不留(ADR-0010 §1 第四类)。
+    #[test]
+    fn 暂存档_正常失败返航三径都清干净() {
+        let root = fixture("clear-paths");
+        fs::create_dir_all(root.join("recipes/research-desk")).unwrap();
+        fs::write(root.join("recipes/research-desk/recipe.yaml"), SAMPLE).unwrap();
+        let r = repo(&root);
+        let doc = load(&r, "recipes/research-desk/recipe.yaml").unwrap();
+        // ① 正常径:预跑回音落地即清
+        let ok = ScratchSlot::stage(&r, &doc, "recipes/research-desk/recipe.yaml").unwrap();
+        ok.clear();
+        assert!(!root.join(ok.rel.as_str()).exists(), "正常径:回音落地即清");
+        // ② 失败径:预跑未过也清(不让残档冒充下一轮的编辑态)
+        let bad = ScratchSlot::stage(&r, &doc, "recipes/research-desk/recipe.yaml").unwrap();
+        bad.clear();
+        assert!(!root.join(bad.rel.as_str()).exists(), "失败径:未过也清");
+        // ③ 返航径:没跑预跑就放弃,同样清
+        let dropped = ScratchSlot::stage(&r, &doc, "recipes/research-desk/recipe.yaml").unwrap();
+        dropped.clear();
+        assert!(!root.join(dropped.rel.as_str()).exists(), "返航径:放弃也清");
+        // recipe.yaml 自始至终未被确认不动
+        assert_eq!(
+            fs::read_to_string(root.join("recipes/research-desk/recipe.yaml")).unwrap(),
+            SAMPLE
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 换根径:暂存档按**暂存时那个根**清——操作者中途换过数据仓根,残档也不
+    /// 留在旧根里(否则「确认前一个字节都不落」在换根这一刻漏一个洞)。
+    #[test]
+    fn 暂存档_换根也按当初那个根清() {
+        let old_root = fixture("swap-old");
+        let new_root = fixture("swap-new");
+        for r in [&old_root, &new_root] {
+            fs::create_dir_all(r.join("recipes/research-desk")).unwrap();
+            fs::write(r.join("recipes/research-desk/recipe.yaml"), SAMPLE).unwrap();
+        }
+        let doc = load(&repo(&old_root), "recipes/research-desk/recipe.yaml").unwrap();
+        // 在旧根暂存,随后设置态指向新根
+        let slot = ScratchSlot::stage(&repo(&old_root), &doc, "recipes/research-desk/recipe.yaml")
+            .unwrap();
+        assert!(old_root.join(slot.rel.as_str()).exists(), "暂存落在旧根");
+        // 此刻设置态若指向新根(调用方拿的是新句柄),slot 仍按暂存时那个根清
+        slot.clear();
+        assert!(
+            !old_root.join(slot.rel.as_str()).exists(),
+            "换根也清:残档不留在旧根"
+        );
+        assert!(
+            !new_root.join(slot.rel.as_str()).exists(),
+            "新根什么都没落(暂存只发生一次)"
+        );
+        fs::remove_dir_all(&old_root).ok();
+        fs::remove_dir_all(&new_root).ok();
+    }
+
+    /// 名字确定(隐藏 + 固定)的后果:进程被杀留下的残档被下一轮 stage 截断
+    /// 复用,不积垃圾、也不会和下一轮的编辑态混在一起。
+    #[test]
+    fn 暂存档_残档被下一轮截断复用_不积垃圾() {
+        let root = fixture("stale");
+        fs::create_dir_all(root.join("recipes/research-desk")).unwrap();
+        fs::write(root.join("recipes/research-desk/recipe.yaml"), SAMPLE).unwrap();
+        let r = repo(&root);
+        let doc = load(&r, "recipes/research-desk/recipe.yaml").unwrap();
+        let first = ScratchSlot::stage(&r, &doc, "recipes/research-desk/recipe.yaml").unwrap();
+        // 模拟崩溃:不 clear,直接再来一轮(编辑态已改)
+        let mut edited = load(&r, "recipes/research-desk/recipe.yaml").unwrap();
+        edited.add_component("retention", "0.4.1");
+        let second = ScratchSlot::stage(&r, &edited, "recipes/research-desk/recipe.yaml").unwrap();
+        assert_eq!(first.rel, second.rel, "固定名:两轮落在同一个文件(截断复用)");
+        assert_eq!(
+            fs::read_to_string(root.join(second.rel.as_str())).unwrap(),
+            edited.serialize(),
+            "残档被截断,内容是这一轮的编辑态,不混上一轮"
+        );
+        // 目录里只有 recipe.yaml + 暂存档两件,没有 .nwt-tmp 残渣
+        let names: Vec<String> = fs::read_dir(root.join("recipes/research-desk"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 2, "不积垃圾:{names:?}");
+        second.clear();
         fs::remove_dir_all(&root).ok();
     }
 

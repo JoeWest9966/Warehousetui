@@ -1,4 +1,4 @@
-//! 作者侧脚手架表单流(spec #95 工单 #110 skill 含首套模板 / #111
+//! 作者侧脚手架表单流(spec #95 工单 #110 skill 含模板清单 / #111
 //! extension pi-extension 契约)。
 //!
 //! 面板第一次**自己写文件**的消费方之一(ADR-0010):图形表单生成 `SKILL.md`
@@ -23,19 +23,23 @@
 //!
 //! 字段形状校验**分别对齐上游对相应文件的检查**:skill 侧
 //! `SKILL.md` frontmatter 必填 `name` + `description`(见上游
-//! `docs/external-sources.md` 注册验收第 2 条);skill 身份 = frontmatter 的
+//! `docs/external-sources.md` 注册验收第 2 条);正文可按内置模板清单
+//! ([`SKILL_TEMPLATES`],面板静态资产:agent skill / MCP server / TUI 工具,
+//! 空白仍是默认一路)起步;skill 身份 = frontmatter 的
 //! `name`,故名字按引擎 `validName` 同款口径校验(它同时是落点目录名
 //! `skills/<名>/`)。extension 侧对齐 #21 的第六条验收:条目子树自带
 //! `package.json` 且 `pi.extensions` 非空、清单里每条路径真实存在
 //! (上游 `internal/source/scan.go` 的 `ExtensionManifestIssue`;validate 的
-//! 形态面 = `catalog.extension_entries`),面板侧镜像见
-//! [`ext_manifest_audit`]。产出内容是**面板自有资产**
-//! (内置模板),不是引擎逻辑复刻(ADR-0010 §3)。
+//! 形态面 = `catalog.extension_entries`),面板侧镜像在
+//! [`crate::datarepo::scaffold::ext_manifest_audit`](与落点计算同处)。产出内容是
+//! **面板自有资产**(内置模板),不是引擎逻辑复刻(ADR-0010 §3)。
 //!
 //! 两份规格的落点同源:数据仓的组件家是 `skills/` 与 `extensions/`
-//! (`datarepo` 读侧 `SKILLS_DIR` / `EXTENSIONS_DIR` 是路径知识的单源,
-//! #114 预扫与 #116 引用完整性都按它认条目)。上游那半的**派内**落点是
-//! `<agent-dir>/nw/extensions/<仓库>/<条目>/` 且必须登记
+//! (路径知识的单源在 `datarepo`——读侧 `SKILLS_DIR` / `EXTENSIONS_DIR`,写侧
+//! [`crate::datarepo::scaffold`] 的落点计算;#114 预扫与 #116 引用完整性都按它
+//! 认条目)。屏幕层只交「条目名 + 内容」这种意图级形状,拿回拟落账条目,
+//! 自己拼不出一个路径(code-review H1:落点下沉,读写两侧认同一批组件家)。
+//! 上游那半的**派内**落点是 `<agent-dir>/nw/extensions/<仓库>/<条目>/` 且必须登记
 //! `settings.packages`(external-sources.md「扩展这半」)——那是 `up` 铺下
 //! 去的事,面板脚手架只写数据仓里的源,不写派、也不写 `catalog.json`。
 
@@ -46,11 +50,12 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::datarepo::write::{PlannedWrite, RepoRelPath, WritePlan, WriteReceipt};
+use crate::datarepo::scaffold;
+use crate::datarepo::write::{PlannedWrite, WritePlan, WriteReceipt};
 use crate::input::{self, InputAction};
 use crate::layout::popup_rect;
 use crate::screens::recipes::clip;
-use crate::screens::FormAction;
+use crate::screens::{FormAction, FormField};
 
 // ---- 共用的表单流:阶段机 + 拟落账/收据槽 ----
 
@@ -162,16 +167,17 @@ pub enum SkillField {
     Template,
 }
 
-impl SkillField {
-    pub const ALL: [SkillField; 4] = [
+/// 字段顺序即 ↑/↓ 轮转顺序;标签与工单「名称/描述/触发词」同词。光标移动
+/// (到顶/到底不越界、不绕回)走共用形状 [`FormField`],不在这再写一遍。
+impl FormField for SkillField {
+    const ALL: &'static [SkillField] = &[
         SkillField::Name,
         SkillField::Description,
         SkillField::Triggers,
         SkillField::Template,
     ];
 
-    /// 字段标签(与工单「名称/描述/触发词」同词)。
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             SkillField::Name => "名称",
             SkillField::Description => "描述",
@@ -179,18 +185,16 @@ impl SkillField {
             SkillField::Template => "模板",
         }
     }
+}
 
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
-    }
-
+impl SkillField {
     /// 文本字段(有单行缓冲);模板开关没有。
     fn is_text(self) -> bool {
         !matches!(self, SkillField::Template)
     }
 }
 
-/// skill 脚手架表单:名称 / 描述 / 触发词 + 模板起步开关。
+/// skill 脚手架表单:名称 / 描述 / 触发词 + 模板起步。
 /// `name` = skill 身份(= SKILL.md frontmatter 的 name,也是落点目录名)。
 #[derive(Clone, Default)]
 pub struct SkillForm {
@@ -198,8 +202,9 @@ pub struct SkillForm {
     pub description: String,
     /// 触发词:一行,逗号 / 顿号 / 分号分隔(面板侧便利,进骨架正文)。
     pub triggers: String,
-    /// 从内置 agent skill 模板起步(true)还是空白骨架(false)。
-    pub template: bool,
+    /// 从哪套内置模板起步(`None` = 空白骨架,默认一路;存 id 不存下标——
+    /// 模板清单往后加,旧状态不会悄悄改指向)。
+    pub template: Option<&'static str>,
     pub field: SkillField,
 }
 
@@ -211,17 +216,6 @@ impl SkillForm {
             SkillField::Triggers => Some(&mut self.triggers),
             SkillField::Template => None,
         }
-    }
-
-    /// ↑/↓ 移字段(四字段轮转,到顶/到底不越界、不绕回)。
-    fn move_field(&mut self, down: bool) {
-        let i = self.field.index();
-        let n = SkillField::ALL.len();
-        self.field = SkillField::ALL[if down {
-            (i + 1).min(n - 1)
-        } else {
-            i.saturating_sub(1)
-        }];
     }
 }
 
@@ -249,10 +243,11 @@ impl ScaffoldSpec for SkillForm {
         }
         let triggers = split_triggers(&self.triggers);
         let content = skill_md(name, description, &triggers, self.template);
-        // 落点:数据仓 skills/<名>/SKILL.md。name 已校验为合法目录名,拼得出合法相对路径。
-        let path = RepoRelPath::new(&format!("skills/{name}/SKILL.md"))
-            .expect("name 已校验:拼得出的相对路径合法");
-        Ok(vec![PlannedWrite::text(path, &content)])
+        // 落点:数据仓 skills/<名>/SKILL.md(家目录与文件名是 datarepo 的路径
+        // 知识,这里只交「名 + 正文」——屏幕层零路径拼接)。
+        scaffold::skill_write(name, &content)
+            .map(|w| vec![w])
+            .map_err(|e| vec![e.why()])
     }
 }
 
@@ -287,33 +282,134 @@ fn split_triggers(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// 一套内置模板:稳定 id(表单状态里存它,清单扩了不改旧状态的语义),加屏上
+/// 标签与正文生成器(**面板静态资产**,ADR-0010 §1:产出内容是面板自有资产,
+/// 不是引擎逻辑复刻)。正文生成器收「名 + 描述 + 触发词」,frontmatter 由
+/// [`skill_md`] 统一补(上游 validate 盯着 name + description 两项,哪套模板都
+/// 不许缺)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SkillTemplate {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub body: fn(&str, &str, &[String]) -> String,
+}
+
+/// 内置模板清单:**面板定义、可扩展**——加一套模板只在这里加一行,表单 / 落点 /
+/// 表单流一字不改。「空白」不是清单里的一项,它是默认一路(`template = None`)。
+///
+/// 首套就是 #110 的 agent skill(何时触发 / 用法 / 备注);后两套按 spec #95
+/// 第 6 项「内置几套常用模板」补:MCP server 与 TUI 工具。都是 skill(一份带
+/// frontmatter 的 markdown),换的只有正文骨架。
+pub const SKILL_TEMPLATES: &[SkillTemplate] = &[
+    SkillTemplate {
+        id: "agent-skill",
+        label: "agent skill(何时触发/用法/备注)",
+        body: agent_skill_body,
+    },
+    SkillTemplate {
+        id: "mcp-server",
+        label: "MCP server(工具/资源/起步)",
+        body: mcp_server_body,
+    },
+    SkillTemplate {
+        id: "tui-tool",
+        label: "TUI 工具(界面/键位/起步)",
+        body: tui_tool_body,
+    },
+];
+
+/// 按 id 取内置模板(不认的 id 当空白,不猜、不按序号猜)。
+pub fn skill_template(id: &str) -> Option<&'static SkillTemplate> {
+    SKILL_TEMPLATES.iter().find(|t| t.id == id)
+}
+
+/// 空格轮转:空白 → 第一套 → … → 最后一套 → 空白。表单里选模板起步,
+/// 空白永远是默认一路(第一下空格给第一套,再一下从最后一套回空白)。
+fn next_skill_template(cur: Option<&str>) -> Option<&'static str> {
+    let idx = match cur {
+        None => 0,
+        Some(id) => match SKILL_TEMPLATES.iter().position(|t| t.id == id) {
+            Some(i) => i + 1,
+            None => 0, // 不认的 id(清单动过)当空白重来
+        },
+    };
+    SKILL_TEMPLATES.get(idx).map(|t| t.id)
+}
+
+/// agent skill 正文(#110 首套):「何时触发 / 用法 / 备注」的起步段落。
+fn agent_skill_body(_name: &str, _description: &str, triggers: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str("\n## 何时触发\n\n");
+    if triggers.is_empty() {
+        s.push_str("- (补充:什么时候该启用这个 skill)\n");
+    } else {
+        for t in triggers {
+            s.push_str(&format!("- {t}\n"));
+        }
+    }
+    s.push_str("\n## 用法\n\n(说明这个 skill 做什么、怎么用)\n");
+    s.push_str("\n## 备注\n\n- 由 nwt 脚手架生成(agent skill 模板起步);按需增删。\n");
+    s
+}
+
+/// MCP server 正文(spec #95 第 6 项第二套):起一个 MCP server 该交代的事 ——
+/// 暴露哪些工具 / 资源、怎么起、凭据从哪来。
+fn mcp_server_body(_name: &str, _description: &str, triggers: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str("\n## 何时触发\n\n");
+    if triggers.is_empty() {
+        s.push_str("- (补充:什么时候该走这个 MCP server)\n");
+    } else {
+        for t in triggers {
+            s.push_str(&format!("- {t}\n"));
+        }
+    }
+    s.push_str("\n## 暴露的工具\n\n- (列出工具名 + 一句话用途)\n");
+    s.push_str("\n## 暴露的资源\n\n- (列出资源 URI + 一句话用途)\n");
+    s.push_str("\n## 怎么起\n\n(入口命令 / 传输方式 / 端口或 stdio)\n");
+    s.push_str("\n## 凭据\n\n- (从环境变量读,别把密钥写进本文件)\n");
+    s
+}
+
+/// TUI 工具正文(spec #95 第 6 项第三套):起一个终端界面该交代的事 —— 界面布局、
+/// 键位、刷新节奏。
+fn tui_tool_body(_name: &str, _description: &str, triggers: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str("\n## 何时触发\n\n");
+    if triggers.is_empty() {
+        s.push_str("- (补充:什么时候该起这个界面)\n");
+    } else {
+        for t in triggers {
+            s.push_str(&format!("- {t}\n"));
+        }
+    }
+    s.push_str("\n## 界面\n\n- (几块区 / 各摆什么 / 常驻哪条提示栏)\n");
+    s.push_str("\n## 键位\n\n- (主操作 + 返航 + 帮助,别占运行环境已有的键)\n");
+    s.push_str("\n## 刷新\n\n- (什么触发重画 / 慢查询怎么不卡界面)\n");
+    s
+}
+
 /// 生成 `SKILL.md` 字节。**frontmatter 必填 `name` + `description`**(上游
 /// validate 对 skill 的检查项);正文按空白 / 模板两路给——模板是面板自有的
-/// 「首套 agent skill 模板」静态资产,不是引擎逻辑复刻。
-fn skill_md(name: &str, description: &str, triggers: &[String], template: bool) -> String {
+/// 静态资产(见 [`SKILL_TEMPLATES`]),不是引擎逻辑复刻。
+fn skill_md(name: &str, description: &str, triggers: &[String], template: Option<&str>) -> String {
     let mut s = String::new();
     s.push_str("---\n");
     s.push_str(&format!("name: {name}\n"));
     s.push_str(&format!("description: {description}\n"));
     s.push_str("---\n");
     s.push_str(&format!("\n# {name}\n\n{description}\n"));
-    if template {
-        // 首套 agent skill 模板:给「何时触发 / 用法 / 备注」的起步段落。
-        s.push_str("\n## 何时触发\n\n");
-        if triggers.is_empty() {
-            s.push_str("- (补充:什么时候该启用这个 skill)\n");
-        } else {
-            for t in triggers {
-                s.push_str(&format!("- {t}\n"));
-            }
-        }
-        s.push_str("\n## 用法\n\n(说明这个 skill 做什么、怎么用)\n");
-        s.push_str("\n## 备注\n\n- 由 nwt 脚手架生成(agent skill 模板起步);按需增删。\n");
-    } else if !triggers.is_empty() {
+    match template.and_then(skill_template) {
+        // 模板路:正文由那一套内置模板给(加模板只加清单一行)。
+        Some(t) => s.push_str(&(t.body)(name, description, triggers)),
         // 空白骨架:只在前置必填之外补一个触发词段(有触发词才补)。
-        s.push_str("\n## 触发词\n\n");
-        for t in triggers {
-            s.push_str(&format!("- {t}\n"));
+        None => {
+            if !triggers.is_empty() {
+                s.push_str("\n## 触发词\n\n");
+                for t in triggers {
+                    s.push_str(&format!("- {t}\n"));
+                }
+            }
         }
     }
     s
@@ -325,16 +421,17 @@ fn skill_md(name: &str, description: &str, triggers: &[String], template: bool) 
 pub fn on_key_skill_form(form: &mut SkillForm, k: KeyEvent) -> FormAction {
     match k.code {
         KeyCode::Up => {
-            form.move_field(false);
+            form.field = form.field.moved(false);
             return FormAction::Edited;
         }
         KeyCode::Down => {
-            form.move_field(true);
+            form.field = form.field.moved(true);
             return FormAction::Edited;
         }
-        // 模板开关:焦点在模板字段时,空格切换(空格在文本字段里仍是普通字符)。
+        // 模板起步:焦点在模板字段时,空格在「空白 → 各套模板 → 空白」间轮转
+        // (空格在文本字段里仍是普通字符)。
         KeyCode::Char(' ') if form.field == SkillField::Template => {
-            form.template = !form.template;
+            form.template = next_skill_template(form.template);
             return FormAction::Edited;
         }
         _ => {}
@@ -389,16 +486,17 @@ pub enum ExtensionField {
     Template,
 }
 
-impl ExtensionField {
-    pub const ALL: [ExtensionField; 4] = [
+/// 光标移动走共用形状 [`FormField`](crate::screens::FormField),与
+/// [`SkillField`] 同一只移字段习惯,不因规格不同改操作者的肌肉记忆。
+impl FormField for ExtensionField {
+    const ALL: &'static [ExtensionField] = &[
         ExtensionField::Name,
         ExtensionField::Description,
         ExtensionField::Entry,
         ExtensionField::Template,
     ];
 
-    /// 字段标签。
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             ExtensionField::Name => "名称",
             ExtensionField::Description => "描述",
@@ -406,11 +504,9 @@ impl ExtensionField {
             ExtensionField::Template => "模板",
         }
     }
+}
 
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
-    }
-
+impl ExtensionField {
     /// 文本字段(有单行缓冲);模板开关没有。
     fn is_text(self) -> bool {
         !matches!(self, ExtensionField::Template)
@@ -426,9 +522,6 @@ pub const DEFAULT_ENTRY: &str = "index.ts";
 /// 条目 `package.json` 的起始版本:上游只读它、不校验它(本地组件的
 /// `version` 才被 validate 查),给一个诚实的起步值,作者自己 bump。
 const EXT_VERSION: &str = "0.1.0";
-
-/// 条目清单的文件名:上游样本 `docs/samples/components/scout/package.json`。
-const EXT_MANIFEST_FILE: &str = "package.json";
 
 /// extension 脚手架表单:名称 / 描述 / 入口文件 + 模板起步开关。
 /// `name` = 条目身份(= 条目子树目录名,上游 #21:扩展没有 frontmatter 可当
@@ -452,18 +545,6 @@ impl ExtensionForm {
             ExtensionField::Entry => Some(&mut self.entry),
             ExtensionField::Template => None,
         }
-    }
-
-    /// ↑/↓ 移字段(四字段轮转,到顶/到底不越界、不绕回)——与 [`SkillForm`]
-    /// 同一只移字段习惯,不因规格不同改操作者的肌肉记忆。
-    fn move_field(&mut self, down: bool) {
-        let i = self.field.index();
-        let n = ExtensionField::ALL.len();
-        self.field = ExtensionField::ALL[if down {
-            (i + 1).min(n - 1)
-        } else {
-            i.saturating_sub(1)
-        }];
     }
 }
 
@@ -509,28 +590,17 @@ impl ScaffoldSpec for ExtensionForm {
         if !errs.is_empty() {
             return Err(errs);
         }
-        // 落点:数据仓 extensions/<名>/(作者侧脚手架的扩展家,与 skills/ 对称;
-        // 见 datarepo::SKILLS_DIR / EXTENSIONS_DIR 的路径知识单源)。
-        let dir = format!("extensions/{name}");
-        let writes = vec![
-            PlannedWrite::text(
-                RepoRelPath::new(&format!("{dir}/{EXT_MANIFEST_FILE}"))
-                    .expect("name 已校验:拼得出的相对路径合法"),
-                &ext_package_json(name, description, entry),
-            ),
-            PlannedWrite::text(
-                RepoRelPath::new(&format!("{dir}/{entry}"))
-                    .expect("name/entry 已校验:拼得出的相对路径合法"),
-                &ext_entry_ts(name, description, self.template),
-            ),
-        ];
-        // 自审:上游 register 验收第六条(仅 --kind extension)的面板侧镜像。
-        // 面板自己生成 manifest 与入口两边,这里保证两边对得上 —— 对不上就是
-        // 「装上了不加载」的形状,上游 register 会拒。
-        if let Some(reason) = ext_manifest_audit(&dir, &writes) {
-            return Err(vec![reason]);
-        }
-        Ok(writes)
+        // 落点:数据仓 extensions/<名>/ 下的清单与入口两件(家目录与文件名
+        // 是 datarepo 的路径知识,这里只交「条目名 + 两份正文 + 入口文件名」
+        // ——屏幕层零路径拼接)。自审(上游 register 验收第六条)也在接缝里:
+        // 面板自己生成 manifest 与入口两边,对不上 = 装上了不加载,过不去。
+        scaffold::ext_writes(
+            name,
+            &ext_package_json(name, description, entry),
+            entry,
+            &ext_entry_ts(name, description, self.template),
+        )
+        .map_err(|e| vec![e.why()])
     }
 }
 
@@ -651,60 +721,16 @@ fn ext_entry_ts(name: &str, description: &str, template: bool) -> String {
     s
 }
 
-/// 上游 register 验收第六条(仅 `--kind extension`,#21)的面板侧镜像:
-/// 条目子树自带 `package.json`、`pi.extensions` 非空、清单里每条路径在条目
-/// 子树里真实存在。判据逐条对齐上游 `internal/source/scan.go` 的
-/// `ExtensionManifestIssue`(路径不许绝对、不许越级,匹配得到文件)。
-///
-/// 面板自己生成 manifest 与入口两边,这个自审把「两边对不上」挡在拟落账
-/// 之前 —— 那种形状上游 register 会拒(装上了不加载),不该流到确认闸。
-fn ext_manifest_audit(dir: &str, writes: &[PlannedWrite]) -> Option<String> {
-    let manifest_rel = format!("{dir}/{EXT_MANIFEST_FILE}");
-    let at = |rel: &str| writes.iter().find(|w| w.path.as_str() == rel);
-    let Some(manifest) = at(&manifest_rel) else {
-        return Some(format!(
-            "条目子树没有 {EXT_MANIFEST_FILE}:pi 的包登记不兜底这种形状"
-        ));
-    };
-    let text = String::from_utf8_lossy(&manifest.content);
-    let v: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => return Some(format!("{EXT_MANIFEST_FILE} 解析失败:{e}")),
-    };
-    let Some(patterns) = v.pointer("/pi/extensions").and_then(|p| p.as_array()) else {
-        return Some(format!(
-            "{EXT_MANIFEST_FILE} 缺 pi.extensions:这不是一个 pi 扩展条目"
-        ));
-    };
-    if patterns.is_empty() {
-        return Some(format!(
-            "{EXT_MANIFEST_FILE} 的 pi.extensions 为空:这不是一个 pi 扩展条目"
-        ));
-    }
-    for p in patterns.iter().filter_map(|p| p.as_str()) {
-        if p.starts_with('/') || p.contains("..") {
-            return Some(format!("pi.extensions 里的 {p:?} 不许绝对路径或越级"));
-        }
-        let rel = p.trim_start_matches("./");
-        if at(&format!("{dir}/{rel}")).is_none() {
-            return Some(format!(
-                "pi.extensions 里的 {p:?} 在条目子树里一个文件都没匹配上"
-            ));
-        }
-    }
-    None
-}
-
 /// 表单键位(规格自己的键入分发):与 [`on_key_skill_form`] 同一只形状 ——
 /// ↑/↓ 移字段、模板字段空格切换、文本字段走通用单行输入态机。
 pub fn on_key_ext_form(form: &mut ExtensionForm, k: KeyEvent) -> FormAction {
     match k.code {
         KeyCode::Up => {
-            form.move_field(false);
+            form.field = form.field.moved(false);
             return FormAction::Edited;
         }
         KeyCode::Down => {
-            form.move_field(true);
+            form.field = form.field.moved(true);
             return FormAction::Edited;
         }
         KeyCode::Char(' ') if form.field == ExtensionField::Template => {
@@ -758,17 +784,27 @@ fn render_skill_form(frame: &mut Frame, area: Rect, app: &App) {
         "  skill 身份 = SKILL.md frontmatter 的 name;落进 skills/<名>/",
         p.dim(),
     ))];
-    for field in SkillField::ALL {
+    for field in SkillField::ALL.iter().copied() {
         let on = field == f.field;
         if field == SkillField::Template {
-            let mark = if f.template { "[x]" } else { "[ ]" };
+            // 当前选中哪一路(空白 / 哪套模板);下面把可选项逐行摊开 —— 清单由
+            // 面板定义,加模板只加清单一行,渲染这里一行都不用改。
+            let cur = f.template.and_then(skill_template);
             lines.push(Line::from(vec![
                 Span::raw(format!("  {} ", field.label())),
                 Span::styled(
-                    format!("{mark} 从内置 agent skill 模板起步"),
+                    format!("[{}] 空格切换", cur.map(|t| t.label).unwrap_or("空白")),
                     if on { p.sel().bold() } else { p.text() },
                 ),
             ]));
+            let mut opts: Vec<(&str, bool)> = vec![("空白", cur.is_none())];
+            opts.extend(SKILL_TEMPLATES.iter().map(|t| (t.label, cur == Some(t))));
+            for (label, chosen) in opts {
+                lines.push(Line::from(Span::styled(
+                    format!("    {} {label}", if chosen { "▸" } else { "·" }),
+                    if chosen { p.sel() } else { p.dim() },
+                )));
+            }
             continue;
         }
         let value = match field {
@@ -816,7 +852,7 @@ fn render_ext_form(frame: &mut Frame, area: Rect, app: &App) {
         "  pi 只扫一层 extensions/*/index.ts:条目必须自带 package.json",
         p.dim(),
     ))];
-    for field in ExtensionField::ALL {
+    for field in ExtensionField::ALL.iter().copied() {
         let on = field == f.field;
         if field == ExtensionField::Template {
             let mark = if f.template { "[x]" } else { "[ ]" };
@@ -1023,10 +1059,16 @@ mod tests {
         // 到底不绕回
         on_key_skill_form(&mut f, down());
         assert_eq!(f.field, SkillField::Template);
-        // 模板字段:空格切换起步方式
-        assert!(!f.template);
+        // 模板字段:空格在「空白 → 各套模板 → 空白」间轮转
+        assert_eq!(f.template, None, "空白是默认一路");
         on_key_skill_form(&mut f, press(' '));
-        assert!(f.template);
+        assert_eq!(f.template, Some("agent-skill"), "第一下空格给第一套模板");
+        on_key_skill_form(&mut f, press(' '));
+        assert_eq!(f.template, Some("mcp-server"));
+        on_key_skill_form(&mut f, press(' '));
+        assert_eq!(f.template, Some("tui-tool"));
+        on_key_skill_form(&mut f, press(' '));
+        assert_eq!(f.template, None, "轮转一圈回空白(空白永远是默认一路)");
         // 键入进当前文本字段
         f.field = SkillField::Name;
         on_key_skill_form(&mut f, press('a'));
@@ -1088,6 +1130,114 @@ mod tests {
         );
     }
 
+    /// 模板库(spec #95 第 6 项):面板定义的清单,至少 agent skill / MCP server /
+    /// TUI 工具三套;表单里可选模板起步,空白仍是默认一路。
+    #[test]
+    fn 模板清单_三套可选_空白是默认一路_每套正文不同且都过必填两项() {
+        // ① 清单:三套,id 稳定、标签非空、正文生成器都在
+        assert!(SKILL_TEMPLATES.len() >= 3, "至少三套:{SKILL_TEMPLATES:?}");
+        let ids: Vec<&str> = SKILL_TEMPLATES.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec!["agent-skill", "mcp-server", "tui-tool"]);
+        for t in SKILL_TEMPLATES {
+            assert!(!t.label.is_empty(), "{} 要有屏上标签", t.id);
+            assert_eq!(
+                skill_template(t.id).map(|x| x.id),
+                Some(t.id),
+                "按 id 取得回来"
+            );
+        }
+        assert!(skill_template("nope").is_none(), "不认的 id 不当模板(不猜)");
+        // ② 表单默认 = 空白;清单里每套都有屏上标签(表单逐行摊开它们)
+        assert_eq!(SkillForm::default().template, None, "空白是默认一路");
+        for t in SKILL_TEMPLATES {
+            assert!(!t.label.is_empty(), "{} 要有屏上标签", t.id);
+        }
+        // ③ 每套模板:正文互不相同,且 frontmatter 必填两项都过(上游 validate 盯的)
+        let mut bodies: Vec<String> = Vec::new();
+        for t in SKILL_TEMPLATES {
+            let f = SkillForm {
+                name: "web-scout".into(),
+                description: "从网页检索资料".into(),
+                triggers: "查网页".into(),
+                template: Some(t.id),
+                ..SkillForm::default()
+            };
+            let md = String::from_utf8(f.planned_writes().unwrap()[0].content.clone()).unwrap();
+            assert!(
+                md.starts_with("---\n"),
+                "{} 也要 YAML frontmatter 开头:{md}",
+                t.id
+            );
+            assert!(
+                md.contains("name: web-scout"),
+                "{} frontmatter 有 name:{md}",
+                t.id
+            );
+            assert!(
+                md.contains("description: 从网页检索资料"),
+                "{} frontmatter 有 description:{md}",
+                t.id
+            );
+            bodies.push(md);
+        }
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                assert_ne!(bodies[i], bodies[j], "两套模板正文不同({i} vs {j})");
+            }
+        }
+        // 空白路与任何一套模板路都不同
+        let blank = String::from_utf8(
+            SkillForm {
+                name: "web-scout".into(),
+                description: "从网页检索资料".into(),
+                triggers: "查网页".into(),
+                ..SkillForm::default()
+            }
+            .planned_writes()
+            .unwrap()[0]
+                .content
+                .clone(),
+        )
+        .unwrap();
+        for (i, b) in bodies.iter().enumerate() {
+            assert_ne!(&blank, b, "空白路与第 {i} 套模板路不同");
+        }
+    }
+
+    /// 表单里轮转模板:空格从空白起,一圈回到空白;落点不随模板改(只有正文改)。
+    #[test]
+    fn 表单_轮转模板_落点不变只换正文() {
+        let mut f = SkillForm {
+            name: "web-scout".into(),
+            description: "d".into(),
+            ..SkillForm::default()
+        };
+        let mut seen: Vec<Option<&str>> = vec![f.template];
+        let mut paths: Vec<String> = Vec::new();
+        for _ in 0..=SKILL_TEMPLATES.len() {
+            let w = f.planned_writes().unwrap();
+            paths.push(w[0].path.as_str().to_string());
+            f.field = SkillField::Template;
+            on_key_skill_form(&mut f, press(' '));
+            seen.push(f.template);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                None,
+                Some("agent-skill"),
+                Some("mcp-server"),
+                Some("tui-tool"),
+                None
+            ],
+            "一圈轮转:空白起、空白收"
+        );
+        assert!(
+            paths.iter().all(|p| p == "skills/web-scout/SKILL.md"),
+            "模板只换正文,落点恒定:{paths:?}"
+        );
+    }
+
     #[test]
     fn 空白与模板两路_产出不同骨架() {
         let base = SkillForm {
@@ -1098,7 +1248,7 @@ mod tests {
         };
         let blank = String::from_utf8(base.planned_writes().unwrap()[0].content.clone()).unwrap();
         let mut tmpl = base.clone();
-        tmpl.template = true;
+        tmpl.template = Some("agent-skill");
         let tmpl_md = String::from_utf8(tmpl.planned_writes().unwrap()[0].content.clone()).unwrap();
         assert_ne!(blank, tmpl_md, "两路骨架不同");
         assert!(blank.contains("## 触发词"), "空白路给触发词段:{blank}");
@@ -1228,6 +1378,11 @@ mod tests {
             let f = snap(&app, w, h);
             assert!(f.contains("新建 skill"), "{w}×{h} 表单标题:{f}");
             assert!(f.contains("web-scout"), "{w}×{h} 名称回显:{f}");
+            // 模板那一栏把可选项逐行摊开(面板定义的清单,加模板不改渲染)
+            assert!(f.contains("agent skill"), "{w}×{h} 模板可选项:{f}");
+            assert!(f.contains("MCP server"), "{w}×{h} 模板可选项:{f}");
+            assert!(f.contains("TUI 工具"), "{w}×{h} 模板可选项:{f}");
+            assert!(f.contains("[空白]"), "{w}×{h} 空白是默认一路:{f}");
             for ln in frame_display(&app, w, h).lines() {
                 assert!(
                     unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
@@ -1330,8 +1485,8 @@ mod tests {
             manifest.contains("\"extensions\": [\"./main.js\"]"),
             "manifest 的 pi.extensions 跟着入口文件走:{manifest}"
         );
-        // 自定义入口名也过自审(manifest 与入口两边对得上)
-        assert_eq!(ext_manifest_audit("extensions/ribbon", &writes), None);
+        // 落点由接缝算:manifest 仍是 extensions/ribbon/package.json
+        assert_eq!(writes[0].path.as_str(), "extensions/ribbon/package.json");
     }
 
     #[test]
@@ -1363,55 +1518,11 @@ mod tests {
         let f = ext_form("ribbon", "他说\"你好\" \\ 走人");
         let writes = f.planned_writes().unwrap();
         let manifest = String::from_utf8(writes[0].content.clone()).unwrap();
-        // 仍是合法 JSON(自审要能解析),且转义落在字节里
+        // 仍是合法 JSON(接缝里的自审要能解析),且转义落在字节里
         assert!(manifest.contains("\\\"你好\\\""), "双引号转义:{manifest}");
-        assert_eq!(ext_manifest_audit("extensions/ribbon", &writes), None);
+        assert_eq!(writes.len(), 2, "manifest 与入口两件都在拟落账里");
         let ts = String::from_utf8(writes[1].content.clone()).unwrap();
         assert!(ts.contains("// 他说\"你好\" \\ 走人"), "注释单行化:{ts}");
-    }
-
-    #[test]
-    fn extension_自审_对齐上游验收第六条_对不上就拦() {
-        // 合法形状:manifest + 入口都在,pi.extensions 指着入口
-        let ok = ext_form("ribbon", "d").planned_writes().unwrap();
-        assert_eq!(ext_manifest_audit("extensions/ribbon", &ok), None);
-        // ① 缺 manifest
-        let no_manifest = vec![PlannedWrite::text(
-            RepoRelPath::new("extensions/ribbon/index.ts").unwrap(),
-            "x",
-        )];
-        assert!(ext_manifest_audit("extensions/ribbon", &no_manifest)
-            .unwrap()
-            .contains("package.json"));
-        // ② pi.extensions 为空
-        let empty_pi = vec![PlannedWrite::text(
-            RepoRelPath::new("extensions/ribbon/package.json").unwrap(),
-            "{\n  \"pi\": {\n    \"extensions\": []\n  }\n}\n",
-        )];
-        assert!(ext_manifest_audit("extensions/ribbon", &empty_pi)
-            .unwrap()
-            .contains("pi.extensions"));
-        // ③ 清单指着一个不存在的文件(= 装上了不加载)
-        let dangling = vec![
-            PlannedWrite::text(
-                RepoRelPath::new("extensions/ribbon/package.json").unwrap(),
-                "{\n  \"pi\": {\n    \"extensions\": [\"./gone.ts\"]\n  }\n}\n",
-            ),
-            PlannedWrite::text(RepoRelPath::new("extensions/ribbon/index.ts").unwrap(), "x"),
-        ];
-        assert!(ext_manifest_audit("extensions/ribbon", &dangling)
-            .unwrap()
-            .contains("一个文件都没匹配上"));
-        // ④ 绝对路径 / 越级
-        for bad in ["/etc/passwd", "../outside.ts"] {
-            let evil = vec![PlannedWrite::text(
-                RepoRelPath::new("extensions/ribbon/package.json").unwrap(),
-                &format!("{{\n  \"pi\": {{\n    \"extensions\": [\"{bad}\"]\n  }}\n}}\n"),
-            )];
-            assert!(ext_manifest_audit("extensions/ribbon", &evil)
-                .unwrap()
-                .contains("不许绝对路径或越级"));
-        }
     }
 
     #[test]

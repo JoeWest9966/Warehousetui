@@ -17,6 +17,7 @@
 
 pub mod pack;
 pub mod recipe;
+pub mod scaffold;
 pub mod write;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -211,8 +212,12 @@ pub fn archive_lamp(state: &ArchiveState) -> State {
 /// 数据仓根的三个组件家(上游事实 + spec #95 作者侧脚手架落点):本地组件住
 /// `components/`,作者侧脚手架的 skill / extension 落 `skills/` 与
 /// `extensions/`。路径知识只在本模块,模块外不出现第二处。
-const SKILLS_DIR: &str = "skills";
-const EXTENSIONS_DIR: &str = "extensions";
+///
+/// 写侧的脚手架落点计算在[`scaffold`] 子模块(同族:它只借这里的家目录名,
+/// 不另立第二处);读侧 `reference_scan` 与写侧 `scaffold::skill_write` /
+/// `scaffold::ext_writes` 因此认同一批家——读写对称,不断链。
+pub(crate) const SKILLS_DIR: &str = "skills";
+pub(crate) const EXTENSIONS_DIR: &str = "extensions";
 const COMPONENTS_DIR: &str = "components";
 /// 配方目录与文件名(上游 `nw validate` 的发现规则:`recipes/<名>/recipe.yaml`,
 /// 单配方仓回落 `recipe/recipe.yaml`)。
@@ -1096,5 +1101,51 @@ components:
                 "健康屏不得出现 `{needle}`:数据仓路径拼接归 datarepo(接缝纪律)"
             );
         }
+    }
+
+    /// 禁字面量的小帮手(与 [`tests::健康屏零路径_api`] 同一套判据,屏名进
+    /// 失败信息:哪一屏哪一条要说清)。
+    fn 禁字面量(screen: &str, src: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(
+                !src.contains(needle),
+                "{screen}不得出现 `{needle}`:数据仓路径知识只有 datarepo 一个家(接缝纪律)"
+            );
+        }
+    }
+
+    /// 同一条接缝纪律的**写侧**半边(code-review H1):脚手架屏与配方屏只消费
+    /// 意图级形状——数据仓的组件家与配方文件名是 datarepo 才有的路径知识,
+    /// 屏幕层自己拼不出一个路径。禁字面量与 [`tests::健康屏零路径_api`] 同款。
+    ///
+    /// 只扫生产码(`#[cfg(test)]` 之前):测试夹具要造 fixture 数据仓,免不了
+    /// `std::fs` 与落点字面量——那是测试自己的事,不是屏幕层的事。
+    ///
+    /// 脚手架屏另禁两条**路径形状**的家目录字面量(`\"skills/` / `\"extensions/`):
+    /// 落点下沉之后,屏幕层连 `skills/` 这个词都不该出现。配方屏不禁这两条 ——
+    /// 它身上的 `skills/<仓库>/<条目>/` 是 #115 **派内**落点的只读呈现
+    /// (上游 external-sources.md 的口径,与数据仓组件家不是一回事,也不归
+    /// datarepo 管);禁它会逼着把只读知识也搬进接缝,那是扩范围。
+    #[test]
+    fn 写侧两屏零路径_api() {
+        let common: &[&str] = &[
+            "PathBuf",
+            "Path::new",
+            "std::fs",
+            "read_dir",
+            "read_to_string",
+            "\"skills\"",
+            "\"extensions\"",
+            "\"components\"",
+            "\"recipes\"",
+            "\"recipe.yaml\"",
+        ];
+        let scaffold_src = include_str!("../screens/scaffold.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        禁字面量("脚手架屏", scaffold_src, common);
+        禁字面量("配方屏", include_str!("../screens/recipes.rs"), common);
+        禁字面量("脚手架屏", scaffold_src, &["\"skills/", "\"extensions/"]);
     }
 }

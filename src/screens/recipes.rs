@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Domain, RegKind, RegState};
 use crate::layout::{size_class, SizeClass};
-use crate::screens::{body, data_root_signpost};
+use crate::screens::{body, data_root_signpost, FormField};
 
 pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
     let block = body(app, "五域只读浏览");
@@ -1744,24 +1744,23 @@ pub enum PackField {
     Version,
 }
 
-impl PackField {
-    pub const ALL: [PackField; 3] = [PackField::Source, PackField::Name, PackField::Version];
+/// 字段顺序即 ↑/↓ 轮转顺序。光标移动走共用形状
+/// [`FormField`](crate::screens::FormField)(与脚手架两份字段枚举同一只形状)。
+impl FormField for PackField {
+    const ALL: &'static [PackField] = &[PackField::Source, PackField::Name, PackField::Version];
 
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
-    }
-
-    pub fn from_index(i: usize) -> Self {
-        Self::ALL.get(i).copied().unwrap_or_default()
-    }
-
-    /// 字段标签(渲染与命中共用同一份词)。
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             PackField::Source => "源目录",
             PackField::Name => "组件名",
             PackField::Version => "版  本",
         }
+    }
+}
+
+impl PackField {
+    pub fn from_index(i: usize) -> Self {
+        Self::ALL.get(i).copied().unwrap_or_default()
     }
 
     /// 一句字段说明(表单里的 dim 行)。
@@ -1834,13 +1833,7 @@ impl PackFlow {
 
     /// ↑/↓ 移字段(三字段轮转,到顶/到底不越界、不绕回)。
     pub fn move_field(&mut self, down: bool) {
-        let i = self.field.index();
-        let n = PackField::ALL.len();
-        self.field = PackField::ALL[if down {
-            (i + 1).min(n - 1)
-        } else {
-            i.saturating_sub(1)
-        }];
+        self.field = self.field.moved(down);
     }
 }
 
@@ -1980,7 +1973,7 @@ fn render_pack_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     match flow.phase {
         PackPhase::Form => {
-            for f in PackField::ALL {
+            for f in PackField::ALL.iter().copied() {
                 let cur = f == flow.field;
                 let text = match f {
                     PackField::Source => flow.source.clone(),
@@ -2012,6 +2005,14 @@ fn render_pack_overlay(frame: &mut Frame, area: Rect, app: &App) {
                 crate::layout::SizeClass::Compact => PACK_MANIFEST_LINES_COMPACT,
             };
             lines = pack_review_lines(app, inner_w, cap);
+            // 落盘失败(磁盘 / 权限)在确认闸里说得清(ADR-0010 §5:不混同
+            // 「输入无效」,也别只写一行日志让操作者对浮层干瞪眼)。
+            if let Some(err) = flow.err.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", clip(err, inner_w.saturating_sub(4))),
+                    p.fail(),
+                )));
+            }
         }
         PackPhase::Done => {
             lines.push(Line::from(Span::styled(
@@ -2125,8 +2126,9 @@ pub struct RecipeEditFlow {
     pub receipt: Option<String>,
     /// 面板侧就拒 / 加载失败的人话(留在编辑态可改)。
     pub err: Option<String>,
-    /// 预跑暂存文件(scratch)的相对路径——返航 / 回音落地时清。
-    pub scratch_rel: Option<String>,
+    /// 预跑暂存档(scratch)的落点——按**暂存时那个数据仓根**清:换过根也
+    /// 不把残档留在旧根里(ADR-0010 §1 第四类)。None = 这一程没暂存。
+    pub scratch: Option<crate::datarepo::recipe::ScratchSlot>,
 }
 
 impl RecipeEditFlow {
@@ -2149,7 +2151,7 @@ impl RecipeEditFlow {
             validate_pass: false,
             receipt: None,
             err: None,
-            scratch_rel: None,
+            scratch: None,
         }
     }
 

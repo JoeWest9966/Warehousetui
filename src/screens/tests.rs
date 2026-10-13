@@ -3131,6 +3131,193 @@ fn 打包_确认闸两档快照() {
     std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
 }
 
+/// 三道门收成一处(`App::author_side_gate`)后,三处入口的指路措辞仍逐字同调:
+/// 装配互斥说「<动作>与装配互斥」、根不就绪说「<动作>入口:…」。收拢不改语义。
+#[test]
+fn 作者侧三道门_三处入口措辞同调() {
+    // 装配互斥:三个入口同一句话形状(动作词各自)
+    let (mut app, _r) = recipe_app("gate-word", 0, VALIDATE_PASS);
+    app.assembling = true;
+    for (what, code, domain) in [
+        (
+            "脚手架",
+            crossterm::event::KeyCode::Char('n'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "打包",
+            crossterm::event::KeyCode::Char('p'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "配方编辑",
+            crossterm::event::KeyCode::Char('e'),
+            crate::app::Domain::Recipes,
+        ),
+    ] {
+        app.rc_domain = domain;
+        let before = app.log.len();
+        key(&mut app, code);
+        // 日志是新近在前(push_log 前插),取最新一行
+        assert_eq!(
+            app.log.first().map(|l| l.as_str()),
+            Some(format!("装配进行中:{what}与装配互斥,稍后再试").as_str()),
+            "{what} 入口的互斥措辞与另外两处同调"
+        );
+        assert!(app.log.len() > before, "{what} 要留一行指路");
+    }
+    // 根不就绪:三个入口同一句话形状
+    let (mut app2, _r2) = recipe_app("gate-root-word", 0, VALIDATE_PASS);
+    let app2_root = std::path::PathBuf::from(app2.data_root.clone().unwrap());
+    app2.data_root = None;
+    for (what, code, domain) in [
+        (
+            "脚手架",
+            crossterm::event::KeyCode::Char('n'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "打包",
+            crossterm::event::KeyCode::Char('p'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "配方编辑",
+            crossterm::event::KeyCode::Char('e'),
+            crate::app::Domain::Recipes,
+        ),
+    ] {
+        app2.rc_domain = domain;
+        key(&mut app2, code);
+        let last = app2.log.first().cloned().unwrap_or_default();
+        assert!(last.starts_with(&format!("{what}入口:")), "{what}:{last}");
+        assert!(
+            last.contains("数据仓"),
+            "{what} 根不就绪的指路带数据仓词:{last}"
+        );
+    }
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+    std::fs::remove_dir_all(&app2_root).ok();
+}
+
+/// 三份字段枚举(skill / extension / 打包)走同一只字段光标(共用形状
+/// `FormField`):顺序即 `ALL`,↑/↓ 到顶 / 到底不越界、不绕回 —— 字段枚举各不同,
+/// 操作者的肌肉记忆不分叉。
+#[test]
+fn 字段光标_三份枚举同一条轮转习惯() {
+    use crate::screens::recipes::PackField;
+    use crate::screens::scaffold::{ExtensionField, SkillField};
+    use crate::screens::FormField;
+    /// 从起点一路向下(多走一格):末两份相同 = 到底不绕回。
+    fn down_walk<F: FormField>(start: F) -> Vec<&'static str> {
+        let mut cur = start;
+        let mut out = vec![cur.label()];
+        for _ in 0..F::ALL.len() {
+            cur = cur.moved(true);
+            out.push(cur.label());
+        }
+        out
+    }
+    /// 从起点一路向上(多走一格):末两份相同 = 回顶不越界。
+    fn up_walk<F: FormField>(start: F) -> Vec<&'static str> {
+        let mut cur = start;
+        let mut out = vec![cur.label()];
+        for _ in 0..F::ALL.len() {
+            cur = cur.moved(false);
+            out.push(cur.label());
+        }
+        out
+    }
+    assert_eq!(
+        down_walk(SkillField::Name),
+        vec!["名称", "描述", "触发词", "模板", "模板"],
+        "skill 四字段:到底停在模板不绕回"
+    );
+    assert_eq!(
+        down_walk(ExtensionField::Name),
+        vec!["名称", "描述", "入口文件", "模板", "模板"],
+        "extension 四字段:同一只习惯"
+    );
+    assert_eq!(
+        down_walk(PackField::Source),
+        vec!["源目录", "组件名", "版  本", "版  本"],
+        "pack 三字段:同一只习惯"
+    );
+    assert_eq!(
+        up_walk(SkillField::Template),
+        vec!["模板", "触发词", "描述", "名称", "名称"],
+        "回顶不越界"
+    );
+    assert_eq!(
+        up_walk(PackField::Version),
+        vec!["版  本", "组件名", "源目录", "源目录"],
+        "回顶不越界"
+    );
+    // index 与 ALL 自洽(下标 = 标签序)
+    for (i, f) in SkillField::ALL.iter().enumerate() {
+        assert_eq!(f.index(), i, "{} 的下标与 ALL 序一致", f.label());
+    }
+    for (i, f) in PackField::ALL.iter().enumerate() {
+        assert_eq!(f.index(), i, "{} 的下标与 ALL 序一致", f.label());
+    }
+}
+
+/// 规格验收 5(ADR-0010 §5):落盘失败是磁盘 / 权限问题,要在**确认闸**里看得见
+/// ——与脚手架同款(fail() + 预览态渲染),不是只写一行日志让操作者对浮层干瞪眼。
+#[test]
+fn 打包_落盘失败_确认闸里看得见_不冒充成功() {
+    let mut app = pack_app("commit-fail");
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    pack_fill(&mut app, "payloads/web-scout", "web-scout", "1.0.0");
+    assert_eq!(
+        app.pk_flow.as_ref().unwrap().phase,
+        crate::screens::recipes::PackPhase::Review,
+        "拟落账在手,进确认闸"
+    );
+    // 抢占落点:让 rename 必败(目标处是个目录)——磁盘 / 权限类失败
+    std::fs::create_dir_all(root.join("payloads/web-scout/component.yaml")).unwrap();
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    // 留在确认态(不回表单、不假装成功),err 在手
+    assert_eq!(
+        app.pk_flow.as_ref().unwrap().phase,
+        crate::screens::recipes::PackPhase::Review,
+        "落盘失败留在确认态,不冒充成功"
+    );
+    let err = app
+        .pk_flow
+        .as_ref()
+        .unwrap()
+        .err
+        .clone()
+        .expect("失败原因要留下来");
+    assert!(err.contains("落盘失败"), "人话点题:{err}");
+    assert!(
+        err.contains("payloads/web-scout/component.yaml"),
+        "带上相对路径:{err}"
+    );
+    // 浮层里渲染得见(常畅 / 紧凑两档)
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("落盘失败"), "{w}×{h} 确认闸渲染落盘失败:{f}");
+        assert!(
+            f.contains("payloads/web-scout/component.yaml"),
+            "{w}×{h} 带路径:{f}"
+        );
+    }
+    // 目标处原样(没写进去),也不留半文件
+    assert!(
+        root.join("payloads/web-scout/component.yaml").is_dir(),
+        "失败不覆盖目标"
+    );
+    assert!(
+        !root
+            .join("payloads/web-scout/.component.yaml.nwt-tmp")
+            .exists(),
+        "失败清 tmp"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// 表单两档快照:三字段 + 当前字段块光标 + 键位提示。
 #[test]
 fn 打包_表单两档快照() {
@@ -3428,11 +3615,14 @@ async fn 配方编辑_预跑argv与健康屏validate同源() {
     drive_edits(&mut app);
     key(&mut app, crossterm::event::KeyCode::Char('s'));
     let argv = app.queue.last().expect("s 入队了 validate").clone();
-    // 与健康屏同一构造函数:commands::validate_recipe(abs)
+    // 与健康屏同一构造函数:commands::validate_recipe(abs)。绝对路径由写侧
+    // 句柄的 abs_path 出(测试侧按同一形状独立拼一遍,不当「面板说对」的证据)。
     let scratch_abs = format!(
         "{}/{}",
         root.trim_end_matches('/'),
         crate::datarepo::recipe::scratch_rel("recipes/research-desk/recipe.yaml")
+            .expect("夹具配方路径是合法相对路径")
+            .as_str()
     );
     assert_eq!(
         argv,
@@ -3444,6 +3634,44 @@ async fn 配方编辑_预跑argv与健康屏validate同源() {
         argv[1], "--recipe",
         "子形状是 --recipe(非 --lock / 非面板自造检查)"
     );
+}
+
+/// 窄准许面的第四条约束「换根也清」:暂存后操作者在设置屏换过数据仓根,
+/// 返航时残档必须从**旧根**消失(按暂存时那个根清,不按当前设置态)。
+#[tokio::test]
+async fn 配方编辑_换根返航_暂存档从旧根清掉() {
+    let (mut app, _runner) = recipe_app("swap-root", 0, VALIDATE_PASS);
+    let old_root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    // 另备一个新根(同一棵夹具树:换根后 editor 还能读得到配方)
+    let new_root = recipe_fixture("swap-root-new");
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    assert!(
+        app.rc_edit_flow
+            .as_ref()
+            .and_then(|f| f.scratch.as_ref())
+            .is_some(),
+        "s 后暂存档在场"
+    );
+    let scratch = old_root.join("recipes/research-desk/.nwt-validate.yaml");
+    assert!(scratch.exists(), "暂存落在旧根:{scratch:?}");
+    // 换根(设置态改指新根),然后返航
+    app.data_root = Some(new_root.to_string_lossy().to_string());
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.recipe_edit_open(), "Esc 收起浮层");
+    assert!(
+        !scratch.exists(),
+        "换根也清:残档不留在旧根(按暂存时那个根清)"
+    );
+    assert!(
+        !new_root
+            .join("recipes/research-desk/.nwt-validate.yaml")
+            .exists(),
+        "新根什么都没落"
+    );
+    std::fs::remove_dir_all(&old_root).ok();
+    std::fs::remove_dir_all(&new_root).ok();
 }
 
 /// 规格验收 3:预跑失败可放弃写回,数据仓状态不变(recipe.yaml 逐字节原样,scratch 已清)。

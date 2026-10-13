@@ -377,13 +377,14 @@ pub struct App {
     /// 待扫 slug 队列(工单 #114):键位处理器没有 tx,只排队;主循环
     /// 取出后跑只读 `gh api`,回音经扫描通道回流。
     pub scan_pending: Vec<String>,
-    /// 作者侧脚手架表单流(spec #95 工单 #110,含首套模板):与登记两段式
+    /// 作者侧脚手架表单流(spec #95 工单 #110,含内置模板清单):与登记两段式
     /// 同级的顶层浮层——表单 → 拟落账预览 → 图形确认 → datarepo 写侧原子
     /// 落盘。与规格无关的骨架(#111 extension 复用);规格自己的表单在
     /// [`scaffold_form`](Self::scaffold_form)。
     pub scaffold_flow: crate::screens::ScaffoldFlow,
-    /// skill 脚手架表单(名称 / 描述 / 触发词 + 模板起步开关)。#111 追加
-    /// extension 表单时,在此旁添一份并让表单流按 kind 分派。
+    /// skill 脚手架表单(名称 / 描述 / 触发词 + 模板起步:存内置模板 id,
+    /// `None` = 空白骨架)。#111 追加 extension 表单时,在此旁添一份并让表单流
+    /// 按 kind 分派。
     pub scaffold_form: crate::screens::SkillForm,
     /// 脚手架的目标规格(#111):skill 与 extension 共用[`scaffold_flow`](Self::scaffold_flow)
     /// 那一条表单流,表单各一份,按它取哪份在场。
@@ -2570,6 +2571,29 @@ impl App {
 
     // ---- 作者侧脚手架表单流(spec #95 工单 #110,ADR-0010) ----
 
+    /// 作者侧写动作入口的**共用门**(ADR-0010 §5:写动作并入 `assembling` 语义,
+    /// 与装配不同时进行)。三处入口(#110/#111 脚手架、#112 打包、#113 配方
+    /// 编辑)同一道门,不写三遍:装配互斥 → 流程不重入 → 数据仓根就绪。
+    ///
+    /// `what` 是日志里的动作词(脚手架 / 打包 / 配方编辑);`busy` 是「本族流程
+    /// 已在场」的判据,由各入口自己给(脚手架还多一道登记两段式不重入)。
+    /// 任一门不过只留指路 / 静默,不开流程——调用方照旧返回。
+    fn author_side_gate(&mut self, what: &str, busy: bool) -> bool {
+        if self.assembling {
+            // 写互斥(ADR-0010 §5):写动作与装配不同时进行。
+            self.push_log(format!("装配进行中:{what}与装配互斥,稍后再试"));
+            return false;
+        }
+        if busy {
+            return false; // 登记 / 脚手架 / 打包 / 编辑流程进行中不重入
+        }
+        if self.data_root_cause().is_some() {
+            self.push_log(format!("{what}入口:{}", self.data_root_gate_msg()));
+            return false;
+        }
+        true
+    }
+
     /// 组件域 `n` 发起 skill 脚手架:与 [`start_ext_scaffold`] 共用
     /// [`begin_scaffold`] 那三道门(装配互斥 / 流程不重入 / 数据仓根就绪),
     /// 过后进 skill 表单态。
@@ -2587,16 +2611,10 @@ impl App {
     /// 数据仓根就绪。过后按 kind 复位那一份表单并进表单态——另一份表单
     /// 一并清掉,旧字段不冒充本次。
     fn begin_scaffold(&mut self, kind: crate::screens::ScaffoldKind) {
-        if self.assembling {
-            // 写互斥(ADR-0010 §5):脚手架与装配不同时进行。
-            self.push_log("装配进行中:脚手架与装配互斥,稍后再试");
-            return;
-        }
-        if self.reg_state != RegState::Idle || self.scaffold_flow.in_flight() {
-            return; // 登记 / 脚手架流程进行中不重入
-        }
-        if self.data_root_cause().is_some() {
-            self.push_log(format!("脚手架入口:{}", self.data_root_gate_msg()));
+        if !self.author_side_gate(
+            "脚手架",
+            self.reg_state != RegState::Idle || self.scaffold_flow.in_flight(),
+        ) {
             return;
         }
         self.scaffold_kind = kind;
@@ -3770,6 +3788,9 @@ impl App {
             // 漂移复核走 run_recheck(三道门 + 按名/全查),不在这条派体检路上;
             // 引用完整性(#116)在函数开头就分流出去了(它跟派无关)。
             HealthMode::Recheck => self.run_recheck(None),
+            // 死臂:函数开头已按 Integrity 分流(引用完整性不挑派),到这儿不可达。
+            // 留着只为穷尽匹配——删了它 `match` 要补 `_`,反而丢掉「四个档都在
+            // 这里点过名」这份清点。
             HealthMode::Integrity => {}
         }
     }
@@ -3949,15 +3970,7 @@ impl App {
     /// 装配互斥(写互斥,ADR-0010 §5)、不重入、数据仓根就绪(未设/不可用
     /// 都给指路,不拿当前目录兜底)。过后开一张空表单。
     fn start_pack(&mut self) {
-        if self.assembling {
-            self.push_log("装配进行中:打包与装配互斥,稍后再试".to_string());
-            return;
-        }
-        if self.pack_open() {
-            return; // 流程进行中不重入
-        }
-        if self.data_root_cause().is_some() {
-            self.push_log(format!("打包入口:{}", self.data_root_gate_msg()));
+        if !self.author_side_gate("打包", self.pack_open()) {
             return;
         }
         self.pk_flow = Some(crate::screens::recipes::PackFlow::new());
@@ -4069,12 +4082,20 @@ impl App {
                     &plan.digest[..8]
                 ));
                 if let Some(f) = self.pk_flow.as_mut() {
+                    f.err = None;
                     f.receipt = Some(format!("已写入 {}", receipt.written.join(", ")));
                     f.phase = crate::screens::recipes::PackPhase::Done;
                 }
             }
             Err(e) => {
-                self.push_log(e.why());
+                // 落盘失败(磁盘 / 权限)不回表单、也不假装成功 —— 留在确认态
+                // 把结论说清(ADR-0010 §5),与脚手架 fail() 同款呈现:浮层里
+                // 渲染得见,不是只写一行日志。
+                let why = e.why();
+                self.push_log(why.clone());
+                if let Some(f) = self.pk_flow.as_mut() {
+                    f.err = Some(why);
+                }
             }
         }
     }
@@ -4102,15 +4123,7 @@ impl App {
         if self.rc_domain != Domain::Recipes {
             return; // 只配方域给(编辑的是 recipe.yaml)
         }
-        if self.assembling {
-            self.push_log("装配进行中:配方编辑与装配互斥,稍后再试".to_string());
-            return;
-        }
-        if self.recipe_edit_open() {
-            return; // 流程进行中不重入
-        }
-        if self.data_root_cause().is_some() {
-            self.push_log(format!("配方编辑入口:{}", self.data_root_gate_msg()));
+        if !self.author_side_gate("配方编辑", self.recipe_edit_open()) {
             return;
         }
         let picked = self
@@ -4361,23 +4374,26 @@ impl App {
             }
         };
         // 暂存编辑态到 scratch(写侧原子落),喂引擎 validate 读;这不是对
-        // recipe.yaml 的写回。
-        let scratch = crate::datarepo::recipe::scratch_rel(&flow.recipe_rel);
-        if let Err(reason) = crate::datarepo::recipe::stage_for_validate(&repo, &flow.doc, &scratch)
-        {
-            self.push_log(format!("预跑暂存失败:{reason},一个字节都没写回"));
-            if let Some(f) = self.rc_edit_flow.as_mut() {
-                f.err = Some(reason);
-            }
-            return;
-        }
+        // recipe.yaml 的写回。落点由 ScratchSlot 持(记住暂存时那个根),
+        // 换过根也清得掉残档。
+        let slot =
+            match crate::datarepo::recipe::ScratchSlot::stage(&repo, &flow.doc, &flow.recipe_rel) {
+                Ok(s) => s,
+                Err(reason) => {
+                    self.push_log(format!("预跑暂存失败:{reason},一个字节都没写回"));
+                    if let Some(f) = self.rc_edit_flow.as_mut() {
+                        f.err = Some(reason);
+                    }
+                    return;
+                }
+            };
         // 预跑 argv:与健康屏 validate 同源(同一 `commands::validate_recipe`
         // 构造函数),只是路径指向 scratch(编辑态)——recipe.yaml 仍未动。
-        let scratch_abs = format!("{}/{scratch}", root.trim_end_matches('/'));
-        self.queue.push(commands::validate_recipe(&scratch_abs));
+        // 绝对路径由写侧句柄出(壳层不拼字符串)。
+        self.queue.push(commands::validate_recipe(&slot.abs()));
         if let Some(f) = self.rc_edit_flow.as_mut() {
             f.plan = Some(plan);
-            f.scratch_rel = Some(scratch);
+            f.scratch = Some(slot);
             f.validate = None;
             f.validate_pass = false;
             f.phase = crate::screens::RecipeEditPhase::PreRun;
@@ -4395,21 +4411,13 @@ impl App {
                 .and_then(|e| e.data_as::<crate::engine::ValidateData>())
                 .is_some_and(|d| d.summary.fail == 0);
         let headline = out.headline().to_string();
-        // 清 scratch(预跑读完即清,recipe.yaml 自始至终未动)。
-        if let Some(scratch) = self
-            .rc_edit_flow
-            .as_ref()
-            .and_then(|f| f.scratch_rel.clone())
-        {
-            if let Some(root) = self.usable_data_root() {
-                crate::datarepo::recipe::clear_staged(
-                    &crate::datarepo::write::DataRepo::new(&root),
-                    &scratch,
-                );
-            }
+        // 清 scratch(预跑读完即清,recipe.yaml 自始至终未动)。按暂存时那个
+        // 根清——操作者中途换过根也不留残档。
+        if let Some(slot) = self.rc_edit_flow.as_ref().and_then(|f| f.scratch.clone()) {
+            slot.clear();
         }
         if let Some(f) = self.rc_edit_flow.as_mut() {
-            f.scratch_rel = None;
+            f.scratch = None;
             f.validate_pass = pass;
             f.validate = Some(out);
             f.phase = crate::screens::RecipeEditPhase::Review;
@@ -4481,13 +4489,8 @@ impl App {
         let Some(flow) = self.rc_edit_flow.take() else {
             return;
         };
-        if let Some(scratch) = flow.scratch_rel {
-            if let Some(root) = self.usable_data_root() {
-                crate::datarepo::recipe::clear_staged(
-                    &crate::datarepo::write::DataRepo::new(&root),
-                    &scratch,
-                );
-            }
+        if let Some(slot) = flow.scratch.as_ref() {
+            slot.clear();
         }
         let done = flow.phase == crate::screens::RecipeEditPhase::Done;
         self.push_log(if done {
