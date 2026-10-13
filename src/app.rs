@@ -7574,7 +7574,7 @@ mod tests {
                 "source".to_string(),
                 "recheck".into(),
                 "--root".into(),
-                std::env::temp_dir().display().to_string()
+                crate::testutil::stable_root()
             ],
             "全查:不带 --name"
         );
