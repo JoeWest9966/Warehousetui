@@ -431,6 +431,9 @@ impl CatalogKind {
                         let n = d.machines.len();
                         app.vps_ls = Some(d);
                         app.catalog_clamp();
+                        // 反查跳转的待落地选中位(#120):vps 投影读到了,
+                        // 按名字把选中位落下去(见 `App::land_jump_pending`)。
+                        app.land_jump_pending();
                         app.push_log(format!("vps 编目册已刷新:{n} 台机器(只读)"));
                     }
                     None => app.push_log(format!("vps ls 结果不可用:{}", out.headline())),
@@ -460,6 +463,19 @@ impl CatalogKind {
                             let hits = tags_referring(&d.sheet(), "vps", m);
                             (m.clone(), hits)
                         });
+                        // 反查跳转浮层的命中条目(#120):只在这一本、且问的
+                        // 是某一条(`tag_lookup` = Some)时才开——列全部与
+                        // 机器册反查上浮都走 `run_tag_ls(None)`,那一态没有
+                        // 「这一条的命中」可言。一条引用都没有的标签不开
+                        // (没有可跳的东西,册体的「引用 ——」已经说清)。
+                        // 在 move out 之前算完:借用 d,不借用 app。
+                        let jumped = asked.as_deref().and_then(|name| {
+                            d.tags
+                                .iter()
+                                .find(|t| t.name == name)
+                                .map(|t| (name.to_string(), t.refs.clone()))
+                                .filter(|(_, refs)| !refs.is_empty())
+                        });
                         app.tag_ls_echo = Some(out);
                         app.catalog_clamp();
                         if let Some((m, hits)) = converged {
@@ -472,6 +488,10 @@ impl CatalogKind {
                                 }
                             };
                         }
+                        app.tag_jump = match jumped {
+                            Some((tag, hits)) => TagJump::Hits { tag, hits, sel: 0 },
+                            None => TagJump::Idle,
+                        };
                         let scope = match asked.as_deref() {
                             Some(name) => format!("标签 {name}:{n} 条"),
                             None => format!("全部标签:{n} 条"),
@@ -481,6 +501,10 @@ impl CatalogKind {
                     None => {
                         let h = out.headline().to_string();
                         app.tag_ls_echo = Some(out);
+                        // 读不到的一律不收跳转浮层(#120):「这次没读到」
+                        // 与「有 N 条命中」是两件事,话不许互相冒充——浮层
+                        // 不开,既有指路(日志 + 册体那行)说这次的实话。
+                        app.tag_jump = TagJump::Idle;
                         if let Some(m) = machine {
                             app.vps_reverse = VpsReverse::Unreadable {
                                 machine: m,
@@ -1570,6 +1594,183 @@ impl VpsReverse {
     }
 }
 
+/// 反查跳转浮层里一条**命中条目**的去处(#120):按 kind 钉死在现有屏结构上。
+///
+/// - `vps` → 编目册屏的**机器册**(条目就是一台机器);
+/// - `skill` / `extension` → **配方屏的外部源域**(技能与扩展住在源仓里,
+///   `nw ls` 的 sources 域是面板唯一看得到它们的地方——编目册屏四本册都
+///   不是它们的家,硬安一个去处等于造第六本册)。
+///
+/// `None` = 这个 kind 在现有屏结构里没有去处。**不是死键**:条目照画在
+/// 浮层里,Enter 给人话(见 [`App::tag_jump_to`](crate::app::App::tag_jump_to))。
+/// 已知 kind 集合是 [`crate::engine::commands::TAG_REF_KINDS`];本表与它的
+/// 对齐由测试钉住(`TAG_REF_KINDS_每个kind都有去处`)——上游加 kind 而这里
+/// 没跟上,当场红,不许静默少一个去处。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JumpDest {
+    /// 编目册屏的机器册。
+    Machine,
+    /// 配方屏的外部源域。
+    SourceEntry,
+}
+
+impl JumpDest {
+    /// 去处的中文名(浮层里画在命中条目右侧,操作者先看见去处再跳)。
+    pub fn label(self) -> &'static str {
+        match self {
+            JumpDest::Machine => "机器册",
+            JumpDest::SourceEntry => "外部源域",
+        }
+    }
+}
+
+/// 一条 `<kind>/<条目>` 引用的去处。查表同 [`CatalogKind::action`] 的法子:
+/// 按 kind 的差异是**数据**,不是调用方的一串分支。
+pub fn jump_dest(kind: &str) -> Option<JumpDest> {
+    match kind {
+        "vps" => Some(JumpDest::Machine),
+        "skill" | "extension" => Some(JumpDest::SourceEntry),
+        _ => None,
+    }
+}
+
+/// skill / extension 命中条目在**外部源域**里的下标(#120)。
+///
+/// 引用的 id 形状是引擎自己的口径(`nw tag add` 第③道闸的 hint:
+/// `skill/<仓库>/<条目>`),所以 id 按 `/` 拆:**最后一段是条目名**,前面的
+/// 是仓库提示。匹配两步走,都不猜:
+/// ① 条目名对上——源的 `entries[]` 里有一条同名条目;
+/// ② 仓库提示也对得上——优先取 `name` 或 `repo` 与提示相符的那一条
+///    (同一条目名可能出现在多个源里;都相符时取引擎给的确定性顺序里的
+///    第一个,面板不重排)。
+/// 两条都落空给 `None` = 这个条目在当前 `ls` 回音里没有去处,调用方明示。
+pub fn source_hit_index(ls: &crate::engine::LsData, id: &str) -> Option<usize> {
+    let (entry, repo_hint) = split_ref_id(id)?;
+    let mut first: Option<usize> = None;
+    for (i, s) in ls.sources.iter().enumerate() {
+        if !s.entries.iter().any(|e| e.name == entry) {
+            continue;
+        }
+        if repo_hint.is_some_and(|h| source_namesake(s, h)) {
+            return Some(i);
+        }
+        if first.is_none() {
+            first = Some(i);
+        }
+    }
+    first
+}
+
+/// `o/r/deep-research` → `("deep-research", Some("o/r"))`。
+/// 只有一段(没有仓库提示)也认:条目名就是它自己,仓库提示 None——匹配退
+/// 化成「只看条目名」,不因此把这条引用判成无去处。
+fn split_ref_id(id: &str) -> Option<(&str, Option<&str>)> {
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    match id.rsplit_once('/') {
+        Some((head, entry)) if !entry.is_empty() && !head.is_empty() => Some((entry, Some(head))),
+        _ => Some((id, None)),
+    }
+}
+
+/// 源的哪一个字段算「仓库提示相符」:`name` 直接相等,或 `repo` 链接以提示
+/// 收尾(`https://github.com/o/r` ↔ `o/r`)。两者都不判空——空串不配对。
+fn source_namesake(s: &crate::engine::SourceRow, hint: &str) -> bool {
+    s.name == hint
+        || s.repo
+            .as_deref()
+            .is_some_and(|r| r.trim_end_matches('/').ends_with(hint))
+}
+
+/// 标签册反查浮层的**命中条目跳转**(#120):问「这一条标签引用了什么」之后,
+/// 浮层把命中条目列出来,↑/↓ 选、Enter 直跳它所在的册 / 视图。
+///
+/// 与 [`VpsReverse`](机器册反查上浮)是两件事,别混:那边问「什么标签引用
+/// 了这一条」,命中是**标签**、没有 kind 维度;这边问「这一条标签引用了
+/// 什么」,命中是**条目**、每条带 kind,所以才谈得上「跳到哪个册」。
+///
+/// **独立小状态,不并入 `assembling` 写互斥**:跳转只是改面板自己的状态树,
+/// 零引擎调用、零写路径。开浮层的条件只有一条——标签册 + 正在反查某一条
+/// (`App::tag_lookup` = Some)+ 回音可定型;列全部(`l`)与机器册反查上浮都走
+/// `run_tag_ls(None)`,`tag_lookup` 是 None,浮层不开。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TagJump {
+    /// 闲置:没有反查跳转浮层在场。
+    #[default]
+    Idle,
+    /// 在场:这一条标签的命中条目清单 + 浮层内选中行。
+    Hits {
+        tag: String,
+        hits: Vec<crate::engine::CatalogRef>,
+        sel: usize,
+    },
+}
+
+impl TagJump {
+    /// 浮层在不在场(渲染 / 键位吞键 / 命中区共用这一判据)。
+    pub fn is_open(&self) -> bool {
+        matches!(self, TagJump::Hits { .. })
+    }
+
+    /// 问的是哪一条标签(浮层标题用)。
+    pub fn tag(&self) -> Option<&str> {
+        match self {
+            TagJump::Hits { tag, .. } => Some(tag.as_str()),
+            TagJump::Idle => None,
+        }
+    }
+
+    /// 命中条目清单(空 = 没开场)。
+    pub fn hits(&self) -> &[crate::engine::CatalogRef] {
+        match self {
+            TagJump::Hits { hits, .. } => hits.as_slice(),
+            TagJump::Idle => &[],
+        }
+    }
+
+    /// 浮层内选中行(越界钳在最后一条;没开场给 0)。
+    pub fn sel(&self) -> usize {
+        match self {
+            TagJump::Hits { sel, hits, .. } => (*sel).min(hits.len().saturating_sub(1)),
+            TagJump::Idle => 0,
+        }
+    }
+
+    /// 选中那一条命中(越界 / 未开场给 None)。
+    pub fn hit(&self, sel: usize) -> Option<&crate::engine::CatalogRef> {
+        match self {
+            TagJump::Hits { hits, .. } => hits.get(sel),
+            TagJump::Idle => None,
+        }
+    }
+
+    /// ↑/↓ 移选中:上下各一档,钳在 `[0, len)`(空清单不动)。
+    pub fn move_sel(&mut self, down: bool) {
+        if let TagJump::Hits { sel, hits, .. } = self {
+            if hits.is_empty() {
+                return;
+            }
+            *sel = if down {
+                (*sel + 1).min(hits.len() - 1)
+            } else {
+                (*sel).saturating_sub(1)
+            };
+        }
+    }
+
+    /// 鼠标点第 `i` 条:先把选中落到那一行(越界钳住),再由调用方按
+    /// [`Self::sel`] 直跳——点哪跳哪,与 `↑/↓` + `Enter` 同一个后果。
+    pub fn move_sel_to(&mut self, i: usize) {
+        if let TagJump::Hits { sel, hits, .. } = self {
+            if !hits.is_empty() {
+                *sel = i.min(hits.len() - 1);
+            }
+        }
+    }
+}
+
 /// 册内浮层的两种形态(登记流 / rm 确认;弹层优先级高于册体)。
 /// 渲染与命中区都只认这两个形态,不认「哪一本」。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2602,6 +2803,17 @@ pub fn render_catalog(frame: &mut Frame, area: Rect, app: &App) {
     if app.vps_reverse_open() {
         render_vps_reverse_popup(frame, area, app);
     }
+    // 反查跳转浮层(#120):标签册「这一条引用了什么」的命中条目清单。与上面
+    // 那一层同族(册体不动、薄浮层叠加),但**只标签册开**——换册已把状态清
+    // 成 Idle(见 `App::cycle_catalog_kind`),所以这本就画在标签册上。
+    //
+    // 基准矩形取 `inner`(册体内层)而不是 `area`:命中区(`layout::catalog_hits`
+    // 收的也是 shrink 过的 inner)按同一个矩形算命中行的 y——渲染与命中
+    // 共用一处几何,点哪打哪(ADR-0005)。上面那一层只用「整块关闭」命中区,
+    // 基准取哪边都看不出分歧;这一层有逐行命中区,基准必须钉死在同一处。
+    if app.tag_jump_open() {
+        render_tag_jump_popup(frame, inner, app);
+    }
 }
 
 /// 标签册的边界表述(ADR-0009 §5,工单 #54 验收第 7 条):标签随组织演进,
@@ -3498,6 +3710,97 @@ fn render_vps_reverse_popup(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// 反查跳转浮层的宽(#120):与反查上浮([`REVERSE_W`])同一个量级——一层
+/// **薄浮层**,不是新屏、不是新册;同一个 [`popup_rect`] 基准。
+pub const JUMP_W: u16 = 56;
+
+/// 反查跳转浮层的矩形(#120):**渲染与命中共用这一处几何**(ADR-0005,同
+/// [`vps_reverse_popup_rect`] 的法子)。高按命中数现算:标题 1 行 + N 条
+/// 命中 + 收口 1 行 + 上下边框 2 行。`None` = 浮层没开场。
+pub(crate) fn tag_jump_popup_rect(area: Rect, app: &App) -> Option<Rect> {
+    if !app.tag_jump_open() {
+        return None;
+    }
+    let content = app.tag_jump.hits().len().saturating_add(2);
+    let h = u16::try_from(content).unwrap_or(u16::MAX).saturating_add(2);
+    let popup = popup_rect(area, JUMP_W, h);
+    (popup.width > 0 && popup.height > 0).then_some(popup)
+}
+
+/// 反查跳转浮层里第 `i` 条命中的矩形:渲染把第 i 条画在 `popup.y + 1 + i`,
+/// 命中区按同一个矩形发 [`Target::TagJump`](crate::layout::Target::TagJump)
+/// ——一处几何,点哪打哪。越出浮层可见区的行不给(末行是收口提示,
+/// 与渲染的 `truncate(budget)` 同一个收口)。
+pub(crate) fn tag_jump_row_rect(popup: Rect, i: usize) -> Option<Rect> {
+    let budget = popup.height.saturating_sub(2) as usize; // 去掉上下边框
+    let content_rows = budget.saturating_sub(1); // 末行留给收口提示
+    if i + 1 > content_rows {
+        return None;
+    }
+    let w = popup.width.saturating_sub(2);
+    (w > 0).then(|| Rect::new(popup.x + 1, popup.y + 1 + i as u16, w, 1))
+}
+
+/// 反查跳转浮层(#120):标签册问「这一条标签引用了什么」之后,把命中条目
+/// 列成一层薄浮层(册体原样在场,与 [`render_vps_reverse_popup`] 同族的
+/// 叠加形态)。每行右侧写**去处**(机器册 / 外部源域),`→ 无去处` 的
+/// warn 行明说这个 kind 在现有屏结构里落不到地——不是死键,Enter 给人话。
+///
+/// 只印 `kind/id` 指针,不印任何机密本体(与面板其余部分同纪律,ADR-0009
+/// §1:指针不是密钥)。`Enter` 直跳所选、`↑/↓` 选、`Esc/q` 关闭。
+fn render_tag_jump_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(popup) = tag_jump_popup_rect(area, app) else {
+        return;
+    };
+    let Some(tag) = app.tag_jump.tag() else {
+        return;
+    };
+    let p = &app.palette;
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    // 右侧去处列的宽度预算:`→ 外部源域` 是去处里最长的一条
+    let dest_w = 14;
+    let label_budget = inner_w.saturating_sub(dest_w + 6).max(8);
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!("  标签 {tag} 引用了 {} 条", app.tag_jump.hits().len()),
+        p.text().bold(),
+    ))];
+    let sel = app.tag_jump.sel();
+    for (i, r) in app.tag_jump.hits().iter().enumerate() {
+        let chosen = i == sel;
+        let mark = if chosen { "▸" } else { " " };
+        let (dest_text, dest_style) = match jump_dest(&r.kind) {
+            Some(d) => (format!("→ {}", d.label()), p.info()),
+            None => ("→ 无去处".to_string(), p.warn()),
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!("  {mark} ")),
+            Span::styled(
+                clip(&r.label(), label_budget),
+                if chosen { p.accent().bold() } else { p.text() },
+            ),
+            Span::raw("  "),
+            Span::styled(dest_text, dest_style),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "  Enter 直跳所选条目 · ↑/↓ 选 · Esc/q 关闭",
+        p.dim(),
+    )));
+    let budget = popup.height.saturating_sub(2) as usize;
+    lines.truncate(budget);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 反查 · 这一条引用了什么 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
 /// `expiring` = Warn、`expired` = Fail;回音缺 `status` 字段 = 第四态 Skip
 /// (「没这道标记」,显式「——」不猜)。三态本身仍是引擎的原词
 /// (active / expiring / expired,上游 `status.go` 的三个取值),面板只做
@@ -3548,11 +3851,186 @@ fn sub_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
     )
 }
 
+/// 钥匙轮换账龄的 amber 阈值(天,spec #94 第 5 项)。**照订阅到期 7 天的
+/// 先例,不配置化**;订阅那 7 天是上游 `status.go` 算好随回音下发的,这一条
+/// 是面板自己的展示阈值——两处不同源,不许互相「对齐」成一套。只标记不治理:
+/// 不碰退出码、不提醒、不自动轮换。
+const KEY_AGE_WARN_DAYS: u32 = 7;
+
+/// UTC 日历日——账龄运算的唯一时间粒度(整天,不涉时刻)。
+///
+/// 面板不引 chrono:账龄是**纯展示运算**(`rotated-at` 是静态登记字段,引擎
+/// 不下发账龄;订阅三态「引擎在回音里算好、面板零日期运算」那条口径讲的是
+/// 订阅,不禁这一处——spec #94 实现决策点名开了这个口子)。要的只是两个日历
+/// 日之间的整天数,整数运算就够,不值得为一个差引一整个时区库。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct UtcDay {
+    y: i32,
+    m: u32,
+    d: u32,
+}
+
+impl UtcDay {
+    /// 严格 `YYYY-MM-DD`(引擎 `rotatedAt` 的契约形状)**且真是日历日**;
+    /// 空串 / 形状不认 / `2026-02-30` 这种不存在的日子 = None。
+    ///
+    /// 形状那一层与登记表单共用同一条 strict 校验([`valid_expires`]);这里
+    /// 多要一层「真是日历日」,是因为账龄要把日期换成天数——`2026-02-30`
+    /// 会被静默滚成 3 月 2 日,印一个看着精确、其实无依据的天数。算不出就
+    /// 说算不出,不猜(与 `days_left_line` 同一口径)。
+    fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() || !valid_expires(s) {
+            return None;
+        }
+        let y: i32 = s.get(0..4)?.parse().ok()?;
+        let m: u32 = s.get(5..7)?.parse().ok()?;
+        let d: u32 = s.get(8..10)?.parse().ok()?;
+        if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
+            return None;
+        }
+        Some(Self { y, m, d })
+    }
+
+    /// 日历日 → Unix 纪元天数(Howard Hinnant `days_from_civil`,纯整数,
+    /// 无时区无库)。
+    fn epoch_days(self) -> i64 {
+        let y = i64::from(self.y) - i64::from(self.m <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400; // [0, 399]
+        let m = i64::from(self.m);
+        let d = i64::from(self.d);
+        let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+        let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+        era * 146_097 + doe - 719_468
+    }
+
+    /// Unix 纪元天数 → 日历日(Hinnant `civil_from_days`)。
+    fn from_epoch_days(z: i64) -> Self {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097; // [0, 146096]
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+        let mp = (5 * doy + 2) / 153; // [0, 11]
+        let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1); // [1, 31]
+        let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1); // [1, 12]
+        Self {
+            y: i32::try_from(if m <= 2 { y + 1 } else { y }).unwrap_or(1970),
+            m,
+            d,
+        }
+    }
+
+    /// 今天(UTC):本模块唯一读时钟的地方。
+    ///
+    /// 每帧每条目读一次(廉价,`clock_gettime` 而已);要收成「一帧一次」得把
+    /// today 传进 [`EntryDetail`] 签名,那是动骨架,本票不做。时钟早于 1970
+    /// (不存在的机器)按纪元日算,账龄会大得离谱 → 亮 amber,方向安全。
+    fn today() -> Self {
+        #[cfg(test)]
+        if let Some(d) = pinned_today() {
+            return d;
+        }
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self::from_epoch_days(i64::try_from(secs).unwrap_or(i64::MAX) / 86_400)
+    }
+}
+
+// 测试钉死的「今天」。账龄随墙钟走,而 golden 是逐字节的字面量——不钉的话
+// 同一帧每天都漂一次,钥匙册两档 golden 会天天红。thread_local 让并行测试
+// 各钉各的,不必像 env 那样上串行锁(`testutil::ConfigGuard` 的取舍)。
+#[cfg(test)]
+thread_local! {
+    static PINNED_TODAY: std::cell::Cell<Option<UtcDay>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn pinned_today() -> Option<UtcDay> {
+    PINNED_TODAY.with(|c| c.get())
+}
+
+/// 钉死「今天」,见 `PINNED_TODAY`。
+#[cfg(test)]
+fn pin_today_for_test(y: i32, m: u32, d: u32) {
+    PINNED_TODAY.with(|c| c.set(Some(UtcDay { y, m, d })));
+}
+
+/// 某年某月有几天(含闰年)。月越界返回 0——调用方据此判「不是真日历日」。
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// 钥匙册的轮换账龄(spec #94 第 5 项):`rotated-at` 至今的 UTC 整天数。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RotationAge {
+    /// 算得出:0 = 今天刚轮换。
+    Days(u32),
+    /// 算不出:没给轮换日 / 形状或日历日不认 / 轮换日在未来。**不拿 0 冒充**
+    /// (规格用户故事 16:0 天是「今天刚换」,与「不知道」是两件事)。
+    Unknown,
+}
+
+impl RotationAge {
+    fn of(e: &CatalogEntryView, today: UtcDay) -> Self {
+        let Some(r) = e.rotated_at.as_deref().and_then(UtcDay::parse) else {
+            return Self::Unknown;
+        };
+        let days = today.epoch_days() - r.epoch_days();
+        if days < 0 {
+            // 轮换日在未来(时钟漂移或预登记):印负数没有意义,拿 0 冒充
+            // 「今天刚换」更是假话——两类都归未知。
+            return Self::Unknown;
+        }
+        // 现实中到不了(天数溢出 u32 等于一千多万年);真到了也读成 amber,
+        // 比 panic 或悄悄截断成小数好。
+        Self::Days(u32::try_from(days).unwrap_or(u32::MAX))
+    }
+
+    /// 「账龄 N 天」/「账龄 未知」——算不出就说算不出,不拿 0 占位。
+    fn line(self) -> String {
+        match self {
+            Self::Days(n) => format!("账龄 {n} 天"),
+            Self::Unknown => "账龄 未知".to_string(),
+        }
+    }
+
+    /// 超阈(见 [`KEY_AGE_WARN_DAYS`]);「超」是严格大于,7 天本身不算超。
+    /// 未知不算超:没有依据就不亮。
+    fn over_threshold(self) -> bool {
+        matches!(self, Self::Days(n) if n > KEY_AGE_WARN_DAYS)
+    }
+}
+
 /// 钥匙册的条目明细:名字行后缀给 kind(条目级,恒 `github-key`),之下给
-/// **主机 / 作用域 / 轮换日**(缺字段显式「——」)。**没有本体槽,也不印
+/// **主机 / 作用域 / 轮换日 + 账龄**(缺字段显式「——」)。**没有本体槽,也不印
 /// 指纹**——投影里就没有这两格(上游 `KeySummary` 五键冻结),面板连「这像是
 /// 哪把钥匙」都不该让人推断出来。作用域**原样逐条报**(只登记不设闸,面板不代管、
 /// 不提醒、不评审;它们是登记元数据,与 secret 槽的「不印指纹」是两回事)。
+///
+/// 账龄那一列(#106):轮换日之后跟「账龄 N 天」,超 [`KEY_AGE_WARN_DAYS`] 天
+/// 亮 amber、其余 dim。**只标记不治理**——不动退出码、不动 doctor 档位、不
+/// 提醒、不自动轮换;册面其余读法逐字节不变。宽度上给它留位:超宽先砍日期
+/// (截断,不折行),账龄文案一个字节不砍——砍了等于这一列白加。
+///
+/// 两档 golden 里的 345 / 271 天是**钉出来的**:测试经 `pin_today_for_test`
+/// 把「今天」钉在 2026-10-13(见 `PINNED_TODAY`),所以这两帧不随墙钟漂。
 fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDetailOut {
     let kind = e
         .kind
@@ -3560,6 +4038,11 @@ fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
         .map(str::trim)
         .filter(|k| !k.is_empty())
         .unwrap_or("——");
+    let age = RotationAge::of(e, UtcDay::today());
+    let age_line = age.line();
+    let date_w = width
+        .saturating_sub(12) // 字段标签的既有预算(与另外两行同一口径)
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(age_line.as_str()) + 2); // 两个空格 + 账龄文案
     (
         Some(format!("kind {kind}")),
         vec![
@@ -3576,9 +4059,15 @@ fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
             ]),
             Line::from(vec![
                 Span::raw("    轮换日 "),
+                Span::styled(clip(&e.rotated_at_line(), date_w), p.text()),
+                Span::raw("  "),
                 Span::styled(
-                    clip(&e.rotated_at_line(), width.saturating_sub(12)),
-                    p.text(),
+                    age_line,
+                    if age.over_threshold() {
+                        p.warn()
+                    } else {
+                        p.dim()
+                    },
                 ),
             ]),
         ],
@@ -5494,6 +5983,439 @@ mod tests {
         let s = crate::testutil::frame_display(&miss, 80, 30);
         assert!(s.contains("反查没结果"), "rc 3 给人话:{s}");
         assert!(s.contains("问错了名字"), "说清不是空结果:{s}");
+    }
+
+    // ---- #120 反查结果跳转:标签册命中条目回车直跳对应册 ----
+
+    /// 标签册**带参反查**回音(#120):只问 pi 一条,引擎给这一条 + 它的引用。
+    /// 引用跨三个 kind——两个有去处(`skill` / `vps`),一个**没有**
+    /// (`mystery`)。引擎今天不会给出处表外的 kind(第②道闸就拒),但 ls 回音
+    /// 是数据,面板不能假设它永远只给已知 kind:无去处那条专门用来钉
+    /// 「明示而非死键」。
+    const TAG_LS_ONE: &str = r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[{"name":"pi","refs":[{"kind":"skill","id":"o/r/deep-research"},{"kind":"vps","id":"gate"},{"kind":"mystery","id":"x"}]}]}}"#;
+
+    /// 五域回音的**外部源域**(#120):两条源都带一条叫 `deep-research` 的
+    /// 条目——条目名撞车时按仓库提示择优(标签引用 `skill/o/r/deep-research`
+    /// 该落到 `o/r`,不该落到排在前面的 `x/y`)。第三条没有条目清单。
+    const LS_SOURCES: &str = r#"{"domain":"all","recipes":[],"components":[],"sources":[{"name":"other","repo":"https://github.com/x/y","kind":"skill","entries":[{"name":"deep-research","path":"skills/deep-research/SKILL.md"}]},{"name":"o/r","repo":"https://github.com/o/r","kind":"skill","entries":[{"name":"deep-research","path":"skills/deep-research/SKILL.md"}]},{"name":"empty-pack","repo":"https://github.com/e/f","kind":"extension","entries":[]}],"profiles":[],"locks":[]}"#;
+
+    /// 机器册投影(#120 跳转夹具):**已按名排好序**的三台(引擎的编目册输出
+    /// 是确定性排序的,生产路径上「册体行序」恒等于「数组序」)。`gate` 是
+    /// 标签引用 `vps/gate` 的落点。
+    ///
+    /// 两份形状:裸 data(直接 `serde_json::from_str::<VpsLsData>()` 灌
+    /// `app.vps_ls`)与整信封(FakeRunner 回放用——回音要过契约守卫那一关,
+    /// 少 `schema` 就是「stdout 不是合法 envelope」)。
+    const JUMP_VPS_LS: &str = r#"{"catalogPath":"/r/vps.json","machines":[{"name":"bare","ips":[],"port":0,"logins":[]},{"name":"gate","ips":[],"port":22,"logins":[]},{"name":"zen","ips":[],"port":0,"logins":[]}]}"#;
+
+    /// [`JUMP_VPS_LS`] 的整信封形状(FakeRunner 的 `vps ls` 规则用)。
+    fn jump_vps_ls_echo() -> String {
+        format!(
+            r#"{{"schema":"nw/vps-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{JUMP_VPS_LS}}}"#
+        )
+    }
+
+    /// 一路走到「标签册反查某一条、命中浮层在场」(#120 的共同就绪态)。
+    ///
+    /// 一并把 **vps 组能力**记成可用:第 2 条命中的去处是机器册,
+    /// `run_vps_ls` 的门(先根后能力)要过能力这一道才放行刷新——夹具只记
+    /// Tag 一门,跳转那条入队刷新的路就走不到(那是「引擎没这能力」的合法
+    /// 结论,由 `反查跳转_目标册缺能力时不入队只指路` 单独钉)。
+    fn jump_ready() -> crate::app::App {
+        let echo = jump_vps_ls_echo();
+        let mut app = tag_app(&[("tag ls", 0, TAG_LS_ONE), ("vps ls", 0, echo.as_str())]);
+        app.capabilities.record(
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+        );
+        app.run_tag_ls(Some("pi"));
+        feed(&mut app);
+        assert!(app.tag_jump_open(), "就绪态:反查跳转浮层应在场");
+        app
+    }
+
+    /// 去处表与引擎的已知 kind 集合**互为镜像**(#120):上游 `TAG_REF_KINDS`
+    /// 里每个 kind 都有去处(不多不少),去处表也不替上游发明 kind。上游加
+    /// kind 而这里没跟上,这条当场红——少一个去处 = 那个 kind 的命中成死键。
+    #[test]
+    fn tag_ref_kinds_每个kind都有去处_去处表也不发明kind() {
+        for k in crate::engine::commands::TAG_REF_KINDS {
+            assert!(
+                jump_dest(k).is_some(),
+                "引擎已知 kind `{k}` 在去处表里没有落点(会变成死键)"
+            );
+        }
+        for d in [JumpDest::Machine, JumpDest::SourceEntry] {
+            let known = match d {
+                JumpDest::Machine => "vps",
+                JumpDest::SourceEntry => "skill",
+            };
+            assert!(
+                crate::engine::commands::TAG_REF_KINDS.contains(&known),
+                "去处 {d:?} 对应的 kind 不在引擎已知集合里(面板在替上游发明 kind)"
+            );
+        }
+        assert!(
+            jump_dest("subscription-url").is_none(),
+            "订阅/钥匙条目不在 TAG_REF_KINDS 里,没有去处(明说,不造)"
+        );
+    }
+
+    /// skill / extension 命中的落点纯函数(#120):条目名 + 仓库提示两步匹配,
+    /// 同条目名多源时按仓库提示择优,没有提示时退化成「只看条目名」。
+    #[test]
+    fn source_hit_index_条目名加仓库提示两步匹配() {
+        let ls: crate::engine::LsData = serde_json::from_str(LS_SOURCES).unwrap();
+        assert_eq!(
+            source_hit_index(&ls, "o/r/deep-research"),
+            Some(1),
+            "仓库提示 o/r 择优:不落到排在前面的 x/y"
+        );
+        assert_eq!(
+            source_hit_index(&ls, "deep-research"),
+            Some(0),
+            "没有仓库提示 = 只看条目名,取引擎顺序里的第一个"
+        );
+        assert_eq!(
+            source_hit_index(&ls, "x/y/deep-research"),
+            Some(0),
+            "仓库提示 x/y 落到另一条"
+        );
+        assert_eq!(
+            source_hit_index(&ls, "o/r/nope"),
+            None,
+            "条目名对不上 = 这一条在当前五域回音里没有去处"
+        );
+        assert_eq!(source_hit_index(&ls, ""), None, "空 id 不配对");
+        assert_eq!(source_hit_index(&ls, "o/r/"), None, "条目名为空不配对");
+    }
+
+    /// 反查跳转浮层在场:册体原样在场(叠加层,不是模式劫持),命中条目逐条
+    /// 列出并**带去处**;无去处那条画成 warn 的「→ 无去处」——明示,不藏。
+    /// 常畅 / 紧凑两档都不溢宽(66×50 下限)。
+    #[test]
+    fn 反查跳转浮层_命中条目列出且带去处_两档不溢宽() {
+        let app = jump_ready();
+        for (w, h) in [(80u16, 30u16), (66, 50), (110, 30)] {
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("这一条引用了什么"), "{w}×{h} 浮层标题:{s}");
+            assert!(s.contains("标签 pi 引用了 3 条"), "{w}×{h} 命中数:{s}");
+            assert!(
+                s.contains("skill/o/r/deep-research"),
+                "{w}×{h} 命中条目:{s}"
+            );
+            assert!(s.contains("vps/gate"), "{w}×{h} vps 命中:{s}");
+            assert!(s.contains("→ 外部源域"), "{w}×{h} 去处写明:{s}");
+            assert!(s.contains("→ 机器册"), "{w}×{h} 去处写明:{s}");
+            assert!(s.contains("→ 无去处"), "{w}×{h} 无去处明示:{s}");
+            assert!(s.contains("Enter 直跳所选条目"), "{w}×{h} 收口键位:{s}");
+            // 册体仍在场:浮层是叠加层,把编目册本体盖掉就不是叠加了
+            assert!(s.contains("当前册 标签"), "{w}×{h} 册体原样在场:{s}");
+            for ln in s.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 不溢宽:{ln:?}"
+                );
+            }
+        }
+    }
+
+    /// vps 命中 → 机器册,选中位落在命中那一台上(#120 验收第 1 条)。
+    ///
+    /// 夹具刻意用**已按名排好序**的投影:引擎的编目册输出是确定性排序的
+    /// (「机器写、确定性排序」),所以生产路径上「册体行序」与「引擎给的
+    /// 数组序」恒同。选中位断言同时看两处——帧上 `▸` 落在 gate 那一行
+    /// (操作者眼里的事实)与 `selected_vps_name()`(面板自己的取值口,
+    /// `d 删除` 用的就是它)——两边必须同时成立,跳转才算真的落对。
+    #[test]
+    fn 反查跳转_vps命中落到机器册并选中那一台() {
+        let mut app = jump_ready();
+        app.vps_ls = Some(serde_json::from_str(JUMP_VPS_LS).unwrap());
+        tap(&mut app, KeyCode::Down); // 浮层内选中第 2 条 = vps/gate
+        tap(&mut app, KeyCode::Enter);
+        assert!(!app.tag_jump_open(), "跳转与浮层关闭同帧完成");
+        assert_eq!(app.screen, crate::app::Screen::Vps, "落到编目册屏");
+        assert_eq!(app.catalog_kind, CatalogKind::Vps, "vps 条目落到机器册");
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate"),
+            "选中位落在命中那一台上"
+        );
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        // 帧上高亮行就是命中那一台。竖导航轨也有 `▸`(当前屏标记),所以按
+        // 机器名找行,再断言那一行带高亮标记——按 `▸` 找行会先命中导航轨。
+        let marked = s.lines().find(|l| l.contains("gate")).unwrap_or_default();
+        assert!(marked.contains("▸"), "帧上高亮行就是命中那一台:{marked:?}");
+        assert!(!app.assembling, "跳转是纯面板内改状态:不点写互斥灯");
+    }
+
+    /// skill 命中 → 配方屏外部源域,选中位落在命中条目**所在的那条源**上
+    /// (#120 验收第 1 条 + 规格「按现有屏结构钉死」)。
+    #[test]
+    fn 反查跳转_skill命中落到外部源域并选中所在源() {
+        let mut app = jump_ready();
+        app.ls = Some(serde_json::from_str(LS_SOURCES).unwrap());
+        tap(&mut app, KeyCode::Enter); // 第 1 条 = skill/o/r/deep-research
+        assert!(!app.tag_jump_open(), "跳转与浮层关闭同帧完成");
+        assert_eq!(app.screen, crate::app::Screen::Recipes, "落到配方屏");
+        assert_eq!(app.rc_domain, crate::app::Domain::Sources, "落到外部源域");
+        assert_eq!(app.rc_sel, 1, "选中位落在 o/r 那条源上(不是排在前面的 x/y)");
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("外部源"), "屏上就是外部源域:{s}");
+    }
+
+    /// 跳转后无残留(#120 验收第 2 条):浮层收了、反查态清了、册头口径回到
+    /// 「全部标签」——不把数据仓根当标签名(#70 既有口径,别撞)。
+    ///
+    /// 先给足 `ls`:第 1 条命中是 skill,去处是外部源域,五域已读 = **同步
+    /// 落地**,这才谈得上「不欠待落地选中位」。五域没读时走的是异步那半
+    /// (入队刷新 + `jump_pending`),由下面那条专门钉。
+    #[test]
+    fn 反查跳转_同帧收浮层并无残留_册头回到全部标签() {
+        let mut app = jump_ready();
+        app.ls = Some(serde_json::from_str(LS_SOURCES).unwrap());
+        tap(&mut app, KeyCode::Enter);
+        assert!(!app.tag_jump_open(), "浮层关闭");
+        assert!(app.tag_lookup.is_none(), "反查态清空");
+        assert!(app.tag_ls_echo.is_none(), "不拿上一轮结论冒充本次");
+        assert_eq!(
+            app.catalog_scope_label(),
+            "全部标签",
+            "册头口径回到全部标签:不把数据仓根当标签名"
+        );
+        assert!(app.jump_pending.is_none(), "同步落地不欠待落地选中位");
+        // 回到标签册:册体说的是「还没反查过」,不是上一轮的命中清单
+        app.screen = crate::app::Screen::Vps;
+        app.catalog_kind = CatalogKind::Tag;
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(
+            s.contains("还没反查过"),
+            "回来看到的是未反查态,不是陈 conclusion:{s}"
+        );
+    }
+
+    /// kind 无去处 / 条目找不到 → 明示而非死键(#120 验收第 3 条):给人话、
+    /// 留日志、不入队任何命令、选中位一个字节都没动。
+    #[test]
+    fn 反查跳转_kind无去处时明示而非死键() {
+        let mut app = jump_ready();
+        let qlen = app.queue.len();
+        let sel0 = app.catalog_sel();
+        tap(&mut app, KeyCode::Down);
+        tap(&mut app, KeyCode::Down); // 第 3 条 = mystery/x,无去处
+        tap(&mut app, KeyCode::Enter);
+        assert!(!app.tag_jump_open(), "浮层照收");
+        assert_eq!(app.queue.len(), qlen, "明示路零引擎调用");
+        assert_eq!(app.catalog_sel(), sel0, "选中位没动");
+        assert_eq!(
+            app.screen,
+            crate::app::Screen::Vps,
+            "没有去处就不切屏(不把操作者扔去一个错的屏)"
+        );
+        assert!(
+            app.log[0].contains("没有去处") && app.log[0].contains("mystery/x"),
+            "日志说清是哪个 kind 的哪一条:{:?}",
+            app.log.first()
+        );
+        // 条目在目标数据里找不到:另一句明示(引用可能已悬空)
+        let mut miss = jump_ready();
+        miss.vps_ls = Some(serde_json::from_str(CAT_VPS_LS).unwrap());
+        // 把机器册投影换成没有 gate 的一份
+        miss.vps_ls = Some(
+            serde_json::from_str(r#"{"catalogPath":"/r/vps.json","machines":[{"name":"bare","ips":[],"port":0,"logins":[]}]}"#)
+                .unwrap(),
+        );
+        tap(&mut miss, KeyCode::Down);
+        tap(&mut miss, KeyCode::Enter);
+        assert!(
+            miss.log[0].contains("册里没有 gate"),
+            "条目找不到给人话,不静默:{:?}",
+            miss.log.first()
+        );
+    }
+
+    /// 目标册还没读过(#120 验收第 1 条的异步半边):入队刷新 + 记待落地选中位,
+    /// 回音到达才按名字落选中——不假装选中。
+    #[test]
+    fn 反查跳转_目标册未读时入队刷新_回音落地后选中() {
+        let mut app = jump_ready();
+        let qlen = app.queue.len();
+        assert!(app.vps_ls.is_none(), "前提:机器册投影还没读过");
+        tap(&mut app, KeyCode::Down); // vps/gate
+        tap(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, crate::app::Screen::Vps, "先切到机器册");
+        assert_eq!(app.catalog_kind, CatalogKind::Vps);
+        assert_eq!(app.queue.len(), qlen + 1, "入队一次 vps ls 刷新");
+        assert_eq!(
+            app.queue.last().map(|a| a.join(" ")).as_deref(),
+            Some(format!("vps ls --root {}", app.usable_data_root().unwrap()).as_str()),
+            "刷新走既有只读 argv,不新造调用形状"
+        );
+        assert_eq!(
+            app.jump_pending,
+            Some(crate::app::JumpPending::Machine("gate".to_string())),
+            "待落地选中位记下要落哪一台"
+        );
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            None,
+            "投影没读到就不假装选中"
+        );
+        // 回音落地:选中位落在 gate 上
+        feed(&mut app);
+        assert!(app.jump_pending.is_none(), "落地后清待落位");
+        assert_eq!(
+            app.selected_vps_name().as_deref(),
+            Some("gate"),
+            "回音到达后选中位落在命中那一台上"
+        );
+    }
+
+    /// 目标册**缺能力**时不入队、只指路(#120):刷新走的是 `run_vps_ls` 既有
+    /// 那道门(先根后能力),门不过 = 一条必败的命令都不发。与「投影没读到」
+    /// 是两回事,话不许互相冒充。
+    #[test]
+    fn 反查跳转_目标册缺能力时不入队只指路() {
+        // tag_app 只记 Tag 一门:vps 组能力未决 → 门不过
+        let echo = jump_vps_ls_echo();
+        let mut app = tag_app(&[("tag ls", 0, TAG_LS_ONE), ("vps ls", 0, echo.as_str())]);
+        app.run_tag_ls(Some("pi"));
+        feed(&mut app);
+        assert!(app.tag_jump_open(), "就绪态");
+        let qlen = app.queue.len();
+        tap(&mut app, KeyCode::Down); // vps/gate
+        tap(&mut app, KeyCode::Enter);
+        assert_eq!(app.queue.len(), qlen, "缺能力不入队任何命令");
+        assert!(app.jump_pending.is_none(), "没入队就不欠待落地选中位");
+        assert!(
+            app.log[0].contains("刷新也没入队"),
+            "日志说清为什么没刷新:{:?}",
+            app.log.first()
+        );
+    }
+
+    /// 鼠标与键盘同路(#120):点浮层里的命中条目 = 选中它并直跳,与
+    /// `↑/↓` + `Enter` 同一个函数、同一条后果链。命中区矩形与渲染同源。
+    #[test]
+    fn 反查跳转_点命中条目等于上下加回车() {
+        let mut app = jump_ready();
+        app.vps_ls = Some(serde_json::from_str(JUMP_VPS_LS).unwrap());
+        app.size = ratatui::layout::Rect::new(0, 0, 110, 30);
+        let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+        let row = hits
+            .iter()
+            .find(|(_, t)| matches!(t, crate::layout::Target::TagJump(1)))
+            .map(|(r, _)| *r)
+            .expect("第 2 条命中应有可点矩形");
+        // 点它 = 选中第 2 条(vps/gate)并直跳
+        let mut app2 = jump_ready();
+        app2.vps_ls = Some(serde_json::from_str(JUMP_VPS_LS).unwrap());
+        app2.size = app.size;
+        crate::app::App::update(
+            &mut app2,
+            crate::app::Message::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: row.x + 1,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert!(!app2.tag_jump_open(), "点了就跳,浮层同帧收");
+        assert_eq!(app2.screen, crate::app::Screen::Vps);
+        assert_eq!(
+            app2.selected_vps_name().as_deref(),
+            Some("gate"),
+            "点第 2 条 = 键盘选中第 2 条再回车"
+        );
+    }
+
+    /// 反查跳转浮层对鼠标的收口(#120):浮层外的正文是「点任意处关闭」,与
+    /// Esc 同路;浮层里的命中行才是动作。
+    #[test]
+    fn 反查跳转浮层_点浮层外关闭_命中行才是动作() {
+        let mut app = jump_ready();
+        app.size = ratatui::layout::Rect::new(0, 0, 110, 30);
+        let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+        assert!(
+            hits.iter()
+                .any(|(_, t)| matches!(t, crate::layout::Target::DismissPopup)),
+            "浮层外点任意处 = 关闭(Esc 同路)"
+        );
+        assert!(
+            hits.iter()
+                .all(|(_, t)| !matches!(t, crate::layout::Target::SelectRow(_))),
+            "浮层吞点击:底层清单行不产命中"
+        );
+        // 点浮层外 = 关
+        let outside = hits
+            .iter()
+            .find(|(r, t)| {
+                matches!(t, crate::layout::Target::DismissPopup) && r.y < app.size.height - 1
+            })
+            .map(|(r, _)| *r)
+            .expect("有关闭命中区");
+        crate::app::App::update(
+            &mut app,
+            crate::app::Message::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: outside.x,
+                row: outside.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert!(!app.tag_jump_open(), "点浮层外 = Esc 同路关闭");
+    }
+
+    /// 只有「标签册 + 正在反查某一条」才开跳转浮层(#120):列全部(`l`)与
+    /// 机器册反查上浮都走 `run_tag_ls(None)`,`tag_lookup` 是 None——那一态
+    /// 没有「这一条的命中」可言,不开浮层(开了就是噪声)。
+    #[test]
+    fn 列全部与机器册反查上浮_都不开跳转浮层() {
+        // ① 标签册列全部
+        let mut all = tag_app(&[("tag ls", 0, TAG_LS_ALL)]);
+        tap(&mut all, KeyCode::Char('l'));
+        feed(&mut all);
+        assert!(!all.tag_jump_open(), "列全部不开跳转浮层");
+        // ② 机器册反查上浮(#70):回音同样落 tag_ls_echo,但不该开跳转浮层
+        let (_r, mut rev) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
+        反查这台(&mut rev);
+        feed(&mut rev);
+        assert!(rev.vps_reverse_open(), "机器册反查上浮在场");
+        assert!(
+            !rev.tag_jump_open(),
+            "反查上浮不开跳转浮层(问的不是同一件事)"
+        );
+        // ③ 换册即收:标签册的命中清单不顺带到别的册上
+        // ③ 浮层在场 = 顶层浮层吞键:`m` 换册不被受理(与反查上浮同口径——
+        //    弹层优先级高于册体键位)。要先 Esc 收浮层,再换册;换册本身也清
+        //    状态(防御:哪条路径换了册却忘了清,画出来的就是标签册的命中
+        //    清单摊在别的册上)。
+        let mut j = jump_ready();
+        tap(&mut j, KeyCode::Char('m'));
+        assert!(j.tag_jump_open(), "浮层在场时吞册体键:换册不被受理");
+        assert_eq!(j.catalog_kind, CatalogKind::Tag, "册没换");
+        tap(&mut j, KeyCode::Esc);
+        assert!(!j.tag_jump_open(), "Esc 收浮层");
+        tap(&mut j, KeyCode::Char('m'));
+        assert!(!j.tag_jump_open(), "换册后不收着浮层");
+        assert_eq!(
+            j.catalog_kind,
+            CatalogKind::Subscription,
+            "标签册之后是订阅册"
+        );
+    }
+
+    /// 反查跳转是只读(#120):不点亮 `assembling` 写互斥、不新增任何写路径。
+    /// 写互斥点亮意味着别的写动作会被挡住——一次跳转不该有那个代价。
+    #[test]
+    fn 反查跳转_是只读_不点亮assembling写互斥() {
+        let mut app = jump_ready();
+        app.vps_ls = Some(serde_json::from_str(JUMP_VPS_LS).unwrap());
+        let qlen = app.queue.len();
+        tap(&mut app, KeyCode::Down);
+        tap(&mut app, KeyCode::Enter);
+        assert!(!app.assembling, "跳转不占写互斥");
+        assert_eq!(app.queue.len(), qlen, "投影已读过:零引擎调用");
     }
 
     /// add 幂等由面板复用同一 argv 保证;四道闸摊开给看;无确认闸
@@ -8146,7 +9068,7 @@ mod tests {
             "{w}×{h} 整帧渲染发生变化(见本族测试头注的修订纪律)"
         );
     }
-    /// 机器册 80×30 整帧 golden(基线 `bb19d70` + #66;此后 #67 加 `m 换册`、#69 加 `/ 过滤`、#70 改 `Esc` 并加 `Enter 反查`)。
+    /// 机器册 80×30 整帧 golden(基线 `bb19d70` + #66;此后 #67 加 `m 换册`、#69 加 `/ 过滤`、#70 改 `Esc` 并加 `Enter 反查`;#119 常畅态 HUD 加 `Ctrl+P 命令` 段)。
     const VPS_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 机器 · 机器 · 编目 /r/vps.json                           │
@@ -8176,7 +9098,7 @@ mod tests {
 │          ││                                                                  │
 │          ││  ↑/↓ 选 ·r 登记 ·d 删除 ·Esc ·Enter 反查 ·m 换册 ·/ 过滤         │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
- j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+ j/k 切屏 Enter 确认 t 主题 ? 帮助 Ctrl+P 命令   q 退出主题:暗色仓库            "####;
     /// 机器册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
     const VPS_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
@@ -8258,7 +9180,7 @@ mod tests {
 │          ││                                                                  │
 │          ││  ↑/↓ 选 ·Enter 反查 ·l 全部 ·r 挂标签 ·d 摘/删 ·m 换册 ·/ 过滤   │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
- j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+ j/k 切屏 Enter 确认 t 主题 ? 帮助 Ctrl+P 命令   q 退出主题:暗色仓库            "####;
     /// 标签册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
     const TAG_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
@@ -8340,7 +9262,7 @@ mod tests {
 │          ││                                                                  │
 │          ││  ↑/↓ 选订阅 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤      │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
- j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
+ j/k 切屏 Enter 确认 t 主题 ? 帮助 Ctrl+P 命令   q 退出主题:暗色仓库            "####;
     /// 订阅册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
     const SUB_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
@@ -8392,18 +9314,19 @@ mod tests {
 │  ↑/↓ 选订阅 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤    │
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
-    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动)。
+    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动;
+    /// #106 轮换日那一行加了账龄列——本轮唯二变动,来历记在这里)。
     const KEY_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                      │
 │  ⚙ 装配  ││  ▸ ci  kind github-key                                           │
 │  ✚ 健康  ││    主机 ghe.internal                                             │
 │  ▤ 配方  ││    作用域 未声明(0 条)                                           │
-│▸ ▩ 编目  ││    轮换日 2025-11-02                                             │
+│▸ ▩ 编目  ││    轮换日 2025-11-02  账龄 345 天                                │
 │  ✦ 设置  ││    deploy  kind github-key                                       │
 │          ││    主机 github.com                                               │
 │          ││    作用域 repo · read:org                                        │
-│          ││    轮换日 2026-01-15                                             │
+│          ││    轮换日 2026-01-15  账龄 271 天                                │
 │          ││  取回钥匙(面板不代跑,按 g 收进日志):                             │
 │          ││nw key get --name ci --root /tmp | jq -r .data.key                │
 │          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
@@ -8422,8 +9345,8 @@ mod tests {
 │          ││                                                                  │
 │          ││  ↑/↓ 选钥匙 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤      │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
- j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
-    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
+ j/k 切屏 Enter 确认 t 主题 ? 帮助 Ctrl+P 命令   q 退出主题:暗色仓库            "####;
+    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档;#106 同因加账龄列)。
     const KEY_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
 ┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
@@ -8431,11 +9354,11 @@ mod tests {
 │  ▸ ci  kind github-key                                         │
 │    主机 ghe.internal                                           │
 │    作用域 未声明(0 条)                                         │
-│    轮换日 2025-11-02                                           │
+│    轮换日 2025-11-02  账龄 345 天                              │
 │    deploy  kind github-key                                     │
 │    主机 github.com                                             │
 │    作用域 repo · read:org                                      │
-│    轮换日 2026-01-15                                           │
+│    轮换日 2026-01-15  账龄 271 天                              │
 │  取回钥匙(面板不代跑,按 g 收进日志):                           │
 │nw key get --name ci --root /tmp | jq -r .data.key              │
 │  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
@@ -8510,9 +9433,163 @@ mod tests {
     /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
     #[test]
     fn 钥匙册整帧golden_两档golden() {
+        pin_today_for_test(2026, 10, 13);
         let app = book("钥匙");
         assert_book_frame(&app, 80, 30, KEY_80X30);
         assert_book_frame(&app, 66, 50, KEY_66X50);
+    }
+
+    // ---- 钥匙轮换账龄(spec #94 第 5 项 / 工单 #106) ----
+
+    /// 造一条只填了轮换日的钥匙条目——账龄只依赖这一格(其余槽与本票无关)。
+    fn key_entry(rotated_at: Option<&str>) -> CatalogEntryView {
+        CatalogEntryView {
+            name: "ci".into(),
+            rotated_at: rotated_at.map(str::to_string),
+            ..CatalogEntryView::default()
+        }
+    }
+
+    fn age_of(rotated_at: Option<&str>, today: UtcDay) -> RotationAge {
+        RotationAge::of(&key_entry(rotated_at), today)
+    }
+
+    /// 账龄是 UTC **日历日**差(不是 30 天月、不是 365 天年)。期望值取自独立
+    /// 算法(python3 `datetime.date` 减法),不按实现里的同一套公式反推。
+    #[test]
+    fn 轮换账龄_按日历日差算_同一天为0() {
+        let today = UtcDay {
+            y: 2026,
+            m: 10,
+            d: 13,
+        };
+        assert_eq!(age_of(Some("2026-10-13"), today), RotationAge::Days(0));
+        assert_eq!(age_of(Some("2026-10-12"), today), RotationAge::Days(1));
+        assert_eq!(age_of(Some("2026-10-06"), today), RotationAge::Days(7));
+        assert_eq!(age_of(Some("2026-01-15"), today), RotationAge::Days(271));
+        assert_eq!(age_of(Some("2025-11-02"), today), RotationAge::Days(345));
+        // 跨闰年与闰日本身:2024-02-29 是真日子,2025-02-29 不是
+        assert_eq!(age_of(Some("2024-02-29"), today), RotationAge::Days(957));
+        assert_eq!(age_of(Some("2025-02-29"), today), RotationAge::Unknown);
+    }
+
+    /// 算不出的五类(没这一格 / 空 / 形状不认 / 不是真日历日 / 未来日)全归
+    /// 未知,**没有一类拿 0 冒充**——0 天只有「今天刚轮换」一种来路。
+    #[test]
+    fn 轮换账龄_算不出就说未知_不拿0冒充() {
+        let today = UtcDay {
+            y: 2026,
+            m: 10,
+            d: 13,
+        };
+        for r in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("2026-1-5"),
+            Some("2026-13-01"),
+            Some("2026-02-30"),
+            Some("2025-02-29"),
+            Some("昨天"),
+        ] {
+            assert_eq!(age_of(r, today), RotationAge::Unknown, "{r:?} 应算不出");
+        }
+        assert_eq!(
+            age_of(Some("2026-10-14"), today),
+            RotationAge::Unknown,
+            "轮换日在未来:不印负数,也不拿 0 冒充今天刚换"
+        );
+    }
+
+    #[test]
+    fn 账龄一行_算得出报天数_算不出说未知() {
+        assert_eq!(RotationAge::Days(0).line(), "账龄 0 天");
+        assert_eq!(RotationAge::Days(345).line(), "账龄 345 天");
+        assert_eq!(RotationAge::Unknown.line(), "账龄 未知");
+    }
+
+    /// 阈值为 7 天、「超」是严格大于:7 天本身不亮,8 天亮;未知不亮
+    /// (没有依据就不标记)。
+    #[test]
+    fn 账龄超7天才亮_未知与7天本身不亮() {
+        assert!(!RotationAge::Days(0).over_threshold());
+        assert!(!RotationAge::Days(7).over_threshold(), "7 天本身不算超");
+        assert!(RotationAge::Days(8).over_threshold());
+        assert!(
+            !RotationAge::Unknown.over_threshold(),
+            "算不出不亮:没有依据就不标记"
+        );
+    }
+
+    /// 一把老钥匙 + 一把新钥匙:老的那把亮 amber,新的那把不亮(今天钉在
+    /// 2026-10-13,账龄 345 天 / 1 天)。
+    const KEY_LS_AGE_MIX: &str = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[{"name":"old","kind":"github-key","host":"github.com","scopes":[],"rotatedAt":"2025-11-02"},{"name":"fresh","kind":"github-key","host":"github.com","scopes":[],"rotatedAt":"2026-10-12"}]}}"#;
+
+    /// 册面真画出了账龄,且两档都不溢宽(66×50 是响应式下限)。
+    #[test]
+    fn 钥匙册_轮换日行带账龄_两档都在且不溢宽() {
+        pin_today_for_test(2026, 10, 13);
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        app.nw_home = "/nw".into();
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("账龄 345 天"), "{w}×{h} 老钥匙的账龄应在场:{s}");
+            assert!(s.contains("账龄 271 天"), "{w}×{h} 另一把的账龄应在场:{s}");
+            assert!(
+                s.contains("轮换日 2025-11-02"),
+                "{w}×{h} 轮换日原文应在场:{s}"
+            );
+            for ln in s.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 有行超宽:{ln}"
+                );
+            }
+        }
+    }
+
+    /// 账龄列只标记不治理:超阈的那条亮 amber,未超的那条不亮,册面其余读法
+    /// (主机 / 作用域 / 轮换日原文)逐字节不变。
+    #[test]
+    fn 钥匙册_账龄超阈亮amber_未超不亮() {
+        pin_today_for_test(2026, 10, 13);
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_AGE_MIX)]);
+        app.nw_home = "/nw".into();
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        let p = app.palette;
+        assert_ne!(
+            p.warn().fg,
+            p.dim().fg,
+            "两种样式得能分辨,否则这条什么都没测"
+        );
+        let old = crate::testutil::frame_span_fg(&app, 80, 30, "账龄 345 天");
+        let fresh = crate::testutil::frame_span_fg(&app, 80, 30, "账龄 1 天");
+        assert_eq!(old, p.warn().fg, "超阈账龄应亮 amber");
+        assert_eq!(fresh, p.dim().fg, "未超阈账龄不应亮");
+        assert_ne!(fresh, p.warn().fg);
+        // 轮换日原文不跟着变色(只标记账龄,不动册面其余读法)
+        assert_eq!(
+            crate::testutil::frame_span_fg(&app, 80, 30, "2025-11-02"),
+            p.text().fg,
+            "轮换日原文仍是正文色"
+        );
+    }
+
+    /// 没给轮换日 = 「账龄 未知」,不是「账龄 0 天」;也不该把整册带炸。
+    #[test]
+    fn 钥匙册_没给轮换日_账龄未知且不顶替0天() {
+        pin_today_for_test(2026, 10, 13);
+        let ls = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"ghe.internal","scopes":[]}]}}"#;
+        let (mut app, _r) = key_app(&[("key ls", 0, ls)]);
+        app.nw_home = "/nw".into();
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("账龄 未知"), "没给轮换日应说未知:{s}");
+        assert!(!s.contains("账龄 0 天"), "不许拿 0 天冒充不知道:{s}");
     }
 
     /// 四本册走同一条键位路径(#66 验收第 4 条):对四本册各驱动一次**相同**

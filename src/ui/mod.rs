@@ -8,12 +8,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::app::{App, Domain, HealthMode, Screen};
 use crate::layout::{popup_rect, size_class, SizeClass, HELP_H, HELP_W, NAV_WIDTH};
 use crate::screens;
 use crate::theme::Palette;
+
+pub(crate) mod commands;
 
 /// 壳三段:顶栏 1 行 / 主区 / HUD 1 行。
 pub fn render(frame: &mut Frame, app: &App) {
@@ -44,6 +46,14 @@ pub fn render(frame: &mut Frame, app: &App) {
         // 传 body 区(去掉顶栏 1 行)而非整帧:与 `layout::help_hits` 的
         // `area_pad(area,1)` 同源,浮层可见区与「点任意处关」命中区永不分歧。
         render_help(frame, rows[1], app);
+    }
+    // 全局命令面板(#119):Ctrl+P 呼出的叠加浮层。与帮助浮层同族——同一份
+    // body 区、同一个 `popup_rect`,几何在 `layout::cmd_*` 一处算,渲染与命中
+    // 共用。它在帮助浮层之后画:两者都是「查询型」浮层,而 `on_key` 里帮助
+    // 浮层是最外层(它开着时其余键一律不收),所以这个次序只是兜底,真正常
+    // 态是二者只开一个。
+    if app.cmd_open {
+        commands::render(frame, rows[1], app);
     }
     let _ = p;
 }
@@ -157,6 +167,14 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     }
     spans.push(Span::styled("?", p.accent()));
     spans.push(Span::raw(" 帮助 "));
+    // 命令面板键位只在常畅态给(#67 键位行纪律:放不下整段不收)。紧凑态
+    // HUD 只留切屏/确认/帮助/退出四段核心,66 列里再塞「Ctrl+P 命令」会把
+    // 「装配中:x 中止 · 其余动作已锁定」那段挤出屏外——所以整段不收,紧凑态
+    // 靠 `?` 帮助浮层与 Ctrl+P 本身呼出的面板学这个键。
+    if !compact {
+        spans.push(Span::styled("Ctrl+P", p.accent()));
+        spans.push(Span::raw(" 命令 "));
+    }
     if app.assembling {
         spans.push(Span::raw(" "));
         // 中止键只在真有 up 在途时给(#59):登记落账也点这盏灯,但它的
@@ -167,12 +185,18 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
             "装配中:动作已锁定"
         };
         spans.push(Span::styled(hint, p.dim()));
-    } else if app.home_input || app.data_input || app.rc_filter_on {
+    } else if app.home_input || app.data_input || app.rc_filter_on || app.ah_filter_on {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
     } else if app.reg_state == crate::app::RegState::RepoInput {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记填链:Enter 继续 · Esc/q 放弃", p.accent()));
+    } else if app.reg_state == crate::app::RegState::PreScanPick {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "预扫选单:空格勾选 · Enter 继续 · Esc 返航",
+            p.accent(),
+        ));
     } else if app.reg_state != crate::app::RegState::Idle {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记中:Esc 返航", p.accent()));
@@ -200,10 +224,16 @@ pub(crate) enum Prep {
     Shell,
     /// 先打开帮助浮层再派发(验证 Esc/q 关浮层)。
     HelpOpen,
+    /// 先布成装配历史次级视图在场(#101):`/` 过滤与 `r` 重读只在这个
+    /// 上下文里有分支,帮助对照表因此要能把它布出来(与 `running` 旗同级
+    /// 的布场口,不是新浮层)。
+    HistoryView,
 }
 
-/// 帮助浮层的一行键位:渲染与「帮助↔实现不脱节」测试共用这一份
-/// (`app::tests` 的对照测试遍历它),是帮助内容的单一真相源。
+/// 帮助浮层的一行键位,同时是**全局命令面板**(#119)的命令清单——
+/// 一处登记、两处消费:帮助浮层按它渲染,命令面板按它搜索与执行。
+/// 这治的是「帮助写的键与实现真有的键互相漂移」那笔历史账(#62 起双向
+/// 对齐测试钉住它,#119 把第二份消费者接上来)。
 /// - `key` = 浮层展示的键名(可列别名,如 `a / h / l`);`desc` = 一句说明。
 /// - `screen` / `domain` / `mode` = 测试派发前把 App 布到的上下文
 ///   (`None` = 壳级 / 默认域);`prep` = 额外浮层预设;`code` = 代表性键码。
@@ -220,14 +250,36 @@ pub(crate) struct HelpRow {
     pub(crate) book: Option<crate::screens::CatalogKind>,
     pub(crate) prep: Prep,
     pub(crate) code: KeyCode,
+    /// 派发这一条时要带的修饰键(对照测试据此造 KeyEvent)。绝大多数键位是
+    /// 裸键(`NONE`);`Ctrl+P`(#119)要带 `CONTROL`——不带修饰符的 `p` 在
+    /// 任何屏都没有分支,所以照 `NONE` 派发会让「帮助列的键实现里都有分支」
+    /// 这条测试对 Ctrl+P 假红。
+    pub(crate) modifiers: KeyModifiers,
     /// 派发前先把 App 布成「有 up 在途」(#59 中止键的受理面前提)。
     pub(crate) running: bool,
+    /// 这一条的后果是**写**(登记 / 删除 / 打开发射仪式):装配态下命令
+    /// 面板不透出它(规格故事 9:不许从面板绕过装配互斥)。帮助浮层照旧
+    /// 全列——它是文档,不是执行面。
+    pub(crate) write: bool,
 }
 
-/// 帮助浮层键位对照表(单一真相源):顺序即浮层里的自上而下。
-/// 别名不逐列——`↑/↓` 之 `n/p`、`h/l` 之 `←/→`、`j/k` 之 `Tab/BackTab`
-/// 与主键同义,帮助只呈现主键(与 README 键位表同粒度)。
+/// 键位登记表(单一真相源):顺序即帮助浮层里的自上而下,也是命令面板
+/// 搜索结果里的次序。别名不逐列——`↑/↓` 之 `n/p`、`h/l` 之 `←/→`、
+/// `j/k` 之 `Tab/BackTab` 与主键同义,只呈现主键(与 README 键位表同粒度)。
 pub(crate) const HELP_ROWS: &[HelpRow] = &[
+    HelpRow {
+        key: "Ctrl+P",
+        desc: "命令面板:模糊搜全部键位,回车执行",
+        screen: None,
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('p'),
+        modifiers: KeyModifiers::CONTROL,
+        write: false,
+    },
     HelpRow {
         key: "j / k",
         desc: "切屏(下一屏 / 上一屏)",
@@ -238,6 +290,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('j'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "↑ / ↓",
@@ -249,6 +303,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "a / h / l / v",
@@ -260,6 +316,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('a'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "r",
@@ -271,6 +329,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Enter",
@@ -282,6 +342,21 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: true,
+    },
+    HelpRow {
+        key: "h",
+        desc: "装配:开/关装配历史(清单存档)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('h'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "x",
@@ -293,6 +368,34 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: true,
         prep: Prep::Shell,
         code: KeyCode::Char('x'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "/",
+        desc: "装配历史:按派过滤(本地筛选,Esc 清词)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('/'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "r",
+        desc: "装配历史:重读存档快照(显式刷新,不自动跑)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "m",
@@ -304,6 +407,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "r",
@@ -315,6 +420,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Enter",
@@ -326,6 +433,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "h / l",
@@ -337,6 +446,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('h'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "c",
@@ -348,6 +459,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "r",
@@ -359,6 +472,21 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: true,
+    },
+    HelpRow {
+        key: "Enter",
+        desc: "配方:看选中组件的落点(只读)",
+        screen: Some(Screen::Recipes),
+        domain: Some(Domain::Sources),
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "/",
@@ -370,6 +498,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('/'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "r",
@@ -381,6 +511,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: true,
     },
     HelpRow {
         key: "d",
@@ -392,6 +524,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('d'),
+        modifiers: KeyModifiers::NONE,
+        write: true,
     },
     HelpRow {
         key: "l",
@@ -403,6 +537,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('l'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "m",
@@ -414,6 +550,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "/",
@@ -425,6 +563,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('/'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "g",
@@ -436,6 +576,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('g'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "g",
@@ -447,6 +589,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('g'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Enter",
@@ -458,6 +602,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Enter",
@@ -469,6 +615,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "n",
@@ -480,6 +628,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('n'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "i",
@@ -491,6 +641,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('i'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "d",
@@ -502,6 +654,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('d'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "e",
@@ -513,6 +667,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('e'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "m",
@@ -524,6 +680,21 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "v",
+        desc: "设置:引擎版本对照(v / Esc 返回,r 重查)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('v'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Esc",
@@ -535,6 +706,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::HelpOpen,
         code: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "t",
@@ -546,6 +719,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('t'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "?",
@@ -557,6 +732,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('?'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "q",
@@ -568,6 +745,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('q'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
 ];
 
@@ -586,13 +765,16 @@ pub(crate) const MOUSE_LINES: &[&str] = &[
     "编目册键位行可点段:换册 / 过滤 / 反查(点它 = 按对应键)",
     "取回段只订阅/钥匙册:点它 = 按 g(只收建议命令,不代跑)",
     "删除段四本册可点 = 按 d(先确认;标签册是「d 摘/删」)",
+    "概览警示带点名到期订阅,点那一条 = 跳到订阅册并选中它",
     "捕获默认开的代价:复制要按 Shift",
     "逃逸:--no-mouse / 设置屏 m 关(重启生效)",
 ];
 
 /// 帮助浮层正文(键位对照表 + 鼠标章节 + 尾注):渲染开窗与 ↑/↓ 滚动的
 /// 钳位都按它算,一处真相。样式在此一次上齐,开窗只切行、不重上色。
-fn help_lines(p: &crate::theme::Palette) -> Vec<Line<'static>> {
+/// `pub(crate)` 供命令面板(#119)的同源测试直接读它——「面板与帮助浮层
+/// 消费同一张登记表」这条不许靠两份手抄期望值去对。
+pub(crate) fn help_lines(p: &crate::theme::Palette) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::with_capacity(HELP_ROWS.len() + MOUSE_LINES.len() + 3);
     for row in HELP_ROWS {
         lines.push(Line::from(vec![
@@ -733,6 +915,8 @@ mod tests {
     /// 期望值从当前正确渲染生成并经人工核对(顶栏/导航/警示带/派表/指令栏/
     /// 最近日志/计数卡/HUD 逐行过目);若既有渲染面发生真实回归而改期望,
     /// 必须与该回归同一次提交并说明——不许为过测试回填。
+    /// #119 修订:HUD 常畅态加 `Ctrl+P 命令` 段(紧凑态 66 列放不下整段,按
+    /// #67 纪律整段不收),所以本次只改 HUD 那一行,其余逐字节不动。
     /// 场景全部钉死:with_runner(引擎状态固定「测试注入」)+ splash 关 +
     /// NW_HOME 置 /nw + ls 固定夹具——CI 三平台 HOME/配置不同也不漂。
     #[test]
@@ -774,7 +958,7 @@ mod tests {
 │          │││           ││           ││            ││           ││           ││
 │          ││└───────────┘└───────────┘└────────────┘└───────────┘└───────────┘│
 └──────────┘└──────────────────────────────────────────────────────────────────┘
- j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "#;
+ j/k 切屏 Enter 确认 t 主题 ? 帮助 Ctrl+P 命令   q 退出主题:暗色仓库            "#;
         assert_eq!(
             got, want,
             "常畅态 80×30 整帧渲染发生变化(上=got 下=want;见 golden 测试头注的修订纪律)"
@@ -928,6 +1112,23 @@ mod tests {
         assert!(hud.contains("切屏") && hud.contains("确认"));
         assert!(hud.contains("帮助") && hud.contains("退出"));
         assert!(!hud.contains("主题"), "紧凑态 HUD 少给提示、无主题标注");
+    }
+
+    /// 命令面板键位(#119)在 HUD 里的两档纪律(#67:放不下整段不收):
+    /// 常畅态给整段 `Ctrl+P 命令`;紧凑态 66 列里塞它会挤出「装配中:x 中止 ·
+    /// 其余动作已锁定」那段,所以整段不收——紧凑态靠 `?` 帮助浮层与 Ctrl+P
+    /// 本身呼出的面板学这个键。
+    #[test]
+    fn 命令面板键位_hud常畅给紧凑不收() {
+        let app = ui_app();
+        let comfy = render_to_string(&app, 80, 30);
+        assert!(comfy.contains("Ctrl+P 命令"), "常畅态 HUD 给整段:{comfy}");
+        let compact = render_to_string(&app, 66, 50);
+        assert!(
+            !compact.contains("Ctrl+P"),
+            "紧凑态放不下整段,按 #67 纪律整段不收:{compact}"
+        );
+        assert!(compact.contains("帮助"), "紧凑态仍保留核心提示:{compact}");
     }
 
     /// j/k 切屏与 Tab 指示同步(紧凑态):选中标记跟到当前屏。
