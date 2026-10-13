@@ -445,12 +445,25 @@ fn bake_suggest_lines(
             }
         }
         Err(g) => {
-            lines.push(Line::from(Span::styled(
-                format!("  ⚠ {}", g.title()),
-                p.warn().bold(),
-            )));
-            for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
-                lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+            // #124:缺能力那一支**整句**交给共享构造器的单行形态(三态措辞 +
+            // 探针证据带,与册体 #122 / 日志结论句 #118 同一处真相),并且不再
+            // 另铺 `title()`——那句「引擎缺 X 能力」对未决态是冒充(引擎这一跑
+            // 根本没答上,不是没有这个能力,spec #90 故事 23)。另两支(数据仓根
+            // 未设 / 没有选中的配方)仍是纯函数层自己的标题 + 说法。
+            if g == crate::engine::commands::BakeGate::NoCapability {
+                // 不按 take(3) 收口:裁掉尾部等于把证据带切掉,操作者正好看不到
+                // 引擎那一跑的原话。
+                for ln in wrap(&app.bake_gate_line(g), w.saturating_sub(4)) {
+                    lines.push(Line::from(Span::styled(format!("  {ln}"), p.warn().bold())));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", g.title()),
+                    p.warn().bold(),
+                )));
+                for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
+                    lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+                }
             }
         }
     }
@@ -466,12 +479,21 @@ fn bake_empty_lines(p: &crate::theme::Palette, app: &App, w: usize) -> Vec<Line<
         p.dim(),
     ))];
     if let Some(g) = gate {
-        lines.push(Line::from(Span::styled(
-            format!("  ⚠ {}", g.title()),
-            p.warn().bold(),
-        )));
-        for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
-            lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+        // 同 bake_suggest_lines:缺能力那一支整句走共享构造器的单行形态
+        // (带证据),不另铺 title、不按 take(3) 收口;另两支仍是纯函数层
+        // 自己的标题 + 说法。
+        if g == crate::engine::commands::BakeGate::NoCapability {
+            for ln in wrap(&app.bake_gate_line(g), w.saturating_sub(4)) {
+                lines.push(Line::from(Span::styled(format!("  {ln}"), p.warn().bold())));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ {}", g.title()),
+                p.warn().bold(),
+            )));
+            for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
+                lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+            }
         }
     }
     lines
@@ -521,11 +543,21 @@ fn recipe_new_suggest_lines(
             );
         }
         Err(g) => {
-            head.push(Line::from(Span::styled(
-                format!("  ⚠ {}", g.title()),
-                p.warn().bold(),
-            )));
-            notes.push(g.advice());
+            // #124:与 bake 同一收口——缺能力那一支整句交给共享构造器的单行
+            // 形态(带证据),不另铺 `title()`(对未决是冒充);另两支仍是纯函数层
+            // 自己的标题 + 说法。折行进 head:它替代了原来的标题行,视觉重量
+            // 不能比原标题轻;竖向仍由下面的 room 收口,放不下整块不渲染。
+            if g == crate::engine::commands::RecipeNewGate::NoCapability {
+                for ln in wrap(&app.recipe_new_gate_line(g), w.saturating_sub(4)) {
+                    head.push(Line::from(Span::styled(format!("  {ln}"), p.warn().bold())));
+                }
+            } else {
+                head.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", g.title()),
+                    p.warn().bold(),
+                )));
+                notes.push(g.advice());
+            }
         }
     }
     if head.len() > room {

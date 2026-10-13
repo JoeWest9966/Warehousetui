@@ -332,6 +332,31 @@ impl GateSignpost {
         }
         s
     }
+
+    /// 单行形态·**指路**(工单 #124 的收口):机器册反查未下发、配方烘焙 /
+    /// 配方新建建议闸、外部源复核闸四处单行指路共用这一句。
+    ///
+    /// 与 [`Self::line`](日志结论句)、册体真相行(#122)同一处措辞真相:三态
+    /// 标签取自 [`Probe::label`],下一步取自 [`next_steps`](与册体同一句),
+    /// 证据带就是 [`Self::evidence`] 原字段——不另排一遍、不改写。
+    ///
+    /// 为什么不复用 [`Self::line`]:那句的主语是「能力探测」本身(日志结论
+    /// 形态);指路要的是「⚠ 哪一项 什么态:这一步该做什么」,操作者照着做。
+    /// 两者共用同一份证据字段,只头部形态不同。
+    pub fn hint(&self, cap: Capability, verdict: Probe, facts: &EngineFacts) -> String {
+        let mut s = format!(
+            "{} {} {}:{}",
+            verdict_mark(verdict),
+            cap.label(),
+            verdict.label(),
+            next_steps(verdict, facts).concat()
+        );
+        for e in &self.evidence {
+            s.push_str(" · ");
+            s.push_str(e);
+        }
+        s
+    }
 }
 
 /// 能力门关门的规范指路(spec #90 / 工单 #122 的**唯一新缝针**):册体(#122)、
@@ -382,8 +407,9 @@ fn verdict_lines(subject: &str, verdict: Probe, facts: &EngineFacts) -> Vec<Stri
         // 中间一行整句引用 [`GATE_HINT`]——那句话的唯一出处就是那个常量,
         // 这里只引用、不复制字符串(同一句话两个出处正是本票要收掉的重复)。
         Probe::Unavailable => vec![
-            format!("⚠ {subject} 册入口禁用"),
-            GATE_HINT.to_string(),
+            format!("{} {subject} 册入口禁用", verdict_mark(verdict)),
+            // 下一步与单行指路(#124)同一句:一处措辞真相。
+            next_steps(verdict, facts).concat(),
             "编目册内容此时不可信也不呈现。".to_string(),
         ],
         // 未决:引擎这一跑没答上,不是缺能力。修引擎发现(attempted 素材)
@@ -392,27 +418,65 @@ fn verdict_lines(subject: &str, verdict: Probe, facts: &EngineFacts) -> Vec<Stri
         Probe::Unknown => {
             // 问的是哪个引擎(故事 3/4/5):与证据带同源,这里说「谁没答上」。
             let mut v = vec![format!(
-                "? {subject} 册入口未决:引擎这一跑没答上,册体不可信也不呈现。"
+                "{} {subject} 册入口未决:引擎这一跑没答上,册体不可信也不呈现。",
+                verdict_mark(verdict)
             )];
-            match facts.bin {
-                Some(b) => v.push(format!(
-                    "问的是 {b} ({}, {});修引擎发现后重启重探。",
-                    facts.source, facts.version
-                )),
-                None => {
-                    // 没找到二进制:如实说没找到,不拿一个路径冒充(故事 3)。
-                    v.push("没找到 nw 二进制;修引擎发现后重启重探。".to_string());
-                    // 引擎发现素材(故事 15):把试过的地方摊开,操作者按图索骥。
-                    // 这一行可能长,超预算时由册体的 clip 收尾——素材本身
-                    // 宁可被截,也不为省一行把它并进上一句。
-                    if !facts.attempted.is_empty() {
-                        v.push(format!("找 nw 试过:{}", facts.attempted.join("、")));
-                    }
-                }
-            }
+            // 下一步(问的是哪个引擎 / 没找到二进制 / 引擎发现素材)与单行
+            // 指路同一句——册体按行铺,单行形态拼成一行。
+            v.extend(next_steps(verdict, facts));
             v
         }
         // 可用不产指路(`gate_signpost` 已在上面拦掉)。
+        Probe::Available => Vec::new(),
+    }
+}
+
+/// 三态各自的醒目标记:册体真相行(#122)与单行指路(#124)共用——
+/// 禁用 = ⚠(要动手),未决 = ?(要先修发现),一眼可辨且不互冒充。
+fn verdict_mark(verdict: Probe) -> &'static str {
+    match verdict {
+        Probe::Unavailable => "⚠",
+        Probe::Unknown => "?",
+        // 可用不产指路,标记用不上;给空串而不是 panic,调用方自己已经拦掉。
+        Probe::Available => "",
+    }
+}
+
+/// 这一态最短的下一步:册体真相行(#122)与单行指路(#124)共用的一句/一组。
+///
+/// 为什么单独抽出来:四处单行指路(反查未下发 / 烘焙 / 新建建议 / 外部源复核)
+/// 与册体说的是同一件事,只密度不同——「升级所配 nw」只在真禁用态出现,
+/// 未决只说「修引擎发现后重启重探」(spec #90 故事 22 / 23:两态互不冒充)。
+/// 写成两份就是两处真相,迟早说岔。
+///
+/// 返回 `Vec` 是因为未决且没找到二进制时要多铺一行「找 nw 试过:…」
+/// (引擎发现素材,故事 15):册体按行铺,单行形态直接concat 成一句。
+fn next_steps(verdict: Probe, facts: &EngineFacts) -> Vec<String> {
+    match verdict {
+        // 真禁用:升级所配 nw,入口下次启动自动开启。整句引用 [`GATE_HINT`]
+        // ——那句话的唯一出处就是那个常量,这里只引用、不复制字符串。
+        Probe::Unavailable => vec![GATE_HINT.to_string()],
+        // 未决:引擎这一跑没答上,不是缺能力——升级 nw 对未决未必管用,
+        // 所以这里绝不出现那句禁用话术。
+        Probe::Unknown => match facts.bin {
+            // 问的是哪个引擎(故事 3/4/5):与证据带同源,这里说「谁没答上」。
+            Some(b) => vec![format!(
+                "问的是 {b} ({}, {});修引擎发现后重启重探。",
+                facts.source, facts.version
+            )],
+            None => {
+                // 没找到二进制:如实说没找到,不拿一个路径冒充(故事 3)。
+                let mut v = vec!["没找到 nw 二进制;修引擎发现后重启重探。".to_string()];
+                // 引擎发现素材(故事 15):把试过的地方摊开,操作者按图索骥。
+                // 这一行可能长,超预算时由册体的 clip 收尾——素材本身
+                // 宁可被截,也不为省一行把它并进上一句。
+                if !facts.attempted.is_empty() {
+                    v.push(format!("找 nw 试过:{}", facts.attempted.join("、")));
+                }
+                v
+            }
+        },
+        // 可用不产指路。
         Probe::Available => Vec::new(),
     }
 }
@@ -653,8 +717,8 @@ mod tests {
 
     /// 按一条证据立一份规范指路(测试专用):把证据记进一个一次性账,再走与
     /// 生产同一个入口 [`gate_signpost`]——断言的是操作者可见的那行。
-    /// `line()` 只取「入口 + 三态 + 证据带」,不碰真相行,所以引擎发现事实
-    /// 给空值即可(真相行另有测试盯着)。
+    /// `line()` / `hint()` 只取「入口 + 三态 + (下一步 + )证据带」,不碰册体
+    /// 专属的真相行措辞,所以引擎发现事实给空值即可(真相行另有测试盯着)。
     fn signpost_of(ev: &ProbeEvidence, cap: Capability, verdict: Probe) -> GateSignpost {
         let mut gate = Gate::default();
         gate.record(cap, verdict, Some(ev.clone()));
@@ -947,6 +1011,63 @@ mod tests {
         let line = s.line(Capability::Vps, Probe::Unknown);
         assert!(line.contains("能力探测:vps 未决"), "{line}");
         assert!(!line.contains("入口禁用"), "单行形态也不冒充:{line}");
+    }
+
+    /// 单行形态·**指路**(工单 #124):四处单行指路(机器册反查未下发 / 烘焙 /
+    /// 新建建议 / 外部源复核)共用这一句——与册体真相行同一处措辞真相
+    /// (三态标签 + 下一步),证据带同一份字段,只密度不同。
+    #[tokio::test]
+    async fn 单行指路_禁用态给升级下一步_未决态只给重启重探_互不冒充() {
+        // 真禁用:下一步是升级所配 nw(整句引用 GATE_HINT),四要素证据在场。
+        let bad = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
+        let ev = ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH", "0.1.0");
+        let mut gate = Gate::default();
+        gate.record(Capability::Vps, interpret(&bad), Some(ev));
+        let facts = EngineFacts {
+            bin: Some("/tmp/nw"),
+            source: "PATH",
+            version: "0.1.0",
+            attempted: &[],
+        };
+        let s = gate_signpost("机器", Capability::Vps, &gate, &facts).expect("禁用要产指路");
+        let hint = s.hint(Capability::Vps, Probe::Unavailable, &facts);
+        assert!(hint.starts_with("⚠ vps 入口禁用:"), "禁用态头部形态:{hint}");
+        assert!(hint.contains(GATE_HINT), "下一步整句引用 GATE_HINT:{hint}");
+        assert!(!hint.contains("重启重探"), "禁用态不给未决话术:{hint}");
+        assert!(hint.contains("/tmp/nw"), "bin 在场:{hint}");
+        assert!(hint.contains("(PATH, 0.1.0)"), "来源与版本在场:{hint}");
+        assert!(hint.contains("探针 nw vps"), "探针 argv 在场:{hint}");
+        assert!(
+            hint.contains("引擎原话:nw: 未知子命令 \"vps\" (rc 3)"),
+            "引擎原话与 rc 在场:{hint}"
+        );
+        // 未决:换成「修引擎发现后重启重探」,那三样字样一个都不出现。
+        let missing = MissingRunner {
+            attempted: vec!["PATH".into()],
+        }
+        .run(&["vps".to_string()])
+        .await;
+        let ev = ProbeEvidence::capture(&missing, None, "未发现", "未知");
+        let mut gate = Gate::default();
+        gate.record(Capability::Vps, interpret(&missing), Some(ev));
+        let attempted = ["PATH".to_string(), "$NW_HOME/nw".to_string()];
+        let facts = facts_missing(&attempted);
+        let s = gate_signpost("机器", Capability::Vps, &gate, &facts).expect("未决要产指路");
+        let hint = s.hint(Capability::Vps, Probe::Unknown, &facts);
+        assert!(hint.starts_with("? vps 未决:"), "未决态头部形态:{hint}");
+        assert!(hint.contains("修引擎发现后重启重探"), "未决的下一步:{hint}");
+        assert!(
+            hint.contains("找 nw 试过:PATH、$NW_HOME/nw"),
+            "引擎发现素材并入同一行:{hint}"
+        );
+        assert!(!hint.contains("入口禁用"), "未决不冒充禁用:{hint}");
+        assert!(!hint.contains("缺的是引擎能力"), "未决不冒充缺能力:{hint}");
+        assert!(!hint.contains("升级所配 nw"), "未决不给误导性下一步:{hint}");
+        assert!(hint.contains("探针 nw vps"), "未决也带探针:{hint}");
+        assert!(
+            hint.contains("引擎原话:引擎未给出可解回答 (rc 2)"),
+            "没答上就如实说没答上:{hint}"
+        );
     }
 
     /// 没收到证据时(测试里 `record(cap, verdict, None)` / 未探测过):

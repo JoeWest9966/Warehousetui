@@ -7341,6 +7341,10 @@ mod tests {
     /// 自造:门禁顺序钉死「先根、再能力、最后才发那一次只读调用」,任缺一条
     /// 给各自指路且**一次引擎调用都不发**。
     ///
+    /// `tag_cap = false` 记的是**真禁用**(`Unavailable`,引擎没有 tag 命令组),
+    /// 不是「没探测过」——未决(探测失败)是另一种真相、另一种下一步
+    /// (#124 三态互不冒充),要单造一条回放来钉,别复用这一档。
+    ///
     /// 返回 runner 是为了探针:`call_argvs()` 是「发没发命令」唯一可观察的
     /// 证据(FakeRunner 只记 argv、绝不存 stdin 本体,守「面板侧不留副本」铁律)。
     fn reverse_app(
@@ -7367,6 +7371,14 @@ mod tests {
                 crate::engine::Probe::Available,
                 None,
             );
+        } else {
+            // 真禁用:引擎这一跑亲口说「未知子命令」——与「没探测过」(未决)
+            // 是两种真相,指路的下一步也不同(升级所配 nw vs 修引擎发现)。
+            app.capabilities.record(
+                crate::engine::Capability::Tag,
+                crate::engine::Probe::Unavailable,
+                None,
+            );
         }
         app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
         app.data_root = root.map(str::to_string);
@@ -7389,6 +7401,24 @@ mod tests {
     /// 鼠标触发完全同路(见 `反查触发段_有鼠标命中_点它等于按键`)。
     fn 反查这台(app: &mut crate::app::App) {
         tap(app, KeyCode::Enter);
+    }
+
+    /// 造一条探针回放(#124 四处单行指路的证据断言用):只碰 argv / stderr
+    /// 人话 / rc 三样——探针无参,证据不可能也不该碰到任何本体(机密纪律)。
+    fn probe_echo(args: &[&str], rc: i32, stderr: &str) -> crate::engine::EngineOutput {
+        crate::engine::EngineOutput {
+            args: args.iter().map(|s| s.to_string()).collect(),
+            exit_code: crate::engine::ExitCode::from_number(rc),
+            ok: rc == 0,
+            stderr_tail: if stderr.is_empty() {
+                Vec::new()
+            } else {
+                vec![stderr.to_string()]
+            },
+            envelope: None,
+            raw_stdout: String::new(),
+            parse_error: None,
+        }
     }
 
     /// 直接灌一条 `tag ls` 回音(不经 FakeRunner):用来造「迟到的第二条回音」
@@ -7591,6 +7621,92 @@ mod tests {
         );
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
+    }
+
+    /// #124:反查未下发的**真禁用**回放——三态里只有这一态说「升级所配 nw」,
+    /// 并且带上探针证据带(问的是哪个引擎、探针 argv、引擎那一跑的原话与 rc)。
+    /// 操作者据此分清「引擎旧」与「问错了二进制」,不必跳设置屏翻日志
+    /// (spec #90 故事 3/4/5/6/9)。
+    #[test]
+    fn 反查未下发_标签组真禁用_升级指路带探针证据带() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            Some(&root),
+            false,
+        );
+        // 同机双构建同版本号的实证形态:这个构建对 `nw tag` 回「未知子命令」。
+        let echo = probe_echo(&["tag"], 3, "nw: 未知子命令 \"tag\"");
+        let ev = crate::engine::ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH", "0.1.0");
+        app.capabilities.record(
+            crate::engine::Capability::Tag,
+            crate::engine::Probe::Unavailable,
+            Some(ev),
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "能力不可用:一条 argv 都不发:{:?}",
+            runner.call_argvs()
+        );
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("反查未下发"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            line.contains("缺的是引擎能力,不是面板坏了;升级所配 nw 后入口自动开启。"),
+            "禁用态下一步:{line}"
+        );
+        assert!(!line.contains("重启重探"), "禁用态不给未决话术:{line}");
+        assert!(line.contains("/tmp/nw"), "bin 在场:{line}");
+        assert!(line.contains("(PATH, 0.1.0)"), "来源与版本在场:{line}");
+        assert!(line.contains("探针 nw tag"), "探针 argv 在场:{line}");
+        assert!(
+            line.contains("引擎原话:nw: 未知子命令 \"tag\" (rc 3)"),
+            "引擎原话与 rc 在场:{line}"
+        );
+    }
+
+    /// #124:反查未下发的**未决**回放——探测失败(引擎没答上)时走未决话术:
+    /// 问的是哪个引擎 + 修引擎发现后重启重探。「入口禁用」「缺的是引擎能力」
+    /// 「升级所配 nw」三样一个都不出现:未决与禁用是两种真相,下一步正好
+    /// 相反(盲目升级对未决未必管用,spec #90 故事 2/22/23)。
+    #[test]
+    fn 反查未下发_标签组能力未决_走未决话术_不给升级下一步() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            Some(&root),
+            false,
+        );
+        // 夹具那一档是真禁用;这里改记未决(没探测过 = 探测失败,不冒充任何一种)
+        app.capabilities.record(
+            crate::engine::Capability::Tag,
+            crate::engine::Probe::Unknown,
+            None,
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "未决同样一条 argv 都不发:{:?}",
+            runner.call_argvs()
+        );
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("反查未下发"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(line.contains("标签 未决"), "未决话术:{line}");
+        assert!(line.contains("问的是"), "说清问的是哪个引擎:{line}");
+        assert!(line.contains("修引擎发现后重启重探"), "未决的下一步:{line}");
+        assert!(!line.contains("入口禁用"), "未决不冒充禁用:{line}");
+        assert!(!line.contains("缺的是引擎能力"), "未决不冒充缺能力:{line}");
+        assert!(!line.contains("升级所配 nw"), "未决不给误导性下一步:{line}");
     }
 
     /// 故事 39 的**鼠标那一侧**(「反查要求标签组能力可用,缺能力时入口禁用并
