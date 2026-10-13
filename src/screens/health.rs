@@ -73,11 +73,13 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App, out: &crate::engine:
                     })
                     .collect()
             };
-            let banner = match out.exit_code {
-                crate::engine::ExitCode::Ok => ("✓ 全绿", p.ok()),
-                crate::engine::ExitCode::Degraded => ("降级:没完全好,但不算坏", p.warn()),
-                crate::engine::ExitCode::Drift => ("漂移:声明物被改", p.fail()),
-                crate::engine::ExitCode::ManifestBroken => ("破损:清单没了", p.fail()),
+            // 档位 → 状态的映射只有一处(`ExitCode::doctor_state`):多派总览
+            // (#107)的一行一派一档问的是同一个函数,两处不各写一份 match。
+            let banner = match out.exit_code.doctor_state() {
+                crate::engine::State::Ok => ("✓ 全绿", p.ok()),
+                crate::engine::State::Degraded => ("降级:没完全好,但不算坏", p.warn()),
+                crate::engine::State::Drift => ("漂移:声明物被改", p.fail()),
+                crate::engine::State::Broken => ("破损:清单没了", p.fail()),
                 _ => ("看证据", p.dim()),
             };
             let mut all = vec![

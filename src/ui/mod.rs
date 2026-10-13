@@ -211,6 +211,10 @@ pub(crate) enum Prep {
     /// 这个上下文里有分支(且要求回收站非空,否则复制动作无从下手),帮助
     /// 对照表因此要能把它布出来(与 `HistoryView` 同级的布场口)。
     BinView,
+    /// 先布成设置屏多派总览页在场(#107):`↑/↓` 选派与 `Enter` 跳转、`r`
+    /// 显式刷新只在这个上下文里有分支(常驻面板上这些键无分支),帮助对照
+    /// 表因此要能把它布出来。
+    ProfilesView,
 }
 
 /// 帮助浮层的一行键位:渲染与「帮助↔实现不脱节」测试共用这一份
@@ -623,6 +627,40 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('v'),
+    },
+    // ---- #107 多派总览(设置屏次级页) ----
+    HelpRow {
+        key: "p",
+        desc: "设置:多派总览(p 翻页,Esc 返回)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('p'),
+    },
+    HelpRow {
+        key: "r",
+        desc: "多派总览:显式刷新 doctor 档位(打开不跑)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::ProfilesView,
+        code: KeyCode::Char('r'),
+    },
+    HelpRow {
+        key: "Enter",
+        desc: "多派总览:跳到选中派的装配历史",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::ProfilesView,
+        code: KeyCode::Enter,
     },
     HelpRow {
         key: "Esc",

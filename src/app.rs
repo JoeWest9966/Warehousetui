@@ -125,6 +125,8 @@ pub enum SettingsPage {
     Panel,
     /// 引擎版本对照页:本地 `nw` 版本 ↔ 引擎 release 仓最新 tag。
     Version,
+    /// 多派总览(#107):NW_HOME 下每一派一行,doctor 档位只读快照。
+    Profiles,
 }
 
 /// 数据仓根门控的三种不可用原因(spec #24:「没设 / 目录不可用 / 引擎缺能力」
@@ -308,6 +310,17 @@ pub struct App {
     pub release_probing: bool,
     /// 远端对照的注入缝(测试换 `release::FakeReleaseLookup`,零网络)。
     pub release_lookup: Arc<dyn ReleaseLookup>,
+    /// 多派总览的行(#107):`None` = 本会话还没翻开过这一页。
+    ///
+    /// 为什么是 `Option` 而不是空向量:空向量在屏上与「安装根不在、一个派都
+    /// 读不到」长得一样(规格故事 28 不许出现「拼错路径读空目录」的假象),
+    /// 所以「没读过」与「读过了,没有派」必须是两件事。
+    pub mp_rows: Option<Vec<crate::screens::ProfileRow>>,
+    /// 多派总览的选中行(#107):**可见行**里的位置(本页无过滤,可见行 = 全部行)。
+    pub mp_sel: usize,
+    /// 已下发、回音未到的派(#107):doctor 回音按 `--profile` 认领,
+    /// 认领不了的仍走健康屏那条老路——迟到回音不冒充总览快照。
+    pub mp_pending: Vec<String>,
     pub runner: Arc<dyn CommandRunner>,
 
     // ---- 概览 ----
@@ -592,6 +605,9 @@ impl App {
             release_remote: None,
             release_probing: false,
             release_lookup: Arc::new(crate::release::GhReleaseLookup),
+            mp_rows: None,
+            mp_sel: 0,
+            mp_pending: Vec::new(),
             runner,
             ls: None,
             ls_loading: false,
@@ -1276,6 +1292,10 @@ impl App {
                     self.screen = Screen::Assemble;
                 }
             }
+            // 多派总览的 doctor 回音(#107):先问总览认不认领。认领 = 按
+            // `--profile` 对上在途的那一派,结论落那一行的档位格;认领不了
+            // (别处发起 / 迟到)就落回健康屏那条老路,不互相冒充。
+            "doctor" if self.mp_claim_doctor(&out) => {}
             "doctor" | "validate" => {
                 self.hl_loading = false;
                 self.push_log(format!("{cmd} 复核完成"));
@@ -2133,26 +2153,186 @@ impl App {
             KeyCode::Char('v') if self.engine.found => {
                 self.settings_page = match self.settings_page {
                     SettingsPage::Panel => SettingsPage::Version,
-                    SettingsPage::Version => SettingsPage::Panel,
+                    _ => SettingsPage::Panel,
                 };
                 self.push_log(match self.settings_page {
                     SettingsPage::Panel => "版本对照收起:回常驻面板".to_string(),
-                    SettingsPage::Version => {
-                        "版本对照:本地 nw 版本 ↔ 引擎 release 仓最新 tag".to_string()
-                    }
+                    _ => "版本对照:本地 nw 版本 ↔ 引擎 release 仓最新 tag".to_string(),
                 });
             }
-            // 版本对照页内 Esc 返航(壳级 Esc 的既有语义:「返回」)。常驻面板上
-            // Esc 仍是无分支——那里没有可返回的上一层。
-            KeyCode::Esc if self.settings_page == SettingsPage::Version => {
-                self.settings_page = SettingsPage::Panel;
+            // 多派总览(#107):p 翻开,再按 p 或 Esc 回常驻面板。与版本对照
+            // 共用一套「一个键翻一页、Esc 返航」的形状,不新开顶级屏。
+            KeyCode::Char('p') if self.engine.found => {
+                let opening = self.settings_page != SettingsPage::Profiles;
+                self.settings_page = if opening {
+                    SettingsPage::Profiles
+                } else {
+                    SettingsPage::Panel
+                };
+                if opening {
+                    // 翻开即读盘(派枚举),**零引擎命令**——档位要按 r 显式刷新
+                    // (规格用户故事 22:打开设置屏不偷偷跑一堆引擎命令)。
+                    self.load_profiles();
+                    let n = self.mp_rows.as_ref().map(|r| r.len()).unwrap_or(0);
+                    self.push_log(format!(
+                        "多派总览:读到 {n} 个派(只读;按 r 显式刷新 doctor 档位)"
+                    ));
+                } else {
+                    self.mp_pending.clear();
+                    self.push_log("多派总览收起:回常驻面板".to_string());
+                }
             }
+            // 次级页内 Esc 返航(壳级 Esc 的既有语义:「返回」)。常驻面板上
+            // Esc 仍是无分支——那里没有可返回的上一层。
+            KeyCode::Esc if self.settings_page != SettingsPage::Panel => {
+                self.settings_page = SettingsPage::Panel;
+                self.mp_pending.clear();
+            }
+            // 多派总览的键位(#107):选中、跳转、显式刷新。全部只读——刷新
+            // 只入队 doctor(只读命令),没有任何写动作。
+            _ if self.settings_page == SettingsPage::Profiles => self.key_profiles(k),
             // 版本对照页内 r 重查(显式刷新,与健康屏 r 复核同语气)
             KeyCode::Char('r') if self.settings_page == SettingsPage::Version => {
                 self.reprobe_release();
             }
             _ => {}
         }
+    }
+
+    /// 多派总览的键位(#107)。
+    ///
+    /// 打开页面不跑 doctor:档位是按 `r` 的**显式刷新**,与装配历史的
+    /// `r` 重读快照、版本对照的 `r` 重查同一语气(规格用户故事 22)。
+    /// `Enter` 跳到选中那一派的装配历史(规格用户故事 23)。
+    fn key_profiles(&mut self, k: KeyEvent) {
+        let n = self.mp_rows.as_ref().map(|r| r.len()).unwrap_or(0);
+        match k.code {
+            KeyCode::Down => {
+                if n > 0 {
+                    self.mp_sel = (self.mp_sel + 1) % n;
+                }
+            }
+            KeyCode::Up => {
+                if n > 0 {
+                    self.mp_sel = (self.mp_sel + n - 1) % n;
+                }
+            }
+            // 跳到这一派的装配历史(#101 的那个次级视图):三个新视图互相打通
+            // (规格用户故事 23)。装配在途不受理——在途那屏归七步与 stderr
+            // 日志,历史是闲时浏览的只读视图。
+            KeyCode::Enter => self.jump_profile_history(),
+            KeyCode::Char('r') => self.refresh_profiles(),
+            _ => {}
+        }
+    }
+
+    /// 读一遍 NW_HOME 下的派(#107):只读盘,经 [`crate::datarepo`] 唯一接缝。
+    ///
+    /// **快照语义**:翻开页面 / 按 `r` 时读一次,不轮询、不自动刷。已有的
+    /// 档位结论在重读时保留(派还在就还是那一档)——重读盘不该把上一次
+    /// 显式刷新得来的结论悄悄抹掉。
+    pub fn load_profiles(&mut self) {
+        let names = crate::datarepo::list_profiles(&self.nw_home);
+        let old = self.mp_rows.take().unwrap_or_default();
+        let rows = names
+            .into_iter()
+            .map(|profile| {
+                let tier = old
+                    .iter()
+                    .find(|r| r.profile == profile)
+                    .and_then(|r| r.tier);
+                crate::screens::ProfileRow { profile, tier }
+            })
+            .collect();
+        self.mp_rows = Some(rows);
+        self.mp_sel = 0;
+    }
+
+    /// 显式刷新 doctor 档位(#107):重读盘 + 给每个派入队一条只读 doctor。
+    ///
+    /// 入队而非就地发起:键位处理器没有 channel(同 `queue` 的纪律),下一帧
+    /// 主循环统一取走下发。**打开页面不调它**——那是规格用户故事 22 的
+    /// 「不自动跑」;要档位就得操作者按一下。
+    pub fn refresh_profiles(&mut self) {
+        self.load_profiles();
+        self.mp_pending.clear();
+        let home = self.nw_home.clone();
+        let Some(rows) = self.mp_rows.as_ref() else {
+            return;
+        };
+        let names: Vec<String> = rows.iter().map(|r| r.profile.clone()).collect();
+        for name in &names {
+            self.mp_pending.push(name.clone());
+            self.queue
+                .push(crate::engine::commands::doctor_profile(name, Some(&home)));
+        }
+        self.push_log(format!(
+            "多派总览:显式刷新 {n} 个派的 doctor 档位(只读,入队下发)",
+            n = names.len()
+        ));
+    }
+
+    /// 从多派总览跳到选中那一派的装配历史(#107,规格用户故事 23)。
+    ///
+    /// 跳的是 #101 那个次级视图(装配屏的第五态),不新开顶级屏;选中行按
+    /// **派名**对过去,不靠两个列表的下标巧合。回收站的入口等 #102 落地后
+    /// 再接(ADR-0010 §7 的挂点纪律:点不到一个当前不存在的动作,比点得到
+    /// 更糟)。
+    pub fn jump_profile_history(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:先看七步与 stderr 日志,历史闲时再看".to_string());
+            return;
+        }
+        let Some(profile) = self
+            .mp_rows
+            .as_ref()
+            .and_then(|rows| rows.get(self.mp_sel.min(rows.len().saturating_sub(1))))
+            .map(|r| r.profile.clone())
+        else {
+            self.push_log("多派总览还没有派可跳".to_string());
+            return;
+        };
+        self.screen = Screen::Assemble;
+        self.as_history = true;
+        self.as_history_raw = None;
+        self.as_history_filter_on = false;
+        self.load_history();
+        // 选中跳过来的那一派:按名字找(过滤为空时就是全量的下标)
+        if let Some(rows) = self.as_history_rows.as_ref() {
+            if let Some(i) = rows.iter().position(|r| r.profile == profile) {
+                self.as_history_sel = i;
+            }
+        }
+        self.push_log(format!("跳到 {profile} 的装配历史(只读)"));
+    }
+
+    /// 多派总览的 doctor 回音认领(#107)。
+    ///
+    /// 按 argv 里的 `--profile` 认领**自己那一份**:认领不了的(别处发起的
+    /// doctor、迟到回音)返回 `false`,仍走健康屏那条老路——不把别人的结论
+    /// 冒充总览快照,也不把总览的结论写进健康屏。
+    fn mp_claim_doctor(&mut self, out: &EngineOutput) -> bool {
+        if self.screen != Screen::Settings || self.settings_page != SettingsPage::Profiles {
+            return false;
+        }
+        let Some(profile) = doctor_arg_profile(&out.args) else {
+            return false;
+        };
+        if !self.mp_pending.contains(&profile) {
+            return false;
+        }
+        self.mp_pending.retain(|p| p != &profile);
+        if let Some(rows) = self.mp_rows.as_mut() {
+            if let Some(row) = rows.iter_mut().find(|r| r.profile == profile) {
+                row.tier = Some(out.exit_code);
+            }
+        }
+        self.push_log(format!(
+            "{profile} 的 doctor 档位:rc {}({})",
+            out.exit_code.number(),
+            out.exit_code.doctor_state().label()
+        ));
+        true
     }
 
     /// 逃逸两联之一:设置屏 m 开关。翻状态 + 持久化 config
@@ -3961,6 +4141,16 @@ fn history_row_fields(row: &crate::screens::HistoryRow) -> Vec<String> {
     v
 }
 
+/// 从 doctor argv 里取 `--profile` 的值(#107 的 doctor 回音认领面)。
+///
+/// 为什么按 argv 认领而不按「当前在哪一屏」:健康屏的 doctor 也带
+/// `--profile`(`commands::doctor_profile`),两处下发形状相同,能区分的
+/// 只有「这一份是不是总览自己在等的」。迟到回音(已翻走 / 已重查过)/// 因此仍走健康屏那条老路,不冒充总览快照。
+fn doctor_arg_profile(args: &[String]) -> Option<String> {
+    let i = args.iter().position(|a| a == "--profile")?;
+    args.get(i + 1).cloned()
+}
+
 /// repo 链接形状检查(spec #25:owner/repo · https://github.com/… ·
 /// git@github.com:…,非 GitHub 拒)。面板侧快一拍拒绝,免得操作者
 /// 等引擎跑一趟才发现写错(#30 故事 14);真正的守门人仍是引擎。
@@ -4522,6 +4712,306 @@ mod tests {
         let mut app = fake_app();
         app.screen = Screen::Settings;
         app
+    }
+
+    // ---- #107 多派总览(设置屏次级页:派枚举 + doctor 档位只读快照) ----
+
+    /// 一座 fixture 安装根(#107):三部派,目录故意乱序创建——枚举顺序该由
+    /// `datarepo::list_profiles` 的字典序保证,不靠 `read_dir` 的偶然顺序。
+    fn profiles_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nwt-mp-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for p in ["zeta", "alpha", "mid"] {
+            std::fs::create_dir_all(dir.join("profiles").join(p)).unwrap();
+        }
+        dir
+    }
+
+    /// 多派总览的就绪态:设置屏 + 多派总览页 + 一座三部派的安装根。
+    fn mp_app(tag: &str) -> App {
+        let mut app = settings_app();
+        app.splash = false; // 整帧量要过 splash 那一关(既有 frame_display 测试同款)
+        app.nw_home = profiles_home(tag).display().to_string();
+        app.update(Message::Key(key('p')));
+        app
+    }
+
+    /// doctor 回音夹具(#107):三档各一份,形状照引擎真样本
+    /// (`nw/doctor.v1`,与 `screens/tests.rs` 的健康屏夹具同源同形状)。
+    /// 档位由 `exit` / rc 给,总览读的就是这一个字段。
+    const MP_DOCTOR_OK: &str = r#"{"schema":"nw/doctor.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"results":[{"surface":"manifest","status":"pass","message":"在位"}],"exit":0,"converged":true}}"#;
+    const MP_DOCTOR_DEGRADED: &str = r#"{"schema":"nw/doctor.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[{"exitCode":10,"message":"OPENAI_API_KEY 未设","hint":"导出后重跑"}],"data":{"results":[],"exit":10}}"#;
+    const MP_DOCTOR_BROKEN: &str = r#"{"schema":"nw/doctor.v1","nw":"0.1.0","ok":false,"errors":[{"code":"MANIFEST_BROKEN","exitCode":12,"message":".nw-manifest 损坏","hint":"重新装配"}],"warnings":[],"data":{"results":[{"surface":"manifest","status":"fail","message":"损坏"}],"exit":12}}"#;
+
+    /// 规格用户故事 22 的硬钉子:**打开视图不自动跑 doctor**。
+    ///
+    /// 两处都查——`queue`(还没下发的)与运行器实录(已经下发过的):
+    /// 只查队列会漏掉「翻页时就地发起」那种写法,而那句话正是本条要禁的。
+    #[test]
+    fn 多派总览_打开不自动发doctor_零引擎命令() {
+        let runner = Arc::new(FakeRunner::new(&[]));
+        let mut app = App::with_runner(Arc::clone(&runner) as Arc<dyn CommandRunner>);
+        app.screen = Screen::Settings;
+        app.nw_home = profiles_home("open").display().to_string();
+        app.update(Message::Key(key('p')));
+        assert_eq!(
+            app.settings_page,
+            crate::app::SettingsPage::Profiles,
+            "p 翻开多派总览页"
+        );
+        assert_eq!(
+            app.mp_rows.as_ref().map(|r| r.len()),
+            Some(3),
+            "三部派都枚举到(字典序)"
+        );
+        assert_eq!(
+            app.mp_rows
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|r| r.profile.clone())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "mid", "zeta"],
+            "顺序确定,渲染与测试都不靠 read_dir 的偶然顺序"
+        );
+        assert!(
+            app.queue.is_empty(),
+            "打开页面一条命令都不排:{:?}",
+            app.queue
+        );
+        assert!(
+            app.mp_pending.is_empty(),
+            "没有在途 doctor:{:?}",
+            app.mp_pending
+        );
+        assert!(
+            runner
+                .call_argvs()
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("doctor")),
+            "翻页期间运行器没收过任何 doctor:{:?}",
+            runner.call_argvs()
+        );
+        // 三行都还没有档位:「未查」与「查过了是某一档」是两件事
+        assert!(
+            app.mp_rows
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|r| r.tier.is_none()),
+            "未显式刷新前没有档位可显示"
+        );
+    }
+
+    /// 档位摘要的来源与落点(#107 验收:枚举与档位映射正确)。
+    ///
+    /// 显式刷新才入队 doctor(一部派一条,只读);回音按 argv 里的
+    /// `--profile` 认领自己那一份,0 / 10 / 12 三档各就各位。
+    #[tokio::test]
+    async fn 多派总览_显式刷新才入队doctor_回音按派落档() {
+        let mut app = mp_app("refresh");
+        app.update(Message::Key(key('r')));
+        assert_eq!(app.queue.len(), 3, "一部派一条 doctor(只读命令)");
+        for argv in &app.queue {
+            assert_eq!(argv.first().map(String::as_str), Some("doctor"));
+            assert!(
+                argv.windows(2).any(|w| w[0] == "--profile"),
+                "按派问:{argv:?}"
+            );
+            assert!(
+                argv.windows(2).any(|w| w[0] == "--nw-home"),
+                "问的就是枚举时那座安装根,不靠引擎自己的解析:{argv:?}"
+            );
+        }
+        assert_eq!(app.mp_pending.len(), 3, "三部都在途");
+        let runner = FakeRunner::new(&[
+            ("--profile alpha", 0, MP_DOCTOR_OK),
+            ("--profile mid", 10, MP_DOCTOR_DEGRADED),
+            ("--profile zeta", 12, MP_DOCTOR_BROKEN),
+        ]);
+        for name in ["alpha", "mid", "zeta"] {
+            let argv = app
+                .queue
+                .iter()
+                .find(|a| a.iter().any(|s| s == name))
+                .expect("该部在队列里")
+                .clone();
+            let out = runner.run(&argv).await;
+            app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        }
+        let rows = app.mp_rows.as_ref().unwrap();
+        let tier = |name: &str| {
+            rows.iter()
+                .find(|r| r.profile == name)
+                .expect("该派在总览里")
+                .tier
+                .map(|c| c.number())
+        };
+        assert_eq!(tier("alpha"), Some(0), "rc 0 落 ok 档");
+        assert_eq!(tier("mid"), Some(10), "rc 10 落降级档");
+        assert_eq!(tier("zeta"), Some(12), "rc 12 落破损档");
+        assert!(app.mp_pending.is_empty(), "回音到齐,在途清空");
+    }
+
+    /// 档位措辞复用既有词汇(#107:不另造一套 doctor 话术)。
+    ///
+    /// 一行一派一档的词全部来自 `State::label()`(ok / 降级 / 漂移 / 破损),
+    /// 与健康屏 doctor 横幅同一个映射函数(`ExitCode::doctor_state`);
+    /// 还没查过的那一派说「未查」,在途的说「对照中」——三个状态互不冒充。
+    #[tokio::test]
+    async fn 多派总览_档位措辞走既有词汇_未查与在途不冒充() {
+        let mut app = mp_app("wording");
+        app.update(Message::Key(key('r')));
+        // 只回一部:另两部还在途
+        let runner = FakeRunner::new(&[("--profile alpha", 0, MP_DOCTOR_OK)]);
+        let argv = app.queue.first().unwrap().clone();
+        let out = runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("多派总览"), "页标题在场:{s}");
+        assert!(s.contains("alpha"), "枚举到的派在屏:{s}");
+        assert!(s.contains("ok"), "rc 0 用既有词汇「ok」:{s}");
+        assert!(s.contains("对照中"), "在途的那部明说在对照:{s}");
+        assert!(!s.contains("降级"), "没查过的派不画降级:{s}");
+        let s = crate::testutil::frame_display(&app, 66, 50);
+        for l in s.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= 66,
+                "紧凑态不溢宽:{l}"
+            );
+        }
+    }
+
+    /// 安装根不在(#107 验收:NW_HOME 未设走既有指路语义):走共用指路件,
+    /// **不画空列表**——「NW_HOME 指错了」与「一个派都还没装」在屏上是
+    /// 两件事(规格故事 28)。
+    #[test]
+    fn 多派总览_安装根不在走指路_不画空列表() {
+        let mut app = settings_app();
+        app.splash = false;
+        app.nw_home = std::env::temp_dir()
+            .join(format!("nwt-mp-gone-{}", std::process::id()))
+            .display()
+            .to_string();
+        app.update(Message::Key(key('p')));
+        assert!(app.home_cause().is_some(), "安装根不在");
+        for (w, h) in [(110u16, 30u16), (66, 50)] {
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("NW_HOME"), "{w}×{h} 指路点名 NW_HOME:{s}");
+            assert!(
+                !s.contains("还没有任何派"),
+                "{w}×{h} 不拿「还没装过」冒充指错了:{s}"
+            );
+            assert!(app.queue.is_empty(), "指路页也不排命令");
+        }
+    }
+
+    /// 安装根在、一个派都没有(#107 验收:派目录异常降级呈现):明说「还没
+    /// 装过」,与「读不到」分开——这一态不是错误。
+    #[test]
+    fn 多派总览_一个派都没有_明说还没装过() {
+        let dir = std::env::temp_dir().join(format!("nwt-mp-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = settings_app();
+        app.splash = false;
+        app.nw_home = dir.display().to_string();
+        app.update(Message::Key(key('p')));
+        assert_eq!(app.mp_rows.as_ref().map(|r| r.len()), Some(0));
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("还没有任何派"), "空安装根说人话:{s}");
+    }
+
+    /// 从一条派跳它的装配历史(#107 验收 + 规格用户故事 23)。
+    ///
+    /// 跳的是 #101 那个次级视图(装配屏第五态),选中行按**派名**对过去。
+    #[test]
+    fn 多派总览_跳到选中派的装配历史() {
+        let mut app = mp_app("jump");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.screen, Screen::Assemble, "跳到装配屏");
+        assert!(app.as_history, "落的是历史次级视图");
+        let rows = app.as_history_rows.as_ref().expect("历史已读盘");
+        assert_eq!(
+            rows.get(app.as_history_sel).map(|r| r.profile.as_str()),
+            Some("mid"),
+            "选中行按派名对过去,不靠两个列表的下标巧合"
+        );
+        assert!(app.queue.is_empty(), "跳转零引擎命令");
+    }
+
+    /// 总览的 doctor 回音认领是**按 argv 认领**的:别处发起的 doctor(不在
+    /// 在途集里)仍走健康屏那条老路——不把别人的结论冒充总览快照,
+    /// 也不把总览的结论写进健康屏。
+    #[tokio::test]
+    async fn 多派总览_不是自己在等的doctor回音_走健康屏老路() {
+        let mut app = mp_app("claim");
+        app.update(Message::Key(key('r')));
+        let runner = FakeRunner::new(&[]);
+        // 一部没在在途集里的派(迟到 / 别处发起)
+        let out = runner
+            .run(&["doctor".to_string(), "--profile".into(), "stranger".into()])
+            .await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert!(app.hl_result.is_some(), "认领不了的 doctor 回音仍归健康屏");
+        assert_eq!(
+            app.mp_pending.len(),
+            3,
+            "在途集不被打乱:{:?}",
+            app.mp_pending
+        );
+        assert!(
+            app.mp_rows
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|r| r.tier.is_none()),
+            "总览的快照一个字节都没被别人的结论改掉"
+        );
+    }
+
+    /// 常畅/紧凑两档快照(#107 验收):页在场、枚举到的派在场、无行超宽。
+    ///
+    /// 安装根故意给一条长路径:紧凑态内层 64 列,NW_HOME 那一行该按显示宽
+    /// 截断(不折行、不越界)——长路径把末列顶出屏外,是本页唯一会溢宽的
+    /// 地方,所以这一条两档都量。
+    #[test]
+    fn 多派总览页_两档快照不溢宽() {
+        let deep = std::env::temp_dir()
+            .join(format!("nwt-mp-deep-{}", std::process::id()))
+            .join("a-deliberately-long-install-root-name-for-the-clip-check");
+        let _ = std::fs::remove_dir_all(deep.parent().unwrap());
+        std::fs::create_dir_all(deep.join("profiles").join("alpha")).unwrap();
+        let mut app = settings_app();
+        app.splash = false;
+        app.nw_home = deep.display().to_string();
+        app.update(Message::Key(key('p')));
+        assert_eq!(app.mp_rows.as_ref().map(|r| r.len()), Some(1));
+        for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("多派总览"), "{w}×{h} 页名在场:{s}");
+            assert!(s.contains("alpha"), "{w}×{h} 枚举到的派在场:{s}");
+            assert!(s.contains("未查"), "{w}×{h} 未刷新前说未查:{s}");
+            for l in s.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(l) <= usize::from(w),
+                    "{w}×{h} 有行超宽:{l}"
+                );
+            }
+        }
+        // 紧凑态:长路径的尾巴被截断(不越界);常畅态放得下就不截
+        let compact = crate::testutil::frame_display(&app, 66, 50);
+        assert!(
+            !compact.contains("clip-check"),
+            "紧凑态长路径该被截断:{compact}"
+        );
     }
 
     // ---- #108 引擎版本对照(数据面在 release 模块,这里只钉 App 行为缝) ----
@@ -7402,6 +7892,16 @@ mod tests {
                 app.load_history();
                 app.as_bin = true;
                 app.load_bin();
+            }
+            if row.prep == Prep::ProfilesView {
+                // 多派总览页(#107):`↑/↓` 选派、`Enter` 跳转与 `r` 显式刷新只在
+                // 这个上下文里有分支(常驻面板上无分支),帮助对照表要能布出
+                // 「这一页在场」——布一座真有一座派的安装根,让 Enter 真有
+                // 一行可跳(不靠空列表碰运气)。
+                app.screen = Screen::Settings;
+                app.settings_page = crate::app::SettingsPage::Profiles;
+                app.nw_home = profiles_home("help").display().to_string();
+                app.load_profiles();
             }
             let before = key_snap(&app);
             app.update(Message::Key(KeyEvent::new(row.code, KeyModifiers::NONE)));
