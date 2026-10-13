@@ -96,6 +96,10 @@ _Avoid_: 编辑器、生成器（面板不是通用文件编辑器：只写数�
 选中数据仓内一个本地 skill / extension 目录，图形化打成组件：面板自己算**目录校验和**（逐文件「相对路径 + 内容 sha256」一行，按行字典序拼起来再 sha256，排除 `.git/` 与 `node_modules/`——与上游 `manifest.DirHash` 同算法，于是面板算的值就是 bake / `up` 后来在同一棵树上算的值）、生成**组件清单**（`component.yaml`，schema 以数据仓现有组件为样本钉死：`apiVersion/kind/name/version/pi.package/packages/vendored/depends/params/config/env/requires`）。校验和与拟生成清单在确认闸摊开，确认才经 datarepo 写侧原子落盘（ADR-0010）。
 _Avoid_: 压缩包、打包命令（产物是一份组件清单，不是 tarball；面板不代跑 bake，也不复制 payload 文件——只写确认过的那一个文件）
 
+**extension 脚手架（extension scaffold）**：
+作者侧工具之一：图形表单生成 **pi-extension landing 契约**骨架——条目子树自带 `package.json` 且 `pi.extensions` 非空、入口文件（缺省 `index.ts`）就是那份清单指着的一个，两件一起落进数据仓 `extensions/<条目名>/`（条目身份 = 子树目录名，上游 #21：扩展没有 frontmatter 可当身份）。字段形状与自审判据对齐上游 `--kind extension` 的验收第六条（缺清单 = 装上了不加载）；派内落点 `<agent-dir>/nw/extensions/<仓库>/<条目>/` 与 `settings.packages` 登记是 `up` 的事，面板只写数据仓里的源、不写 `catalog.json`。与 skill 脚手架共用同一条表单流（阶段机 / 拟落账 / 确认闸 / 原子落盘），换的只有表单与规格。
+_Avoid_: 扩展生成器、扩展模板（面板不是通用代码生成器：只写数据仓根之下 manifest + 入口两件且全过确认闸；「模板」是面板静态资产，不是引擎概念）
+
 **跟随引擎（upstream-first）**：
 本面板不拥有任何领域决策：CLI 契约、领域词汇、「准许代跑哪些命令」的边界,一律以上游 Nous Warehouse 仓为唯一真相源;上游改,面板跟,不自创、不背离、不复刻引擎逻辑。
 _Avoid_: 兼容、适配（太被动;适配暗示以面板为主位）
