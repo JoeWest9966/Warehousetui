@@ -625,6 +625,14 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
 /// (45% 栏),紧凑态在 Tab 行之下(52% 栏)。两支都用与渲染同一套
 /// ratatui `Layout` 常量,几何零分歧(#18 收起内层栏后命中自动跟随)。
 fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    // 组件打包器浮层(#112):与落点溯源浮层同一条弹层纪律 —— 在场时整块正文
+    // 只有浮层自己的命中区,底层列表行与键位行一段都不产。表单段鼠标惰性
+    // (打字归键盘,同手填浮层先例);确认段键位行两段(Enter 落盘 /
+    // Esc 返航);结果段点任意处 = 返航。
+    if app.pack_open() {
+        pack_hits(area, app, class, hits);
+        return;
+    }
     // 落点溯源浮层(#115):与反查浮层同一条弹层纪律 —— 在场时整块正文只有
     // 一个「点任意处返航」命中区,底层列表行与键位行(含「Enter 落点」之外
     // 的一切)一段都不产:浮层吞点击、不穿透底层。
@@ -697,6 +705,45 @@ fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, T
                 Rect::new(d.x, d.y + d.height - 1, d.width, 1),
                 Target::ToggleSuggest,
             ));
+        }
+    }
+}
+
+/// 组件打包器浮层(#112)的命中区:几何与 `recipes::render_pack_overlay`
+/// 同一组常量、同一个 `pack_popup_rect`(渲染与命中共用一份,ADR-0005)。
+/// 表单段鼠标惰性(键入归键盘);确认段键位行两段(Enter 落盘 /
+/// Esc 返航);结果段整块点任意处 = 返航。浮层外无任何命中区。
+fn pack_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    let Some(popup) = crate::screens::recipes::pack_popup_rect(area, app, class) else {
+        return;
+    };
+    let phase = match app.pk_flow.as_ref() {
+        Some(f) => f.phase,
+        None => return,
+    };
+    match phase {
+        // 表单:打字归键盘,鼠标不分派(同 NW_HOME / 数据仓根手填浮层先例)。
+        crate::screens::recipes::PackPhase::Form => {}
+        // 确认闸:键位行两段。左段 Enter 落盘(与键盘 Enter 同一条路),
+        // 右段 Esc 返航(与键盘 Esc 同一条路)。
+        crate::screens::recipes::PackPhase::Review => {
+            if popup.height < 4 {
+                return; // 收窄后键位行不再可信,不产命中
+            }
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(
+                popup,
+                key_y,
+                crate::screens::recipes::PACK_KEY_COMMIT,
+                RITUAL_KEY_RETURN,
+                hits,
+            );
+        }
+        // 结果屏:点任意处 = 返航(同登记结果屏先例)。
+        crate::screens::recipes::PackPhase::Done => {
+            if popup.width > 0 && popup.height > 0 {
+                hits.push((popup, Target::DismissPopup));
+            }
         }
     }
 }

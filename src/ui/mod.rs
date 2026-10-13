@@ -182,6 +182,9 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.reg_state != crate::app::RegState::Idle {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记中:Esc 返航", p.accent()));
+    } else if app.pack_open() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("打包中:Enter 落盘 · Esc 返航", p.accent()));
     } else {
         spans.push(Span::styled("  q", p.accent()));
         spans.push(Span::raw(" 退出"));
@@ -389,6 +392,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+    },
+    HelpRow {
+        key: "p",
+        desc: "配方:打包组件(组件域,算 sha256 + 生成清单)",
+        screen: Some(Screen::Recipes),
+        domain: Some(Domain::Components),
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('p'),
     },
     HelpRow {
         key: "Enter",

@@ -486,7 +486,7 @@ mod tests {
         dir
     }
 
-    fn repo(root: &PathBuf) -> DataRepo {
+    fn repo(root: &Path) -> DataRepo {
         DataRepo::new(root.to_str().unwrap())
     }
 
@@ -542,7 +542,7 @@ mod tests {
             let Ok(out) = out else {
                 // 平台上没有 sha256sum(多平台目标):已知向量那条已守算法,
                 // 这里静默跳过,不把「工具不在」伪装成「对拍通过」。
-                eprintln!("sha256sum 不在:跳过工具对拍({})", i);
+                eprintln!("sha256sum 不在:跳过工具对拍({i})");
                 continue;
             };
             assert!(out.status.success(), "sha256sum 应跑成功");
