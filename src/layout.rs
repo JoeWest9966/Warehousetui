@@ -94,6 +94,18 @@ pub enum Target {
     /// 边界(输入态只管键入,见 `CatalogGet` 那条同口径注记),不是本段特有的
     /// 分叉。
     CatalogDelete,
+    /// 点命令面板(#119)的结果行 = 选中那一行(与 ↑/↓ 同义)。**只选中、不
+    /// 执行**:执行留给 Enter,免得误点就开火(与 #78 「点行只选中」同口径)。
+    /// 面板开着时底层一律不产命中区——浮层吞点击不穿透(README 鼠标小节
+    /// 既有纪律),所以这个目标只在面板自己那份命中区里出现。
+    CmdRow(usize),
+    /// 点反查跳转浮层里的第 `n` 条命中 = 在浮层里选中它并回车直跳(#120)。
+    /// 与键盘 `↑/↓` + `Enter` 完全同路——矩形由
+    /// [`catalog::tag_jump_row_rect`](crate::screens::catalog::tag_jump_row_rect)
+    /// 与渲染同源产出(渲染把第 n 条画在同一个矩形里),点哪打哪(ADR-0005)。
+    /// **只标签册、且反查跳转浮层在场时**由 `catalog_hits` 产出;浮层外的
+    /// 正文是「点任意处关闭」(`DismissPopup`),与 Esc 同路。
+    TagJump(usize),
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -167,6 +179,12 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
     // 期间鼠标不分派任何命中区——点击只作用于浮层,不误触底层
     // (spec #15 故事 14/16;数据仓根手填沿用同一条)。
     if app.home_input || app.data_input {
+        return hits;
+    }
+    // 全局命令面板(#119):叠加浮层,与帮助浮层同级的吞点击纪律——底层
+    // 导航 / 列表一个命中区都不产。面板自己的命中区只有结果行(点行 = 选中)。
+    if app.cmd_open {
+        cmd_hits(body, app.cmd_results_len(), app.cmd_sel, &mut hits);
         return hits;
     }
     // 登记两段式(#30):输入/等回音态同手填浮层惰性;kind 选择与
@@ -293,6 +311,24 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     // 「点外面没反应」,与规格原文相反。整块正文即浮层自己的命中区,底层
     // 不另产——「只有浮层自己的命中」这条弹层纪律不变。
     if app.vps_reverse_open() {
+        if inner.width > 0 && inner.height > 0 {
+            hits.push((inner, Target::DismissPopup));
+        }
+        return;
+    }
+    // 反查跳转浮层(#120):标签册那一层薄浮层,弹层优先级与反查上浮同级
+    // (本屏最高)。命中条目行给 `TagJump(i)`(点它 = 选中并直跳,与
+    // `↑/↓` + `Enter` 同路);浮层外的正文整块是「点任意处关闭」,与 Esc 同路
+    // ——规格钉的是「Esc 或点浮层外关闭」,只给浮层矩形会变成「点外面没
+    // 反应」,与反查上浮那一层的口径相反。
+    if app.tag_jump_open() {
+        if let Some(popup) = crate::screens::catalog::tag_jump_popup_rect(inner, app) {
+            for i in 0..app.tag_jump.hits().len() {
+                if let Some(r) = crate::screens::catalog::tag_jump_row_rect(popup, i) {
+                    hits.push((r, Target::TagJump(i)));
+                }
+            }
+        }
         if inner.width > 0 && inner.height > 0 {
             hits.push((inner, Target::DismissPopup));
         }
@@ -873,6 +909,65 @@ fn help_hits(area: Rect, hits: &mut Vec<(Rect, Target)>) {
 /// 帮助浮层尺寸:渲染(`ui::render_help`)与命中(`help_hits`)共用。
 pub(crate) const HELP_W: u16 = 60;
 pub(crate) const HELP_H: u16 = 30;
+
+/// 命令面板(#119)尺寸:渲染(`ui::commands::render`)与命中(`cmd_hits`)共用。
+/// 与 `HELP_W`/`HELP_H` 同族——一处几何真相,渲染与命中永不分歧。
+pub(crate) const CMD_W: u16 = 64;
+pub(crate) const CMD_H: u16 = 20;
+
+/// 命令面板头部占的行数:查询行 + 提示行(结果行从内层第 `CMD_HEAD` 行起)。
+pub(crate) const CMD_HEAD: u16 = 2;
+
+/// 命令面板浮层矩形(与渲染同一个 `popup_rect` + 同一组常量)。
+pub(crate) fn cmd_popup_rect(area: Rect) -> Rect {
+    popup_rect(area, CMD_W, CMD_H)
+}
+
+/// 命令面板浮层内层(去掉边框,与 `Block::bordered().inner()` 同结果)。
+pub(crate) fn cmd_inner(area: Rect) -> Rect {
+    shrink_border(cmd_popup_rect(area))
+}
+
+/// 命令面板可见结果行数(内层高度去掉头部两行)。
+pub(crate) fn cmd_visible(area: Rect) -> usize {
+    cmd_inner(area).height.saturating_sub(CMD_HEAD) as usize
+}
+
+/// 结果行窗口:把选中行带进可见区(到下边界不越界、到上边界不回绕)。
+/// 渲染与命中共用——窗口一偏,「画得出的那行」就点不中。
+pub(crate) fn cmd_window(n: usize, sel: usize, visible: usize) -> (usize, usize) {
+    if visible == 0 || n == 0 {
+        return (0, 0);
+    }
+    let first = sel
+        .saturating_sub(visible.saturating_sub(1))
+        .min(n.saturating_sub(1));
+    let count = visible.min(n - first);
+    (first, count)
+}
+
+/// 结果行矩形清单:`(矩形, 命中下标)`。渲染按同一份几何画行——点哪打哪。
+pub(crate) fn cmd_row_rects(area: Rect, first: usize, count: usize) -> Vec<(Rect, usize)> {
+    let inner = cmd_inner(area);
+    let top = inner.y.saturating_add(CMD_HEAD);
+    (0..count)
+        .filter_map(|i| {
+            let y = top.checked_add(i as u16)?;
+            (y < inner.y.saturating_add(inner.height))
+                .then(|| (Rect::new(inner.x, y, inner.width, 1), first + i))
+        })
+        .collect()
+}
+
+/// 命令面板的命中区:只产结果行(点行 = 选中),浮层其余部分吞点击、不穿透
+/// 底层。与 `ui::commands::render` 的画行几何同一个 `cmd_row_rects`。
+pub(crate) fn cmd_hits(area: Rect, n: usize, sel: usize, hits: &mut Vec<(Rect, Target)>) {
+    let visible = cmd_visible(area);
+    let (first, count) = cmd_window(n, sel, visible);
+    for (rect, idx) in cmd_row_rects(area, first, count) {
+        hits.push((rect, Target::CmdRow(idx)));
+    }
+}
 
 /// 自升级浮层(#121)尺寸:渲染(`ui::render_upgrade`)与命中(`upgrade_hits`)
 /// 共用,与 `HELP_W` / `HELP_H` 同族——一处几何真相。
