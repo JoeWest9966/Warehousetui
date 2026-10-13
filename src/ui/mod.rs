@@ -185,12 +185,18 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
             "装配中:动作已锁定"
         };
         spans.push(Span::styled(hint, p.dim()));
-    } else if app.home_input || app.data_input || app.rc_filter_on {
+    } else if app.home_input || app.data_input || app.rc_filter_on || app.ah_filter_on {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
     } else if app.reg_state == crate::app::RegState::RepoInput {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记填链:Enter 继续 · Esc/q 放弃", p.accent()));
+    } else if app.reg_state == crate::app::RegState::PreScanPick {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "预扫选单:空格勾选 · Enter 继续 · Esc 返航",
+            p.accent(),
+        ));
     } else if app.reg_state != crate::app::RegState::Idle {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记中:Esc 返航", p.accent()));
@@ -340,6 +346,19 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         write: true,
     },
     HelpRow {
+        key: "h",
+        desc: "装配:开/关装配历史(清单存档)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('h'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
         key: "x",
         desc: "装配:中止在途子进程(进程真止,日志不清)",
         screen: Some(Screen::Assemble),
@@ -349,19 +368,6 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: true,
         prep: Prep::Shell,
         code: KeyCode::Char('x'),
-        modifiers: KeyModifiers::NONE,
-        write: false,
-    },
-    HelpRow {
-        key: "h",
-        desc: "装配:翻装配历史(各派清单存档,只读;再按退出)",
-        screen: Some(Screen::Assemble),
-        domain: None,
-        mode: None,
-        book: None,
-        running: false,
-        prep: Prep::Shell,
-        code: KeyCode::Char('h'),
         modifiers: KeyModifiers::NONE,
         write: false,
     },
@@ -468,6 +474,19 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('r'),
         modifiers: KeyModifiers::NONE,
         write: true,
+    },
+    HelpRow {
+        key: "Enter",
+        desc: "配方:看选中组件的落点(只读)",
+        screen: Some(Screen::Recipes),
+        domain: Some(Domain::Sources),
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "/",

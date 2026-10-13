@@ -10,6 +10,7 @@ mod engine;
 mod input;
 pub mod layout;
 mod release;
+mod scan;
 mod screens;
 mod term;
 #[cfg(test)]
@@ -92,6 +93,9 @@ async fn main() -> Result<()> {
 
     // 引擎事件通道 + 开机自举(版本探测 + 首次 ls)。
     let (etx, mut erx) = mpsc::unbounded_channel::<engine::EngineEvent>();
+    // 预扫通道(工单 #114):外部源登记向导的只读 GitHub 查询回音,
+    // 与引擎回音分两条路——预扫不调引擎,也不冒充引擎回音。
+    let (stx, mut srx) = mpsc::unbounded_channel::<scan::ScanEvent>();
     app.bootstrap(&etx);
     // 引擎版本对照(#108)的回音通道:与引擎通道并列而不同路——release 查询
     // 不是 `nw` 的进程输出,不借道 EngineEvent(见 `Message::Release`)。
@@ -105,6 +109,8 @@ async fn main() -> Result<()> {
         &etx,
         &rtx,
         &mut rrx,
+        &stx,
+        &mut srx,
     )
     .await;
 
@@ -120,6 +126,8 @@ async fn run_loop(
     etx: &mpsc::UnboundedSender<engine::EngineEvent>,
     rtx: &mpsc::UnboundedSender<release::ReleaseProbe>,
     rrx: &mut mpsc::UnboundedReceiver<release::ReleaseProbe>,
+    stx: &mpsc::UnboundedSender<scan::ScanEvent>,
+    srx: &mut mpsc::UnboundedReceiver<scan::ScanEvent>,
 ) -> Result<()> {
     let mut tick = interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -151,6 +159,15 @@ async fn run_loop(
         for (args, body) in std::mem::take(&mut app.fed_queue) {
             app.spawn_engine_fed(args, body, etx);
         }
+        // 预扫队列(#114):键位处理器没有 tx,只排队 slug;这里取出后跑
+        // 只读 `gh api`(不落文件、不调引擎),回音走扫描通道回流。
+        for slug in std::mem::take(&mut app.scan_pending) {
+            let stx = stx.clone();
+            tokio::spawn(async move {
+                let outcome = scan::scan_repo(&slug).await;
+                let _ = stx.send(scan::ScanEvent::Finished { slug, outcome });
+            });
+        }
         // 外部编辑器逃逸口:挂起我们的终端,让 $EDITOR 用,完事再点火。
         if std::mem::take(&mut app.pending_editor) {
             open_editor(terminal, app)?;
@@ -168,6 +185,7 @@ async fn run_loop(
             Some(ev) = erx.recv() => app.update(Message::Engine(ev)),
             // 版本对照回音:与引擎回音并列收,不借道 EngineEvent
             Some(p) = rrx.recv() => app.update(Message::Release(p)),
+            Some(ev) = srx.recv() => app.update(Message::Scan(ev)),
             _ = tick.tick(), if app.assembling => app.update(Message::Tick),
         }
     }

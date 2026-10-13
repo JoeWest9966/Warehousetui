@@ -56,6 +56,8 @@ const LS_CALM: &str = r#"{"domain":"all","recipes":[],"components":[],"sources":
 /// 到期日)、一条 expiring(剩 3 天)、一条 expired。三态与 `daysLeft` 全是
 /// 上游 `status.go` 算好随回音下发的,面板零本地日期运算。
 const SUB_LS_BAND: &str = r#"{"catalogPath":"/r/subscriptions.json","subscriptions":[{"name":"airport","kind":"subscription-url","client":"Mihomo","expires":"2099-03-01","status":"active","daysLeft":26000},{"name":"soon","kind":"subscription-url","client":"Clash","expires":"2099-03-04","status":"expiring","daysLeft":3},{"name":"gone","kind":"subscription-url","client":"Stash","expires":"2026-01-01","status":"expired","daysLeft":null},{"name":"forever","kind":"subscription-url","client":"Surge","expires":"","status":"active","daysLeft":null}]}"#;
+/// #115 落点浮层夹具:两个本地组件 + 一条 skill 外部源 + 一条 extension 外部源。
+const LOCAL_LS: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0"}],"components":[{"name":"retention"},{"name":"scout"}],"sources":[{"name":"hello-world","repo":"https://github.com/o/hello-world","kind":"skill","entries":[{"name":"web-scout","path":"skills/web-scout"},{"name":"doc-lookup","path":"skills/doc-lookup"}]},{"name":"theme-pack","kind":"extension","entries":[{"name":"ribbon","path":"extensions/ribbon"}]}],"profiles":[{"name":"desk","state":"ok","lockId":"9f8e"}],"locks":[]}"#;
 
 // ---- 五屏快照 ----
 
@@ -2149,284 +2151,621 @@ fn 不过滤时渲染与过滤前逐字节相同() {
     );
 }
 
-// ---- #101 装配历史次级视图:只读档案,两档快照,坏记录不废屏 ----
+// ---- 装配历史次级视图(#101,datarepo 读侧)----
 
-/// 清单 fixture:字段与取值照引擎真样本
-/// (`docs/real-first-run/envelopes/doctor-profile.json` 的 `data.manifest`)。
-const HISTORY_MANIFEST_OK: &str = r#"{"schema":"nw/manifest.v1","lockId":"research-desk-1.0.0-360ae68","profile":"research-desk","recipe":"research-desk","version":"1.0.0","runtimeKey":"node-22.19.0+pi-1.0.2","installedAt":"2026-10-09T03:00:07Z","convergeHash":"3cf6a584a523b35ec42630766a9eb6a84d3dcf11d2347d5aa3f3ae879b420502","engine":"0.1.0"}"#;
+/// 就绪派的一份清单(字段集对齐上游 internal/manifest/manifest.go 样本)。
+const MANIFEST_FIXTURE: &str = r#"{"schema":"nw/manifest.v1","lockId":"desk-1.0.0-8f3a1c2","installedAt":"2026-10-01T12:00:00Z","recipe":{"name":"research-desk","version":"1.0.0"},"profile":"desk","runtime":{"runtimeKey":"node-24.21.0+pi-1.0.0","node":"24.21.0","pi":"1.0.0","chezmoi":"2.73.0","nodeSource":"bundled"},"components":[{"name":"retention","version":"0.4.1","landing":{"path":"nw/components/retention","kind":"pi-local-package"}},{"name":"scout","version":"0.2.0","landing":{"path":"nw/components/scout","kind":"pi-local-package"}}],"skeletonFiles":["AGENTS.md"],"configKeys":["/settings/theme"],"env":[{"name":"TAVILY_API_KEY","required":true,"present":true}],"convergeHash":"9f2c","engine":{"nw":"0.1.0","schema":"nw/manifest.v1"}}"#;
 
-/// 造一座 fixture 安装根(#101):一部装好的、一部清单写坏了的、一部还没装的。
-fn history_home(tag: &str) -> std::path::PathBuf {
-    // 每个用例一座目录:测试并行跑,共用一个路径会互相 remove_dir_all。
-    let dir = std::env::temp_dir().join(format!("nwt-hist-{}-{tag}", std::process::id()));
+/// 一次性 NW_HOME fixture:三个派三种态——desk 就绪、lab 缺失(派目录在、
+/// 清单不在=上一轮没提交完)、broken 破损(清单不是合法 JSON)。
+fn history_fixture(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nwt-hist-{}-{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&dir);
-    for (p, text) in [
-        ("research-desk", HISTORY_MANIFEST_OK),
-        ("half", "{\"schema\":\"nw/manifest.v1\",\"lockId\""),
-        ("fresh", ""),
-    ] {
-        let d = dir.join("profiles").join(p);
-        std::fs::create_dir_all(&d).unwrap();
-        if !text.is_empty() {
-            std::fs::write(d.join(".nw-manifest"), text).unwrap();
-        }
-    }
+    let profiles = dir.join("profiles");
+    std::fs::create_dir_all(profiles.join("desk")).unwrap();
+    std::fs::write(profiles.join("desk/.nw-manifest"), MANIFEST_FIXTURE).unwrap();
+    std::fs::create_dir_all(profiles.join("lab")).unwrap();
+    std::fs::create_dir_all(profiles.join("broken")).unwrap();
+    std::fs::write(profiles.join("broken/.nw-manifest"), "{not json").unwrap();
     dir
 }
 
-/// 一部好派 + 一部坏派 + 一部没装的派,历史视图在场。
+/// 打开装配历史的就绪态 App(NW_HOME 指向 fixture)。
 fn history_app(tag: &str) -> App {
     let mut app = fake_app();
     app.screen = Screen::Assemble;
-    app.splash = false; // 整帧量要过 splash 那一关(既有 frame_display 测试同款)
-    app.nw_home = history_home(tag).display().to_string();
-    app.as_history = true;
-    app.load_history();
-    // 默认选中装好的那一派(字典序 fresh / half / research-desk → 2):
-    // 明细栏要能摊开全字段,不然两档快照只钉到一个空态。
-    app.as_history_sel = 2;
-    app
-}
-
-/// 两档都在场、无行超宽,且认得的那一派把三个字段都给出来(#101 验收:
-/// 常畅/紧凑两档快照)。
-#[test]
-fn 装配历史屏_两档不溢出_列出锁装于收敛() {
-    let app = history_app("snap");
-    // 最宽那一档:字段全文明出(截断还没吃到它)
-    let wide = crate::testutil::frame_display(&app, 110, 30);
-    assert!(
-        wide.contains("research-desk-1.0.0-360ae68"),
-        "锁 id:{wide:?}"
-    );
-    assert!(wide.contains("2026-10-09T03:00:07Z"), "装配时刻:{wide:?}");
-    assert!(wide.contains("3cf6a584a523b35ec4"), "收敛指纹:{wide:?}");
-    // 三档都在场、无行超宽:窄档字段按 `clip` 截断(不折行——折行会多占
-    // 一行,命中区整体错位),所以断言前缀而不是全文明。
-    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
-        let s = crate::testutil::frame_display(&app, w, h);
-        assert!(s.contains("research-desk-1.0."), "{w}×{h} 锁 id 前缀:{s:?}");
-        assert!(
-            s.contains("2026-10-09T03:00:0"),
-            "{w}×{h} 装配时刻前缀:{s:?}"
-        );
-        assert!(s.contains("3cf6a584"), "{w}×{h} 收敛指纹前缀:{s:?}");
-        assert!(s.contains("只读"), "{w}×{h} 注脚标明只读:{s:?}");
-        for line in s.lines() {
-            assert!(
-                unicode_width::UnicodeWidthStr::width(line) <= w as usize,
-                "{w}×{h} 有行超宽:{line:?}"
-            );
-        }
-    }
-}
-
-// ---- #108 引擎版本对照(设置屏次级页) ----
-
-/// 版本对照页的就绪态:注入回放式查询(零网络),本地版本给定。
-fn version_app(remote: Option<crate::release::ReleaseProbe>) -> App {
-    let mut app = fake_app();
     app.splash = false;
-    app.screen = Screen::Settings;
-    app.settings_page = crate::app::SettingsPage::Version;
-    app.engine_version = "0.1.0".into();
-    app.release_remote = remote;
-    app.release_lookup = Arc::new(crate::release::FakeReleaseLookup::new(vec![
-        crate::release::ReleaseProbe::Unreachable,
-    ]));
+    app.nw_home = history_fixture(tag).to_str().unwrap().to_string();
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
     app
 }
 
 #[test]
-fn 版本对照页_本地与远端并排_两档不溢出() {
-    let app = version_app(Some(crate::release::ReleaseProbe::Latest("v0.2.0".into())));
-    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
-        let s = draw(&app, w, h);
-        assert!(s.contains("版本对照"), "{w}×{h} 页标题在场:{s}");
-        assert!(s.contains("本地"), "{w}×{h} 本地版本在场:{s}");
-        assert!(s.contains("nw 0.1.0"), "{w}×{h} 本地版本原话:{s}");
-        assert!(s.contains("v0.2.0"), "{w}×{h} 远端 tag 在场:{s}");
-        // 宽度不变量走 frame_display:draw() 的 TestBackend 串带隐藏格注记,
-        // 拿它量宽度会把自己撑爆(既有两档测试同一把尺)
+fn 装配历史_三态两档渲染不炸且锚点在阵() {
+    let app = history_app("snap");
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
         let f = crate::testutil::frame_display(&app, w, h);
-        for l in f.lines() {
-            assert!(
-                unicode_width::UnicodeWidthStr::width(l) <= usize::from(w),
-                "{w}×{h} 行不超宽:{l}"
-            );
+        assert!(f.contains("装配历史"), "{w}×{h} 应有次级视图标题:{f}");
+        for name in ["broken", "desk", "lab"] {
+            assert!(f.contains(name), "{w}×{h} 派 {name} 上表:{f}");
         }
+        assert!(
+            f.contains("desk-1.0.0-8f3a1c2"),
+            "{w}×{h} 就绪派的锁定集上表:{f}"
+        );
+        assert!(f.contains("清单缺失"), "{w}×{h} 缺失态措辞:{f}");
+        assert!(f.contains("清单破损"), "{w}×{h} 破损态措辞:{f}");
+        assert!(!f.contains("panic"), "{w}×{h} 不炸:{f}");
     }
 }
 
-/// 一条坏记录只坏它自己那一行(规格故事 4):坏派显破损、好派照常、没装的那派
-/// 显缺失——整屏不炸,其余条目一个字节不少。
 #[test]
-fn 装配历史_坏清单呈破损态_其余条目照常() {
-    let mut app = history_app("snap2");
-    app.as_history_sel = 1; // 字典序第二位:写坏清单的 half
-    let s = draw(&app, 110, 30);
-    assert!(s.contains("清单破损"), "坏派显破损:{s:?}");
-    assert!(s.contains("还没装(清单缺失)"), "没装的派显缺失:{s:?}");
+fn 装配历史_就绪行详情给全字段_含后续票占位() {
+    let mut app = history_app("detail");
+    // 排序 broken → desk → lab:按一次到 desk(就绪态)看详情
+    key(&mut app, crossterm::event::KeyCode::Down);
+    let f = draw(&app, 110, 30);
+    for anchor in [
+        "desk-1.0.0-8f3a1c2",
+        "2026-10-01T12:00:00Z",
+        "9f2c",
+        "research-desk",
+        "node-24.21.0+pi-1.0.0",
+        "0.1.0",
+    ] {
+        assert!(f.contains(anchor), "详情应有 {anchor}:{f}");
+    }
+    assert!(f.contains("组件 2 条"), "组件条数:{f}");
+    assert!(f.contains("Enter 看清单原文"), "键位说明:{f}");
     assert!(
-        s.contains("research-desk-1.0.0-360ae68"),
-        "好派照常给锁 id:{s:?}"
+        f.contains("#102") && f.contains("#103"),
+        "回收站/存档日志挂点占位(#101):{f}"
     );
-    // 明细里明说「其余派照常」——坏记录不废整屏这句话写在屏上
-    assert!(s.contains("其余派照常"), "屏上明说坏记录不连坐:{s:?}");
 }
 
-/// 安装根不在(#101 验收:NW_HOME 未设走既有指路语义):走指路,不画空列表——
-/// 「NW_HOME 指错了」与「一个派都还没装」在屏上是两件事。
 #[test]
-fn 装配历史_安装根不在走指路_不画空列表() {
+fn 装配历史_回车看清单原文_esc关() {
+    let mut app = history_app("raw");
+    // 排序 broken → desk → lab:按一次到 desk(就绪态,有原文)
+    key(&mut app, crossterm::event::KeyCode::Down);
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    let raw = app.ah_raw.clone().expect("回车应开原文浮层");
+    assert_eq!(raw, MANIFEST_FIXTURE, "原文即数据仓里那个文件的字节");
+    let f = draw(&app, 110, 30);
+    assert!(f.contains("清单原文"), "浮层标题:{f}");
+    assert!(f.contains("nw/manifest.v1"), "原文内容上屏:{f}");
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(app.ah_raw.is_none(), "Esc 关原文");
+}
+
+#[test]
+fn 装配历史_缺失态回车不开空浮层只留指路() {
+    let mut app = history_app("raw-missing");
+    // 排序 broken → desk → lab:按两次到 lab(缺失态)
+    key(&mut app, crossterm::event::KeyCode::Down);
+    key(&mut app, crossterm::event::KeyCode::Down);
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.ah_raw.is_none(), "缺失态没有原文,不开空浮层");
+    assert!(
+        app.log.iter().any(|l| l.contains("没有清单原文")),
+        "留一句指路:{:?}",
+        app.log.iter().take(3).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn 装配历史_nwhome未设走指路不摆空列表() {
     let mut app = fake_app();
     app.screen = Screen::Assemble;
+    app.splash = false;
+    // 一个不存在的安装根:未设/不存在态
     app.nw_home = std::env::temp_dir()
-        .join(format!("nwt-hist-gone-{}", std::process::id()))
-        .display()
+        .join(format!("nwt-hist-nope-{}", std::process::id()))
+        .to_str()
+        .unwrap()
         .to_string();
-    app.as_history = true;
-    app.load_history();
-    for (w, h) in [(110u16, 30u16), (66, 50)] {
-        let s = draw(&app, w, h);
-        assert!(s.contains("NW_HOME 目录不在"), "{w}×{h} 给指路:{s:?}");
-        assert!(s.contains("n 轮换"), "{w}×{h} 指路带下一步:{s:?}");
-        assert!(!s.contains("还没有任何派"), "{w}×{h} 不拿空列表冒充:{s:?}");
-    }
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
+    assert!(app.as_history.as_ref().unwrap().root_missing, "根缺失标记");
+    let f = draw(&app, 110, 30);
+    assert!(f.contains("没有安装根"), "指路标题:{f}");
+    assert!(f.contains("不存在"), "指路带事实:{f}");
+    assert!(
+        !f.contains("一个派都还没有"),
+        "不摆「空列表」那种骗人话:{f}"
+    );
 }
 
-/// 不认识的 schema 走契约守卫同款话术(规格:不猜、不按旧形状降级解析),
-/// 且**不**给原文浮层——面板拒绝解释它。
 #[test]
-fn 装配历史_不认识的schema走契约守卫话术() {
+fn 装配历史_有根没派_与未设两态可区分() {
     let mut app = fake_app();
     app.screen = Screen::Assemble;
-    let dir = std::env::temp_dir().join(format!("nwt-hist-v2-{}", std::process::id()));
+    app.splash = false;
+    let dir = std::env::temp_dir().join(format!("nwt-hist-empty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let d = dir.join("profiles").join("future");
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(
-        d.join(".nw-manifest"),
-        r#"{"schema":"nw/manifest.v2","lockId":"x-1.0.0-bbb","engine":"9.9.9"}"#,
+    std::fs::create_dir_all(&dir).unwrap();
+    app.nw_home = dir.to_str().unwrap().to_string();
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
+    assert!(!app.as_history.as_ref().unwrap().root_missing, "根在");
+    let f = draw(&app, 110, 30);
+    assert!(f.contains("一个派都还没有"), "有根没派说空列表:{f}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn 装配历史_开关与选中_键位自成一套() {
+    let mut app = history_app("keys");
+    assert!(app.as_history.is_some(), "h 开");
+    key(&mut app, crossterm::event::KeyCode::Down);
+    assert_eq!(app.ah_sel, 1, "↓ 选下一行");
+    key(&mut app, crossterm::event::KeyCode::Up);
+    assert_eq!(app.ah_sel, 0, "↑ 选上一行");
+    // 视图内 Enter 是看原文,不是发射仪式
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.ah_raw.is_some(), "Enter 看原文(选中行=broken,也有原文)");
+    assert!(!app.as_confirm, "不误打开发射仪式");
+    key(&mut app, crossterm::event::KeyCode::Esc); // 关原文
+    key(&mut app, crossterm::event::KeyCode::Esc); // 关视图
+    assert!(app.as_history.is_none(), "Esc 返航");
+    // 关后键位回归选锁定集:h 再开
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
+    assert!(app.as_history.is_some(), "h 再开");
+}
+
+#[test]
+fn 装配历史_过滤本地筛_esc清词() {
+    let mut app = history_app("filter");
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    assert!(app.ah_filter_on, "/ 进过滤输入态");
+    for c in ['d', 'e', 's'] {
+        key(&mut app, crossterm::event::KeyCode::Char(c));
+    }
+    assert_eq!(app.ah_visible().len(), 1, "只命中 desk");
+    key(&mut app, crossterm::event::KeyCode::Enter); // 收词退输入态
+    assert!(!app.ah_filter_on, "Enter 收词");
+    assert_eq!(app.ah_visible().len(), 1, "词仍生效");
+    key(&mut app, crossterm::event::KeyCode::Esc); // 视图内 Esc = 返航(不过滤输入态)
+    assert!(app.as_history.is_none(), "无过滤输入态时 Esc 返航");
+}
+
+#[test]
+fn 装配历史_过滤无命中给可区分空态() {
+    let mut app = history_app("filter-empty");
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    for c in ['z', 'z', 'z'] {
+        key(&mut app, crossterm::event::KeyCode::Char(c));
+    }
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.ah_visible().is_empty(), "无命中");
+    let f = draw(&app, 110, 30);
+    assert!(f.contains("没有派命中过滤词"), "空态与真空册可区分:{f}");
+}
+
+// ---- #115 反向溯源:派落点(纯函数 + 选中行快照) ----
+
+/// 本地组件的落点 = `nw/components/<组件名>/`:上游 external-sources.md
+/// 「本地组件的 skill 仍住 nw/components/<组件>/ 里 —— 机制不同,家就不同」
+/// (2026-10-03 家长裁定)。纯函数,零 IO;规则只读知识,面板不另造。
+#[test]
+fn 落点纯函数_本地组件落nw_components() {
+    assert_eq!(
+        super::recipes::local_component_landing("retention"),
+        "nw/components/retention/"
+    );
+}
+
+/// 外部 skill 的落点 = `skills/<仓库名>/<条目名>/`:上游 external-sources.md
+/// 「选中的 skill 铺到 <派目录>/skills/<仓库名>/<skill 名>/ —— 仓库名就是
+/// 命名空间」;锁定集 landing.path 同形(`<agent-dir>/skills/hello-world/
+/// web-scout`,kind `pi-skill`)。
+#[test]
+fn 落点纯函数_外部skill落skills_仓库名是命名空间() {
+    assert_eq!(
+        super::recipes::external_entry_landing("hello-world", "web-scout", Some("skill")),
+        "skills/hello-world/web-scout/"
+    );
+}
+
+/// 外部 extension 的落点 = `nw/extensions/<仓库名>/<条目名>/`:上游
+/// external-sources.md「扩展这半」§1 —— 与本地组件同一屋檐(`nw/`)但
+/// **不进 nw/components/**(外部扩展本体没有 component.yaml,塞进去会让
+/// up 步 3 的拓扑与 pruneRemoved 的语义变味)。
+#[test]
+fn 落点纯函数_外部extension落nw_extensions() {
+    assert_eq!(
+        super::recipes::external_entry_landing("theme-pack", "ribbon", Some("extension")),
+        "nw/extensions/theme-pack/ribbon/"
+    );
+}
+
+/// 选中行 → 落点快照(#115):components 域恒为本地组件(上游 ls.go 的
+/// readComponents 只扫 <root>/components/<名>/component.yaml,外部条目住在
+/// sources 域);sources 域一条记录 = 一个仓库 + 条目清单,按 kind 分派落点。
+/// 无落点语义的域(recipes/profiles/locks)不给快照。
+#[test]
+fn 落点快照_组件域取本地_源域取外部条目_其它域无() {
+    let ls: crate::engine::LsData = serde_json::from_str(
+        r#"{"domain":"all","recipes":[{"name":"r1"}],"components":[{"name":"retention"},{"name":"scout"}],"sources":[{"name":"hello-world","repo":"https://github.com/o/hello-world","kind":"skill","entries":[{"name":"web-scout","path":"skills/web-scout"}]},{"name":"theme-pack","kind":"extension","entries":[{"name":"ribbon","path":"extensions/ribbon"}]}],"profiles":[],"locks":[]}"#,
     )
     .unwrap();
-    app.nw_home = dir.display().to_string();
-    app.as_history = true;
-    app.load_history();
-    let s = draw(&app, 110, 30);
-    assert!(s.contains("需升级 nw"), "契约守卫同款话术:{s:?}");
-    assert!(s.contains("不按旧形状降级解析"), "屏上写明立场:{s:?}");
-    assert!(!s.contains("装于"), "不按旧形状解析出一排字段:{s:?}");
-}
-
-/// 回车看清单原文(规格故事 3):原文照贴,Enter / Esc 关闭,历史视图与选中行
-/// 原样不动(看原文不写任何选中态)。
-#[test]
-fn 装配历史_回车看清单原文_照贴且关掉不动选中() {
-    let mut app = history_app("snap2");
-    app.update(Message::Key(KeyEvent::new(
-        KeyCode::Enter,
-        KeyModifiers::NONE,
-    )));
-    let raw = app.as_history_raw.clone().expect("原文浮层在场");
-    assert!(raw.contains("convergeHash"), "原文照贴:{raw}");
-    assert!(raw.contains("nw/manifest.v1"), "schema 原文也在:{raw}");
-    app.update(Message::Key(KeyEvent::new(
-        KeyCode::Esc,
-        KeyModifiers::NONE,
-    )));
-    assert!(app.as_history_raw.is_none(), "Esc 关浮层");
-    assert!(app.as_history, "历史视图原样在场");
-    assert_eq!(app.as_history_sel, 2, "选中行一个字节不动");
-}
-
-#[test]
-fn 版本对照页_落后时给升级指路_只标记不治理() {
-    let app = version_app(Some(crate::release::ReleaseProbe::Latest("v0.2.0".into())));
-    let s = draw(&app, 110, 30);
-    assert!(s.contains("落后"), "判词点名落后:{s}");
-    assert!(
-        s.contains(crate::release::upgrade_hint()),
-        "建议命令可复制:{s}"
-    );
-    assert!(s.contains("不代跑"), "执行权留给操作者:{s}");
-    assert!(s.contains("不改退出码"), "只标记不治理的口径:{s}");
-    // 紧凑态(保证最小 66×50)指路两行都放得下
-    let c = draw(&app, 66, 50);
-    assert!(c.contains("落后"), "紧凑态判词在场:{c}");
-    assert!(c.contains("升级指路"), "紧凑态指路在场:{c}");
-}
-
-#[test]
-fn 版本对照页_取不到远端降级为只显示本地_不报错() {
-    for (remote, needle) in [
-        (
-            crate::release::ReleaseProbe::Unreachable,
-            "gh 不在 PATH 或没网",
-        ),
-        (crate::release::ReleaseProbe::Garbage, "回话不是可用 tag"),
-    ] {
-        let app = version_app(Some(remote));
-        for (w, h) in [(110, 30), (66, 50)] {
-            let s = draw(&app, w, h);
-            assert!(s.contains("nw 0.1.0"), "{w}×{h} 本地版本仍在:{s}");
-            assert!(s.contains(needle), "{w}×{h} 取不到的理由在场:{s}");
-            assert!(!s.contains("升级指路"), "{w}×{h} 不给升级指路:{s}");
-            assert!(!s.contains("✗"), "{w}×{h} 不画成错误:{s}");
+    let mut app = fake_app();
+    app.ls = Some(ls);
+    // components 域:选中第二行(scout)
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_sel = 1;
+    assert!(matches!(
+        super::recipes::landing_trace(&app),
+        Some(super::recipes::LandingTrace::Local { name }) if name == "scout"
+    ));
+    // sources 域:第一条记录(hello-world / skill)
+    app.rc_domain = crate::app::Domain::Sources;
+    app.rc_sel = 0;
+    match super::recipes::landing_trace(&app) {
+        Some(super::recipes::LandingTrace::External {
+            repo,
+            kind,
+            entries,
+        }) => {
+            assert_eq!(repo, "hello-world");
+            assert_eq!(kind.as_deref(), Some("skill"));
+            assert_eq!(entries, vec!["web-scout".to_string()]);
         }
+        other => panic!("sources 域应给外部快照,得到 {other:?}"),
     }
-}
-
-#[test]
-fn 版本对照页_上游tag不是版本号就判比不了_不猜() {
-    // 上游真会发出来的 tag(带前缀 + commit 短 hash)
-    let app = version_app(Some(crate::release::ReleaseProbe::Latest(
-        "bake/research-desk-1.0.0-360ae68".into(),
-    )));
-    let s = draw(&app, 110, 30);
-    assert!(s.contains("比不了"), "判词说比不了:{s}");
-    assert!(s.contains("nw 0.1.0"), "本地原话并排:{s}");
+    // 无落点语义的域
+    app.rc_domain = crate::app::Domain::Profiles;
     assert!(
-        s.contains("bake/research-desk-1.0.0-360ae68"),
-        "远端原话并排:{s}"
+        super::recipes::landing_trace(&app).is_none(),
+        "profiles 域无落点语义"
     );
-    assert!(!s.contains("升级指路"), "比不了就不给升级指路:{s}");
-    assert!(!s.contains("一致"), "不冒充已是最新:{s}");
+    app.rc_domain = crate::app::Domain::Locks;
+    assert!(
+        super::recipes::landing_trace(&app).is_none(),
+        "locks 域无落点语义"
+    );
+    app.rc_domain = crate::app::Domain::Recipes;
+    assert!(
+        super::recipes::landing_trace(&app).is_none(),
+        "recipes 域无落点语义"
+    );
 }
 
+/// 过滤后选中行跟随「看得见的那一行」(#61 同源):过滤词把 scout 筛掉后,
+/// 原下标 1 不再有落点快照。
 #[test]
-fn 版本对照页_一致与领先都不是问题态() {
-    for (tag, word) in [("v0.1.0", "一致"), ("v0.0.9", "领先")] {
-        let app = version_app(Some(crate::release::ReleaseProbe::Latest(tag.into())));
-        let s = draw(&app, 110, 30);
-        assert!(s.contains(word), "tag {tag} 该判 {word}:{s}");
-        assert!(!s.contains("升级指路"), "{word} 不给升级指路:{s}");
+fn 落点快照_过滤后取看得见的那一行() {
+    let mut app = fake_app();
+    app.ls = Some(
+        serde_json::from_str(
+            r#"{"domain":"all","recipes":[],"components":[{"name":"retention"},{"name":"scout"}],"sources":[],"profiles":[],"locks":[]}"#,
+        )
+        .unwrap(),
+    );
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_sel = 1;
+    app.rc_filter = "retention".into();
+    assert!(
+        super::recipes::landing_trace(&app).is_none(),
+        " scout 被过滤掉:原下标不再有快照(与详情取同一行)"
+    );
+    app.rc_sel = 0;
+    assert!(matches!(
+        super::recipes::landing_trace(&app),
+        Some(super::recipes::LandingTrace::Local { name }) if name == "retention"
+    ));
+}
+
+// ---- #115 落点浮层:两类分列的内容与两档快照(纯呈现) ----
+
+/// 规格验收 1 / 故事 19:选中本地组件,浮层两类分列 —— 本地类摊实指
+/// (`nw/components/<名>/`,上游 external-sources.md「本地组件的 skill 仍住
+/// nw/components/<组件>/ 里」),外部类给上游规则作对照:两类落点差异一目了然。
+#[test]
+fn 落点浮层_本地组件_实指与外部规则分列() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.ls = Some(serde_json::from_str(LOCAL_LS).unwrap());
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_landing = Some(super::recipes::LandingTrace::Local {
+        name: "retention".into(),
+    });
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("nw/components/retention/"),
+        "本地组件实指落点:{s}"
+    );
+    assert!(
+        s.contains("skills/<仓库名>/<条目名>/"),
+        "外部 skill 规则作对照:{s}"
+    );
+    assert!(
+        s.contains("nw/extensions/<仓库名>/<条目名>/"),
+        "外部 extension 规则作对照:{s}"
+    );
+    assert!(s.contains("Esc 或点击任意处关闭"), "收口给返航路:{s}");
+}
+
+/// 规格验收 1 / 故事 18:选中外部 skill 源,条目逐个落
+/// `skills/<仓库名>/<条目名>/`(仓库名即命名空间,上游 2026-10-03 裁定);
+/// 本地类规则作对照。一条记录 = 一个仓库 + 一次扫描的条目清单。
+#[test]
+fn 落点浮层_外部源skill_条目逐个落点() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "hello-world".into(),
+        kind: Some("skill".into()),
+        entries: vec!["web-scout".into(), "doc-lookup".into()],
+    });
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("skills/hello-world/web-scout/"),
+        "skill 条目落点:{s}"
+    );
+    assert!(
+        s.contains("skills/hello-world/doc-lookup/"),
+        "同仓第二条条目同规则:{s}"
+    );
+    assert!(
+        s.contains("nw/components/<组件名>/"),
+        "本地类规则作对照:{s}"
+    );
+}
+
+/// 规格验收 1:外部 extension 落 `nw/extensions/<仓库名>/<条目名>/` —— 上游
+/// external-sources.md「扩展这半」§1:与本地组件同一屋檐但不进 components/。
+#[test]
+fn 落点浮层_外部源extension_落nw_extensions() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "theme-pack".into(),
+        kind: Some("extension".into()),
+        entries: vec!["ribbon".into()],
+    });
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("nw/extensions/theme-pack/ribbon/"),
+        "extension 条目落点:{s}"
+    );
+}
+
+/// kind 缺省不静默冒充:标题明说「kind 未给出」,落点按 skill 呈现
+/// (上游编目两条数组必居其一;面板不猜,只把「按什么呈现」摊开)。
+#[test]
+fn 落点浮层_外部源kind缺失_明说按skill落点() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "bare".into(),
+        kind: None,
+        entries: vec!["x".into()],
+    });
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("kind 未给出"), "kind 缺失明说:{s}");
+    assert!(s.contains("skills/bare/x/"), "按 skill 落点呈现:{s}");
+}
+
+/// 规格验收 4:常畅(110×30)与紧凑(66×50)两档浮层都在帧上、不炸。
+#[test]
+fn 落点浮层_两档快照() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.ls = Some(serde_json::from_str(LOCAL_LS).unwrap());
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_landing = Some(super::recipes::LandingTrace::Local {
+        name: "retention".into(),
+    });
+    for (w, h) in [(110u16, 30u16), (66, 50)] {
+        app.splash = false;
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(
+            f.contains("nw/components/retention/"),
+            "{w}×{h} 本地落点:{f}"
+        );
+        assert!(f.contains("Esc 或点击任意处关闭"), "{w}×{h} 收口在帧:{f}");
     }
 }
 
-#[test]
-fn 版本对照页_在途不拿旧结论冒充本次() {
-    let mut app = version_app(None);
-    app.release_probing = true;
-    let s = draw(&app, 110, 30);
-    assert!(s.contains("对照中"), "在途明说在对照:{s}");
-    assert!(!s.contains("取不到"), "在途不冒充取不到:{s}");
+// ---- #115 落点浮层:键位 / 鼠标行为(纯呈现可证) ----
+
+/// 落点浮层行为夹具:数据仓根指向真实可读临时目录(三道闸放行)、五域有料、
+/// FakeRunner 可见 —— 这些测试要能证明「零引擎调用」。
+fn landing_app() -> (Arc<FakeRunner>, App) {
+    let dir = std::env::temp_dir().join(format!("nwt-landing-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let runner = Arc::new(FakeRunner::new(&[(
+        "ls",
+        0,
+        r#"{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}}"#,
+    )]));
+    let mut app = App::with_runner(runner.clone());
+    app.screen = Screen::Recipes;
+    app.data_root = Some(dir.to_string_lossy().to_string());
+    app.ls = Some(serde_json::from_str(LOCAL_LS).unwrap());
+    (runner, app)
 }
 
+/// 规格验收 2:Enter 打开浮层 = 纯呈现 —— 一个引擎调用都不发、一个字节都
+/// 不入队(落点规则是面板侧只读知识,不读派目录、不代跑)。
 #[test]
-fn 版本对照页_常驻面板逐字节不动() {
-    // v 翻开的是新页:常驻面板那一棵扁平行向量一个字节都不该变
-    let mut app = version_app(Some(crate::release::ReleaseProbe::Latest("v0.2.0".into())));
-    app.settings_page = crate::app::SettingsPage::Panel;
-    let panel = draw(&app, 110, 30);
-    key(&mut app, crossterm::event::KeyCode::Char('v'));
-    let page = draw(&app, 110, 30);
-    assert_ne!(panel, page, "翻开对照页后画面该变");
+fn 落点浮层_enter打开_零引擎调用零入队() {
+    let (runner, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.landing_open(), "Enter 打开落点浮层");
+    assert!(
+        matches!(&app.rc_landing, Some(super::recipes::LandingTrace::Local { name }) if name == "retention"),
+        "快照取选中行(第一行 retention)"
+    );
+    assert!(
+        runner.call_argvs().is_empty(),
+        "零引擎调用:{:?}",
+        runner.call_argvs()
+    );
+    assert!(app.queue.is_empty(), "零入队");
+}
+
+/// 外部源域 Enter 给外部快照(一条记录 = 一个仓库 + 条目清单,按 kind 分派)。
+#[test]
+fn 落点浮层_外部源域enter给外部快照() {
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Sources;
+    app.rc_sel = 1; // theme-pack(extension)
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    match &app.rc_landing {
+        Some(super::recipes::LandingTrace::External {
+            repo,
+            kind,
+            entries,
+        }) => {
+            assert_eq!(repo, "theme-pack");
+            assert_eq!(kind.as_deref(), Some("extension"));
+            assert_eq!(entries, &vec!["ribbon".to_string()]);
+        }
+        other => panic!("应给外部快照,得到 {other:?}"),
+    }
+    assert!(_r.call_argvs().is_empty(), "零引擎调用");
+}
+
+/// 三道门各说各话:无落点语义的域(recipes/profiles/locks)、没有选中行、
+/// 数据仓根未设 —— Enter 静默不摆浮层(不缺能力、不发调用、不摆空浮层)。
+#[test]
+fn 落点浮层_三道门_不满足不摆() {
+    // 无落点语义的域
+    for d in [
+        crate::app::Domain::Recipes,
+        crate::app::Domain::Profiles,
+        crate::app::Domain::Locks,
+    ] {
+        let (_r, mut app) = landing_app();
+        app.rc_domain = d;
+        key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(!app.landing_open(), "{d:?} 域无落点语义,不摆浮层");
+    }
+    // 没有选中行(components 域被过滤空)
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_filter = "查无此件".into();
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(!app.landing_open(), "无选中行不摆浮层");
+    // 数据仓根未设:与五域同门,不摆(也不拿落点冒充)
+    let dir = std::env::temp_dir().join(format!("nwt-landing-noroot-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let runner = Arc::new(FakeRunner::new(&[]));
+    let mut app = App::with_runner(runner);
+    app.screen = Screen::Recipes;
+    app.data_root = None;
+    app.ls = Some(serde_json::from_str(LOCAL_LS).unwrap());
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(!app.landing_open(), "数据仓根未设不摆浮层");
+}
+
+/// 规格验收 3:Esc 返航只收浮层状态 —— 配方屏选中行原样在场(浮层读的是
+/// 打开那一刻的快照,返航不顺手改 rc_sel/rc_domain)。
+#[test]
+fn 落点浮层_esc返航_选中行原样在场() {
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_sel = 1;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.landing_open());
     key(&mut app, crossterm::event::KeyCode::Esc);
-    assert_eq!(draw(&app, 110, 30), panel, "Esc 返回常驻面板,逐字节相同");
-    // 常驻面板的节与末行都还在原处(版本行 / 能力 / 环境 / config)
-    assert!(panel.contains("版本"), "引擎节的版本行在场");
-    assert!(panel.contains("能力"), "能力节在场");
-    assert!(panel.contains("数据仓根"), "环境节在场");
-    assert!(panel.contains("config 状态"), "配置节末行在场");
+    assert!(!app.landing_open(), "Esc 关浮层");
+    assert_eq!(app.rc_sel, 1, "选中行原样在场");
+    assert_eq!(app.rc_domain, crate::app::Domain::Components, "域原样在场");
+}
+
+/// 规格验收 3:浮层在场时吞键 —— 五域键位(h 切域 / ↑↓ 选行 / c 建议命令)
+/// 一个都不受理,与反查浮层同一条弹层纪律;再按 Esc 才返航。
+#[test]
+fn 落点浮层_在场吞键_五域键位不受理() {
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    let sel = app.rc_sel;
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
+    key(&mut app, crossterm::event::KeyCode::Down);
+    key(&mut app, crossterm::event::KeyCode::Char('c'));
+    assert_eq!(app.rc_sel, sel, "浮层吞键:选中行不动");
+    assert_eq!(
+        app.rc_domain,
+        crate::app::Domain::Components,
+        "浮层吞键:不切域"
+    );
+    assert!(!app.rc_bake_sel, "浮层吞键:c 不受理");
+    assert!(app.landing_open(), "非 Esc 键不返航");
+}
+
+/// 规格验收 3:鼠标点任意处关闭(与键盘 Esc 一个后果)—— 命中区取整块正文,
+/// 点浮层外的空白也算返航(与 #70 反查浮层同一条弹层纪律)。
+#[test]
+fn 落点浮层_点任意处关闭_整块正文都是返航命中() {
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    app.size = ratatui::layout::Rect::new(0, 0, 110, 30);
+    let class = crate::layout::size_class(app.size);
+    let hits = crate::layout::hitmap(app.size, &app, class);
+    assert!(
+        hits.iter()
+            .any(|(_, t)| *t == crate::layout::Target::DismissPopup),
+        "浮层在场:整块正文产「点任意处返航」命中"
+    );
+    assert!(
+        hits.iter()
+            .all(|(_, t)| !matches!(t, crate::layout::Target::SelectRow(_))),
+        "浮层吞点击:底层列表行不产命中(不穿透)"
+    );
+    // 点命中区中心(浮层外空白)= 返航(坐标取自布局模型,不硬编码)
+    let dismiss = hits
+        .iter()
+        .find(|(_, t)| *t == crate::layout::Target::DismissPopup)
+        .map(|(r, _)| *r)
+        .expect("上面已断言有 DismissPopup 命中");
+    app.update(Message::Mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: dismiss.x + dismiss.width / 2,
+        row: dismiss.y + dismiss.height / 2,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    }));
+    assert!(!app.landing_open(), "点任意处关闭");
+}
+
+/// 外部源记录还没有扫出条目(register 预审时才有):明说,不画成空列表也不
+/// 拿本地落点冒充;本地类规则仍在(两类分列的读法不因条目空而缺一半)。
+#[test]
+fn 落点浮层_外部源无条目_明说与规则对照() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "tiny-skills".into(),
+        kind: Some("skill".into()),
+        entries: vec![],
+    });
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("该仓库还没有扫出条目"), "无条明说:{s}");
+    assert!(
+        s.contains("nw/components/<组件名>/"),
+        "本地类规则仍作对照:{s}"
+    );
+}
+
+/// 一仓扫出超过上限的条目:浮层不无限长,摊前 6 条 + 明说其余条数
+/// (与健康屏证据面板上限同一种纪律)。
+#[test]
+fn 落点浮层_外部源条目超上限_明说其余条数() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    let entries: Vec<String> = (0..9).map(|i| format!("e{i}")).collect();
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "many".into(),
+        kind: Some("skill".into()),
+        entries: entries.clone(),
+    });
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("skills/many/e0/"), "首条在:{s}");
+    assert!(s.contains("skills/many/e5/"), "第 6 条在:{s}");
+    assert!(!s.contains("skills/many/e6/"), "第 7 条不进浮层:{s}");
+    assert!(s.contains("…其余 3 条"), "超出明说条数:{s}");
 }
