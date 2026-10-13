@@ -624,6 +624,17 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
         row_hits(lst, 0, app.bin_total(), hits, Target::SelectRow);
         return;
     }
+    // 两个顶层浮层(#101 清单原文 / #103 存档日志)在场时,整块正文只有一个
+    // 「点任意处关闭」命中区,底层派行一段都不产——浮层吞点击、不穿透底层
+    // (与 `catalog_hits` 的反查浮层同一条弹层纪律)。少了这一条,点派行会
+    // 在浮层还开着的时候改选中行,而浮层自己说的是「点任意处关闭」。
+    if (app.as_history_raw.is_some() || app.as_history_log.is_some()) && app.home_cause().is_none()
+    {
+        if area.width > 0 && area.height > 0 {
+            hits.push((area, Target::DismissPopup));
+        }
+        return;
+    }
     if app.as_history && app.home_cause().is_none() {
         let list = match class {
             SizeClass::Comfy => h_split2(area, 55, 45).0,
@@ -1206,6 +1217,71 @@ mod tests {
             first(&hits, |t| matches!(t, Target::SelectRow(0))),
             Some(Rect::new(14, 3, 34, 1)),
             "选锁定集首行:屏体边框 → 55% 左栏 → 列表边框,首行即数据"
+        );
+    }
+
+    #[test]
+    fn hitmap_装配历史浮层在场_整块只有一个关闭命中_派行不产出() {
+        // #103 存档日志浮层(与 #101 清单原文浮层同一条弹层纪律):浮层吞点击,
+        // 底层派行一段都不产——否则「点任意处关闭」在派行上会变成改选中行。
+        let mut app = test_app();
+        let a = area(80, 30);
+        app.screen = Screen::Assemble;
+        app.as_history = true;
+        // 安装根要真的在:不在时历史视图整块换成指路(那是另一条路),
+        // 浮层纪律要在「历史视图真在画派行」的前提下才测得着。
+        let home = std::env::temp_dir().join(format!("nwt-layout-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        app.nw_home = home.display().to_string();
+        // 两个派目录 + 读一次快照:派行命中区的条数由它决定
+        for p in ["desk", "lab"] {
+            std::fs::create_dir_all(home.join("profiles").join(p)).unwrap();
+        }
+        app.load_history();
+        // 先钉「没有浮层时派行照常产出」这条基线
+        let bare = hitmap(a, &app, size_class(a));
+        let rows = bare
+            .iter()
+            .filter(|(_, t)| matches!(t, Target::SelectRow(_)))
+            .count();
+        assert!(rows > 0, "基线:历史视图的派行有命中区({rows} 行)");
+
+        app.as_history_log = Some("铺骨架…\n".into());
+        let hits = hitmap(a, &app, size_class(a));
+        check(&hits, a, "浮层在场 80×30");
+        assert!(
+            hits.iter()
+                .all(|(_, t)| matches!(t, Target::NavTo(_) | Target::DismissPopup)),
+            "屏内只剩「点任意处关闭」一个动作,派行一段都不产:{:?}",
+            hits.iter().map(|(_, t)| t).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hits.iter()
+                .filter(|(_, t)| matches!(t, Target::DismissPopup))
+                .count(),
+            1,
+            "关闭命中区只有一个(整块正文,不是浮层矩形——点外面也算关)"
+        );
+        assert!(
+            hits.iter().all(|(_, t)| !matches!(t, Target::SelectRow(_))),
+            "底层派行不穿透浮层"
+        );
+
+        // 清单原文浮层同一条纪律(#101):两个顶层浮层不许分叉
+        app.as_history_log = None;
+        app.as_history_raw = Some("{}".into());
+        let hits = hitmap(a, &app, size_class(a));
+        assert!(
+            hits.iter().all(|(_, t)| !matches!(t, Target::SelectRow(_))),
+            "清单原文浮层同样吞掉派行:{:?}",
+            hits.iter().map(|(_, t)| t).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hits.iter()
+                .filter(|(_, t)| matches!(t, Target::DismissPopup))
+                .count(),
+            1
         );
     }
 

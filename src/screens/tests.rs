@@ -2584,6 +2584,98 @@ fn 装配历史_回车看清单原文_照贴且关掉不动选中() {
     assert_eq!(app.as_history_sel, 2, "选中行一个字节不动");
 }
 
+// ---- #103 存档日志回看:l 翻开、照贴、只读;没有这一份时指路 ----
+
+/// 在历史视图里给选中派写一份存档日志(装配真跑过才会有),回 `l` 读它。
+fn history_with_log(tag: &str) -> App {
+    let app = history_app(tag);
+    // 选中派(字典序第三)的清单里有 lockId,存档日志就按它命名
+    let lock = app
+        .as_history_rows
+        .as_ref()
+        .and_then(|r| r.get(2))
+        .and_then(|row| match &row.status {
+            crate::datarepo::ManifestStatus::Ok(a) => a.brief.lock_id.clone(),
+            _ => None,
+        })
+        .expect("fixture 第三派有认得的清单");
+    let mut tee = crate::datarepo::LogTee::open(&app.nw_home, &lock).unwrap();
+    for l in [
+        "铺骨架…",
+        "落组件 retention",
+        "装配完成:convergeHash 3cf6a584",
+    ] {
+        tee.line(l).unwrap();
+    }
+    app
+}
+
+#[test]
+fn 存档日志_l翻开照贴stderr流_两档都在且不溢宽() {
+    let mut app = history_with_log("log-open");
+    key(&mut app, crossterm::event::KeyCode::Char('l'));
+    let body = app.as_history_log.clone().expect("l 翻开存档日志浮层");
+    assert!(body.contains("铺骨架…"), "stderr 流照贴:{body}");
+    assert!(
+        body.contains("convergeHash 3cf6a584"),
+        "停在哪一步看得见:{body}"
+    );
+    // 两档:浮层与正文都在,无行超宽
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let s = crate::testutil::frame_display(&app, w, h);
+        assert!(s.contains("存档日志"), "{w}×{h} 浮层标题在场:{s}");
+        assert!(s.contains("铺骨架…"), "{w}×{h} 内容在场:{s}");
+        assert!(s.contains("只读"), "{w}×{h} 注脚标明只读:{s}");
+        for line in s.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line) <= w as usize,
+                "{w}×{h} 有行超宽:{line:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn 存档日志_esc关掉_历史视图与选中行原样不动() {
+    let mut app = history_with_log("log-esc");
+    let sel_before = app.as_history_sel;
+    key(&mut app, crossterm::event::KeyCode::Char('l'));
+    assert!(app.as_history_log.is_some(), "先翻开");
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(app.as_history_log.is_none(), "Esc 关浮层");
+    assert!(app.as_history, "历史视图还在");
+    assert_eq!(
+        app.as_history_sel, sel_before,
+        "看日志不写选中态(「看」不是「挑」)"
+    );
+}
+
+#[test]
+fn 存档日志_没有这一份时给指路_不画空浮层() {
+    // 清单认得(有 lockId)但从没在面板里跑过装配:logs/ 下没有这一份。
+    let mut app = history_app("log-none");
+    key(&mut app, crossterm::event::KeyCode::Char('l'));
+    assert!(app.as_history_log.is_none(), "没有这一份:不画空浮层");
+    assert!(
+        app.log.iter().any(|l| l.contains("没有存档日志")),
+        "指路说清是「没有这一份」而不是读坏了:{:?}",
+        app.log
+    );
+}
+
+#[test]
+fn 存档日志_清单读不通时取不到lock_id_说清线索断了() {
+    let mut app = history_app("log-broken");
+    app.as_history_sel = 1; // 字典序第二位:写坏清单的 half
+    key(&mut app, crossterm::event::KeyCode::Char('l'));
+    assert!(app.as_history_log.is_none(), "没有 lockId 就无从读起");
+    assert!(
+        app.log.iter().any(|l| l.contains("取不到 lockId")),
+        "说清断在哪:{:?}",
+        app.log
+    );
+}
+
 #[test]
 fn 版本对照页_落后时给升级指路_只标记不治理() {
     let app = version_app(Some(crate::release::ReleaseProbe::Latest("v0.2.0".into())));

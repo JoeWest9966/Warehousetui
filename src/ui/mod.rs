@@ -351,6 +351,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('p'),
     },
     HelpRow {
+        key: "l",
+        desc: "装配历史:回看选中派的存档日志(只读)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('l'),
+    },
+    HelpRow {
         key: "Enter",
         desc: "回收站:复制选中条目的完整恢复路径",
         screen: Some(Screen::Assemble),

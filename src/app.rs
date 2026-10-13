@@ -370,6 +370,16 @@ pub struct App {
     pub as_bin_sel: usize,
     /// 从哪一派的视角翻进来的(#102):复用装配历史的选择,**不另立一个派选择槽**。
     pub as_bin_from: Option<String>,
+    /// 在途这一程的 lockId(#103):`launch_selected_lock` 选中哪条锁就记下,
+    /// `note_engine_dispatch` 的 `up` 臂据此开落盘 tee。**从下发时记下,不
+    /// 从 argv 反推**(#65-review 钉过的判法:argv 是给引擎的,不是给面板反推的)。
+    pub as_log_lock: Option<String>,
+    /// 装配 stderr 的落盘 tee(#103,ADR-0010 §6 的写例外):在途那一程的旁路
+    /// 副本。`None` = 这一程不落盘(安装根不可用 / 这一程没有 lockId 可命名 /
+    /// 已经收尾)。中止时**不**清它该写的内容:文件里留着已收到的行。
+    pub as_log_tee: Option<crate::datarepo::LogTee>,
+    /// 回看中的存档日志正文(#103:历史屏 `l` 翻开的顶层浮层)。
+    pub as_history_log: Option<String>,
 
     // ---- 健康 ----
     pub hl_mode: HealthMode,
@@ -638,6 +648,9 @@ impl App {
             as_bin_rows: None,
             as_bin_sel: 0,
             as_bin_from: None,
+            as_log_lock: None,
+            as_log_tee: None,
+            as_history_log: None,
             hl_mode: HealthMode::Doctor,
             hl_sel: 0,
             hl_result: None,
@@ -850,6 +863,23 @@ impl App {
                 self.as_history_raw = None;
                 // 回收站同理(#102):闲时的只读浏览视图,装配一启动就让位。
                 self.as_bin = false;
+                self.as_history_log = None;
+                // 落盘旁路(#103):这一程的 stderr 副本现在开出来。安装根不在
+                // / 读不了时不开,并把原因说给人听——不凭空造一棵 logs/ 树
+                // (规格故事 28),也不静默丢日志(那等于骗人说「有存档`)。
+                self.as_log_tee = match self.as_log_lock.take() {
+                    Some(lock) => match crate::datarepo::LogTee::open(&self.nw_home, &lock) {
+                        Ok(tee) => {
+                            self.push_log(format!("装配日志落盘:{}", tee.path().display()));
+                            Some(tee)
+                        }
+                        Err(e) => {
+                            self.push_log(format!("装配日志不落盘:{e}"));
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 self.push_log(format!("装配启动:{}", args.join(" ")));
             }
             Some("ls") => {
@@ -971,6 +1001,7 @@ impl App {
                 self.as_history_filter_on = false; // 装配历史过滤同理(#101)
                 self.as_history_raw = None; // 原文浮层不跨屏(#101)
                 self.as_bin = false; // 回收站视图不跨屏(#102)
+                self.as_history_log = None; // 存档日志浮层不跨屏(#103)
             }
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
@@ -1162,6 +1193,15 @@ impl App {
         self.push_log("装配已中止:在途 nw up 子进程已止(进程级,不等它跑完)");
         self.push_log("中止可能停在未收敛中间态:面板不宣布成功也不假装失败");
         self.push_log("重跑同一条装配命令即可收敛(up 幂等);收敛与否以健康屏 doctor 复核为准");
+        // 落盘 tee 收尾(#103):**已经收到的行留在盘上**——中止不清日志这条
+        // 纪律在盘上与在内存里同一条(ADR-0010 §6)。每行写完即 flush,所以
+        // 盘上不会有半行;文件到这里就是完整的「停在哪一步」。
+        if let Some(tee) = self.as_log_tee.take() {
+            self.push_log(format!(
+                "装配日志到此为止(中止前的行都在):{}",
+                tee.path().display()
+            ));
+        }
     }
 
     /// 关闭当前浮层,与键盘 Esc 完全同路:帮助只关灯,发射仪式
@@ -1177,6 +1217,9 @@ impl App {
             // 清单原文浮层(#101):只收状态,历史视图与选中行原样不动——
             // 看原文不写任何选中态(规格故事 3 是「看」,不是「挑」)。
             self.as_history_raw = None;
+        } else if self.as_history_log.is_some() {
+            // 存档日志浮层(#103):同理,只收状态——回看日志不写任何选中态。
+            self.as_history_log = None;
         } else if self.vps_reverse_open() {
             // 反查上浮结果浮层返航(#70):只收状态,册体一行不改、机器册原选中行
             // 原样在场——反查从头到尾不写 `vps_sel`(它在途时册体键位被吞、回音
@@ -1213,9 +1256,23 @@ impl App {
     fn on_engine(&mut self, ev: EngineEvent) {
         match ev {
             EngineEvent::Stderr(line) => {
-                self.as_log.push(line);
+                self.as_log.push(line.clone());
                 if self.as_log.len() > 500 {
                     self.as_log.drain(0..self.as_log.len() - 500);
+                }
+                // 落盘旁路(#103):与 `as_log` 同一个汇入处旁一份写文件。
+                // **tee 点选在 app 侧而不是 runner 侧**:runner 是「调 nw 子
+                // 进程」的唯一接缝(ADR-0010 §1),它不该知道 NW_HOME 布局,
+                // 更不该为了一条日志多背一个 lockId 参数;而 lockId 在这里
+                // 是现成的——`launch_selected_lock` 选中哪条锁,面板自己知道
+                // (从 argv 反推是 #65-review 明确否掉的判法)。
+                if let Some(tee) = self.as_log_tee.as_mut() {
+                    if let Err(e) = tee.line(&line) {
+                        // 写失败不拦装配:日志是旁路副本,不是装配的输入。
+                        // 但要说出来—— silently 丢日志等于骗操作者「有存档」。
+                        self.push_log(format!("装配日志写不进盘({e}):这一程没有存档"));
+                        self.as_log_tee = None; // 一路失败就一路不再试
+                    }
                 }
             }
             EngineEvent::Finished(out) => self.on_engine_finished(*out),
@@ -1276,6 +1333,12 @@ impl App {
                 }
             }
             "up" => {
+                // 收尾落盘 tee(#103):所有 Stderr 事件都排在 Finished 之前
+                // (runner 先 await 掉 stderr 读者任务再发回音,见 `spawn_fed`),
+                // 所以到这里这一程的 stderr 已经全部落盘。
+                if let Some(tee) = self.as_log_tee.take() {
+                    self.push_log(format!("装配日志存档:{}", tee.path().display()));
+                }
                 if self.as_aborted {
                     // 中止后的迟到回音(#59):这一程是被杀掉的,半途的 stdout
                     // 不是可信 envelope —— 丢弃,不拿半个结果冒充结论。
@@ -1430,6 +1493,14 @@ impl App {
         // `dismiss_popup`)。关掉后历史视图原样在场:看原文从头到尾不写
         // 选中行。
         if self.as_history_raw.is_some() {
+            if matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                self.dismiss_popup();
+            }
+            return;
+        }
+        // 存档日志浮层(#103):与清单原文浮层同级的顶层浮层——同一条吞键 /
+        // 同一条关闭链(Enter / Esc / q,鼠标点任意处走 `dismiss_popup`)。
+        if self.as_history_log.is_some() {
             if matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
                 self.dismiss_popup();
             }
@@ -1683,6 +1754,10 @@ impl App {
                 }
             }
             KeyCode::Enter => self.show_history_raw(),
+            // 回看存档日志(#103,规格故事 18):选中派的清单里记着 lockId,
+            // 据此读 logs/<lockId>/<lockId>.log。与 Enter(看清单原文)分工:
+            // 原文答「以哪个锁装成的」,日志答「那次装配停在哪一步」。
+            KeyCode::Char('l') => self.show_history_log(),
             // 重读快照(#101):显式刷新,不自动跑——文件可能在面板之外变过
             // (引擎自己装了一版),要新的就按一下。
             KeyCode::Char('r') => {
@@ -1715,6 +1790,7 @@ impl App {
             KeyCode::Char('h') => {
                 self.as_history = false;
                 self.as_history_raw = None;
+                self.as_history_log = None;
                 self.as_history_filter_on = false;
             }
             // Esc 两级(#61 / #69 同口径):有过滤词先清词,再按才退视图。
@@ -1725,6 +1801,7 @@ impl App {
                 } else {
                     self.as_history = false;
                     self.as_history_raw = None;
+                    self.as_history_log = None;
                 }
             }
             _ => {}
@@ -1768,6 +1845,52 @@ impl App {
                 self.as_bin_from = None;
             }
             _ => {}
+        }
+    }
+
+    /// 回看选中派的存档日志(#103):清单给的 lockId 是唯一的线索,所以
+    /// **没有认得的清单就无从知道该读哪一份**——三条路各自说各自的话,
+    /// 不共用一个空态(与清单原文浮层同口径)。
+    fn show_history_log(&mut self) {
+        let Some(rows) = self.as_history_rows.as_ref() else {
+            return;
+        };
+        let Some(&i) = self.history_visible().get(self.as_history_sel) else {
+            // 一个派都没读到(或全被过滤词筛掉):说一句,别让按键像死了
+            self.push_log("装配历史里没有选中的派:没有存档日志可回看");
+            return;
+        };
+        let lock_id = match &rows[i].status {
+            crate::datarepo::ManifestStatus::Ok(a) => a.brief.lock_id.clone(),
+            crate::datarepo::ManifestStatus::Missing => {
+                self.push_log("这一派还没有清单:没有 lockId,也就没有存档日志可看");
+                return;
+            }
+            crate::datarepo::ManifestStatus::Broken { reason } => {
+                self.push_log(format!("清单读不通,取不到 lockId:{reason}"));
+                return;
+            }
+            crate::datarepo::ManifestStatus::UnknownSchema { guard } => {
+                self.push_log(guard.message.clone());
+                return;
+            }
+        };
+        let Some(lock_id) = lock_id.filter(|l| !l.trim().is_empty()) else {
+            self.push_log("这一派的清单没给 lockId:不知道存档日志该读哪一份");
+            return;
+        };
+        match crate::datarepo::read_log(&self.nw_home, &lock_id) {
+            crate::datarepo::LogArchive::Ok { body, .. } => {
+                self.as_history_log = Some(body);
+            }
+            crate::datarepo::LogArchive::Missing => {
+                self.push_log(format!(
+                    "这一派没有存档日志({lock_id} 从没在面板里跑过装配,或日志被清过)"
+                ));
+            }
+            crate::datarepo::LogArchive::Broken { reason } => {
+                self.push_log(format!("存档日志读不出:{reason}"));
+            }
         }
     }
 
@@ -3907,6 +4030,9 @@ impl App {
             .and_then(|l| l.locks.get(self.as_sel))
             .and_then(|l| l.lock_id.clone());
         if let Some(lock) = lock {
+            // 记下这一程的 lockId(#103):落盘 tee 的文件名由它决定。这里记
+            // 而不是在 runner 里从 argv 挖——runner 不该知道 NW_HOME 布局。
+            self.as_log_lock = Some(lock.clone());
             self.queue
                 .push(commands::up(&self.lock_carrier(&lock), None));
             self.as_confirm = false;
@@ -3933,6 +4059,7 @@ impl App {
         self.catalog_filter_on = false; // 编目册过滤同理(#69):退输入态、留词
         self.as_history_filter_on = false; // 装配历史过滤同理(#101)
         self.as_history_raw = None; // 原文浮层不跨屏(#101)
+        self.as_history_log = None; // 存档日志浮层不跨屏(#103)
     }
 
     pub fn prev_screen(&mut self) {
@@ -3942,6 +4069,7 @@ impl App {
         self.catalog_filter_on = false;
         self.as_history_filter_on = false;
         self.as_history_raw = None;
+        self.as_history_log = None;
     }
 
     pub fn cycle_theme(&mut self) {
@@ -4344,6 +4472,257 @@ mod tests {
         app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
         assert!(!app.assembling);
         assert!(app.as_result.is_some());
+    }
+
+    // ---- #103 装配 stderr 落盘:四路径都在、确定命名、无机密本体、中止不留半行 ----
+
+    /// 一座**真的**安装根(#103):落盘是写 NW_HOME 的特批例外,测试因此必须
+    /// 钉一座临时目录,不能拿进程环境里的真安装根写(那会污染开发机)。
+    fn log_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nwt-log-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 一台「有锁定集可选、安装根是真的」的装配屏台子。
+    fn log_ready_app(tag: &str) -> App {
+        let mut app = fake_app();
+        app.splash = false;
+        app.screen = Screen::Assemble;
+        app.nw_home = log_home(tag).display().to_string();
+        app.ls = Some(
+            serde_json::from_str::<LsData>(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"9f8e"}]}"#,
+            )
+            .unwrap(),
+        );
+        app
+    }
+
+    /// 装配 stderr 的夹具(形状照引擎真样本的口径:七步人话 + env **布尔**)。
+    /// 引擎纪律:env 只报 present,本体只从 stdin 进——所以这一串里没有任何
+    /// 机密本体可漏,测试据此断言「面板不多写一行」。
+    const UP_STDERR_LINES: [&str; 4] = [
+        "铺骨架…",
+        "落组件 retention",
+        "env present: GH_TOKEN",
+        "装配完成:convergeHash 3cf6a584",
+    ];
+
+    /// 走完整条发射路:选锁 → 开发射仪式 → 发射(入队 up)→ 主循环取出下发
+    /// (`spawn_engine` 是 tee 的开设点)。
+    fn launch_and_dispatch(app: &mut App) {
+        app.as_sel = 0;
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.as_confirm, "Enter 打开发射仪式");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        // 主循环每个 tick 把 queue 里的 argv 交给 runner;这里手动那一抽。
+        for args in std::mem::take(&mut app.queue) {
+            app.spawn_engine(args, &mpsc::unbounded_channel().0);
+        }
+    }
+
+    /// `up` 回音(与 `screens::tests::out` 同形状;本模块测试自己备一份,
+    /// 不跨模块借私有助手)。
+    fn up_out(rc: i32, json: &str) -> EngineOutput {
+        EngineOutput {
+            args: vec!["up".into(), "--lock".into(), "9f8e".into()],
+            exit_code: crate::engine::ExitCode::from_number(rc),
+            ok: rc == 0,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(json).ok(),
+            raw_stdout: json.to_string(),
+            parse_error: None,
+        }
+    }
+
+    /// 把在途 stderr 一行行喂进去(与 runner 推 UI 的那串同一条路)。
+    fn feed_stderr(app: &mut App) {
+        for l in UP_STDERR_LINES {
+            app.update(Message::Engine(EngineEvent::Stderr(l.to_string())));
+        }
+    }
+
+    /// 落盘文件的内容(读盘,不通过 App)。
+    /// 落盘文件的内容(读盘,不通过 App)。
+    ///
+    /// **只算路径、不建目录**:`log_home` 每个用例开头会 `remove_dir_all`
+    /// 清场,读的时候再调它就把刚写好的存档擦了(第一版就这么错过)。
+    fn archived(tag: &str, lock_id: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("nwt-log-{}-{tag}", std::process::id()));
+        let path = crate::datarepo::log_path(&dir.display().to_string(), lock_id);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("存档该在 {}:{e}", path.display()))
+    }
+
+    #[test]
+    fn 装配四路径_日志文件都在_内容就是stderr流() {
+        // 四条路径(#6 的四态):成功 / 失败 / 空 stderr(没起来成) / 中止。
+        // 每条都断言「文件在 + 内容是那一程的 stderr」。
+        let ok = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","components":["retention"],"envMissing":[],"lockId":"9f8e","convergeHash":"abc"}}"#;
+        let bad = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":false,"errors":[{"code":"APPLY_FAILED","exitCode":4,"message":"sha256 不符","hint":"重新 bake","details":{"file":"bin/pi"}}],"warnings":[],"data":null}"#;
+
+        // ① 成功
+        let mut app = log_ready_app("ok");
+        launch_and_dispatch(&mut app);
+        feed_stderr(&mut app);
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_out(
+            0, ok,
+        )))));
+        assert_eq!(
+            archived("ok", "9f8e"),
+            format!("{}\n", UP_STDERR_LINES.join("\n")),
+            "成功路径:stderr 一行不落"
+        );
+
+        // ② 失败(rc 4)
+        let mut app = log_ready_app("fail");
+        launch_and_dispatch(&mut app);
+        feed_stderr(&mut app);
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_out(
+            4, bad,
+        )))));
+        assert_eq!(
+            archived("fail", "9f8e"),
+            format!("{}\n", UP_STDERR_LINES.join("\n")),
+            "失败路径:日志照样在(失败也要知道停在哪一步)"
+        );
+
+        // ③ 一行 stderr 都没有(引擎没起来成那种):文件仍在,只是空的
+        let mut app = log_ready_app("quiet");
+        launch_and_dispatch(&mut app);
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_out(
+            -1, "",
+        )))));
+        assert_eq!(archived("quiet", "9f8e"), "", "零行 stderr:文件在、内容空");
+
+        // ④ 中止:见下一条测试(它另外断言「没有半行」)
+    }
+
+    #[test]
+    fn 落盘内容只有stderr流_不把argv_nw_home或env值写进去() {
+        let mut app = log_ready_app("secret");
+        launch_and_dispatch(&mut app);
+        feed_stderr(&mut app);
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_out(
+            0, "",
+        )))));
+        let body = archived("secret", "9f8e");
+        // 机密纪律(规格故事 20 / ADR-0009):落盘的是 stderr 的旁路副本,
+        // 面板自己知道的任何东西都不进去——
+        assert!(
+            !body.contains("--lock") && !body.contains("nwlock"),
+            "下发的 argv 不进日志:{body}"
+        );
+        assert!(
+            !body.contains(&app.nw_home),
+            "安装根路径本身不进日志:{body}"
+        );
+        assert!(!body.contains("9f8e.nwlock"), "载体文件名不进日志:{body}");
+        // env 只有布尔(引擎纪律),没有任何值:fixture 里那个 GH_TOKEN 是
+        // present 布尔,不是本体——这一行在,正说明「只记布尔」被保留了。
+        assert!(
+            body.contains("env present: GH_TOKEN"),
+            "布尔行原样在:{body}"
+        );
+        assert_eq!(
+            body.lines().count(),
+            UP_STDERR_LINES.len(),
+            "一行不多:落盘内容恰好是 stderr 流(面板无可添加的第二真相源)"
+        );
+    }
+
+    #[test]
+    fn 中止_盘上不留半个文件_已收到的行都在() {
+        let mut app = log_ready_app("abort");
+        launch_and_dispatch(&mut app);
+        // 只喂了两行就中止(第三行永远没来)
+        app.update(Message::Engine(EngineEvent::Stderr(
+            UP_STDERR_LINES[0].to_string(),
+        )));
+        app.update(Message::Engine(EngineEvent::Stderr(
+            UP_STDERR_LINES[1].to_string(),
+        )));
+        app.update(Message::Key(key('x')));
+        let body = archived("abort", "9f8e");
+        assert_eq!(
+            body,
+            format!("{}\n{}\n", UP_STDERR_LINES[0], UP_STDERR_LINES[1]),
+            "中止前的行都在,后面一行没有(没有半行、没有占位)"
+        );
+        assert!(
+            body.ends_with('\n'),
+            "最后一行是完整的:逐行写完即 flush,被 kill 也不留腰斩的半行"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("装配日志到此为止")),
+            "中止时明说存档到此为止:{:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn 安装根不在_不落盘也不造目录_指路说给人听() {
+        let mut app = log_ready_app("nohome");
+        // 把安装根指到一个不存在的目录(规格故事 28:不拼错路径、不造目录)
+        app.nw_home = std::env::temp_dir()
+            .join(format!("nwt-log-gone-{}", std::process::id()))
+            .display()
+            .to_string();
+        launch_and_dispatch(&mut app);
+        feed_stderr(&mut app);
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_out(
+            0, "",
+        )))));
+        assert!(
+            app.log.iter().any(|l| l.contains("装配日志不落盘")),
+            "不落盘要说出来:{:?}",
+            app.log
+        );
+        assert!(
+            !std::path::Path::new(&app.nw_home).exists(),
+            "更不许 create_dir_all 顺手造出一座安装根"
+        );
+        assert!(
+            !app.as_log.is_empty(),
+            "内存里的 stderr 日志不受影响(落盘是旁路,不是前提)"
+        );
+    }
+
+    #[test]
+    fn 落盘命名按lock_id确定_同一条锁重跑落在同一个文件() {
+        let mut app = log_ready_app("rename");
+        // 第一程
+        launch_and_dispatch(&mut app);
+        feed_stderr(&mut app);
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_out(
+            0, "",
+        )))));
+        // 第二程(up 幂等,同一条锁)
+        launch_and_dispatch(&mut app);
+        feed_stderr(&mut app);
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_out(
+            0, "",
+        )))));
+        let body = archived("rename", "9f8e");
+        assert_eq!(
+            body.lines().filter(|l| l.starts_with("铺骨架")).count(),
+            2,
+            "两程都在同一个文件里(确定命名 ⇒ 重跑不另起一个):{body}"
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("装配日志落盘:") && l.contains("logs/9f8e/9f8e.log")),
+            "落盘点在日志里明说,shell 里照它找:{:?}",
+            app.log
+        );
     }
 
     // ---- #59 up 中途取消:进程级中止,日志不清空,收敛路由指给健康屏 ----
@@ -7844,6 +8223,7 @@ mod tests {
         as_history_filter_on: bool,
         as_history_raw_on: bool,
         as_bin: bool,
+        as_history_log_on: bool,
         pending_editor: bool,
         mouse_enabled: bool,
         settings_page: SettingsPage,
@@ -7877,6 +8257,7 @@ mod tests {
             as_history_filter_on: a.as_history_filter_on,
             as_history_raw_on: a.as_history_raw.is_some(),
             as_bin: a.as_bin,
+            as_history_log_on: a.as_history_log.is_some(),
             pending_editor: a.pending_editor,
             mouse_enabled: a.mouse_enabled,
             settings_page: a.settings_page,
