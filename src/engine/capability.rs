@@ -9,6 +9,9 @@
 //!   答案永远来自引擎当下这一跑,不记某版本有没有——上游一发版面板
 //!   自动跟上。
 //! - 探测失败走既有指路屏语义(见 [`GateHint`]),不瘫痪、不冒充。
+//! - **证据是引擎原文,随进程生命周期**:每次探测的证据(见
+//!   [`ProbeEvidence`])只从那一跑的回放取,原样入账、原样取回;不落盘、
+//!   不进崩溃上报、不跨启动缓存 —— 重启重探即刷新,面板不建本地能力版本表。
 //!
 //! # 入口清单怎么长(#63 立的规矩)
 //!
@@ -163,20 +166,135 @@ pub fn interpret(out: &EngineOutput) -> Probe {
     Probe::Unknown
 }
 
+/// 一次能力探测的证据:面板问的是哪个引擎、引擎那一跑自己怎么答的。
+///
+/// # 不变量
+///
+/// - **证据是引擎原文**:字段只从那一跑的回放(`EngineOutput`)与开机已探明的
+///   引擎身份取,不猜测、不改写、不美化,也不回显任何本体(探针无参,证据
+///   只可能碰到 argv / stderr 人话 / envelope schema / rc)。
+/// - **引擎无话可说时不造句**:那一跑没到过真引擎(二进制缺失)、或既无
+///   stderr 人话也无 envelope 时,如实写「引擎未给出可解回答」并附 rc ——
+///   面板绝不替引擎回答,也不把面板自己的指路素材冒充成引擎原话。
+/// - **随进程生命周期**:只在内存里跟着 [`Gate`] 走,不落盘、不进崩溃上报、
+///   不做跨启动持久化 —— 重启重探即刷新(spec #90:不建本地能力版本表)。
+///
+/// 后面的贵表面(编目册册体 #122、设置屏 #123、四处单行指路 #124)取用同一
+/// 份字段与同一句结论,不各自再采集一遍。
+#[derive(Clone, Debug)]
+pub struct ProbeEvidence {
+    /// 探针 argv(无旗标,一次无害调用):证明面板问的是哪条命令面。
+    pub argv: Vec<String>,
+    /// 生效引擎 bin。二进制缺失时如实记「未发现」——证据带要能分辨
+    /// 「问错二进制」,也要能分辨「根本没找到二进制」。
+    pub bin: String,
+    /// 引擎来源,口径同 `discover::Source::label()`(--nw-bin 指定 / 配置文件 /
+    /// PATH / $NW_HOME/nw)。
+    pub source: &'static str,
+    /// 引擎版本:复用开机版本探测结论,不新增引擎调用;「探测中」/「未知」
+    /// 两态如实呈现,不当成确定性版本号。
+    pub version: String,
+    /// 引擎那一跑的原文:stderr 首条非空人话优先(判定顺序:人话优先于
+    /// envelope,与 [`interpret`] 同源);没有则 envelope 的 schema 原文
+    /// (契约守卫命中也如实记 schema 原文);两者皆无 = 「引擎未给出可解回答」。
+    pub words: String,
+    /// 那一跑的退出码(数字口径同 `ExitCode::number()`,未登记码按 3 兜底
+    /// 与引擎一致)。
+    pub exit_code: i32,
+}
+
+/// 引擎没给出可解回答时的如实写法。附在证据里,rc 由同一份证据带出 ——
+/// 面板不编一句引擎没说过的话。
+const NO_ANSWER: &str = "引擎未给出可解回答";
+
+impl ProbeEvidence {
+    /// 从那一跑的回放与开机已探明的引擎身份立一份证据(纯函数)。
+    ///
+    /// `bin` 为 `None` = 发现失败、那一跑没到过真引擎:此刻引擎无话可说,
+    /// 证据不拿 `MissingRunner` 的指路素材冒充原话。`version` 取开机的
+    /// `--version` 回音(已探明,不在这里再问引擎一次)。
+    pub fn capture(
+        out: &EngineOutput,
+        bin: Option<&str>,
+        source: &'static str,
+        version: &str,
+    ) -> Self {
+        // 没到过真引擎就没有「引擎原话」可言;到过了才按判定顺序取原文。
+        let reached_engine = bin.is_some() || out.envelope.is_some();
+        let words = if reached_engine {
+            out.stderr_tail
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty())
+                .map(str::to_string)
+                .or_else(|| out.envelope.as_ref().map(|e| e.schema.clone()))
+                .unwrap_or_else(|| NO_ANSWER.to_string())
+        } else {
+            NO_ANSWER.to_string()
+        };
+        Self {
+            argv: out.args.clone(),
+            bin: bin.unwrap_or("未发现").to_string(),
+            source,
+            version: version.to_string(),
+            words,
+            exit_code: out.exit_code.number(),
+        }
+    }
+
+    /// 探针 argv 的展示形态(`nw vps`),与 `EngineOutput::command_string`
+    /// 同口径。
+    pub fn probe_display(&self) -> String {
+        format!("nw {}", self.argv.join(" "))
+    }
+
+    /// 把「入口 + 三态 + 证据」排成一行结论句。
+    ///
+    /// 措辞与字段一处真相:日志结论句与册体证据带(#122 起)共用这一行,
+    /// 所以不写日志腔 —— 三态由 [`Probe::label`] 如实分呈,证据字段一样
+    /// 不少,操作者据此可分辨「引擎旧」「探测未决」「问错二进制」三种真相。
+    pub fn conclusion(&self, cap: Capability, verdict: Probe) -> String {
+        format!(
+            "能力探测:{} {} · {} ({}, {}) · 探针 {} · 引擎原话:{} (rc {})",
+            cap.label(),
+            verdict.label(),
+            self.bin,
+            self.source,
+            self.version,
+            self.probe_display(),
+            self.words,
+            self.exit_code,
+        )
+    }
+}
+
 /// 探测结果账:入口可用性的唯一事实来源(默认全 Unknown = 未决)。
+///
+/// 每个能力在 verdict 之外按能力存一份 [`ProbeEvidence`]:结论说「开不开」,
+/// 证据说「凭什么」——呈现表面(日志 / 册体 / 设置屏)只读取,不重新采集。
 #[derive(Default)]
 pub struct Gate {
-    results: HashMap<Capability, Probe>,
+    results: HashMap<Capability, (Probe, Option<ProbeEvidence>)>,
 }
 
 impl Gate {
-    pub fn record(&mut self, cap: Capability, verdict: Probe) {
-        self.results.insert(cap, verdict);
+    /// 收账:verdict 与证据一并写入。`evidence` 为 `None` = 这一跑没有证据
+    /// (非探针回音驱动的结论),读回时如实给 `None`,不补造。
+    pub fn record(&mut self, cap: Capability, verdict: Probe, evidence: Option<ProbeEvidence>) {
+        self.results.insert(cap, (verdict, evidence));
     }
 
     /// 某能力的探测结论;没探测过/失败 = Unknown。
     pub fn get(&self, cap: Capability) -> Probe {
-        self.results.get(&cap).copied().unwrap_or(Probe::Unknown)
+        self.results
+            .get(&cap)
+            .map(|(v, _)| *v)
+            .unwrap_or(Probe::Unknown)
+    }
+
+    /// 某能力的探测证据;未探测过/未收证据 = None。原样取回。
+    pub fn evidence(&self, cap: Capability) -> Option<&ProbeEvidence> {
+        self.results.get(&cap).and_then(|(_, ev)| ev.as_ref())
     }
 
     /// 入口门:只有引擎明确「有」才放行;未决与禁用一律不给。
@@ -277,12 +395,81 @@ mod tests {
     fn 未探测默认未决_只有明确可用才开门() {
         let gate = Gate::default();
         assert_eq!(gate.get(Capability::Tag), Probe::Unknown);
+        assert!(gate.evidence(Capability::Tag).is_none(), "未探测过没有证据");
         assert!(!gate.enabled(Capability::Tag), "未决不放行");
         let mut g = Gate::default();
-        g.record(Capability::Tag, Probe::Unavailable);
+        g.record(Capability::Tag, Probe::Unavailable, None);
         assert!(!g.enabled(Capability::Tag), "禁用不放行");
-        g.record(Capability::SourceRegister, Probe::Available);
+        assert!(g.evidence(Capability::Tag).is_none(), "没收证据就是 None");
+        g.record(Capability::SourceRegister, Probe::Available, None);
         assert!(g.enabled(Capability::SourceRegister), "明确可用才放行");
+    }
+
+    #[tokio::test]
+    async fn 探针回未知子命令_禁用且证据含引擎人话原文() {
+        // 「问错二进制」的实证形态:同机另一个自称 0.1.0 的构建对 `nw vps`
+        // 回「未知子命令」。判禁用的同时,证据要留住引擎那一跑的原话。
+        let out = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
+        let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH", "0.1.0");
+        let mut gate = Gate::default();
+        gate.record(Capability::Vps, interpret(&out), Some(ev));
+        assert_eq!(gate.get(Capability::Vps), Probe::Unavailable);
+        assert!(!gate.enabled(Capability::Vps), "禁用不放行");
+        let ev = gate.evidence(Capability::Vps).expect("禁用也要收证据");
+        assert_eq!(ev.argv, vec!["vps".to_string()], "探针 argv 原样入账");
+        assert_eq!(ev.bin, "/tmp/nw");
+        assert_eq!(ev.source, "PATH");
+        assert_eq!(ev.version, "0.1.0");
+        assert_eq!(ev.words, "nw: 未知子命令 \"vps\"", "引擎原话不改写");
+        assert_eq!(ev.exit_code, 3);
+    }
+
+    #[tokio::test]
+    async fn 探针回_envelope_可用且证据记_schema_原文() {
+        // 可用态同样收证据:册体证据带(#122)与日志都要能说出「引擎答的是
+        // 哪句 schema」——只有原文可信,版本号推不出能力结论。
+        let out = out_for(
+            &["vps"],
+            3,
+            r#"{"schema":"nw/vps-register.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[],"data":{}}"#,
+            &[],
+        )
+        .await;
+        let ev = ProbeEvidence::capture(&out, Some("/usr/local/bin/nw"), "PATH", "0.1.0");
+        let mut gate = Gate::default();
+        gate.record(Capability::Vps, interpret(&out), Some(ev));
+        assert_eq!(gate.get(Capability::Vps), Probe::Available);
+        assert!(gate.enabled(Capability::Vps), "明确可用才放行");
+        let ev = gate.evidence(Capability::Vps).expect("可用也收证据");
+        assert_eq!(ev.words, "nw/vps-register.v1", "证据记 schema 原文");
+        assert_eq!(ev.exit_code, 3);
+    }
+
+    #[tokio::test]
+    async fn 引擎无话可说_未决且证据如实记未给出可解回答_不编造() {
+        // 三种「引擎没答上」:二进制缺失(那一跑没到过真引擎)、空回、
+        // stdout 不可解。一律未决,证据一律如实写「引擎未给出可解回答」
+        // 并附 rc——面板不替引擎造句。
+        let missing = MissingRunner {
+            attempted: vec!["PATH".into()],
+        }
+        .run(&["vps".to_string()])
+        .await;
+        assert_eq!(interpret(&missing), Probe::Unknown);
+        let ev = ProbeEvidence::capture(&missing, None, "未发现", "未知");
+        assert_eq!(ev.words, "引擎未给出可解回答");
+        assert_eq!(ev.exit_code, 2);
+        assert_eq!(ev.bin, "未发现", "没找到二进制也如实记");
+        let blank = out_for(&["vps"], 0, "", &[]).await;
+        let ev = ProbeEvidence::capture(&blank, Some("/tmp/nw"), "PATH", "0.1.0");
+        assert_eq!(interpret(&blank), Probe::Unknown);
+        assert_eq!(ev.words, "引擎未给出可解回答");
+        assert_eq!(ev.exit_code, 0);
+        let unsolvable = out_for(&["vps"], 3, "这不是 envelope", &[]).await;
+        let ev = ProbeEvidence::capture(&unsolvable, Some("/tmp/nw"), "PATH", "0.1.0");
+        assert_eq!(interpret(&unsolvable), Probe::Unknown);
+        assert_eq!(ev.words, "引擎未给出可解回答");
+        assert_eq!(ev.exit_code, 3);
     }
 
     #[test]
@@ -329,6 +516,115 @@ mod tests {
         assert_ne!(
             Capability::RecipeNew.probe_args(),
             Capability::RecipeBake.probe_args()
+        );
+    }
+
+    #[tokio::test]
+    async fn 结论句_禁用态与未决态各带齐证据字段_互不冒充() {
+        // 这一行同时是日志结论句与册体证据带(#122 起共用同一措辞与字段),
+        // 所以禁用态与未决态都要带齐证据,且各说各话、不互相冒充。
+        let bad = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
+        let ev = ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH", "0.1.0");
+        let line = ev.conclusion(Capability::Vps, Probe::Unavailable);
+        assert!(line.contains("能力探测:vps 入口禁用"), "{line}");
+        assert!(line.contains("/tmp/nw"), "bin 在场:{line}");
+        assert!(line.contains("(PATH, 0.1.0)"), "来源与版本在场:{line}");
+        assert!(line.contains("探针 nw vps"), "探针 argv 在场:{line}");
+        assert!(
+            line.contains("引擎原话:nw: 未知子命令 \"vps\" (rc 3)"),
+            "引擎原话与 rc 在场:{line}"
+        );
+        // 未决:同构字段一个不少,但不出现「入口禁用」字样
+        let missing = MissingRunner {
+            attempted: vec!["PATH".into()],
+        }
+        .run(&["vps".to_string()])
+        .await;
+        let ev = ProbeEvidence::capture(&missing, None, "未发现", "未知");
+        let line = ev.conclusion(Capability::Vps, Probe::Unknown);
+        assert!(line.contains("能力探测:vps 未决"), "{line}");
+        assert!(!line.contains("入口禁用"), "未决不冒充禁用:{line}");
+        assert!(line.contains("探针 nw vps"), "未决也带探针:{line}");
+        assert!(
+            line.contains("引擎原话:引擎未给出可解回答 (rc 2)"),
+            "没答上就如实说没答上:{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn 同版本号双构建_证据分辨问错二进制() {
+        // 立项实证:两个都自称 0.1.0 的构建,`nw vps` 一个回 envelope、一个回
+        // 「未知子命令」。版本号推不出能力结论,证据要能分辨问错了二进制。
+        let good = out_for(
+            &["vps"],
+            3,
+            r#"{"schema":"nw/vps-register.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[],"data":{}}"#,
+            &[],
+        )
+        .await;
+        let bad = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
+        let mut gate = Gate::default();
+        gate.record(
+            Capability::Vps,
+            interpret(&good),
+            Some(ProbeEvidence::capture(
+                &good,
+                Some("/usr/local/bin/nw"),
+                "PATH",
+                "0.1.0",
+            )),
+        );
+        assert!(gate.enabled(Capability::Vps), "回 envelope 判可用");
+        // 换成指着 /tmp/nw 再探一次:同一能力重新收账,证据随之刷新
+        // (证据随进程生命周期,不跨启动缓存)。
+        gate.record(
+            Capability::Vps,
+            interpret(&bad),
+            Some(ProbeEvidence::capture(
+                &bad,
+                Some("/tmp/nw"),
+                "PATH",
+                "0.1.0",
+            )),
+        );
+        assert!(!gate.enabled(Capability::Vps), "回未知子命令判禁用");
+        let ev = gate.evidence(Capability::Vps).expect("禁用也要收证据");
+        assert_eq!(ev.version, "0.1.0", "两个构建同版本号");
+        assert_eq!(ev.bin, "/tmp/nw", "bin 可分辨");
+        assert_eq!(ev.words, "nw: 未知子命令 \"vps\"", "引擎原话可分辨");
+        let line = ev.conclusion(Capability::Vps, Probe::Unavailable);
+        assert!(line.contains("/tmp/nw"), "结论句点名生效二进制:{line}");
+        assert!(
+            line.contains("0.1.0"),
+            "版本号照实呈现,但不作为能力依据:{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn 证据只取引擎原话与_schema_不回显本体() {
+        // 探针无参(argv 面无任何载荷形参),证据只可能碰到 argv / stderr 人话 /
+        // envelope schema / rc;envelope 的 data(可能含本体)一个字节都不进
+        // 证据带(ADR-0009:永不回显本体)。
+        let out = out_for(
+            &["key"],
+            3,
+            r#"{"schema":"nw/key-register.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[],"data":{"key":"sk-live-绝密本体"}}"#,
+            &[],
+        )
+        .await;
+        let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH", "0.1.0");
+        let line = ev.conclusion(Capability::Key, Probe::Available);
+        assert!(
+            line.contains("nw/key-register.v1"),
+            "schema 原文在场:{line}"
+        );
+        assert!(!line.contains("sk-live"), "本体不进证据:{line}");
+        assert!(!line.contains("绝密"), "本体字样一个字节都不出现:{line}");
+        assert!(!line.contains("data"), "只取 schema,不摊 data:{line}");
+        assert!(
+            ev.argv.iter().all(|a| !a.starts_with('-')),
+            "探针 argv 无旗标:{:?}",
+            ev.argv
         );
     }
 

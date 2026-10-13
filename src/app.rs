@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 
 use crate::engine::{
     capability::{self, Capability, Probe},
-    commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, Gate, LsData, State,
+    commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, Gate, LsData, ProbeEvidence,
+    State,
 };
 use crate::input::{self, InputAction};
 use crate::layout::{hitmap, size_class, ScrollDir, Target};
@@ -1156,11 +1157,20 @@ impl App {
             _ => {
                 if let Some(cap) = Capability::from_probe(&out.args) {
                     let verdict = capability::interpret(&out);
+                    // 证据(#118):探针 argv 与引擎那一跑的原文随 verdict 一并
+                    // 入账;bin / 来源取开机发现结论,版本复用开机版本探测
+                    // (已探明,不在这里再问引擎一次)。
+                    let ev = ProbeEvidence::capture(
+                        &out,
+                        self.engine.bin.as_deref(),
+                        self.engine.source,
+                        &self.engine_version,
+                    );
                     if verdict != Probe::Available {
-                        // 日志只记一句人话;指路全文归设置屏能力清单。
-                        self.push_log(format!("能力探测:{} {}", cap.label(), verdict.label()));
+                        // 日志只记一句带证据的结论;指路全文归设置屏能力清单。
+                        self.push_log(ev.conclusion(cap, verdict));
                     }
-                    self.capabilities.record(cap, verdict);
+                    self.capabilities.record(cap, verdict, Some(ev));
                 }
             }
         }
@@ -3358,6 +3368,115 @@ mod tests {
         assert_eq!(app.ls.as_ref().unwrap().profiles.len(), 2);
     }
 
+    /// 把一条引擎回音喂给面板(探针回音走的正是这条路)。
+    async fn feed_probe(app: &mut App, args: &[&str]) {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let out = app.runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+    }
+
+    #[tokio::test]
+    async fn 能力探测回音_禁用态连同证据入账_日志结论句带齐证据() {
+        // 「问错二进制」的回放:引擎亲口说没有 vps 命令组。禁用之外,证据
+        // (bin / 来源 / 版本 / 探针 argv / 引擎原话 + rc)要一并入账,
+        // 日志那句从干巴巴的「能力探测:vps 入口禁用」换成带证据的一行。
+        let fake = Arc::new(FakeRunner::with_stderr(&[(
+            "vps",
+            3,
+            "",
+            "nw: 未知子命令 \"vps\"",
+        )]));
+        let mut app = App::with_runner(fake.clone());
+        app.engine_version = "0.1.0".into(); // 开机版本回音已到,复用不再问
+        feed_probe(&mut app, &["vps"]).await;
+        assert_eq!(app.capabilities.get(Capability::Vps), Probe::Unavailable);
+        assert!(!app.entry_enabled(Capability::Vps), "禁用不放行");
+        let ev = app
+            .capabilities
+            .evidence(Capability::Vps)
+            .expect("禁用也要收证据");
+        assert_eq!(ev.words, "nw: 未知子命令 \"vps\"", "引擎原话原样入账");
+        assert_eq!(ev.argv, vec!["vps".to_string()]);
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("能力探测"))
+            .expect("非可用要占日志");
+        assert!(line.contains("能力探测:vps 入口禁用"), "{line}");
+        assert!(line.contains("<fake>"), "生效 bin 在场:{line}");
+        assert!(line.contains("(测试注入, 0.1.0)"), "来源与版本在场:{line}");
+        assert!(line.contains("探针 nw vps"), "探针 argv 在场:{line}");
+        assert!(
+            line.contains("引擎原话:nw: 未知子命令 \"vps\" (rc 3)"),
+            "引擎原话与 rc 在场:{line}"
+        );
+        assert_eq!(
+            fake.call_argvs(),
+            vec![vec!["vps".to_string()]],
+            "版本复用开机结论,不新增引擎调用"
+        );
+    }
+
+    #[tokio::test]
+    async fn 能力探测回音_可用态入账但不占日志() {
+        let mut app = App::with_runner(Arc::new(FakeRunner::new(&[(
+            "vps",
+            3,
+            r#"{"schema":"nw/vps-register.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[],"data":{}}"#,
+        )])));
+        app.engine_version = "0.1.0".into();
+        feed_probe(&mut app, &["vps"]).await;
+        assert_eq!(app.capabilities.get(Capability::Vps), Probe::Available);
+        assert!(app.entry_enabled(Capability::Vps), "明确可用才放行");
+        let ev = app
+            .capabilities
+            .evidence(Capability::Vps)
+            .expect("可用也收证据(册体证据带取用)");
+        assert_eq!(ev.words, "nw/vps-register.v1");
+        assert!(
+            !app.log.iter().any(|l| l.contains("能力探测")),
+            "可用态不占日志:{:?}",
+            app.log
+        );
+    }
+
+    #[tokio::test]
+    async fn 能力探测回音_引擎缺失未决_日志如实记未给出可解回答() {
+        // 引擎没找到:那一跑没到过真引擎,证据不拿指路素材冒充原话,
+        // 如实记「引擎未给出可解回答」并附 rc;未决不冒充禁用。
+        let mut app = App::with_runner(Arc::new(crate::engine::MissingRunner {
+            attempted: vec!["PATH".into()],
+        }));
+        app.engine = EngineStatus {
+            found: false,
+            bin: None,
+            source: "未发现",
+            attempted: vec!["PATH".into()],
+        };
+        feed_probe(&mut app, &["vps"]).await;
+        assert_eq!(app.capabilities.get(Capability::Vps), Probe::Unknown);
+        assert!(!app.entry_enabled(Capability::Vps), "未决不放行");
+        let ev = app
+            .capabilities
+            .evidence(Capability::Vps)
+            .expect("未决也收证据");
+        assert_eq!(ev.words, "引擎未给出可解回答");
+        assert_eq!(ev.exit_code, 2);
+        assert_eq!(ev.bin, "未发现", "没找到二进制也如实记");
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("能力探测"))
+            .expect("非可用要占日志");
+        assert!(line.contains("能力探测:vps 未决"), "{line}");
+        assert!(!line.contains("入口禁用"), "未决不冒充禁用:{line}");
+        assert!(line.contains("探针 nw vps"), "未决也带探针:{line}");
+        assert!(
+            line.contains("引擎原话:引擎未给出可解回答 (rc 2)"),
+            "没答上就如实说没答上:{line}"
+        );
+    }
+
     #[test]
     fn q_退出但装配态禁用() {
         let mut app = fake_app();
@@ -4140,7 +4259,7 @@ mod tests {
             .unwrap(),
         );
         app.capabilities
-            .record(Capability::RecipeBake, capability::Probe::Available);
+            .record(Capability::RecipeBake, capability::Probe::Available, None);
         app
     }
 
@@ -4160,7 +4279,7 @@ mod tests {
         // 引擎没有 recipe bake 能力
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeBake, capability::Probe::Unavailable);
+            .record(Capability::RecipeBake, capability::Probe::Unavailable, None);
         assert_eq!(
             app.bake_suggest_gate(),
             Err(commands::BakeGate::NoCapability)
@@ -4195,7 +4314,7 @@ mod tests {
         // 翻转只读选中态——只留一句与呈现层同源的指路。
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeBake, capability::Probe::Unavailable);
+            .record(Capability::RecipeBake, capability::Probe::Unavailable, None);
         let n = app.queue.len();
         app.update(Message::Key(key('c')));
         assert!(!app.rc_bake_sel, "引擎无能力时 c 不翻只读选中态");
@@ -4241,7 +4360,7 @@ mod tests {
         // 齐备:门放行(面板仍只读呈现,不执行)
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeNew, capability::Probe::Available);
+            .record(Capability::RecipeNew, capability::Probe::Available, None);
         app.data_root = Some("/tmp".into());
         assert!(app.recipe_new_suggest_gate().is_ok(), "三前提齐备门放行");
         // 选中行不是配方(配方域为空)
@@ -4261,7 +4380,7 @@ mod tests {
         // 引擎没有 recipe new 能力
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeNew, capability::Probe::Unavailable);
+            .record(Capability::RecipeNew, capability::Probe::Unavailable, None);
         assert_eq!(
             app.recipe_new_suggest_gate(),
             Err(commands::RecipeNewGate::NoCapability)
@@ -4275,7 +4394,7 @@ mod tests {
         // 会把它下发(没有键位、没有命中区、没有队列入口)。
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeNew, capability::Probe::Available);
+            .record(Capability::RecipeNew, capability::Probe::Available, None);
         app.data_root = Some("/tmp".into());
         // 配方域键面全按一遍(含 bake 的 c 与五域导航/搜索)
         for code in ['h', 'l', 'j', 'k', '/', 'c', 'r', 'n', 'y'] {
@@ -4417,7 +4536,7 @@ mod tests {
         // 门不放行(引擎无能力):命中区不产出,鼠标点哪儿都不取用
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeBake, capability::Probe::Unavailable);
+            .record(Capability::RecipeBake, capability::Probe::Unavailable, None);
         app.size = Rect::new(0, 0, 80, 30);
         let hits = hitmap(app.size, &app, size_class(app.size));
         assert!(
@@ -4743,7 +4862,7 @@ mod tests {
             crate::engine::Capability::Key,
         ] {
             app.capabilities
-                .record(cap, crate::engine::Probe::Available);
+                .record(cap, crate::engine::Probe::Available, None);
         }
         app
     }
@@ -5401,7 +5520,7 @@ mod tests {
     fn reg_app(rules: &[(&str, i32, &str)]) -> App {
         let mut app = App::with_runner(Arc::new(FakeRunner::new(rules)));
         app.capabilities
-            .record(Capability::SourceRegister, Probe::Available);
+            .record(Capability::SourceRegister, Probe::Available, None);
         app.splash = false;
         app.screen = Screen::Recipes;
         app.rc_domain = Domain::Sources;
@@ -5548,7 +5667,7 @@ mod tests {
     fn 引擎无source能力_入口禁用并指路_列表行可见禁用() {
         let mut app = reg_app(&[]);
         app.capabilities
-            .record(Capability::SourceRegister, Probe::Unavailable);
+            .record(Capability::SourceRegister, Probe::Unavailable, None);
         app.ls = Some(
             serde_json::from_str(
                 r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
@@ -6048,8 +6167,11 @@ mod tests {
             )
             .unwrap(),
         );
-        app.capabilities
-            .record(Capability::SourceRecheck, capability::Probe::Available);
+        app.capabilities.record(
+            Capability::SourceRecheck,
+            capability::Probe::Available,
+            None,
+        );
         app
     }
 
@@ -6100,8 +6222,11 @@ mod tests {
         assert!(app.log[0].contains("数据仓根未设"), "{:?}", app.log);
         // 引擎无 source 能力
         let mut app = recheck_app();
-        app.capabilities
-            .record(Capability::SourceRecheck, capability::Probe::Unavailable);
+        app.capabilities.record(
+            Capability::SourceRecheck,
+            capability::Probe::Unavailable,
+            None,
+        );
         let n = app.queue.len();
         app.run_recheck(None);
         assert_eq!(app.queue.len(), n, "缺能力不下发");
@@ -6346,7 +6471,7 @@ mod tests {
         app.splash = false;
         app.data_root = Some(dir.to_string());
         for cap in Capability::ALL {
-            app.capabilities.record(cap, Probe::Available);
+            app.capabilities.record(cap, Probe::Available, None);
         }
         app.ls = Some(
             serde_json::from_str(
