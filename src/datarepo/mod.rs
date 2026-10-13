@@ -16,6 +16,8 @@
 //! [`tests::引用扫描_零写动作_文件树一个字节都不动`] 钉死);写动作全部
 //! 收在 [`write`](ADR-0010),面板永不写 NW_HOME。
 
+pub mod write;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
