@@ -3428,11 +3428,14 @@ async fn 配方编辑_预跑argv与健康屏validate同源() {
     drive_edits(&mut app);
     key(&mut app, crossterm::event::KeyCode::Char('s'));
     let argv = app.queue.last().expect("s 入队了 validate").clone();
-    // 与健康屏同一构造函数:commands::validate_recipe(abs)
+    // 与健康屏同一构造函数:commands::validate_recipe(abs)。绝对路径由写侧
+    // 句柄的 abs_path 出(测试侧按同一形状独立拼一遍,不当「面板说对」的证据)。
     let scratch_abs = format!(
         "{}/{}",
         root.trim_end_matches('/'),
         crate::datarepo::recipe::scratch_rel("recipes/research-desk/recipe.yaml")
+            .expect("夹具配方路径是合法相对路径")
+            .as_str()
     );
     assert_eq!(
         argv,
@@ -3444,6 +3447,44 @@ async fn 配方编辑_预跑argv与健康屏validate同源() {
         argv[1], "--recipe",
         "子形状是 --recipe(非 --lock / 非面板自造检查)"
     );
+}
+
+/// 窄准许面的第四条约束「换根也清」:暂存后操作者在设置屏换过数据仓根,
+/// 返航时残档必须从**旧根**消失(按暂存时那个根清,不按当前设置态)。
+#[tokio::test]
+async fn 配方编辑_换根返航_暂存档从旧根清掉() {
+    let (mut app, _runner) = recipe_app("swap-root", 0, VALIDATE_PASS);
+    let old_root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    // 另备一个新根(同一棵夹具树:换根后 editor 还能读得到配方)
+    let new_root = recipe_fixture("swap-root-new");
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    assert!(
+        app.rc_edit_flow
+            .as_ref()
+            .and_then(|f| f.scratch.as_ref())
+            .is_some(),
+        "s 后暂存档在场"
+    );
+    let scratch = old_root.join("recipes/research-desk/.nwt-validate.yaml");
+    assert!(scratch.exists(), "暂存落在旧根:{scratch:?}");
+    // 换根(设置态改指新根),然后返航
+    app.data_root = Some(new_root.to_string_lossy().to_string());
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.recipe_edit_open(), "Esc 收起浮层");
+    assert!(
+        !scratch.exists(),
+        "换根也清:残档不留在旧根(按暂存时那个根清)"
+    );
+    assert!(
+        !new_root
+            .join("recipes/research-desk/.nwt-validate.yaml")
+            .exists(),
+        "新根什么都没落"
+    );
+    std::fs::remove_dir_all(&old_root).ok();
+    std::fs::remove_dir_all(&new_root).ok();
 }
 
 /// 规格验收 3:预跑失败可放弃写回,数据仓状态不变(recipe.yaml 逐字节原样,scratch 已清)。

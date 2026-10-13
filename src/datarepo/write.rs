@@ -120,6 +120,16 @@ impl DataRepo {
         &self.root
     }
 
+    /// 给引擎 argv 的绝对路径:**写侧句柄唯一的绝对路径出口**。
+    ///
+    /// 引擎是外部进程,只认路径(不收 stdin、不收相对当前工作目录的简称),
+    /// 于是「根 + 相对路径」这一步也必须有个家——壳层不再自己拼
+    /// `format!("{root}/{rel}")`(#113 预跑 argv 先例)。收 [`RepoRelPath`]
+    /// 不收裸串:越界的值连这个出口都到不了。
+    pub fn abs_path(&self, rel: &RepoRelPath) -> String {
+        self.root.join(rel.as_str()).to_string_lossy().to_string()
+    }
+
     /// 写前校验 + 拟落账:**一个字节都不落**。
     ///
     /// 校验:空拟落账拒(没东西可确认是调用方的 bug)、同一次拟落账内

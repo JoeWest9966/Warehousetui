@@ -4361,23 +4361,26 @@ impl App {
             }
         };
         // 暂存编辑态到 scratch(写侧原子落),喂引擎 validate 读;这不是对
-        // recipe.yaml 的写回。
-        let scratch = crate::datarepo::recipe::scratch_rel(&flow.recipe_rel);
-        if let Err(reason) = crate::datarepo::recipe::stage_for_validate(&repo, &flow.doc, &scratch)
-        {
-            self.push_log(format!("预跑暂存失败:{reason},一个字节都没写回"));
-            if let Some(f) = self.rc_edit_flow.as_mut() {
-                f.err = Some(reason);
-            }
-            return;
-        }
+        // recipe.yaml 的写回。落点由 ScratchSlot 持(记住暂存时那个根),
+        // 换过根也清得掉残档。
+        let slot =
+            match crate::datarepo::recipe::ScratchSlot::stage(&repo, &flow.doc, &flow.recipe_rel) {
+                Ok(s) => s,
+                Err(reason) => {
+                    self.push_log(format!("预跑暂存失败:{reason},一个字节都没写回"));
+                    if let Some(f) = self.rc_edit_flow.as_mut() {
+                        f.err = Some(reason);
+                    }
+                    return;
+                }
+            };
         // 预跑 argv:与健康屏 validate 同源(同一 `commands::validate_recipe`
         // 构造函数),只是路径指向 scratch(编辑态)——recipe.yaml 仍未动。
-        let scratch_abs = format!("{}/{scratch}", root.trim_end_matches('/'));
-        self.queue.push(commands::validate_recipe(&scratch_abs));
+        // 绝对路径由写侧句柄出(壳层不拼字符串)。
+        self.queue.push(commands::validate_recipe(&slot.abs()));
         if let Some(f) = self.rc_edit_flow.as_mut() {
             f.plan = Some(plan);
-            f.scratch_rel = Some(scratch);
+            f.scratch = Some(slot);
             f.validate = None;
             f.validate_pass = false;
             f.phase = crate::screens::RecipeEditPhase::PreRun;
@@ -4395,21 +4398,13 @@ impl App {
                 .and_then(|e| e.data_as::<crate::engine::ValidateData>())
                 .is_some_and(|d| d.summary.fail == 0);
         let headline = out.headline().to_string();
-        // 清 scratch(预跑读完即清,recipe.yaml 自始至终未动)。
-        if let Some(scratch) = self
-            .rc_edit_flow
-            .as_ref()
-            .and_then(|f| f.scratch_rel.clone())
-        {
-            if let Some(root) = self.usable_data_root() {
-                crate::datarepo::recipe::clear_staged(
-                    &crate::datarepo::write::DataRepo::new(&root),
-                    &scratch,
-                );
-            }
+        // 清 scratch(预跑读完即清,recipe.yaml 自始至终未动)。按暂存时那个
+        // 根清——操作者中途换过根也不留残档。
+        if let Some(slot) = self.rc_edit_flow.as_ref().and_then(|f| f.scratch.clone()) {
+            slot.clear();
         }
         if let Some(f) = self.rc_edit_flow.as_mut() {
-            f.scratch_rel = None;
+            f.scratch = None;
             f.validate_pass = pass;
             f.validate = Some(out);
             f.phase = crate::screens::RecipeEditPhase::Review;
@@ -4481,13 +4476,8 @@ impl App {
         let Some(flow) = self.rc_edit_flow.take() else {
             return;
         };
-        if let Some(scratch) = flow.scratch_rel {
-            if let Some(root) = self.usable_data_root() {
-                crate::datarepo::recipe::clear_staged(
-                    &crate::datarepo::write::DataRepo::new(&root),
-                    &scratch,
-                );
-            }
+        if let Some(slot) = flow.scratch.as_ref() {
+            slot.clear();
         }
         let done = flow.phase == crate::screens::RecipeEditPhase::Done;
         self.push_log(if done {

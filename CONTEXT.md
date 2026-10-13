@@ -97,7 +97,7 @@ _Avoid_: 编辑器、生成器（面板不是通用文件编辑器：只写数�
 _Avoid_: 压缩包、打包命令（产物是一份组件清单，不是 tarball；面板不代跑 bake，也不复制 payload 文件——只写确认过的那一个文件）
 
 **配方编辑器（recipe editor）**：
-配方屏从只读升级为结构化编辑（spec #95 工单 #113）：加/删组件槽、改 env 声明（required 及默认）。编辑态经**结构化中间形状**往返（`datarepo::recipe::RecipeDoc`——块状 YAML 手写解析，不引 serde_yaml，只解析面板要编辑的 `components:` / `env:` 两条序列，其余顶层块原样保留），**面板不认识的自定义字段原样保留**（硬约束，fixture 断言往返不丢）。写回 `recipe.yaml` 走 datarepo 写侧：先把编辑态暂存成配方同目录的隐藏 scratch 喂引擎 `validate`（引擎代跑、argv 与健康屏同源）预跑，结果四态摊开，拟落账 + 图形确认后才经写侧原子落盘（tmp+rename）——确认前 `recipe.yaml` 一个字节都不落，预跑不过可不写回、数据仓状态不变。是「作者侧工具」八项之一（ADR-0010 §4 #113 行）。
+配方屏从只读升级为结构化编辑（spec #95 工单 #113）：加/删组件槽、改 env 声明（required 及默认）。编辑态经**结构化中间形状**往返（`datarepo::recipe::RecipeDoc`——块状 YAML 手写解析，不引 serde_yaml，只解析面板要编辑的 `components:` / `env:` 两条序列，其余顶层块原样保留），**面板不认识的自定义字段原样保留**（硬约束，fixture 断言往返不丢）。写回 `recipe.yaml` 走 datarepo 写侧：先把编辑态暂存成配方同目录的隐藏 scratch 喂引擎 `validate`（引擎代跑、argv 与健康屏同源）预跑，结果四态摊开，拟落账 + 图形确认后才经写侧原子落盘（tmp+rename）——确认前 `recipe.yaml` 一个字节都不落，预跑不过可不写回、数据仓状态不变。scratch 是「确认前的一次写盘」，ADR-0010 §1 为它单开一行**窄准许面**（隐藏名、确定名、跑完即清、返航/换根也清），落点由 `datarepo::recipe::ScratchSlot` 持（记住暂存时那个数据仓根）。是「作者侧工具」八项之一（ADR-0010 §4 #113 行）。
 _Avoid_: 通用 yaml 编辑器（面板只写数据仓根之下的配方文件且全过确认闸；不是任意文件编辑器，也不是引擎命令）
 
 **extension 脚手架（extension scaffold）**：

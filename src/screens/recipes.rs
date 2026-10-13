@@ -2125,8 +2125,9 @@ pub struct RecipeEditFlow {
     pub receipt: Option<String>,
     /// 面板侧就拒 / 加载失败的人话(留在编辑态可改)。
     pub err: Option<String>,
-    /// 预跑暂存文件(scratch)的相对路径——返航 / 回音落地时清。
-    pub scratch_rel: Option<String>,
+    /// 预跑暂存档(scratch)的落点——按**暂存时那个数据仓根**清:换过根也
+    /// 不把残档留在旧根里(ADR-0010 §1 第四类)。None = 这一程没暂存。
+    pub scratch: Option<crate::datarepo::recipe::ScratchSlot>,
 }
 
 impl RecipeEditFlow {
@@ -2149,7 +2150,7 @@ impl RecipeEditFlow {
             validate_pass: false,
             receipt: None,
             err: None,
-            scratch_rel: None,
+            scratch: None,
         }
     }
 
