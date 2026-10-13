@@ -655,8 +655,9 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
     // `assemble::render_history` 同一个 55/45 分栏 + 缩边框——渲染与
     // 命中共用一份(ADR-0005)。行数是**可见行**(过滤后),索引即
     // `on_mouse` 的 SelectRow 入参(可见下标,与册内过滤同族)。
-    if app.as_history.is_some() {
-        if !app.as_history.as_ref().unwrap().root_missing {
+    if let Some(view) = app.as_history.as_ref() {
+        // 安装根不在时视图整块换成指路,不产命中(与渲染侧同一口径)。
+        if !view.root_missing {
             row_hits(lst, 0, app.ah_visible().len(), hits, Target::SelectRow);
         }
         return;

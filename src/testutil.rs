@@ -39,6 +39,22 @@ impl Drop for ConfigGuard {
     }
 }
 
+/// 测试夹具共用的「真能读的数据仓根」——**字符串三平台逐字节相同**。
+///
+/// 之所以不直接用 `std::env::temp_dir()`:macOS 上它是 `/var/folders/…`、
+/// Windows 上是 `C:\Users\…\AppData\Local\Temp`,长度形状各不同;而
+/// 80 列金色帧与建议命令断言把这条路径原样烘在输出里(根一长就把命令尾
+/// 的 `| jq …` 挤出屏外),同一帧于是只在 Linux 绿。CI 三平台因此全红。
+///
+/// Unix 上 `/tmp` 天生是个能读的目录;Windows 没有这一条,于是在当期盘根
+/// 下建一个(建不动就建不动——`path_usable` 会如实判不可用、测试如实红,
+/// 不装过得去)。
+pub fn stable_root() -> String {
+    #[cfg(windows)]
+    let _ = std::fs::create_dir_all("/tmp");
+    "/tmp".to_string()
+}
+
 /// 整帧的真显示内容(逐格拚行;字节级 golden 与列级命中断言共用)。
 /// `TestBackend::to_string` 带引号与隐藏格注记,不能当裸行用;宽字符
 /// 占两格,第二格是隐藏延续格,跳过——拼出的行即肉眼所见(ADR-0005

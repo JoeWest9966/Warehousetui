@@ -586,6 +586,7 @@ impl App {
     }
 
     /// 测试注入:完全可控的 runner(零真实进程)。
+    #[cfg(test)]
     pub fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
         let status = EngineStatus {
             found: true,
@@ -594,10 +595,13 @@ impl App {
             attempted: Vec::new(),
         };
         let mut app = Self::assemble(runner, status, None);
-        // 测试注入给定一个可用的数据仓根(临时目录,三平台都在),
-        // 让既有行为测试聚焦各自语义;「未设 / 不可用」由 #27 专属
-        // 测试显式置 None / 坏路径验证,不靠环境带过。
-        app.data_root = Some(std::env::temp_dir().display().to_string());
+        // 测试注入给定一个可用的数据仓根,让既有行为测试聚焦各自语义;
+        // 「未设 / 不可用」由 #27 专属测试显式置 None / 坏路径验证,不靠
+        // 环境带过。根取**三平台同串**的定值(见 `testutil::stable_root`):
+        // 80 列金色帧与建议命令断言把这条路径原样烘进输出,用
+        // `std::env::temp_dir()` 会随平台变长变短(macOS `/var/folders/…`、
+        // Windows `C:\Users\…\Temp`),同一帧于是只在 Linux 绿。
+        app.data_root = Some(crate::testutil::stable_root());
         app
     }
 
@@ -5328,7 +5332,7 @@ mod tests {
         let mut app = bake_app();
         app.capabilities
             .record(Capability::RecipeNew, capability::Probe::Available);
-        app.data_root = Some("/tmp".into());
+        app.data_root = Some(crate::testutil::stable_root());
         assert!(app.recipe_new_suggest_gate().is_ok(), "三前提齐备门放行");
         // 选中行不是配方(配方域为空)
         let mut app = bake_app();
@@ -5362,7 +5366,7 @@ mod tests {
         let mut app = bake_app();
         app.capabilities
             .record(Capability::RecipeNew, capability::Probe::Available);
-        app.data_root = Some("/tmp".into());
+        app.data_root = Some(crate::testutil::stable_root());
         // 配方域键面全按一遍(含 bake 的 c 与五域导航/搜索)
         for code in ['h', 'l', 'j', 'k', '/', 'c', 'r', 'n', 'y'] {
             app.update(Message::Key(key(code)));
@@ -5376,9 +5380,12 @@ mod tests {
             app.queue
         );
         // 铁律的另一半:建议命令本身不带任何写旗标
-        let s =
-            crate::engine::commands::recipe_new_suggest(Some("research-desk"), Some("/tmp"), true)
-                .expect("三前提齐备");
+        let s = crate::engine::commands::recipe_new_suggest(
+            Some("research-desk"),
+            Some(&crate::testutil::stable_root()),
+            true,
+        )
+        .expect("三前提齐备");
         for a in &s.argv {
             assert!(!a.contains("--yes"), "建议命令永不带确认闸:{a}");
         }
@@ -5405,7 +5412,7 @@ mod tests {
     /// 配方域两条(bake_app 的夹具即两条配方)+ 数据仓根,便于验 `c` 取用。
     fn filter_app() -> App {
         let mut app = bake_app();
-        app.data_root = Some("/tmp".into());
+        app.data_root = Some(crate::testutil::stable_root());
         app
     }
 
@@ -7567,7 +7574,7 @@ mod tests {
                 "source".to_string(),
                 "recheck".into(),
                 "--root".into(),
-                std::env::temp_dir().display().to_string()
+                crate::testutil::stable_root()
             ],
             "全查:不带 --name"
         );
