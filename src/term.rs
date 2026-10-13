@@ -132,6 +132,41 @@ pub fn mouse_capture_ansi(enabled: bool) -> String {
     buf
 }
 
+// ---- 装配完成通知(#117):bell 与 OSC 9 桌面通知 ----
+
+/// 终端 bell:一个 `\x07`,最低保底——任何终端都认,不支持桌面通知的
+/// 环境也至少响一声(规格 Further Notes:bell 是最低保底)。
+pub const BELL: &str = "\x07";
+
+/// bell 序列(纯函数,与 [`mouse_capture_ansi`] 同族的「term 层输出捕获」
+/// 先例:init 与单测共用同一来源)。
+pub fn bell() -> &'static str {
+    BELL
+}
+
+/// OSC 9 桌面通知序列:`ESC ] 9 ; <文本> BEL`。
+///
+/// **不探测、不报错**:OSC 9 是「支持就弹、不支持就静默丢弃」的序列
+/// (规格 Further Notes:OSC 9 在不支持的环境是静默 no-op),所以这里既
+/// 不做能力探测也不做降级——照发即是覆盖面最大化(bell 兜底 + OSC 9 加成)。
+pub fn osc9(text: &str) -> String {
+    format!("\x1b]9;{text}\x07")
+}
+
+/// 完成通知出口:两个**独立**开关各自门控(bell / desktop),都关则返回
+/// 空串——调用方因此不必自己判空,「共享终端 / 勿扰场景不扰人」在这一处
+/// 收口。文本由调用方给(装配收尾话术,不另造)。
+pub fn notify_ansi(bell_on: bool, desktop_on: bool, text: &str) -> String {
+    let mut s = String::new();
+    if bell_on {
+        s.push_str(BELL);
+    }
+    if desktop_on {
+        s.push_str(&osc9(text));
+    }
+    s
+}
+
 /// 初始化终端:raw mode + 备用屏幕 + 鼠标捕获(由 mouse_enabled 门控)。
 /// 失败时调用方负责 restore。
 pub fn init(mouse_enabled: bool) -> anyhow::Result<Term> {
@@ -205,5 +240,40 @@ mod tests {
         assert!(on.contains("?1006h"), "SGR 坐标到位");
         let off = mouse_capture_ansi(false);
         assert!(off.is_empty(), "关 = 一个字节都不发,原生选中/复制不被接管");
+    }
+
+    #[test]
+    fn 通知bell序列_就是一声x07() {
+        assert_eq!(BELL, "\x07", "bell 是一个字节,不带任何包装");
+        assert_eq!(bell(), "\x07");
+    }
+
+    #[test]
+    fn osc9序列_桌面通知形状正确() {
+        assert_eq!(
+            osc9("装配结束:收敛 (rc 0)"),
+            "\x1b]9;装配结束:收敛 (rc 0)\x07"
+        );
+    }
+
+    #[test]
+    fn 通知出口_两个开关各自门控_都关则一个字节都不发() {
+        let both = notify_ansi(true, true, "x");
+        assert_eq!(
+            both,
+            format!("{BELL}\u{1b}]9;x\u{7}"),
+            "都开 = bell 在前,OSC 9 在后"
+        );
+        assert_eq!(
+            notify_ansi(false, true, "x"),
+            "\u{1b}]9;x\u{7}",
+            "bell 关 = 只剩桌面通知"
+        );
+        assert_eq!(notify_ansi(true, false, "x"), BELL, "桌面关 = 只剩一声响");
+        assert_eq!(
+            notify_ansi(false, false, "x"),
+            "",
+            "都关 = 一个字节都不发,共享终端不扰人"
+        );
     }
 }
