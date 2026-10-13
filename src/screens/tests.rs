@@ -443,8 +443,6 @@ fn 设置屏_手填浮层渲染() {
     app.home_input = true;
     app.home_buf = "/data/pi-homes".into();
     let s = draw(&app, 110, 30);
-    println!("SPLASH={} SCREEN={:?}", app.splash, app.screen);
-    println!("{s}");
     assert!(s.contains("手填 NW_HOME"));
     assert!(s.contains("/data/pi-homes"), "缓冲区原文回显");
     assert!(s.contains("█"), "块光标可见");
