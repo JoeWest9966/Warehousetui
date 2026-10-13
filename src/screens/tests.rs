@@ -1702,6 +1702,229 @@ fn 外部源漂移_紧凑66x50_结论与证据可读不溢出() {
     }
 }
 
+// ---- #116 引用完整性:面板自有检查,四态、来源标注、两档快照 ----
+
+/// 夹具数据仓:孤儿 / 断链 / 正常三态俱全(与 `app::tests` 的夹具同构,
+/// 屏层自己建一份——测试夹具不跨模块共享)。
+fn integrity_repo(tag: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("nwt-integrity-{}-{}", std::process::id(), tag));
+    let _ = std::fs::remove_dir_all(&root);
+    let put = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    put("skills/web-scout/SKILL.md", "---\nname: web-scout\n---\n");
+    put("skills/lonely/SKILL.md", "---\nname: lonely\n---\n");
+    put("extensions/ribbon/package.json", "{}");
+    put("extensions/dropped/package.json", "{}");
+    put(
+        "components/scout/component.yaml",
+        "kind: pi-local-package\n",
+    );
+    put(
+        "recipes/research-desk/recipe.yaml",
+        "kind: recipe\nname: research-desk\ncomponents:\n  - component: scout\n  - component: web-scout\n  - component: ribbon\n  - component: ghost\n",
+    );
+    put(
+        "recipes/lab/recipe.yaml",
+        "kind: recipe\nname: lab\ncomponents:\n  - component: ghost\n  - component: hello-world\n    source: external\n",
+    );
+    root
+}
+
+/// 夹具 App:数据仓根指向夹具仓、切到引用完整性并现扫一次。
+fn integrity_app(tag: &str) -> (App, std::path::PathBuf) {
+    let root = integrity_repo(tag);
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Integrity;
+    app.data_root = Some(root.to_str().unwrap().to_string());
+    app.run_integrity();
+    (app, root)
+}
+
+#[test]
+fn 引用完整性_四态呈现_与引擎读法一致_来源标注可区分() {
+    let (app, root) = integrity_app("four");
+    let s = draw(&app, 110, 30);
+    // 三态分类:孤儿 / 断链 / 正常各就各位
+    assert!(s.contains("ghost"), "断链点名组件:{s}");
+    assert!(s.contains("lonely"), "孤儿 skill 在列:{s}");
+    assert!(s.contains("dropped"), "孤儿 extension 在列:{s}");
+    assert!(s.contains("web-scout"), "正常 skill 也在列:{s}");
+    assert!(s.contains("ribbon"), "正常 extension 也在列:{s}");
+    // 结果四态:与 validate 同一套灯字符(✗ 败 / ◐ 警 / ● 过)
+    assert!(s.contains("✗"), "断链是败:{s}");
+    assert!(s.contains("◐"), "孤儿是警:{s}");
+    assert!(s.contains("●"), "进了配方是过:{s}");
+    // 人话点题
+    assert!(s.contains("没进任何配方"), "孤儿点题:{s}");
+    assert!(s.contains("本体不在"), "断链点题:{s}");
+    assert!(
+        s.contains("被 lab、research-desk 引用"),
+        "断链点名是哪几条配方:{s}"
+    );
+    assert!(s.contains("进了配方"), "正常态点题:{s}");
+    // 来源标注:面板自有检查可区分于引擎检查(引擎三项的块标题带「· 引擎」)
+    assert!(
+        s.contains(crate::screens::health::CheckSource::Panel.badge()),
+        "来源徽标在屏:{s}"
+    );
+    assert!(
+        !s.contains(&format!(
+            "· {}",
+            crate::screens::health::CheckSource::Engine.badge()
+        )),
+        "本模式的块标题不标引擎来源:{s}"
+    );
+    // 只读口径
+    assert!(s.contains("只读"), "明示只读:{s}");
+    assert!(s.contains("只报不修"), "只报不修:{s}");
+    // 自读事实:规模与外部源口径
+    assert!(s.contains("扫到 2 个配方"), "规模在右栏:{s}");
+    assert!(s.contains("外部源引用 1 条"), "外部源引用不进本图:{s}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn 引用完整性_引擎三项的块标题带来源徽标_面板项也带() {
+    // 来源标注是**机制**:四个模式各自声明,不是只给面板那一项贴花。
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Health;
+    let doctor = r#"{"schema":"nw/doctor.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"results":[{"surface":"manifest","status":"pass","message":"在位"}],"exit":0,"converged":true}}"#;
+    feed(&mut app, out(&["doctor", "--profile", "desk"], 0, doctor));
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains(&format!(
+            "七面 {}",
+            crate::screens::health::CheckSource::Engine.title_suffix()
+        )),
+        "doctor 块标题标来源:{s}"
+    );
+    assert!(
+        !s.contains(crate::screens::health::CheckSource::Panel.badge()),
+        "引擎模式不出现面板徽标:{s}"
+    );
+    // 引擎项的灯与文案没被改花:四态灯仍在、原文消息仍在
+    assert!(s.contains("manifest"), "引擎项原文在场:{s}");
+    assert!(s.contains("在位"), "引擎项消息原文在场:{s}");
+    assert!(s.contains("●"), "四态灯读法不变:{s}");
+}
+
+#[test]
+fn 引用完整性_数据仓根未设走指路_不摆空列表不冒充0() {
+    let (mut app, root) = integrity_app("noroot");
+    app.data_root = None;
+    app.run_integrity();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("数据仓根未设"), "未设根走既有指路:{s}");
+    assert!(
+        s.contains(crate::screens::health::CheckSource::Panel.badge()),
+        "来源标注仍在:{s}"
+    );
+    assert!(!s.contains("没进任何配方"), "不摆空列表冒充没问题:{s}");
+    assert!(!s.contains("本体不在"), "不摆断链行:{s}");
+    assert!(!s.contains("ghost"), "没有半个检查行:{s}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn 引用完整性_无可扫对象与全正常两态不互冒充() {
+    // 扫了个空:一个组件家都没有——说「没扫到」,不说「没问题」
+    let empty = std::env::temp_dir().join(format!("nwt-integrity-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&empty);
+    std::fs::create_dir_all(&empty).unwrap();
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Integrity;
+    app.data_root = Some(empty.to_str().unwrap().to_string());
+    app.run_integrity();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("没扫到组件目录"), "空仓说空仓:{s}");
+    assert!(!s.contains("全进配方"), "空仓不冒充全绿:{s}");
+    std::fs::remove_dir_all(&empty).ok();
+    // 全正常:扫到了且全部进配方
+    let root = integrity_repo("clean");
+    std::fs::remove_dir_all(root.join("skills/lonely")).unwrap();
+    std::fs::remove_dir_all(root.join("extensions/dropped")).unwrap();
+    let desk = root.join("recipes/research-desk/recipe.yaml");
+    std::fs::write(&desk, "kind: recipe\nname: research-desk\ncomponents:\n  - component: scout\n  - component: web-scout\n  - component: ribbon\n").unwrap();
+    let lab = root.join("recipes/lab/recipe.yaml");
+    std::fs::write(
+        &lab,
+        "kind: recipe\nname: lab\ncomponents:\n  - component: hello-world\n    source: external\n",
+    )
+    .unwrap();
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Integrity;
+    app.data_root = Some(root.to_str().unwrap().to_string());
+    app.run_integrity();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("全进配方"), "全绿给结论:{s}");
+    assert!(!s.contains("没进任何配方"), "没有孤儿行:{s}");
+    assert!(!s.contains("引用了不存在的组件"), "没有断链行:{s}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn 引用完整性_选中行明细列引用方_上下键与点行同路() {
+    let (mut app, root) = integrity_app("sel");
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("选中:断链 ghost"), "首行(断链)明细在右栏:{s}");
+    assert!(s.contains("引用方:lab、research-desk"), "断链的引用方:{s}");
+    // ↓ 到第一个孤儿行:右栏跟着选中行走
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    )));
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("选中:extension dropped"), "选中行走动:{s}");
+    assert!(s.contains("引用方:无"), "孤儿没有引用方:{s}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn 引用完整性_常畅与紧凑两档快照_结论可读不溢出() {
+    let (app, root) = integrity_app("snap");
+    let comfy = crate::testutil::frame_display(&app, 110, 30);
+    for needle in [
+        "引用完整性",
+        "检查行",
+        "自读事实",
+        "ghost",
+        crate::screens::health::CheckSource::Panel.badge(),
+    ] {
+        assert!(comfy.contains(needle), "常畅 110×30 缺「{needle}」:{comfy}");
+    }
+    let compact = crate::testutil::frame_display(&app, 66, 50);
+    for needle in [
+        "引用完整性",
+        "检查行",
+        "ghost",
+        crate::screens::health::CheckSource::Panel.badge(),
+    ] {
+        assert!(
+            compact.contains(needle),
+            "紧凑 66×50 缺「{needle}」:{compact}"
+        );
+    }
+    for (w, frame) in [(110, comfy.as_str()), (66, compact.as_str())] {
+        for l in frame.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= w,
+                "{w} 宽行不溢出:{l}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // ---- #61 五域搜索过滤:纯本地筛选,空结果两态可区分指路 ----
 
 /// 五域各两条的夹具(#61):每域第二条都带独特可检索词,过滤后应只剩它一条。
