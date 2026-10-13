@@ -536,7 +536,8 @@ impl ScaffoldSpec for ExtensionForm {
 
 /// 入口文件名形状:条目子树里的一个文件,manifest 的 `pi.extensions` 指着它。
 /// 单段(不带 `/` `\`:落点路径由面板拼,入口文件不是子目录)、`.ts` / `.js`
-/// 后缀(pi 的扩展只认这两种)、不是隐藏文件。
+/// 后缀(pi 的扩展只认这两种)、不是隐藏文件、无空白 / 控制字符、不太长
+/// (名字直接进落点路径,文件系统对单段名有上限)。
 fn invalid_entry_file(entry: &str) -> Option<String> {
     if entry.is_empty() {
         return Some(format!(
@@ -551,6 +552,14 @@ fn invalid_entry_file(entry: &str) -> Option<String> {
     }
     if !(entry.ends_with(".ts") || entry.ends_with(".js")) {
         return Some("入口文件名以 .ts 或 .js 结尾:pi 的扩展只认这两种".into());
+    }
+    if let Some(c) = entry.chars().find(|c| c.is_whitespace() || c.is_control()) {
+        return Some(format!(
+            "入口文件名不含空白 / 控制字符:「{c}」(它要拼进落点路径)"
+        ));
+    }
+    if entry.chars().count() > 64 {
+        return Some("入口文件名过长:≤64 字符(文件系统对单段名有上限)".into());
     }
     None
 }
@@ -1417,8 +1426,15 @@ mod tests {
         let errs = ExtensionForm::default().planned_writes().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("名称")), "{errs:?}");
         assert!(errs.iter().any(|e| e.contains("描述")), "{errs:?}");
-        // 入口文件名:必填、单段、.ts/.js、不隐藏
-        for bad in ["", "sub/index.ts", "index.txt", ".hidden.ts", "index"] {
+        // 入口文件名:必填、单段、.ts/.js、不隐藏、无空白、不太长
+        for bad in [
+            "",
+            "sub/index.ts",
+            "index.txt",
+            ".hidden.ts",
+            "my file.ts",
+            &"x".repeat(65),
+        ] {
             let mut f = ext_form("ribbon", "d");
             f.entry = bad.into();
             let errs = f.planned_writes().unwrap_err();
