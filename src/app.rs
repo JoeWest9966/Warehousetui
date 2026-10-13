@@ -7961,6 +7961,42 @@ mod tests {
     }
 
     #[test]
+    fn 对比页_两段可点区不因新页移动_点发射照旧入队() {
+        // #104 只加一页,不动弹层几何:命中区(Enter 发射 / Esc 返航两段)
+        // 在对比页必须一个像素都不移,点下去与键盘同路。
+        let (runner, mut app) = up_inflight_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.nw_home = ritual_diff_home("mouse").display().to_string();
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"new-lock","recipe":"research-desk"}]}"#,
+            )
+            .unwrap(),
+        );
+        app.as_sel = 0;
+        app.as_confirm = true;
+        app.as_ritual_page = crate::screens::RitualPage::Diff;
+        app.load_ritual_diff();
+        let brief_y = {
+            app.as_ritual_page = crate::screens::RitualPage::Brief;
+            let y = hit_target(&app, |t| *t == Target::Activate).y;
+            app.as_ritual_page = crate::screens::RitualPage::Diff;
+            y
+        };
+        assert_eq!(
+            hit_target(&app, |t| *t == Target::Activate).y,
+            brief_y,
+            "对比页上发射段还在同一行"
+        );
+        let qlen = app.queue.len();
+        let act = hit_target(&app, |t| *t == Target::Activate);
+        click(&mut app, act);
+        assert_eq!(app.queue.len(), qlen + 1, "对比页上点发射 = 按 Enter");
+        assert!(!app.as_confirm, "发射后仪式关闭");
+        let _ = runner;
+    }
+
+    #[test]
     fn 对比页_同一锁定集重跑_两侧组件一个不动_指纹不变() {
         // 上游幂等铁律:同 lock 连跑两次 up,manifest 逐字节一致 —— 面板据此
         // 说「指纹不变」,不自己重算任何哈希。
@@ -7976,7 +8012,11 @@ mod tests {
         let d = app.as_ritual_diff.as_ref().expect("对比快照在场");
         assert!(d.added.is_empty(), "同一锁定集:没有新增");
         assert!(d.removed.is_empty(), "同一锁定集:没有删除");
-        assert_eq!(d.unchanged, vec!["scout", "retention"], "两侧都在(按在途文件顺序)");
+        assert_eq!(
+            d.unchanged,
+            vec!["scout", "retention"],
+            "两侧都在(按在途文件顺序)"
+        );
         assert!(!d.hash_changes, "同一 lock:指纹不变");
         assert!(!d.first_assembly, "有旧态,不是首次装配");
     }
