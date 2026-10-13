@@ -12,6 +12,7 @@
 use ratatui::layout::Rect;
 
 use crate::app::{App, Screen};
+use crate::engine::State;
 
 /// 常畅态/紧凑态互换的宽度断点:单一常量,不散值。
 /// 固定 80 = 原 `MIN_W`——旧常态一字不变,变窄才换装(ADR-0004)。
@@ -94,6 +95,19 @@ pub enum Target {
     /// 边界(输入态只管键入,见 `CatalogGet` 那条同口径注记),不是本段特有的
     /// 分叉。
     CatalogDelete,
+    /// 点概览警示带上的**订阅到期条目** = 跳到订阅册并选中那一条(#94 工单
+    /// #105,用户故事 12:「从发现到处理一步到位」)。载荷是这一条在**订阅册
+    /// 投影**里的下标(`CatalogSheet::entries`,与册体同一排序)。
+    ///
+    /// 与 [`Target::SelectRow`] 的可见行下标**是两件事**(#69 册内过滤在场时
+    /// 两者要换算),故单立一个变体而不是复用:命中侧拿投影下标经
+    /// `catalog_visible()` 换成可见行再落选中槽,换算不出来(这一条被过滤词
+    /// 挡在可见行外)走指路日志,不新造禁用态(与册体「无选中行时点下去复现
+    /// 既有指路」同口径)。
+    ///
+    /// **零引擎调用**:回音是既有的 `app.sub_ls`,点它只换视图(定册内维度 →
+    /// 切屏 → 落选中槽),与键盘 `v` 到编目屏同族。
+    AlertSubEntry(usize),
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -101,6 +115,101 @@ pub enum Target {
 pub enum ScrollDir {
     Up,
     Down,
+}
+
+/// 概览警示带**一段**的输入形状(与 [`KeyPart`] 同族:一段文案 + 一个可选
+/// 命中目标),多带一个 [`AlertTone`]。
+///
+/// 为什么不复用 [`KeyPart`]:警示带历来是**一行 `Paragraph` 的一段段 `Span`**
+/// (段间无空隙、不是键位行的分段),且各段各有自己的既定配色——引擎缺失红 /
+/// 数据仓根与漂移琥珀 / 装配进行中强调 / 提示暗,订阅条目还要按引擎下发的
+/// 到期三态上四态色。配色归渲染侧,布局侧只量宽、只发目标,`tone` 原样透传。
+#[derive(Clone, Debug)]
+pub struct AlertPart {
+    pub text: String,
+    /// 命中目标;`None` = 只画不点(提示段与各档的警示头)。
+    pub target: Option<Target>,
+    pub tone: AlertTone,
+}
+
+/// 警示带一段的呈现角色(渲染侧据此取色;布局侧不解释它)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlertTone {
+    /// 红:引擎二进制找不到(既有话术一字不变)。
+    Alarm,
+    /// 琥珀:数据仓根三态 / 漂移派 / 订阅到期三态的警示面。
+    Warn,
+    /// 强调色:装配进行中(既有话术一字不变)。
+    Busy,
+    /// 暗:提示尾巴与「一切平静」。
+    Hint,
+    /// 订阅条目名:按引擎回音的 `status` 上四态色(expiring 警 / expired 败,
+    /// 只标记不治理——不改退出码、不提醒)。
+    Entry(State),
+}
+
+/// 警示带**一段**的产物(与 [`KeySegment`] 同族):文案 + 目标 + 角色 + 矩形。
+#[derive(Debug)]
+pub struct AlertSegment {
+    pub text: String,
+    pub target: Option<Target>,
+    pub tone: AlertTone,
+    /// 段在屏上的矩形(宽 = `unicode_width(文案)`,高 1 行)。
+    pub rect: Rect,
+}
+
+/// 把一串 [`AlertPart`] 从 `anchor.x` 左起**紧贴**铺成一行(段间无空隙:
+/// 警示带是一行 `Paragraph` 的一段段 `Span`,不是键位行的分段)。
+///
+/// 段宽 = `unicode_width(文案)`,与渲染逐字同源。放不下的收口分两种,
+/// 判据是**这一段点不点得中**:
+/// - **可点段**(`target.is_some()`):整段收口——这一段及后续既不画也不给命中
+///   (与 [`key_line_segments`] 同一条纪律,#69)。屏上画得出却点不中的段比不画
+///   更糟,订阅条目宁可少点名一条,也不画一截点不到的残名。
+/// - **只画不点的提示段**:按剩余宽度**截断**后收口(与改动前 `Paragraph`
+///   靠终端裁尾逐字同源)。数据仓根那串带路径的指路在 66×50 下限内本来就被裁过,
+///   裁掉的是尾巴不是整句——若整段收口,窄终端下操作者连收到的路径都看不见。
+pub fn alert_segments(anchor: Rect, parts: &[AlertPart]) -> Vec<AlertSegment> {
+    use unicode_width::UnicodeWidthStr;
+    let right = anchor.x.saturating_add(anchor.width);
+    let mut out = Vec::new();
+    let mut x = anchor.x;
+    for part in parts {
+        let w = u16::try_from(UnicodeWidthStr::width(part.text.as_str())).unwrap_or(0);
+        let end = x.saturating_add(w);
+        if w == 0 {
+            break;
+        }
+        if end > right {
+            match part.target {
+                // 可点段放不下:这一段及后续都不画不命中。
+                Some(_) => break,
+                // 提示段放不下:裁到剩余宽度(终端宽字符不切半,
+                // 与 `recipes::clip` 同一把尺),画完即收口。
+                None => {
+                    let room = usize::from(right.saturating_sub(x));
+                    let text = crate::screens::recipes::clip(&part.text, room);
+                    if !text.is_empty() {
+                        out.push(AlertSegment {
+                            text,
+                            target: None,
+                            tone: part.tone,
+                            rect: Rect::new(x, anchor.y, right.saturating_sub(x), 1),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        out.push(AlertSegment {
+            text: part.text.clone(),
+            target: part.target,
+            tone: part.tone,
+            rect: Rect::new(x, anchor.y, w, 1),
+        });
+        x = end;
+    }
+    out
 }
 
 /// 呈现态:宽 ≥ [`BREAKPOINT`] 为常畅态,否则紧凑态(仍不低于 66×50 下限)。
@@ -430,6 +539,16 @@ fn overview_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     if cmd_inner.height >= 5 {
         let line = Rect::new(cmd_inner.x, cmd_inner.y + 4, cmd_inner.width, 1);
         hits.push((line, Target::NavTo(Screen::Vps)));
+    }
+    // #94 工单 #105:警示带上的订阅到期条目可点(点它 = 跳到订阅册并选中那
+    // 一条)。几何与 `overview::render_alert` **同一份段清单**
+    // (`screens::overview::alert_parts` → [`alert_segments`]):屏上画出的段才
+    // 给命中,放不下的整段两厢都不出现——一处几何真相(ADR-0005)。
+    // 只画不点的段(警示头 / 提示尾巴 / 分隔号)不进命中区。
+    for seg in alert_segments(rows[0], &crate::screens::alert_parts(app)) {
+        if let Some(t) = seg.target {
+            hits.push((seg.rect, t));
+        }
     }
 }
 

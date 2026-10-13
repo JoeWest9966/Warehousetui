@@ -852,6 +852,12 @@ impl App {
             // 路径逐字同一处),所以鼠标与键盘不可能给出两种后果;无选中行 /
             // 入口门不过 / 装配在途时,复现键盘 `d` 的既有日志,不新造行为。
             Target::CatalogDelete => self.catalog_delete(),
+            // 点概览警示带上的订阅到期条目(#94 工单 #105,用户故事 12):跳到
+            // 订阅册并选中那一条。与键盘 `v` 到编目屏同族的三步(定册内维度 →
+            // 切屏 → 落册级选中槽),选中落在**可见行**上(#69 册内过滤);载荷是
+            // 投影下标,与 `SelectRow` 的可见行下标是两回事,故单立变体。
+            // 零引擎调用:回音是既有的 `sub_ls`,面板只换视图。
+            Target::AlertSubEntry(idx) => self.open_subscription_book(idx),
         }
     }
 
@@ -2543,6 +2549,41 @@ impl App {
             k.file(),
             k.next_hint()
         ));
+    }
+
+    /// 点概览警示带的订阅到期条目 = 跳到订阅册并选中那一条(#94 工单 #105,
+    /// 用户故事 12:「从发现到处理一步到位」)。三步与键盘 `v` 到编目屏同族:
+    /// 先定屏内维度(订阅册)、再切屏、最后把册级选中槽落到那一条上。
+    ///
+    /// 选中槽是**可见行**下标(#69 册内过滤),故载荷给的投影下标要经
+    /// `catalog_visible()` 换算;换算不出来(这一条被过滤词挡在可见行外)只留
+    /// 一行指路日志,不新造禁用态——与册体「无选中行时点下去复现既有指路」
+    /// 同一口径。
+    ///
+    /// **零引擎调用**:回音是既有的 `app.sub_ls`,这里只换视图。
+    pub(crate) fn open_subscription_book(&mut self, idx: usize) {
+        self.catalog_kind = crate::screens::CatalogKind::Subscription;
+        // 换册即离开机器册语境(#70):反查上浮是机器册独有的只读动作,跳册同样
+        // 收回任何在场 / 在途的反查——与 `cycle_catalog_kind` 同一条纪律。
+        self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
+        self.screen = Screen::Vps;
+        self.catalog_filter_on = false; // 进册不顺手进过滤输入态(同 NavTo)
+        let name = self
+            .catalog_sheet()
+            .and_then(|s| s.entries.get(idx).map(|e| e.name.clone()));
+        let pos = self.catalog_visible().iter().position(|&i| i == idx);
+        match (pos, name) {
+            (Some(p), Some(name)) => {
+                let (sel, _) = self.catalog_sel_mut();
+                *sel = p;
+                self.push_log(format!("跳到订阅册并选中 {name}"));
+            }
+            (None, Some(name)) => self.push_log(format!(
+                "跳到订阅册:{name} 不在当前过滤后的可见行里——册内按 / 改过滤词"
+            )),
+            _ => self.push_log("跳到订阅册:这一条不在回音里了(可能刚被删)"),
+        }
+        self.catalog_clamp();
     }
 
     /// 编目册屏当前这一本的投影(四本各自的数据源汇到同一个
@@ -4796,6 +4837,90 @@ mod tests {
         wheel(&mut app, row, MouseEventKind::ScrollDown);
         assert_eq!(app.sub_sel, 2, "订阅册滚轮动 sub_sel");
         assert_eq!(app.vps_sel, 0, "订阅册滚轮不误写 vps_sel");
+    }
+
+    // ---- #94 工单 #105:点概览警示带的订阅到期条目直跳订阅册 ----
+
+    /// 点警示带上的到期订阅 = 跳到订阅册并选中那一条(#105 用户故事 12)。
+    /// 三步与键盘 `v` 到编目屏同族(定册内维度 → 切屏 → 落册级选中槽),选中落在
+    /// **可见行**上(#69 过滤的口径);`CAT_SUB_LS` 按名排序后 soon 在投影第 3 条
+    /// (下标 2),无过滤时可见位置就是 2。两档都点得中,全程零引擎调用——回音是
+    /// 既有的 `sub_ls`,面板只换视图。
+    #[test]
+    fn 概览_点警示带到期订阅_跳到订阅册并选中那一条_两档零调用() {
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let mut app = catalog_four_books_app();
+            app.screen = Screen::Overview;
+            app.size = Rect::new(0, 0, w, h);
+            let entry = hit_target(&app, |t| matches!(t, Target::AlertSubEntry(2)));
+            click(&mut app, entry);
+            assert_eq!(app.screen, Screen::Vps, "{w}×{h} 跳到编目屏");
+            assert_eq!(
+                app.catalog_kind,
+                catalog::CatalogKind::Subscription,
+                "{w}×{h} 屏内维度落到订阅册"
+            );
+            assert_eq!(app.sub_sel, 2, "{w}×{h} 选中 soon 那一条");
+            assert_eq!(
+                app.catalog_sel(),
+                2,
+                "{w}×{h} 册级查表读到的就是订阅册的选中槽"
+            );
+            assert!(app.queue.is_empty(), "{w}×{h} 零引擎调用:只换视图");
+            assert!(
+                app.log.iter().any(|l| l.contains("soon")),
+                "{w}×{h} 日志记下选中了哪一条:{:?}",
+                app.log
+            );
+        }
+    }
+
+    /// 册内过滤把这一条筛掉时(#69):点击照旧发生,但不落到一个看不见的选中位上
+    /// ——复现册体「无选中行时点下去给指路」的既有口径,不新造禁用态。
+    #[test]
+    fn 概览_点警示带到期订阅_被册内过滤筛掉时给指路不硬选中() {
+        let mut app = catalog_four_books_app();
+        app.screen = Screen::Overview;
+        app.size = Rect::new(0, 0, 80, 30);
+        // 订阅册的过滤词筛掉 soon(只剩 airport / forever 两条 active)
+        app.catalog_filter[catalog::CatalogKind::Subscription.idx()] = "airport".into();
+        let entry = hit_target(&app, |t| matches!(t, Target::AlertSubEntry(2)));
+        click(&mut app, entry);
+        assert_eq!(app.screen, Screen::Vps, "仍然跳到订阅册");
+        assert_eq!(app.catalog_kind, catalog::CatalogKind::Subscription);
+        assert_eq!(
+            app.catalog_sel(),
+            0,
+            "可见行里没有它:选中钳在可见范围内(2 条可见 → 0),不落在看不见的行上"
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("soon") && l.contains("过滤")),
+            "指路说清它被过滤词挡住了:{:?}",
+            app.log
+        );
+        assert!(app.queue.is_empty(), "零引擎调用");
+    }
+
+    /// 点哪打哪(ADR-0005):命中区不是另推一份几何——坐标取自整帧真显示里
+    /// `soon` 所在的那一列(警示带第一行),点下去落在订阅册并选中它。
+    #[test]
+    fn 概览_点警示带上soon所在列_整帧定位也中_落到订阅册选中它() {
+        let mut app = catalog_four_books_app();
+        app.screen = Screen::Overview;
+        app.splash = false;
+        app.size = Rect::new(0, 0, 80, 30);
+        let (col, row) = locate_col_row(&app, 80, 30, "soon");
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            row,
+        )));
+        assert_eq!(app.screen, Screen::Vps, "整帧定位点下去也跳订阅册");
+        assert_eq!(app.catalog_kind, catalog::CatalogKind::Subscription);
+        assert_eq!(app.sub_sel, 2, "选中 soon 那一条");
+        assert!(app.queue.is_empty(), "零引擎调用");
     }
 
     // ---- #67 正文键位行命中接缝:点「换册」段 = 按 m ----

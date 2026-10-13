@@ -6,8 +6,162 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::engine::State;
+use crate::engine::{Capability, State};
 use crate::screens::{body, data_root_signpost};
+
+/// 警示带要名的**一条订阅**(#94 工单 #105):它在订阅册投影里的下标
+/// (命中侧据此换算可见行)、引擎判的到期三态、带上的文案。
+struct BandSubEntry {
+    idx: usize,
+    st: State,
+    text: String,
+}
+
+/// 警示带要名的订阅条目:走**订阅册同一份投影、同一排序**
+/// ([`crate::screens::CatalogKind::Subscription`] 的 `sheet`),只取引擎已判
+/// expiring / expired 的那几条。
+///
+/// 三道门,缺一道就是空(一档不占,警示带照旧走「装配进行中」或「一切平静」):
+/// 1. 引擎明确「有订阅这一组」(`Capability::Subscription` 探测为可用);
+/// 2. 订阅 ls 回音在场(`app.sub_ls`);
+/// 3. 这一条的 `status` 是 expiring / expired——active 与缺 `status` 都不进带
+///    (缺 status 是第四态 skip,册体自己显式「——」,不进这一档)。
+///
+/// **面板零本地日期运算**:三态与 `daysLeft` 全是上游 `status.go` 在 ls 回音里
+/// 按 UTC 现算好随回音下发的(ADR-0009 §3),这里只点名、只抄数,不算也不改。
+fn band_sub_entries(app: &App) -> Vec<BandSubEntry> {
+    if !app.capabilities.enabled(Capability::Subscription) {
+        return Vec::new();
+    }
+    let Some(sheet) = crate::screens::CatalogKind::Subscription.sheet(app) else {
+        return Vec::new();
+    };
+    sheet
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let st = crate::screens::catalog::expiry_state(e.status.as_deref());
+            match st {
+                State::Warn | State::Fail => Some(BandSubEntry {
+                    idx: i,
+                    st,
+                    text: sub_band_text(e, st),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// 带上的条目文案:名 + 引擎给的剩余天数。过期那条不说「剩 N 天」——已经过去
+/// 了,剩余天数这套说法不成立;没给 `daysLeft` 的 expiring 说「将到期」,不拿
+/// 0 天冒充。
+fn sub_band_text(e: &crate::engine::CatalogEntryView, st: State) -> String {
+    let name = e.name.trim();
+    match st {
+        State::Fail => format!("{name}(已过期)"),
+        _ => match e.days_left {
+            Some(n) => format!("{name}(剩 {n} 天)"),
+            None => format!("{name}(将到期)"),
+        },
+    }
+}
+
+/// 警示带的**段清单**:渲染与鼠标命中共用同一份(ADR-0005 一处几何真相)。
+///
+/// ladder 一道不减、一档不抢:引擎缺失 → 数据仓根三态 → 漂移/破损派 →
+/// **订阅到期(#94 工单 #105,最低一档)** → 装配进行中 → 一切平静。新档只顶掉
+/// 「一切平静」,上面四道既有闸的优先序一字不变(工单 #105「不挤掉既有闸」)。
+///
+/// 只有订阅到期这一档带 `Some(Target::AlertSubEntry(..))` 的可点段(每条目一段,
+/// 载荷 = 投影下标);其余段一律只画不点。
+pub fn alert_parts(app: &App) -> Vec<crate::layout::AlertPart> {
+    use crate::layout::{AlertPart, AlertTone, Target};
+    let hint = |text: String| AlertPart {
+        text,
+        target: None,
+        tone: AlertTone::Hint,
+    };
+    let mut parts: Vec<AlertPart> = Vec::new();
+    if !app.engine.found {
+        parts.push(AlertPart {
+            text: " ⚠ 找不到 nw 二进制 ".into(),
+            target: None,
+            tone: AlertTone::Alarm,
+        });
+        parts.push(hint("——按 F1? 不,按 ? 看帮助;到「设置」屏看指路".into()));
+        return parts;
+    }
+    // 数据仓根门控优先于陈旧派态:根不对时,五域本就没在读(spec #24)。
+    if let Some(cause) = app.data_root_cause() {
+        parts.push(AlertPart {
+            text: format!(" ⚠ {} ", cause.title()),
+            target: None,
+            tone: AlertTone::Warn,
+        });
+        parts.push(hint(format!(
+            "——{}",
+            cause.advice(app.data_root.as_deref())
+        )));
+        return parts;
+    }
+    let drift: Vec<String> = app
+        .ls
+        .as_ref()
+        .map(|l| {
+            l.profiles
+                .iter()
+                .filter(|pr| matches!(pr.state.as_deref(), Some("drift") | Some("broken")))
+                .map(|pr| pr.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !drift.is_empty() {
+        parts.push(AlertPart {
+            text: " ⚠ 警示带 ".into(),
+            target: None,
+            tone: AlertTone::Warn,
+        });
+        parts.push(hint(format!("派 {} 需要关注(漂移/破损)", drift.join("、"))));
+        return parts;
+    }
+    // 订阅到期看板(#94 工单 #105):点名引擎已判 expiring / expired 的订阅,
+    // active 不占带;每条一个可点段,点它 = 跳到订阅册并选中那一条
+    // (`Target::AlertSubEntry`,载荷 = 投影下标)。
+    let subs = band_sub_entries(app);
+    if !subs.is_empty() {
+        parts.push(AlertPart {
+            text: format!(" ⚠ 订阅到期 {} 条 ", subs.len()),
+            target: None,
+            tone: AlertTone::Warn,
+        });
+        for (i, e) in subs.iter().enumerate() {
+            if i > 0 {
+                parts.push(hint("、".into()));
+            }
+            parts.push(AlertPart {
+                text: e.text.clone(),
+                target: Some(Target::AlertSubEntry(e.idx)),
+                tone: AlertTone::Entry(e.st),
+            });
+        }
+        parts.push(hint("——点条目直达订阅册".into()));
+        return parts;
+    }
+    if app.assembling {
+        let lamp = if app.blink { "◉" } else { "○" };
+        parts.push(AlertPart {
+            text: format!(" {lamp} 装配进行中 "),
+            target: None,
+            tone: AlertTone::Busy,
+        });
+        parts.push(hint("其他引擎动作已锁定".into()));
+        return parts;
+    }
+    parts.push(hint(" ✓ 一切平静".into()));
+    parts
+}
 
 pub fn render_overview(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
@@ -41,61 +195,26 @@ pub fn render_overview(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_alert(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    if !app.engine.found {
-        let line = Line::from(vec![
-            Span::styled(" ⚠ 找不到 nw 二进制 ", p.fail()),
-            Span::styled("——按 F1? 不,按 ? 看帮助;到「设置」屏看指路", p.dim()),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
-    // 数据仓根门控优先于陈旧派态:根不对时,五域本就没在读(spec #24)。
-    if let Some(cause) = app.data_root_cause() {
-        let line = Line::from(vec![
-            Span::styled(format!(" ⚠ {} ", cause.title()), p.warn()),
-            Span::styled(
-                format!("——{}", cause.advice(app.data_root.as_deref())),
-                p.dim(),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
-    let drift: Vec<String> = app
-        .ls
-        .as_ref()
-        .map(|l| {
-            l.profiles
-                .iter()
-                .filter(|pr| matches!(pr.state.as_deref(), Some("drift") | Some("broken")))
-                .map(|pr| pr.name.clone())
-                .collect()
+    // 渲染走与命中共用的一份段清单([`alert_parts`] → [`alert_segments`]):
+    // 放不下的整段两厢都不出现(#69 同款纪律)——屏上没有的段,鼠标也点不到,
+    // 点哪打哪(ADR-0005)。段间无空隙:警示带历来是一行 Paragraph 的一段段
+    // Span,不是键位行的分段。各段按自己的角色上色,与改动前逐字同源。
+    let spans: Vec<Span<'static>> = crate::layout::alert_segments(area, &alert_parts(app))
+        .into_iter()
+        .map(|seg| {
+            let style = match seg.tone {
+                crate::layout::AlertTone::Alarm => p.fail(),
+                crate::layout::AlertTone::Warn => p.warn(),
+                crate::layout::AlertTone::Busy => p.accent(),
+                crate::layout::AlertTone::Hint => p.dim(),
+                // 订阅条目:到期三态的四态色(expiring 警 / expired 败),
+                // 只标记不治理——不改退出码、不提醒、不靠 ANSI 颜色。
+                crate::layout::AlertTone::Entry(st) => p.state(st),
+            };
+            Span::styled(seg.text, style)
         })
-        .unwrap_or_default();
-    if !drift.is_empty() {
-        let line = Line::from(vec![
-            Span::styled(" ⚠ 警示带 ", p.warn()),
-            Span::styled(
-                format!("派 {} 需要关注(漂移/破损)", drift.join("、")),
-                p.dim(),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-    } else if app.assembling {
-        let lamp = if app.blink { "◉" } else { "○" };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!(" {lamp} 装配进行中 "), p.accent()),
-                Span::styled("其他引擎动作已锁定", p.dim()),
-            ])),
-            area,
-        );
-    } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(" ✓ 一切平静", p.dim()))),
-            area,
-        );
-    }
+        .collect();
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_profiles(frame: &mut Frame, area: Rect, app: &App) {

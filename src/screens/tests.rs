@@ -45,6 +45,17 @@ fn out(args: &[&str], rc: i32, json: &str) -> EngineOutput {
 
 const LS_FULL: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0"}],"components":[{"name":"retention","depends":[]}],"sources":[],"profiles":[{"name":"desk","state":"drift","lockId":"9f8e","installedAt":"2026-10-01"},{"name":"lab","state":"ok","lockId":"a1b2"}],"locks":[{"lockId":"9f8e","recipe":"research-desk","bakedAt":"2026-10-01"}]}"#;
 
+/// 一份**没有漂移 / 破损派**的 ls(#94 工单 #105:警示带的漂移一档优先于新增的
+/// 订阅到期一档,要看见后者就得先让前者不响)。
+const LS_CALM: &str = r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[{"name":"desk","state":"ok","lockId":"9f8e","installedAt":"2026-10-01"}],"locks":[]}"#;
+
+/// `nw subscription ls` 回音的 data(#94 工单 #105 的警示带数据面;与
+/// `app::tests` 的 `CAT_SUB_LS` / `catalog.rs` 的 `SUB_LS_ALL` 同源同形状,
+/// 各测试模块各留一份是既有惯例):两条 active(一条给了 26000 天、一条没给
+/// 到期日)、一条 expiring(剩 3 天)、一条 expired。三态与 `daysLeft` 全是
+/// 上游 `status.go` 算好随回音下发的,面板零本地日期运算。
+const SUB_LS_BAND: &str = r#"{"catalogPath":"/r/subscriptions.json","subscriptions":[{"name":"airport","kind":"subscription-url","client":"Mihomo","expires":"2099-03-01","status":"active","daysLeft":26000},{"name":"soon","kind":"subscription-url","client":"Clash","expires":"2099-03-04","status":"expiring","daysLeft":3},{"name":"gone","kind":"subscription-url","client":"Stash","expires":"2026-01-01","status":"expired","daysLeft":null},{"name":"forever","kind":"subscription-url","client":"Surge","expires":"","status":"active","daysLeft":null}]}"#;
+
 // ---- 五屏快照 ----
 
 #[test]
@@ -368,6 +379,146 @@ fn 概览警示带点名漂移派() {
     let s = draw(&app, 110, 30);
     assert!(s.contains("警示带"));
     assert!(s.contains("desk"), "点名漂移的派");
+}
+
+// ---- #94 工单 #105:概览警示带的订阅到期看板 ----
+
+/// 给一台「派全 ok、订阅册有回音、引擎有订阅这一组」的台子(#105 用户故事
+/// 11/13):警示带点名 expiring / expired 那两条,active 的两条(一条还剩
+/// 26000 天、一条没给到期日)一档不占。三态与剩余天数全是引擎回音里的
+/// `status` / `daysLeft`,面板不自己算一个数。
+#[test]
+fn 概览警示带_点名到期订阅_active不占带() {
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_CALM).unwrap());
+    app.sub_ls = Some(serde_json::from_str(SUB_LS_BAND).unwrap());
+    app.capabilities.record(
+        crate::engine::Capability::Subscription,
+        crate::engine::Probe::Available,
+    );
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("订阅到期"), "警示带给出租期看板这一档:{s}");
+    assert!(s.contains("2 条"), "带上的条数是引擎回音点出来的:{s}");
+    assert!(s.contains("soon"), "点名还剩 3 天的那条:{s}");
+    assert!(s.contains("剩 3 天"), "剩余天数抄引擎的 daysLeft:{s}");
+    assert!(s.contains("gone"), "点名已过期的那条:{s}");
+    assert!(s.contains("已过期"), "过期不用剩余天数那套说法:{s}");
+    assert!(!s.contains("airport"), "active 不占带:{s}");
+    assert!(!s.contains("forever"), "没给到期日的 active 也不占带:{s}");
+    assert!(!s.contains("一切平静"), "这一档顶掉「一切平静」:{s}");
+}
+
+/// 三种「没到可看的地步」各走各的降级,都不报错、也都不把「没在读」画成
+/// 「没有到期的」:回音没到 / 全是 active / 引擎没有订阅这一组能力。
+/// 第三种是能力门的口径——灌了回音但探测说没有,带上一档不占。
+#[test]
+fn 概览警示带_订阅看板三种降级都不占带() {
+    let calm = |app: &App| draw(app, 110, 30);
+    // 一:订阅册还没读过(回音没到)
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_CALM).unwrap());
+    let s = calm(&app);
+    assert!(s.contains("一切平静"), "没回音时不占带:{s}");
+    assert!(!s.contains("订阅到期"), "没回音不摆这一档:{s}");
+    // 二:回音在场但全是 active
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_CALM).unwrap());
+    app.sub_ls = Some(
+        serde_json::from_str(
+            r#"{"catalogPath":"/r/subscriptions.json","subscriptions":[{"name":"airport","kind":"subscription-url","client":"Mihomo","expires":"2099-03-01","status":"active","daysLeft":26000}]}"#,
+        )
+        .unwrap(),
+    );
+    app.capabilities.record(
+        crate::engine::Capability::Subscription,
+        crate::engine::Probe::Available,
+    );
+    let s = calm(&app);
+    assert!(s.contains("一切平静"), "全 active 时不占带:{s}");
+    assert!(!s.contains("airport"), "全 active 时带上没有订阅名:{s}");
+    // 三:回音里有到期的,但引擎没有订阅这一组(探测结论)
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_CALM).unwrap());
+    app.sub_ls = Some(serde_json::from_str(SUB_LS_BAND).unwrap());
+    app.capabilities.record(
+        crate::engine::Capability::Subscription,
+        crate::engine::Probe::Unavailable,
+    );
+    let s = calm(&app);
+    assert!(s.contains("一切平静"), "引擎没这一组时不占带:{s}");
+    assert!(!s.contains("soon"), "引擎没这一组时不信旧回音:{s}");
+}
+
+/// 新档是**最低**的一档:引擎缺失 / 数据仓根 / 漂移派三道既有闸的优先序
+/// 一字不变(工单 #105「不挤掉既有闸」)。这里漂移派与到期订阅同时在场,
+/// 带上照旧是漂移那条。
+#[test]
+fn 概览警示带_漂移派一档仍优先于订阅到期() {
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap()); // desk 漂移
+    app.sub_ls = Some(serde_json::from_str(SUB_LS_BAND).unwrap());
+    app.capabilities.record(
+        crate::engine::Capability::Subscription,
+        crate::engine::Probe::Available,
+    );
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("警示带"), "漂移一档照旧亮相:{s}");
+    assert!(s.contains("desk"), "点名漂移的派:{s}");
+    assert!(!s.contains("soon"), "订阅到期不抢漂移的位:{s}");
+}
+
+/// 常畅(110×30 / 80×30)与紧凑(66×50)两档都画得出这一档,且无行超宽:
+/// 警示带是 `Constraint::Length(1)` 的一行,条数与文案随宽度收口
+/// (放不下的可点段整段两厢都不出现、提示段裁尾),66×50 下限内至少点名一条 + 给够指路。
+#[test]
+fn 概览警示带_订阅到期一档两档都在场且不超宽() {
+    let mut app = fake_app();
+    app.ls = Some(serde_json::from_str(LS_CALM).unwrap());
+    app.sub_ls = Some(serde_json::from_str(SUB_LS_BAND).unwrap());
+    app.capabilities.record(
+        crate::engine::Capability::Subscription,
+        crate::engine::Probe::Available,
+    );
+    app.splash = false;
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("订阅到期"), "{w}×{h} 这一档在场:{f}");
+        assert!(
+            f.contains("soon") || f.contains("gone"),
+            "{w}×{h} 66×50 下限内至少点名一条:{f}"
+        );
+        for ln in f.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                "{w}×{h} 有行超宽:{ln}"
+            );
+        }
+    }
+}
+
+/// 段清单化不能把**既有**指路悄悄吃掉:数据仓根不可用那串带路径的指路在
+/// 66×50 下限内放不下全句,改动前靠 `Paragraph` 裁尾、操作者还看得见收到的
+/// 路径;现在只画不点的提示段按剩余宽度裁断(可点段才整段收口),路径仍在场。
+#[test]
+fn 概览警示带_根不可用时_66x50下限内指路连路径都在场() {
+    let mut app = fake_app();
+    app.data_root = Some("/nonexistent-nwt-xyz".into());
+    app.screen = Screen::Overview;
+    app.splash = false;
+    // 整帧(与仓库里所有「无行超宽」断言同口径:TestBackend 的 to_string 会给
+    // 宽字后续格打注释,量宽必须走 frame_display 那把尺)
+    let f = crate::testutil::frame_display(&app, 66, 50);
+    assert!(f.contains("数据仓根不可用"), "警示头在场:{f}");
+    assert!(
+        f.contains("/nonexistent-nwt-xyz"),
+        "66×50 下限内带收到的路径仍在场(裁尾不裁整句):{f}"
+    );
+    for ln in f.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(ln) <= 66,
+            "有行超宽:{ln}"
+        );
+    }
 }
 
 #[test]
