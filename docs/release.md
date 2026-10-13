@@ -114,7 +114,7 @@ curl -fsSLO https://github.com/JoeWest9966/Warehousetui/releases/download/v0.2.0
 sha256sum -c checksums.txt        # 每一项都要 OK
 ```
 
-install.sh 装前做同一件事;对不上就非零退出、不留半个二进制。**私有仓库注意**:匿名下载必 404(见「支持级与已知取舍」),带凭证用 `gh release download v0.2.0` 等价。
+install.sh 装前做同一件事;对不上就非零退出、不留半个二进制。手动下载等价于 `gh release download v0.2.0`(公开仓免凭证)。
 
 ## 双出口:install.sh 与面板 `U` 自升级共享同一套校验纪律
 
@@ -158,9 +158,11 @@ apt install gcc-aarch64-linux-gnu mingw-w64 zip
 - 无代码签名/公证(macOS notarization、Windows Authenticode):V1 不做,靠 sha256 校验兜底。
 - 无 `nwt self-update` **引擎命令**:ADR-0003「面板不代跑引擎命令」的边界不变。但面板自身二进制由设置屏 `U` 经 install.sh 同一道 sha256 闸替换(见上文「双出口」)——自改走的是脚本同一道闸,不是面板自己另造一套。
 - **仓库私有时匿名安装必然 404**:release 资产与 `raw.githubusercontent.com` 的 install.sh 对匿名请求都返回 404(私有仓库行为)。`curl | sh` 一行装的前提是**仓库公开**;保持私有则用 `gh release download`(带凭证),或给 install.sh 加 token 认证通道(未实现)。
+- 无自更新命令(`nwt self-update`):保持 ADR-0003 精神,面板不自改。
+- **公开仓匿名安装即用**:`curl | sh` 一行装开箱即用;未认证 API 有 60 次/小时限流,install.sh 带 `GH_TOKEN`/`GITHUB_TOKEN` 时自动改走 API 资产面(既避限流、也兼容私有仓场景)。
 - **glibc 基线 2.41(v0.2.0 linux 包)**:v0.1.0 的 linux 包构建于 ubuntu-24.04(glibc 2.39);v0.2.0 起在本机(Debian 13)构建,基线升到 2.41,老发行版运行会报 `GLIBC_2.41 not found`。需要更宽兼容时用更老的构建机重打这两个 linux 包(命名不变)。
 - 包管理器分发(Homebrew / Scoop / AUR):后续票据。
-- **跨平台回归只剩一台 Linux 机**:不再有 CI 三平台;已被 macOS/Windows 专属问题咬过两次(建议命令测试的 OS 临时目录长度依赖;见 README「开发」节),改渲染/路径相关代码时手动在脑内过一遍另外两个平台。
+- **三平台回归已回 CI**:公库公开后 GitHub Actions 免费额度恢复,ci.yml 在 ubuntu / macos / windows 三平台跑 fmt/clippy/test/build;曾被 macOS/Windows 专属问题咬过两次(建议命令测试的 OS 临时目录长度依赖;见 README「开发」节),CI 回归后这类回归会被当场抓住。
 
 ## 发布记录
 
@@ -168,4 +170,4 @@ apt install gcc-aarch64-linux-gnu mingw-w64 zip
 |---|---|---|---|
 | 2026-10-06 | v0.1.0 | Action(彩排 run [37443153354](https://github.com/JoeWest9966/Warehousetui/actions/runs/37443153354)) | 5 组合全绿;修复两条彩排问题(macOS x86_64 改交叉编译、runs-on 重复定义)后正式成发布 |
 | 2026-10-09 | v0.2.0 | **手动**(`gh release create`,[release 页](https://github.com/JoeWest9966/Warehousetui/releases/tag/v0.2.0)) | 真机首跑实证(docs/real-first-run.md)后发布;Action 因账号级计费全部无法启动(run [37880214287](https://github.com/JoeWest9966/Warehousetui/actions/runs/37880214287) 五 job 无 runner),改为本地交叉构建 3 平台手动发布;macOS 暂缺、windows 换 gnu 目标、glibc 基线 2.41,均记于「支持级与已知取舍」 |
-| 2026-10-12 | v0.3.0 | **手动**(`gh release create`,[release 页](https://github.com/JoeWest9966/Warehousetui/releases/tag/v0.3.0)) | 第 8/9/10 轮(#64→#74→#79 并入 main,62 提交 / 22 票)合并后发布;发布证据裁 A(C-first,#77):fixture + 本地四项闸门(test 421 passed)为凭,真机首跑另立里程碑;三平台本地交叉构建(linux x86_64 / aarch64 + windows x86_64 gnu 静态 CRT),macOS 仍暂缺,glibc 基线 2.41(同 Debian 13 构建机),私有仓匿名 404。 |
+| 2026-10-12 | v0.3.0 | **手动**(`gh release create`,[release 页](https://github.com/JoeWest9966/Warehousetui/releases/tag/v0.3.0)) | 第 8/9/10 轮(#64→#74→#79 并入 main,62 提交 / 22 票)合并后发布;发布证据裁 A(C-first,#77):fixture + 本地四项闸门(test 421 passed)为凭,真机首跑另立里程碑;三平台本地交叉构建(linux x86_64 / aarch64 + windows x86_64 gnu 静态 CRT),macOS 仍暂缺,glibc 基线 2.41(同 Debian 13 构建机);公开仓,匿名安装即用。 |

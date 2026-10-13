@@ -8,10 +8,12 @@ use tokio::sync::mpsc;
 
 use crate::engine::{
     capability::{self, Capability, Probe},
-    commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, Gate, LsData, State,
+    commands, CommandRunner, EngineEvent, EngineOutput, EngineStatus, Gate, LsData, ProbeEvidence,
+    State,
 };
 use crate::input::{self, InputAction};
 use crate::layout::{hitmap, size_class, ScrollDir, Target};
+use crate::release::{upgrade_hint, verdict, ReleaseLookup, ReleaseProbe};
 use crate::screens::{catalog, RegisterSpec};
 use crate::term::{self, ColorCap};
 use crate::theme::{cached_degrade, Palette, ThemeKind};
@@ -113,6 +115,21 @@ pub enum HealthMode {
     Recheck,
 }
 
+/// 设置屏的屏内页(spec #94 工单 #108,照 [`HealthMode`] 的屏内多模样板)。
+///
+/// 为什么不把版本对照并进常驻面板的那棵扁平行向量:设置屏的竖向预算已被
+/// 110×30 内层 26 行钉死(`screens/settings.rs` 能力节注释记着「既有 21 行
+/// 之外只许 +3」),而常驻面板在无 config 告警时正好用满 26 行——再加一行
+/// 就会把末行的「config 状态」静默挤出手屏。新内容另起一页,常驻面板
+/// **逐字节不动**。后续工单(多派总览)往这个枚举加页即可。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SettingsPage {
+    /// 常驻面板(引擎 / 能力 / 环境 / 外观 / 配置)。
+    Panel,
+    /// 引擎版本对照页:本地 `nw` 版本 ↔ 引擎 release 仓最新 tag。
+    Version,
+}
+
 /// 数据仓根门控的三种不可用原因(spec #24:「没设 / 目录不可用 / 引擎缺能力」
 /// 各有各的说法、互不冒充)。`Unset` / `Unavailable` 由 `App::data_root_cause`
 /// 产出;`EngineCapability` 是能力探测门(#29)的接入点,本票只留位。
@@ -195,6 +212,12 @@ pub enum RegState {
     Idle,
     /// 填 repo 链接(通用单行输入态机)。
     RepoInput,
+    /// 预扫已下发(工单 #114:`gh api` 拉目标仓条目清单,只读、不落
+    /// 文件、不调引擎),等回音;Esc 仍可返航(回音将丢弃)。
+    PreScan,
+    /// 预扫选单在场(工单 #114):勾选要登记的条目。面板侧选单,
+    /// 登记仍走引擎两段式;勾选结果随确认态呈现,不旁路引擎闸。
+    PreScanPick,
     /// 选 kind(skill / extension)。
     KindPick,
     /// 预审已下发(不带 `--yes`,文件不落),等回音。
@@ -271,6 +294,10 @@ impl RegKind {
 }
 
 /// 全局消息。引擎事件与动画心跳都在这里。
+///
+/// [`Message::Release`] 是引擎版本对照(#108)的回音:它**不借道**
+/// [`Message::Engine`]——那不是 `nw` 的进程输出,塞进引擎通道会让「面板
+/// 只跟 nw 说话」这条唯一缝说谎。同形(异步、不阻塞渲染)而不同路。
 #[derive(Clone, Debug)]
 pub enum Message {
     Key(KeyEvent),
@@ -278,7 +305,12 @@ pub enum Message {
     Engine(EngineEvent),
     /// 自升级过程的推进(#121):install.sh 的逐行进度 + 终结结论。
     Upgrade(upgrade::UpgradeEvent),
+    /// 引擎 release 仓最新 tag 的对照结论(#108)。
+    Release(ReleaseProbe),
     Tick,
+    /// 外部源登记向导的预扫回音(工单 #114):只读 GitHub 查询的结果,
+    /// 与引擎回音分成两条通道——预扫不调引擎,也不冒充引擎回音。
+    Scan(crate::scan::ScanEvent),
 }
 
 pub struct App {
@@ -300,6 +332,17 @@ pub struct App {
     pub engine_version: String,
     /// 能力探测门(#29):问引擎自己所得的三态结论,入口可用性唯一事实源。
     pub capabilities: Gate,
+    /// 设置屏当前翻开哪一页(#108)。
+    pub settings_page: SettingsPage,
+    /// 引擎版本对照的**远端侧**结论(#108):`None` = 还没对照过,或正在对照中
+    /// (见 `release_probing`)。判词不落状态——渲染时按本地版本 + 远端结论现算,
+    /// 免得本地版本后到的时候屏幕上留着一句已经不算数的话。
+    pub release_remote: Option<ReleaseProbe>,
+    /// 有一次远端对照在途(#108):在途不重复发起(spec #94 实施决策:远端对照
+    /// **不轮询**,定时轮询明确划在范围外)。
+    pub release_probing: bool,
+    /// 远端对照的注入缝(测试换 `release::FakeReleaseLookup`,零网络)。
+    pub release_lookup: Arc<dyn ReleaseLookup>,
     pub runner: Arc<dyn CommandRunner>,
 
     // ---- 概览 ----
@@ -322,6 +365,20 @@ pub struct App {
     /// 在途那一程是被**中止**掉的(#59):进程可能已写了一半,迟到的回音
     /// 按它丢弃——不替引擎宣布成功,也不假装失败。下一次 up 下发时清零。
     pub as_aborted: bool,
+    /// 装配历史次级视图(票 #101,datarepo 读侧):`None` = 不在场
+    /// (屏上还是选锁定集)。在场时装配屏改渲染历史;数据一次打开读
+    /// 一批(`HistoryView`),屏幕层只消费形状、零路径拼接(接缝纪律)。
+    pub as_history: Option<crate::datarepo::HistoryView>,
+    /// 历史列表选中行:**可见行**下标(经 [`App::ah_visible`] 映射回
+    /// 存档行),与编目册册内选中同一族口径(#69)。
+    pub ah_sel: usize,
+    /// 历史过滤输入态(与 `rc_filter_on` 同构:`/` 进,键入归输入态)。
+    pub ah_filter_on: bool,
+    pub ah_filter: String,
+    /// 清单原文浮层(工单 #101 故事 3):`Some` = 在场,内容即原文;
+    /// Esc / 点任意处关。破损态也给原文——解析失败恰恰是最该看
+    /// 原文的时候;缺失态没有原文,不开空浮层。
+    pub ah_raw: Option<String>,
 
     // ---- 健康 ----
     pub hl_mode: HealthMode,
@@ -335,6 +392,10 @@ pub struct App {
     // ---- 配方 ----
     pub rc_domain: Domain,
     pub rc_sel: usize,
+    /// 反向溯源(#115):配方屏选中行的派落点浮层 —— 纯只读呈现(零引擎调用、
+    /// 零文件读取),落点规则取自上游 docs/external-sources.md,面板不另造。
+    /// 打开时从当次 ls 五域数据算定快照,之后不随刷新漂。
+    pub rc_landing: Option<crate::screens::recipes::LandingTrace>,
     /// 外部源登记·预审段状态机(spec #25 / 工单 #30)。
     pub reg_state: RegState,
     /// repo 链接缓冲(通用单行输入态机,[`input::BUF_CAP`] 封顶)。
@@ -345,6 +406,19 @@ pub struct App {
     pub reg_kind_sel: usize,
     /// 预审回音(确认态呈现;为 None 时 Review 不成立)。
     pub reg_result: Option<EngineOutput>,
+    /// 外部源登记向导·预扫选单(工单 #114):面板侧发现的条目,与
+    /// [`reg_scan_checks`] 逐位对应;只在 `PreScanPick` 与确认态呈现里读。
+    pub reg_scan_entries: Vec<crate::scan::ScannedEntry>,
+    /// 预扫选单的勾选态(与 [`reg_scan_entries`] 等长;默认全勾——
+    /// 菜单答「这仓有什么」,作者改的是「我要登记哪些」)。
+    pub reg_scan_checks: Vec<bool>,
+    /// 预扫选单选中行(↑/↓ / 滚轮 / 鼠标点行同源)。
+    pub reg_scan_sel: usize,
+    /// 在途预扫的 slug(对账用:迟到回音只认当前这一次,不幽灵重开)。
+    pub reg_scan_slug: Option<String>,
+    /// 待扫 slug 队列(工单 #114):键位处理器没有 tx,只排队;主循环
+    /// 取出后跑只读 `gh api`,回音经扫描通道回流。
+    pub scan_pending: Vec<String>,
     /// 编目册屏(#53):vps 两段式登记流(与命令组无关的骨架件)。
     pub vps_flow: crate::screens::RegisterFlow,
     /// vps 登记表单(名字 / 若干条地址 / 端口 / 若干条登录 / 备注)。
@@ -552,6 +626,7 @@ impl App {
     }
 
     /// 测试注入:完全可控的 runner(零真实进程)。
+    #[cfg(test)]
     pub fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
         let status = EngineStatus {
             found: true,
@@ -560,10 +635,13 @@ impl App {
             attempted: Vec::new(),
         };
         let mut app = Self::assemble(runner, status, None);
-        // 测试注入给定一个可用的数据仓根(临时目录,三平台都在),
-        // 让既有行为测试聚焦各自语义;「未设 / 不可用」由 #27 专属
-        // 测试显式置 None / 坏路径验证,不靠环境带过。
-        app.data_root = Some(std::env::temp_dir().display().to_string());
+        // 测试注入给定一个可用的数据仓根,让既有行为测试聚焦各自语义;
+        // 「未设 / 不可用」由 #27 专属测试显式置 None / 坏路径验证,不靠
+        // 环境带过。根取**三平台同串**的定值(见 `testutil::stable_root`):
+        // 80 列金色帧与建议命令断言把这条路径原样烘进输出,用
+        // `std::env::temp_dir()` 会随平台变长变短(macOS `/var/folders/…`、
+        // Windows `C:\Users\…\Temp`),同一帧于是只在 Linux 绿。
+        app.data_root = Some(crate::testutil::stable_root());
         app
     }
 
@@ -598,6 +676,10 @@ impl App {
             engine,
             engine_version: "探测中".into(),
             capabilities: Gate::default(),
+            settings_page: SettingsPage::Panel,
+            release_remote: None,
+            release_probing: false,
+            release_lookup: Arc::new(crate::release::GhReleaseLookup),
             runner,
             ls: None,
             ls_loading: false,
@@ -609,6 +691,11 @@ impl App {
             as_result: None,
             as_running: false,
             as_aborted: false,
+            as_history: None,
+            ah_sel: 0,
+            ah_filter_on: false,
+            ah_filter: String::new(),
+            ah_raw: None,
             hl_mode: HealthMode::Doctor,
             hl_sel: 0,
             hl_result: None,
@@ -616,11 +703,18 @@ impl App {
             hl_recheck: None,
             rc_domain: Domain::Recipes,
             rc_sel: 0,
+            // 反向溯源浮层(#115):选中行的派落点只读快照;None = 不在场。
+            rc_landing: None,
             reg_state: RegState::Idle,
             reg_repo_buf: String::new(),
             reg_kind: RegKind::Skill,
             reg_kind_sel: 0,
             reg_result: None,
+            reg_scan_entries: Vec::new(),
+            reg_scan_checks: Vec::new(),
+            reg_scan_sel: 0,
+            reg_scan_slug: None,
+            scan_pending: Vec::new(),
             vps_flow: crate::screens::RegisterFlow::new(),
             vps_form: crate::screens::new_form(),
             vps_ls: None,
@@ -750,6 +844,85 @@ impl App {
         self.runner.spawn(args, tx.clone());
     }
 
+    /// **打开设置屏才对照一次**(spec #94 实施决策:远端对照不轮询,定时轮询
+    /// 明确划在范围外)。结论一到就锁 latch,不再发起;操作者要重查按设置屏
+    /// `r`(清结论,下一帧自然再发起)。
+    ///
+    /// 发起走 `tokio::spawn` + 独立 channel,回音经 [`Message::Release`] 落账:
+    /// 与引擎调用同形(异步、不阻塞渲染),但不借道 [`App::spawn_engine`]——
+    /// 那不是 `nw` 命令,塞进引擎队列会让「面板只跟 nw 说话」这条缝说谎。
+    /// 主循环每帧调它,闸内自行判断要不要发起(幂等)。
+    pub fn ensure_release_probe(&mut self, tx: &mpsc::UnboundedSender<ReleaseProbe>) {
+        if self.screen != Screen::Settings
+            || self.release_probing
+            || self.release_remote.is_some()
+            || !self.engine.found
+        {
+            return;
+        }
+        self.start_release_probe(tx);
+    }
+
+    /// 设置屏 `r`:显式重查(与健康屏 `r` 复核同一语气)。
+    ///
+    /// 只清结论、不自己发起:键位处理器没有 channel(同 `queue` 的纪律),
+    /// 下一帧的 [`App::ensure_release_probe`] 看到「暂无结论」自然会再问一次。
+    pub fn reprobe_release(&mut self) {
+        if self.release_probing {
+            return; // 在途那次问完自然落账,不叠一次
+        }
+        self.release_remote = None;
+        self.push_log("重查引擎 release 仓…");
+    }
+
+    fn start_release_probe(&mut self, tx: &mpsc::UnboundedSender<ReleaseProbe>) {
+        self.release_probing = true;
+        let lookup = Arc::clone(&self.release_lookup);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let probe = lookup.latest_tag().await;
+            // 收端没了(面板正在退)就当没问过:不回写、不告警。
+            let _ = tx.send(probe);
+        });
+    }
+
+    /// 远端对照结论落账(#108):只写状态与日志,**绝不**据此下发任何命令
+    /// (ADR-0003:建议命令只给文案,执行权留给操作者)。
+    fn on_release_probe(&mut self, probe: ReleaseProbe) {
+        self.release_probing = false;
+        self.release_remote = Some(probe.clone());
+        match &probe {
+            ReleaseProbe::Latest(tag) => {
+                self.push_log(format!("引擎 release 仓最新 tag:{tag}"));
+            }
+            // 两种「取不到」理由分开说:操作者要知道是该去装 gh / 联网,
+            // 还是上游这次的发布形态不对劲。都不报错、都不猜(spec 用户故事 25)。
+            ReleaseProbe::Garbage => {
+                self.push_log("引擎 release 仓回话不是可用 tag:只显示本地版本,不猜".to_string())
+            }
+            ReleaseProbe::Unreachable => self.push_log(
+                "取不到引擎 release 仓(gh 不在 PATH 或没网):只显示本地版本,不报错".to_string(),
+            ),
+        }
+        self.note_release_verdict();
+    }
+
+    /// 落后时把升级指路写进日志区(#108,ADR-0003):建议命令只给文案,面板不代跑。
+    ///
+    /// 两个落账点都调它——本地版本与远端 tag 谁后到,这句指路都不该漏
+    /// (版本常比 tag 先到,也可能反过来)。
+    fn note_release_verdict(&mut self) {
+        let Some(ReleaseProbe::Latest(tag)) = self.release_remote.clone() else {
+            return; // 没拿到远端就无从判落后
+        };
+        if verdict(&self.engine_version, Some(&tag)) == crate::release::Verdict::Behind {
+            self.push_log(format!(
+                "引擎落后:升级指路 `{}`(不代跑,升不升你定)",
+                upgrade_hint()
+            ));
+        }
+    }
+
     /// **喂入版**引擎调用入口(#56): argv 同一个入口、同一套进行态登记,差别
     /// 只在多一份一次性 stdin 本体(订阅链接 / 将来的密钥本体)。喂入内容是
     /// 一次性值:原样写进子进程 stdin 后立即 drop,**绝不进 `EngineOutput` /
@@ -780,6 +953,11 @@ impl App {
                 self.as_result = None;
                 self.as_running = true; // 中止键从此可受理(#59)
                 self.as_aborted = false; // 新一程:旧程的中止标记不赖到它头上
+                                         // 装配历史是闲时的只读浏览视图(#101):一启动就让位给七步与
+                                         // stderr 日志,回音落地时屏幕已经在运行态,不搞「装配中还在
+                                         // 翻存档」这种半屏两义。
+                self.as_history = None;
+                self.ah_raw = None;
                 self.push_log(format!("装配启动:{}", args.join(" ")));
             }
             Some("ls") => {
@@ -854,7 +1032,9 @@ impl App {
             Message::Mouse(ev) => self.on_mouse(ev),
             Message::Engine(ev) => self.on_engine(ev),
             Message::Upgrade(ev) => self.on_upgrade(ev),
+            Message::Release(p) => self.on_release_probe(p),
             Message::Tick => self.blink = !self.blink,
+            Message::Scan(ev) => self.on_scan(ev),
         }
     }
 
@@ -898,6 +1078,8 @@ impl App {
                 self.screen = s;
                 self.rc_filter_on = false; // 点导航切屏同样退过滤输入态(#61)
                 self.catalog_filter_on = false; // 编目册过滤同理(#69)
+                self.ah_filter_on = false; // 装配历史过滤同理(#101)
+                self.ah_raw = None; // 原文浮层不跨屏(#101)
             }
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
@@ -908,8 +1090,19 @@ impl App {
                     self.reg_kind = RegKind::from_index(self.reg_kind_sel);
                     return;
                 }
+                // 预扫选单(#114):点行 = 勾选/取消该条(与空格同路,
+                // 顺带移选中)——选单的主操作就是勾选。
+                if self.reg_state == RegState::PreScanPick {
+                    self.toggle_scan_row(i);
+                    return;
+                }
                 match self.screen {
                     Screen::Overview => self.ov_sel = i,
+                    // 装配历史视图在场(#101):点行选中的是历史列表,
+                    // 不是锁定集列表——同一块区域两种列表,按视图分流。
+                    Screen::Assemble if self.as_history.is_some() => {
+                        self.ah_sel = i.min(self.ah_visible().len().saturating_sub(1));
+                    }
                     Screen::Assemble => self.as_sel = i,
                     Screen::Health => self.hl_sel = i,
                     Screen::Recipes => self.rc_sel = i,
@@ -929,6 +1122,7 @@ impl App {
             Target::Activate => match self.reg_state {
                 RegState::KindPick => self.dispatch_register(),
                 RegState::Review if self.reg_can_commit() => self.dispatch_register_commit(),
+                RegState::PreScanPick => self.reg_pick_confirm(),
                 _ => self.launch_selected_lock(),
             },
             // 帮助「任意处关」与仪式「Esc 返航」:与键盘 Esc 同一路
@@ -978,6 +1172,12 @@ impl App {
                 let sel = self.tag_jump.sel();
                 self.tag_jump_to(sel);
             }
+            // 点概览警示带上的订阅到期条目(#94 工单 #105,用户故事 12):跳到
+            // 订阅册并选中那一条。与键盘 `v` 到编目屏同族的三步(定册内维度 →
+            // 切屏 → 落册级选中槽),选中落在**可见行**上(#69 册内过滤);载荷是
+            // 投影下标,与 `SelectRow` 的可见行下标是两回事,故单立变体。
+            // 零引擎调用:回音是既有的 `sub_ls`,面板只换视图。
+            Target::AlertSubEntry(idx) => self.open_subscription_book(idx),
         }
     }
 
@@ -993,8 +1193,15 @@ impl App {
                 (&mut self.ov_sel, n)
             }
             Screen::Assemble => {
-                let n = self.ls.as_ref().map(|l| l.locks.len()).unwrap_or(0);
-                (&mut self.as_sel, n)
+                // 装配历史视图在场(#101):滚轮移历史选中;锁定集
+                // 列表的滚轮语义原样保留(视图不在场时)。
+                if self.as_history.is_some() {
+                    let n = self.ah_visible().len();
+                    (&mut self.ah_sel, n)
+                } else {
+                    let n = self.ls.as_ref().map(|l| l.locks.len()).unwrap_or(0);
+                    (&mut self.as_sel, n)
+                }
             }
             Screen::Health => {
                 let n = self
@@ -1014,6 +1221,18 @@ impl App {
                         ScrollDir::Up => cur.saturating_sub(1),
                     };
                     self.reg_kind = RegKind::from_index(self.reg_kind_sel);
+                    return;
+                }
+                // 预扫选单的滚轮移选中(#114,与 ↑/↓ 同路;勾选归空格/点行)
+                if self.reg_state == RegState::PreScanPick {
+                    let n = self.reg_scan_entries.len();
+                    if n > 0 {
+                        let cur = self.reg_scan_sel.min(n - 1);
+                        self.reg_scan_sel = match dir {
+                            ScrollDir::Down => (cur + 1).min(n - 1),
+                            ScrollDir::Up => cur.saturating_sub(1),
+                        };
+                    }
                     return;
                 }
                 let n = self.domain_len();
@@ -1076,6 +1295,10 @@ impl App {
         if self.help {
             self.help = false;
             self.help_offset = 0; // 关浮层即归零:重开总是从首行看起
+        } else if self.ah_raw.is_some() {
+            // 清单原文浮层(#101):Esc 与点任意处同路关掉。帮助浮层可能
+            // 叠在它上面(? 随时可开),故 `help` 分支在前。
+            self.ah_raw = None;
         } else if self.as_confirm {
             self.as_confirm = false;
             self.push_log("发射取消");
@@ -1096,6 +1319,11 @@ impl App {
             // 不改、反查结论与选中行原样在场。键盘 Esc/q 与鼠标点任意处走这
             // 一条同路(语义不许漂移);没有这一支,点浮层外就会静默无反应。
             self.tag_jump = crate::screens::catalog::TagJump::Idle;
+        } else if self.landing_open() {
+            // 落点溯源浮层返航(#115):只收状态。配方屏选中行原样在场——浮层
+            // 读的是打开那一刻的落点快照(`recipes::LandingTrace`),返航不顺手
+            // 改 rc_sel/rc_domain。Esc 与点任意处走这一条同路(语义不漂移)。
+            self.rc_landing = None;
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
@@ -1153,6 +1381,8 @@ impl App {
                     })
                     .unwrap_or_else(|| "未知".into());
                 self.push_log(format!("引擎就绪:nw {}", self.engine_version));
+                // 版本后到也要补判一次:远端 tag 可能已经等在桌上了(#108)
+                self.note_release_verdict();
             }
             "ls" => {
                 self.ls_loading = false;
@@ -1310,11 +1540,31 @@ impl App {
             _ => {
                 if let Some(cap) = Capability::from_probe(&out.args) {
                     let verdict = capability::interpret(&out);
+                    // 证据(#118):探针 argv 与引擎那一跑的原文随 verdict 一并
+                    // 入账;bin / 来源取开机发现结论,版本复用开机版本探测
+                    // (已探明,不在这里再问引擎一次)。
+                    let ev = ProbeEvidence::capture(
+                        &out,
+                        self.engine.bin.as_deref(),
+                        self.engine.source,
+                        &self.engine_version,
+                    );
+                    // 先入账再取指路:共享构造器从账上读证据带,顺序反了
+                    // 日志那句就会缺证据(#118 的验收正是「日志带证据」)。
+                    self.capabilities.record(cap, verdict, Some(ev));
                     if verdict != Probe::Available {
-                        // 日志只记一句人话;指路全文归设置屏能力清单。
-                        self.push_log(format!("能力探测:{} {}", cap.label(), verdict.label()));
+                        // 日志只记一句带证据的结论(构造器的单行形态,与册体
+                        // 证据带 #122 同一份字段);指路全文归册体 / 设置屏
+                        // 能力清单。可用态不占日志。
+                        let signpost = capability::gate_signpost(
+                            cap.label(),
+                            cap,
+                            &self.capabilities,
+                            &self.engine_facts(),
+                        )
+                        .expect("非可用态必有指路");
+                        self.push_log(signpost.line(cap, verdict));
                     }
-                    self.capabilities.record(cap, verdict);
                 }
             }
         }
@@ -1395,6 +1645,17 @@ impl App {
             }
             return;
         }
+        // 落点溯源浮层(#115):与反查浮层同级的顶层浮层 —— 在场时吞键,只有
+        // Esc 返航;五域键位(切域/选行/过滤/建议命令)一个都不受理,配方屏原
+        // 选中行因此原样不动(浮层读的是打开那一刻的快照,返航不顺手改
+        // rc_sel/rc_domain)。鼠标点任意处与键盘 Esc 一个后果(走 `dismiss_popup`
+        // 同一条路)。
+        if self.landing_open() {
+            if matches!(k.code, KeyCode::Esc) {
+                self.dismiss_popup();
+            }
+            return;
+        }
         // 浮层优先级:帮助浮层 > 发射确认 > 手填输入(NW_HOME / 数据仓根) > 指路屏/常屏(见 spec #9)
         if self.home_input {
             self.on_key_home_input(k);
@@ -1416,6 +1677,13 @@ impl App {
         // 与 `rc_filter` 同级,不与登记两段式混。
         if self.catalog_filter_on && self.screen == Screen::Vps {
             self.on_key_catalog_filter(k);
+            return;
+        }
+        // 装配历史过滤输入态(#101):与 rc_filter/catalog_filter 同级的顶层
+        // 输入态(优先于屏键位,但只在历史视图在场时吞键——Esc 收词/清词,
+        // 关视图即退输入态)。
+        if self.ah_filter_on && self.as_history.is_some() {
+            self.on_key_ah_filter(k);
             return;
         }
         // 编目册登记两段式(#53):与外部源登记同级的浮层优先级,
@@ -1464,11 +1732,19 @@ impl App {
             self.on_key_flow(crate::screens::CatalogKind::Key, k);
             return;
         }
-        // 登记两段式(#30 #31):输入 → 预审 → 确认 → 落账 → 结果,
-        // 浮层优先级接在手填之后
+        // 登记两段式(#30 #31)+ 外部源登记向导(#114):输入 → 预扫 → 选单
+        // → 选 kind → 预审 → 确认 → 落账 → 结果,浮层优先级接在手填之后
         match self.reg_state {
             RegState::RepoInput => {
                 self.on_key_reg_repo(k);
+                return;
+            }
+            RegState::PreScan => {
+                self.on_key_reg_prescan(k);
+                return;
+            }
+            RegState::PreScanPick => {
+                self.on_key_reg_pick(k);
                 return;
             }
             RegState::KindPick => {
@@ -1800,6 +2076,13 @@ impl App {
     }
 
     fn key_assemble(&mut self, k: KeyEvent) {
+        // 装配历史次级视图在场(票 #101):视图内键位自成一套——↑/↓ 选行、
+        // `/` 过滤、Enter 看清单原文、Esc/`h` 返航回选锁定集。与选锁定集
+        // 的键位不共一套(那里 Enter 是发射仪式),所以整段早退,不纠缠。
+        if self.as_history.is_some() {
+            self.key_history(k);
+            return;
+        }
         let n = self.ls.as_ref().map(|l| l.locks.len()).unwrap_or(0);
         match k.code {
             KeyCode::Down => {
@@ -1819,7 +2102,146 @@ impl App {
             // 发射前「返航」的既有语义(还没下发,什么都没发生),两个取消
             // 不许共用一键——按下去之前操作者就该知道会停的是什么。
             KeyCode::Char('x') if self.as_running => self.abort_assembling(),
+            // 装配历史(票 #101):又一个次级视图(与选锁定集/发射仪式/在途
+            // 互斥),键位取本屏未占用的 `h`——装配屏原有键只有
+            // ↑/↓/Enter/x。装配在途不开:在途屏面是七步+日志,历史是
+            // 浏览,两个不相干(想看历史等这一程跑完)。
+            KeyCode::Char('h') if !self.assembling => self.open_history(),
             _ => {}
+        }
+    }
+
+    /// 装配历史次级视图的键位(票 #101): Esc/`h` 返航、↑/↓ 选行、
+    /// `/` 进过滤输入态、Enter 看清单原文。原文浮层在场时只收 Esc
+    /// (与反查结果浮层同款:点任意处关由鼠标侧负责)。
+    fn key_history(&mut self, k: KeyEvent) {
+        if self.ah_raw.is_some() {
+            // 原文浮层只收 Esc:其他键一律吞掉(不穿透回列表),与
+            // `vps_reverse_open()` 反查浮层同一纪律。
+            if k.code == KeyCode::Esc {
+                self.ah_raw = None;
+            }
+            return;
+        }
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('h') => self.close_history(),
+            KeyCode::Down => {
+                let n = self.ah_visible().len();
+                if n > 0 {
+                    self.ah_sel = (self.ah_sel + 1) % n;
+                }
+            }
+            KeyCode::Up => {
+                let n = self.ah_visible().len();
+                if n > 0 {
+                    self.ah_sel = (self.ah_sel + n - 1) % n;
+                }
+            }
+            KeyCode::Char('/') => self.ah_filter_on = true,
+            // 重读快照(#101):显式刷新,不自动跑——文件可能在面板之外变过
+            // (引擎自己装了一版),要新的就按一下。
+            KeyCode::Char('r') => {
+                self.reload_history();
+                let n = self.ah_visible().len();
+                self.push_log(format!("装配历史已重读:{n} 个派(只读快照)"));
+            }
+            KeyCode::Enter => self.open_manifest_raw(),
+            _ => {}
+        }
+    }
+
+    /// 打开装配历史(票 #101):经 datarepo 读侧读一批存档。安装根不存在
+    /// 也开——「NW_HOME 未设」与「有根没派」是两态,屏上分开说
+    /// (前者指路,后者空列表),不摆一个骗人的空列表。
+    pub fn open_history(&mut self) {
+        self.as_history = Some(crate::datarepo::HistoryView::default());
+        self.ah_sel = 0;
+        self.ah_filter.clear();
+        self.ah_filter_on = false;
+        self.ah_raw = None;
+        self.reload_history();
+    }
+
+    /// 重读历史数据(NW_HOME 切换时同步,票 #101):选中行按新行数钳位,
+    /// 原文浮层关掉(旧根的原文不冒充新根的)。
+    fn reload_history(&mut self) {
+        if self.as_history.is_none() {
+            return;
+        }
+        let root = crate::datarepo::InstallRoot::new(&self.nw_home);
+        let rows = root.archives();
+        let root_missing = !root.exists();
+        if let Some(h) = self.as_history.as_mut() {
+            h.rows = rows;
+            h.root_missing = root_missing;
+        }
+        let n = self.ah_visible().len();
+        self.ah_sel = self.ah_sel.min(n.saturating_sub(1));
+        self.ah_raw = None;
+    }
+
+    /// 关历史返航:视图与它的交互态(选中/过滤/原文)一并清,不留给下次。
+    fn close_history(&mut self) {
+        self.as_history = None;
+        self.ah_sel = 0;
+        self.ah_filter.clear();
+        self.ah_filter_on = false;
+        self.ah_raw = None;
+    }
+
+    /// 历史可见行(过滤后下标进 `as_history.rows`):无关键词时全量;
+    /// 命中按派名包含(大小写不敏感)——与册内过滤同一族口径(#69)。
+    pub fn ah_visible(&self) -> Vec<usize> {
+        let Some(h) = self.as_history.as_ref() else {
+            return Vec::new();
+        };
+        let q = self.ah_filter.trim().to_lowercase();
+        (0..h.rows.len())
+            .filter(|&i| q.is_empty() || h.rows[i].profile.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// Enter 看清单原文(工单 #101 故事 3):经 datarepo 读原文;缺失态
+    /// 没有原文,只留一句指路,不开空浮层。
+    fn open_manifest_raw(&mut self) {
+        let Some(h) = self.as_history.as_ref() else {
+            return;
+        };
+        let Some(&i) = self.ah_visible().get(self.ah_sel) else {
+            return;
+        };
+        let profile = h.rows[i].profile.clone();
+        match crate::datarepo::InstallRoot::new(&self.nw_home).manifest_raw(&profile) {
+            Some(raw) => self.ah_raw = Some(raw),
+            None => self.push_log(format!("{profile} 没有清单原文(缺失态:上一轮没提交完)")),
+        }
+    }
+
+    /// 历史过滤输入态(与 `on_key_rc_filter` 同一形态、同一后果链):
+    /// 键入归通用态机,本函数只接过滤这一条的后果。纯本地:改的只有
+    /// 过滤词一个字符串,不入队、不下发。Enter 收词退输入态;Esc/q
+    /// 取消并清空;每改一个词选中回顶。
+    fn on_key_ah_filter(&mut self, k: KeyEvent) {
+        match input::on_key(&mut self.ah_filter, k) {
+            InputAction::Submit => {
+                self.ah_filter_on = false;
+                self.ah_sel = 0;
+                let n = self.ah_visible().len();
+                self.push_log(format!(
+                    "过滤词「{}」:{} 个派命中(本地筛选,未入队)",
+                    self.ah_filter.trim(),
+                    n
+                ));
+            }
+            InputAction::Cancel => {
+                self.ah_filter_on = false;
+                self.ah_filter.clear();
+                self.ah_sel = 0;
+                self.push_log("已清空过滤词:回到全部派".to_string());
+            }
+            // 每改一个词,选中回顶:行数变了,旧下标可能指向另一条
+            InputAction::Edited => self.ah_sel = 0,
+            InputAction::Ignored => {}
         }
     }
 
@@ -1905,7 +2327,7 @@ impl App {
         if !self.capabilities.enabled(Capability::SourceRecheck) {
             self.push_log(format!(
                 "recheck 未下发:{}",
-                crate::engine::capability::GATE_HINT
+                self.capability_gate_line(Capability::SourceRecheck)
             ));
             return;
         }
@@ -1964,6 +2386,10 @@ impl App {
             // 外部源域登记入口(#30):两道门在 start_register 里把守,
             // 不可用时只留一句指路,不进流程。
             KeyCode::Char('r') if self.rc_domain == Domain::Sources => self.start_register(),
+            // 反向溯源(#115):Enter 看选中组件/外部源铺进派后的落点 —— 纯只读
+            // 呈现,不读派目录、不发引擎命令(落点规则是上游 external-sources.md
+            // 的只读知识,面板不另造)。无落点语义的域静默不摆(open_landing 三道门)。
+            KeyCode::Enter => self.open_landing(),
             KeyCode::Down => {
                 let n = self.domain_len();
                 if n > 0 {
@@ -2026,7 +2452,8 @@ impl App {
                 });
             }
             Err(gate) => {
-                self.push_log(format!("建议命令取用:{}:{}", gate.title(), gate.advice()));
+                // #124:整句指路与呈现层同源(屏上那一句、日志这一句同一处真相)
+                self.push_log(format!("建议命令取用:{}", self.bake_gate_line(gate)));
             }
         }
     }
@@ -2055,6 +2482,29 @@ impl App {
             // 两个独立布尔,各自翻转 + 各自持久化(与 m 同一个 config 接缝)。
             KeyCode::Char('b') => self.toggle_notify(NotifyKind::Bell),
             KeyCode::Char('o') => self.toggle_notify(NotifyKind::Desktop),
+            // 引擎版本对照页(#108):v 翻开,再按 v 或 Esc 回常驻面板。
+            // 引擎没找到时不给翻——没有本地版本可比,指路屏的话已经说清了。
+            KeyCode::Char('v') if self.engine.found => {
+                self.settings_page = match self.settings_page {
+                    SettingsPage::Panel => SettingsPage::Version,
+                    SettingsPage::Version => SettingsPage::Panel,
+                };
+                self.push_log(match self.settings_page {
+                    SettingsPage::Panel => "版本对照收起:回常驻面板".to_string(),
+                    SettingsPage::Version => {
+                        "版本对照:本地 nw 版本 ↔ 引擎 release 仓最新 tag".to_string()
+                    }
+                });
+            }
+            // 版本对照页内 Esc 返航(壳级 Esc 的既有语义:「返回」)。常驻面板上
+            // Esc 仍是无分支——那里没有可返回的上一层。
+            KeyCode::Esc if self.settings_page == SettingsPage::Version => {
+                self.settings_page = SettingsPage::Panel;
+            }
+            // 版本对照页内 r 重查(显式刷新,与健康屏 r 复核同语气)
+            KeyCode::Char('r') if self.settings_page == SettingsPage::Version => {
+                self.reprobe_release();
+            }
             _ => {}
         }
     }
@@ -2281,11 +2731,76 @@ impl App {
         self.data_root_cause().is_none() && self.capabilities.enabled(Capability::SourceRegister)
     }
 
+    /// 开机已探明的引擎发现事实:共享指路构造器
+    /// ([`crate::engine::capability::gate_signpost`])的输入。册体、设置屏
+    /// 能力节、日志结论句都从这里取同一份事实,不各自再拼一遍——版本复用
+    /// 开机 `--version` 回音(已探明,不再问引擎一次)。
+    pub fn engine_facts(&self) -> crate::engine::EngineFacts<'_> {
+        crate::engine::EngineFacts {
+            bin: self.engine.bin.as_deref(),
+            source: self.engine.source,
+            version: &self.engine_version,
+            attempted: &self.engine.attempted,
+        }
+    }
+
+    /// 缺能力指路的**单行形态**(工单 #124 的收口):机器册反查未下发、配方
+    /// 烘焙 / 配方新建建议闸、外部源复核闸四处单行指路共用这一句。
+    ///
+    /// 取共享构造器([`crate::engine::capability::gate_signpost`])的单行
+    /// 密度——三态措辞与证据带一处真相,与册体真相行(#122)、日志结论句
+    /// (#118)同源;不各自再排一遍。
+    ///
+    /// 调用点都在闸不过的分支里(能力必非可用态),所以正常情况下一定有指路。
+    /// 万一落在可用态(理论不可达),如实说入口就绪——不编一句指路冒充。
+    pub(crate) fn capability_gate_line(&self, cap: Capability) -> String {
+        let facts = self.engine_facts();
+        match capability::gate_signpost(cap.label(), cap, &self.capabilities, &facts) {
+            Some(s) => s.hint(cap, self.capabilities.get(cap), &facts),
+            None => format!("{} 入口就绪", cap.label()),
+        }
+    }
+
+    /// 配方烘焙闸不过时的**整句指路**(#124 收口):缺能力那一支整句由共享
+    /// 构造器出(三态措辞 + 探针证据带),并且**不拼** `title()`——那句
+    /// 「引擎缺 recipe bake 能力」对未决态是冒充(引擎这一跑根本没答上,不是
+    /// 没有这个能力,spec #90 故事 23);另两支(数据仓根未设 / 没有选中的配方)
+    /// 仍是纯函数层自己的「标题:说法」。三种缺前提仍两两不同、互不冒充。
+    ///
+    /// 为什么在 `App` 层分流:`engine::commands` 是纯函数层,拿不到能力账与
+    /// 引擎身份,三态分措辞与证据带只能在这里接。
+    pub(crate) fn bake_gate_line(&self, gate: crate::engine::commands::BakeGate) -> String {
+        match gate {
+            crate::engine::commands::BakeGate::NoCapability => {
+                self.capability_gate_line(Capability::RecipeBake)
+            }
+            _ => format!("{}:{}", gate.title(), gate.advice()),
+        }
+    }
+
+    /// 配方新建闸不过时的整句指路(#124):与 [`Self::bake_gate_line`] 同构,
+    /// 能力项换成 `RecipeNew`(烘焙与新建同组不同项,各问各的)。
+    pub(crate) fn recipe_new_gate_line(
+        &self,
+        gate: crate::engine::commands::RecipeNewGate,
+    ) -> String {
+        match gate {
+            crate::engine::commands::RecipeNewGate::NoCapability => {
+                self.capability_gate_line(Capability::RecipeNew)
+            }
+            _ => format!("{}:{}", gate.title(), gate.advice()),
+        }
+    }
+
     /// 入口不可用时的一句指路(与入口行提示同源)。
+    ///
+    /// 优先级纪律不变(#27 数据仓根与 #29 能力门两道门互不冒充,既有测试钉着
+    /// 「根那句赢」):根不可用时根那句赢,能力那句不抢跑;根就绪才轮到能力门,
+    /// 且按探测三态如实分措辞 + 带证据(#124)。
     pub fn reg_gate_hint(&self) -> String {
         match self.data_root_cause() {
             Some(_) => self.data_root_gate_msg(),
-            None => capability::GATE_HINT.to_string(),
+            None => self.capability_gate_line(Capability::SourceRegister),
         }
     }
 
@@ -2322,22 +2837,26 @@ impl App {
     }
 
     /// repo 链接提交:格式非法**当场拒绝并留驻可改**(不等引擎跑一趟);
-    /// 合法则进 kind 选择。
+    /// 合法则排队一次只读预扫(工单 #114:面板先看清这仓有什么,再让
+    /// 作者勾选),预扫不落文件、不调引擎;回音失败/空选单回落单条流。
     fn apply_reg_repo(&mut self) {
         let Some(trimmed) = input::normalize(&self.reg_repo_buf) else {
             self.push_log("登记被拒:repo 链接为空,留输入态可改");
             return;
         };
-        if !valid_repo_link(&trimmed) {
+        let Some(slug) = crate::scan::repo_slug(&trimmed) else {
             self.push_log(format!(
                 "登记被拒:\"{trimmed}\" 不是合法 repo 链接(owner/repo、https://github.com/owner/repo 或 git@github.com:owner/repo.git),留输入态可改"
             ));
             return;
-        }
+        };
         self.reg_repo_buf = trimmed;
-        self.reg_state = RegState::KindPick;
         self.reg_kind = RegKind::Skill;
         self.reg_kind_sel = 0;
+        self.reg_scan_slug = Some(slug.clone());
+        self.scan_pending.push(slug);
+        self.reg_state = RegState::PreScan;
+        self.push_log("登记预扫已排队:gh api 拉条目清单(只读,不落文件)");
         self.push_log("选 kind:↑/↓ 或 s/e 选择,Enter 预审,Esc/q 返航");
     }
 
@@ -2401,6 +2920,97 @@ impl App {
         }
     }
 
+    /// 预扫在途键位(#114):等只读回音;Esc 仍可返航(回音将丢弃,
+    /// 不幽灵重开),其余键不动作——与预审在途同纪律。
+    fn on_key_reg_prescan(&mut self, k: KeyEvent) {
+        if matches!(k.code, KeyCode::Esc) {
+            self.cancel_register();
+        }
+    }
+
+    /// 预扫选单键位(#114):↑/↓ 移选中;空格勾选/取消当前条;
+    /// Enter = 带着勾选进 kind 选择(下一段仍是引擎 register 两段式,
+    /// 面板不旁路闸);Esc/q 返航。
+    fn on_key_reg_pick(&mut self, k: KeyEvent) {
+        let n = self.reg_scan_entries.len();
+        match k.code {
+            KeyCode::Up => self.reg_scan_sel = self.reg_scan_sel.saturating_sub(1),
+            KeyCode::Down => {
+                if n > 0 {
+                    self.reg_scan_sel = (self.reg_scan_sel + 1).min(n - 1);
+                }
+            }
+            KeyCode::Char(' ') => {
+                let i = self.reg_scan_sel;
+                self.toggle_scan_row(i);
+            }
+            KeyCode::Enter => self.reg_pick_confirm(),
+            KeyCode::Esc | KeyCode::Char('q') => self.cancel_register(),
+            _ => {}
+        }
+    }
+
+    /// 勾选/取消第 i 条(键盘空格与鼠标点行同一路;顺带移选中)。
+    pub fn toggle_scan_row(&mut self, i: usize) {
+        if let Some(slot) = self.reg_scan_checks.get_mut(i) {
+            *slot = !*slot;
+            self.reg_scan_sel = i;
+        }
+    }
+
+    /// 选单确认:带着勾选结论进 kind 选择——登记落账仍 100% 走引擎
+    /// 两段式(预审 + 图形确认),勾选只是面板侧选单(#114)。
+    pub fn reg_pick_confirm(&mut self) {
+        if self.reg_state != RegState::PreScanPick {
+            return;
+        }
+        let checked = self.reg_scan_checks.iter().filter(|c| **c).count();
+        self.push_log(format!(
+            "预扫选单确认:勾选 {}/{} 条(登记按仓整体进行,引擎扫描为准)",
+            checked,
+            self.reg_scan_entries.len()
+        ));
+        self.reg_state = RegState::KindPick;
+    }
+
+    /// 预扫回音(#114):只读 GitHub 查询的结果,与引擎回音分通道。只在
+    /// 预扫在途且 slug 对得上时受理(迟到回音丢弃,不幽灵重开);失败或
+    /// 空选单一律回落既有单条登记流,不报死、不拦路。
+    fn on_scan(&mut self, ev: crate::scan::ScanEvent) {
+        let crate::scan::ScanEvent::Finished { slug, outcome } = ev;
+        if self.reg_state != RegState::PreScan {
+            return;
+        }
+        if self.reg_scan_slug.as_deref() != Some(slug.as_str()) {
+            return; // 不是当前这一次预扫的回音
+        }
+        match outcome {
+            crate::scan::ScanOutcome::Entries(entries) if !entries.is_empty() => {
+                self.reg_scan_checks = vec![true; entries.len()];
+                self.reg_scan_entries = entries;
+                self.reg_scan_sel = 0;
+                self.reg_state = RegState::PreScanPick;
+                self.push_log(format!(
+                    "预扫完成({slug}):{} 条待勾选(只读,未落任何文件)",
+                    self.reg_scan_entries.len()
+                ));
+            }
+            crate::scan::ScanOutcome::Entries(_) => {
+                // 空选单:没什么可勾,回落单条登记流(引擎自己会扫)
+                self.reg_scan_entries.clear();
+                self.reg_scan_checks.clear();
+                self.reg_scan_slug = None;
+                self.reg_state = RegState::KindPick;
+                self.push_log(format!("预扫未发现条目({slug}):回落单条登记流"));
+            }
+            crate::scan::ScanOutcome::Failed(reason) => {
+                self.reg_scan_slug = None;
+                self.reg_state = RegState::KindPick;
+                self.push_log(reason);
+            }
+        }
+    }
+
     /// 下发预审:不带 `--yes`、不带 `--category`(类别输入不给),
     /// `--root` 指数据仓根;下发前重过两道门(入口状态可能已变)。
     pub fn dispatch_register(&mut self) {
@@ -2457,10 +3067,18 @@ impl App {
 
     /// 返航:任一态 Esc 同义,状态清空不留半条记录(结果丢弃);
     /// 键盘 Esc 与鼠标点「Esc 返航」段同路同语(经 [`App::dismiss_popup`])。
+    /// #114 起连预扫选单与在途对账一并清:已排队未跑的只读扫描撤掉,
+    /// 在途那一次的回音按状态丢弃——向导中途退出零副作用。
     pub fn cancel_register(&mut self) {
         self.reg_state = RegState::Idle;
         self.reg_repo_buf.clear();
         self.reg_result = None;
+        if let Some(slug) = self.reg_scan_slug.take() {
+            self.scan_pending.retain(|s| s != &slug);
+        }
+        self.reg_scan_entries.clear();
+        self.reg_scan_checks.clear();
+        self.reg_scan_sel = 0;
         self.push_log("登记返航");
     }
 
@@ -2518,10 +3136,15 @@ impl App {
     }
 
     /// 入口不可用时的一句指路(与册体提示同源)。
+    ///
+    /// 优先级纪律不变(#27 数据仓根与 #29 能力门两道门互不冒充,既有测试钉着
+    /// 「根那句赢」):根不可用时根那句赢,能力那句不抢跑;根就绪才轮到能力门,
+    /// 且按探测三态如实分措辞 + 带证据(#124)——真禁用才说「升级所配 nw」,
+    /// 未决只说「修引擎发现后重启重探」,两态互不冒充。
     pub fn vps_gate_hint(&self) -> String {
         match self.data_root_cause() {
             Some(_) => self.data_root_gate_msg(),
-            None => capability::GATE_HINT.to_string(),
+            None => self.capability_gate_line(Capability::Vps),
         }
     }
 
@@ -3026,6 +3649,41 @@ impl App {
         ));
     }
 
+    /// 点概览警示带的订阅到期条目 = 跳到订阅册并选中那一条(#94 工单 #105,
+    /// 用户故事 12:「从发现到处理一步到位」)。三步与键盘 `v` 到编目屏同族:
+    /// 先定屏内维度(订阅册)、再切屏、最后把册级选中槽落到那一条上。
+    ///
+    /// 选中槽是**可见行**下标(#69 册内过滤),故载荷给的投影下标要经
+    /// `catalog_visible()` 换算;换算不出来(这一条被过滤词挡在可见行外)只留
+    /// 一行指路日志,不新造禁用态——与册体「无选中行时点下去复现既有指路」
+    /// 同一口径。
+    ///
+    /// **零引擎调用**:回音是既有的 `app.sub_ls`,这里只换视图。
+    pub(crate) fn open_subscription_book(&mut self, idx: usize) {
+        self.catalog_kind = crate::screens::CatalogKind::Subscription;
+        // 换册即离开机器册语境(#70):反查上浮是机器册独有的只读动作,跳册同样
+        // 收回任何在场 / 在途的反查——与 `cycle_catalog_kind` 同一条纪律。
+        self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
+        self.screen = Screen::Vps;
+        self.catalog_filter_on = false; // 进册不顺手进过滤输入态(同 NavTo)
+        let name = self
+            .catalog_sheet()
+            .and_then(|s| s.entries.get(idx).map(|e| e.name.clone()));
+        let pos = self.catalog_visible().iter().position(|&i| i == idx);
+        match (pos, name) {
+            (Some(p), Some(name)) => {
+                let (sel, _) = self.catalog_sel_mut();
+                *sel = p;
+                self.push_log(format!("跳到订阅册并选中 {name}"));
+            }
+            (None, Some(name)) => self.push_log(format!(
+                "跳到订阅册:{name} 不在当前过滤后的可见行里——册内按 / 改过滤词"
+            )),
+            _ => self.push_log("跳到订阅册:这一条不在回音里了(可能刚被删)"),
+        }
+        self.catalog_clamp();
+    }
+
     /// 编目册屏当前这一本的投影(四本各自的数据源汇到同一个
     /// `CatalogSheet`——列表件只有一份,见 `screens::catalog`)。
     ///
@@ -3147,10 +3805,15 @@ impl App {
     }
 
     /// 入口不可用时的一句指路(与册体提示同源)。
+    ///
+    /// 优先级纪律不变(#27 数据仓根与 #29 能力门两道门互不冒充,既有测试钉着
+    /// 「根那句赢」):根不可用时根那句赢,能力那句不抢跑;根就绪才轮到能力门,
+    /// 且按探测三态如实分措辞 + 带证据(#124)——真禁用才说「升级所配 nw」,
+    /// 未决只说「修引擎发现后重启重探」,两态互不冒充。
     pub fn tag_gate_hint(&self) -> String {
         match self.data_root_cause() {
             Some(_) => self.data_root_gate_msg(),
-            None => capability::GATE_HINT.to_string(),
+            None => self.capability_gate_line(Capability::Tag),
         }
     }
 
@@ -3450,10 +4113,15 @@ impl App {
     }
 
     /// 入口不可用时的一句指路(与册体提示同源)。
+    ///
+    /// 优先级纪律不变(#27 数据仓根与 #29 能力门两道门互不冒充,既有测试钉着
+    /// 「根那句赢」):根不可用时根那句赢,能力那句不抢跑;根就绪才轮到能力门,
+    /// 且按探测三态如实分措辞 + 带证据(#124)——真禁用才说「升级所配 nw」,
+    /// 未决只说「修引擎发现后重启重探」,两态互不冒充。
     pub fn sub_gate_hint(&self) -> String {
         match self.data_root_cause() {
             Some(_) => self.data_root_gate_msg(),
-            None => capability::GATE_HINT.to_string(),
+            None => self.capability_gate_line(Capability::Subscription),
         }
     }
 
@@ -3535,10 +4203,15 @@ impl App {
     }
 
     /// 入口不可用时的一句指路(与册体提示同源)。
+    ///
+    /// 优先级纪律不变(#27 数据仓根与 #29 能力门两道门互不冒充,既有测试钉着
+    /// 「根那句赢」):根不可用时根那句赢,能力那句不抢跑;根就绪才轮到能力门,
+    /// 且按探测三态如实分措辞 + 带证据(#124)——真禁用才说「升级所配 nw」,
+    /// 未决只说「修引擎发现后重启重探」,两态互不冒充。
     pub fn key_gate_hint(&self) -> String {
         match self.data_root_cause() {
             Some(_) => self.data_root_gate_msg(),
-            None => capability::GATE_HINT.to_string(),
+            None => self.capability_gate_line(Capability::Key),
         }
     }
 
@@ -3635,6 +4308,9 @@ impl App {
         }
         self.push_log(format!("NW_HOME 切换到 {next}"));
         self.refresh_ls();
+        // 装配历史视图在场就跟着重读(#101):NW_HOME 变了,旧根的存档不
+        // 冒充新根的。不在场不读——开视图时自然会读一次。
+        self.reload_history();
     }
 
     /// 数据仓根门控:已设且目录存在可读才放行;否则给可区分的原因。
@@ -3666,6 +4342,8 @@ impl App {
             None => "数据仓根就绪".into(),
         }
     }
+
+    // ---- #101 装配历史(只读;文件面一律经 datarepo 接缝) ----
 
     /// 外部编辑器逃逸口(设置屏 e)。返回拉起命令;EDITOR/VISUAL 都缺则 None。
     pub fn editor_command() -> Option<String> {
@@ -3767,12 +4445,11 @@ impl App {
 
     /// 选中锁定集的载体文件路径:`$NW_HOME/locks/<lockId>.nwlock`
     /// (引擎 ls 的 locks 域与装配命令交锁段的同一落点;tilde 展开同输入链)。
+    ///
+    /// #101 起路径知识收进 [`crate::datarepo`]:本方法只剩转口,
+    /// app 层不再自己拼 `$NW_HOME`(规格故事 27)。
     fn lock_carrier(&self, lock_id: &str) -> String {
-        let home = crate::engine::discover::expand_tilde(&self.nw_home);
-        format!(
-            "{}/locks/{lock_id}.nwlock",
-            home.display().to_string().trim_end_matches('/')
-        )
+        crate::datarepo::lock_carrier(&self.nw_home, lock_id)
     }
 
     // ---- 通用 ----
@@ -3782,6 +4459,8 @@ impl App {
         self.screen = Screen::ALL[i];
         self.rc_filter_on = false; // 切屏退过滤输入态(#61),过滤词留着回屏还在
         self.catalog_filter_on = false; // 编目册过滤同理(#69):退输入态、留词
+        self.ah_filter_on = false; // 装配历史过滤同理(#101)
+        self.ah_raw = None; // 原文浮层不跨屏(#101)
     }
 
     pub fn prev_screen(&mut self) {
@@ -3789,6 +4468,8 @@ impl App {
         self.screen = Screen::ALL[i];
         self.rc_filter_on = false;
         self.catalog_filter_on = false;
+        self.ah_filter_on = false;
+        self.ah_raw = None;
     }
 
     pub fn cycle_theme(&mut self) {
@@ -3858,6 +4539,23 @@ impl App {
     pub fn domain_len(&self) -> usize {
         self.rc_visible().len()
     }
+
+    /// 落点溯源浮层在不在场(#115):渲染(`recipes::render_landing_overlay`)
+    /// 与命中(`layout::recipes_hits` 的弹层分支)共用这一判据 —— 点哪打哪
+    /// (ADR-0005),与 `vps_reverse_open` 同一条弹层纪律。
+    pub fn landing_open(&self) -> bool {
+        self.rc_landing.is_some()
+    }
+
+    /// Enter 打开落点浮层(#115):纯只读呈现 —— 门只有三道,与五域同源:
+    /// 数据仓根不就绪不摆、当前域无落点语义(recipes/profiles/locks)不摆、
+    /// 没有选中行不摆。不满足时静默无动作(不缺能力、不发调用、不落文件);
+    /// 快照由 `recipes::landing_trace` 从当次 ls 数据算定。
+    fn open_landing(&mut self) {
+        if let Some(trace) = crate::screens::recipes::landing_trace(self) {
+            self.rc_landing = Some(trace);
+        }
+    }
 }
 
 /// 一域的原始条数(#61:不过滤的总数,域轨/Tab 计数与「命中/总数」的分母)。
@@ -3922,35 +4620,9 @@ fn domain_row_fields(d: Domain, l: &LsData, i: usize) -> Vec<String> {
 /// repo 链接形状检查(spec #25:owner/repo · https://github.com/… ·
 /// git@github.com:…,非 GitHub 拒)。面板侧快一拍拒绝,免得操作者
 /// 等引擎跑一趟才发现写错(#30 故事 14);真正的守门人仍是引擎。
+/// 形状规则的唯一出处在 [`crate::scan::repo_slug`](#114 起登记与预扫共用)。
 pub fn valid_repo_link(s: &str) -> bool {
-    let t = s.trim();
-    if t.is_empty() || t.contains(char::is_whitespace) {
-        return false;
-    }
-    if let Some(rest) = t.strip_prefix("https://github.com/") {
-        return is_owner_repo(rest.trim_end_matches(".git"));
-    }
-    if let Some(rest) = t.strip_prefix("git@github.com:") {
-        return is_owner_repo(rest.trim_end_matches(".git"));
-    }
-    // 其余带协议/其它主机的写法一律不在面板放行(非 GitHub 拒)
-    if t.starts_with("http") || t.starts_with("git@") || t.contains("://") {
-        return false;
-    }
-    is_owner_repo(t)
-}
-
-fn is_owner_repo(t: &str) -> bool {
-    let mut parts = t.split('/');
-    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    let seg = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    seg(owner) && seg(repo)
+    crate::scan::repo_slug(s).is_some()
 }
 
 fn prev_domain(d: Domain) -> Domain {
@@ -4024,6 +4696,115 @@ mod tests {
         assert!(saw_ls, "bootstrap 必须打 ls");
         assert!(app.ls.is_some(), "ls 数据应入状态树");
         assert_eq!(app.ls.as_ref().unwrap().profiles.len(), 2);
+    }
+
+    /// 把一条引擎回音喂给面板(探针回音走的正是这条路)。
+    async fn feed_probe(app: &mut App, args: &[&str]) {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let out = app.runner.run(&argv).await;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+    }
+
+    #[tokio::test]
+    async fn 能力探测回音_禁用态连同证据入账_日志结论句带齐证据() {
+        // 「问错二进制」的回放:引擎亲口说没有 vps 命令组。禁用之外,证据
+        // (bin / 来源 / 版本 / 探针 argv / 引擎原话 + rc)要一并入账,
+        // 日志那句从干巴巴的「能力探测:vps 入口禁用」换成带证据的一行。
+        let fake = Arc::new(FakeRunner::with_stderr(&[(
+            "vps",
+            3,
+            "",
+            "nw: 未知子命令 \"vps\"",
+        )]));
+        let mut app = App::with_runner(fake.clone());
+        app.engine_version = "0.1.0".into(); // 开机版本回音已到,复用不再问
+        feed_probe(&mut app, &["vps"]).await;
+        assert_eq!(app.capabilities.get(Capability::Vps), Probe::Unavailable);
+        assert!(!app.entry_enabled(Capability::Vps), "禁用不放行");
+        let ev = app
+            .capabilities
+            .evidence(Capability::Vps)
+            .expect("禁用也要收证据");
+        assert_eq!(ev.words, "nw: 未知子命令 \"vps\"", "引擎原话原样入账");
+        assert_eq!(ev.argv, vec!["vps".to_string()]);
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("能力探测"))
+            .expect("非可用要占日志");
+        assert!(line.contains("能力探测:vps 入口禁用"), "{line}");
+        assert!(line.contains("<fake>"), "生效 bin 在场:{line}");
+        assert!(line.contains("(测试注入, 0.1.0)"), "来源与版本在场:{line}");
+        assert!(line.contains("探针 nw vps"), "探针 argv 在场:{line}");
+        assert!(
+            line.contains("引擎原话:nw: 未知子命令 \"vps\" (rc 3)"),
+            "引擎原话与 rc 在场:{line}"
+        );
+        assert_eq!(
+            fake.call_argvs(),
+            vec![vec!["vps".to_string()]],
+            "版本复用开机结论,不新增引擎调用"
+        );
+    }
+
+    #[tokio::test]
+    async fn 能力探测回音_可用态入账但不占日志() {
+        let mut app = App::with_runner(Arc::new(FakeRunner::new(&[(
+            "vps",
+            3,
+            r#"{"schema":"nw/vps-register.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[],"data":{}}"#,
+        )])));
+        app.engine_version = "0.1.0".into();
+        feed_probe(&mut app, &["vps"]).await;
+        assert_eq!(app.capabilities.get(Capability::Vps), Probe::Available);
+        assert!(app.entry_enabled(Capability::Vps), "明确可用才放行");
+        let ev = app
+            .capabilities
+            .evidence(Capability::Vps)
+            .expect("可用也收证据(册体证据带取用)");
+        assert_eq!(ev.words, "nw/vps-register.v1");
+        assert!(
+            !app.log.iter().any(|l| l.contains("能力探测")),
+            "可用态不占日志:{:?}",
+            app.log
+        );
+    }
+
+    #[tokio::test]
+    async fn 能力探测回音_引擎缺失未决_日志如实记未给出可解回答() {
+        // 引擎没找到:那一跑没到过真引擎,证据不拿指路素材冒充原话,
+        // 如实记「引擎未给出可解回答」并附 rc;未决不冒充禁用。
+        let mut app = App::with_runner(Arc::new(crate::engine::MissingRunner {
+            attempted: vec!["PATH".into()],
+        }));
+        app.engine = EngineStatus {
+            found: false,
+            bin: None,
+            source: "未发现",
+            attempted: vec!["PATH".into()],
+        };
+        feed_probe(&mut app, &["vps"]).await;
+        assert_eq!(app.capabilities.get(Capability::Vps), Probe::Unknown);
+        assert!(!app.entry_enabled(Capability::Vps), "未决不放行");
+        let ev = app
+            .capabilities
+            .evidence(Capability::Vps)
+            .expect("未决也收证据");
+        assert_eq!(ev.words, "引擎未给出可解回答");
+        assert_eq!(ev.exit_code, 2);
+        assert_eq!(ev.bin, "未发现", "没找到二进制也如实记");
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("能力探测"))
+            .expect("非可用要占日志");
+        assert!(line.contains("能力探测:vps 未决"), "{line}");
+        assert!(!line.contains("入口禁用"), "未决不冒充禁用:{line}");
+        assert!(line.contains("探针 nw vps"), "未决也带探针:{line}");
+        assert!(
+            line.contains("引擎原话:引擎未给出可解回答 (rc 2)"),
+            "没答上就如实说没答上:{line}"
+        );
     }
 
     #[test]
@@ -4482,682 +5263,190 @@ mod tests {
         app
     }
 
-    // ---- #121 自升级:`U` 呼出的全屏叠加层 ----
+    // ---- #108 引擎版本对照(数据面在 release 模块,这里只钉 App 行为缝) ----
 
-    /// 按一个字符键(带 NONE 修饰键,与其余测试同口径)。
-    fn keyc(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-    }
-
-    /// Ctrl+P:命令面板的呼出键(唯一带 CONTROL 修饰键的登记行)。
-    fn ctrl_p() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
-    }
-
-    #[test]
-    fn u键_呼出与收起_版本输入态预填latest_归零不留半句() {
+    /// 对照用的就绪态:注入回放式查询(零网络),本地版本给定。
+    fn release_app(script: Vec<crate::release::ReleaseProbe>) -> App {
         let mut app = settings_app();
-        app.update(Message::Key(keyc('u')));
-        assert!(
-            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest"),
-            "U 呼出,预填 latest(可改成钉版本):{:?}",
-            app.upgrade
-        );
-        // 改成一个钉版本
-        app.update(Message::Key(keyc('0')));
-        app.update(Message::Key(keyc('.')));
-        app.update(Message::Key(keyc('4')));
-        app.update(Message::Key(keyc('.')));
-        app.update(Message::Key(keyc('0')));
-        assert!(
-            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest0.4.0"),
-            "键入归版本缓冲:{:?}",
-            app.upgrade
-        );
-        // Esc 收起:状态归零,不留半句版本号
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Esc,
-            KeyModifiers::NONE,
-        )));
-        assert_eq!(app.upgrade, UpgradePhase::Idle, "Esc 收起");
+        app.engine_version = "0.1.0".into();
+        app.release_lookup = Arc::new(crate::release::FakeReleaseLookup::new(script));
+        app
     }
 
-    #[test]
-    fn 装配在途按u_被写互斥拒_留证据且面板也不透出它() {
-        // 写互斥(ADR-0009 §4 / 规格故事 9):自升级要落盘,与装配同一族。
-        // 两条路都要被拒——设置屏直接按 U,以及命令面板里搜到它。
-        let mut app = settings_app();
-        app.assembling = true;
-        app.update(Message::Key(keyc('u')));
-        assert_eq!(app.upgrade, UpgradePhase::Idle, "装配在途不给开自升级");
-        assert!(
-            app.log.iter().any(|l| l.contains("自升级与装配互斥")),
-            "拒绝留证据:{:?}",
-            app.log.first()
-        );
-        // 面板路:装配态下写动作整批收起,U 是其中之一
-        let offered = crate::ui::commands::offered(&app);
-        assert!(
-            !offered.iter().any(|r| r.code == KeyCode::Char('u')),
-            "装配态下面板不透出 U:{:?}",
-            offered.iter().map(|r| r.key).collect::<Vec<_>>()
-        );
-        assert_eq!(crate::ui::commands::hidden_write_count(&app), 5);
-    }
-
-    #[test]
-    fn 面板里执行跨屏条目_先切到那一屏再派发() {
-        // 规格故事 9 的执行面:面板执行 = 「搜到并按下那个键」。跨屏条目
-        // (U 在设置屏)不在当前屏根本没有分支,所以先切屏再派发——否则
-        // 操作者在概览屏执行「U 自升级」会得到零反馈。
-        let mut app = fake_app();
-        app.splash = false;
-        app.screen = Screen::Overview;
-        app.update(Message::Key(ctrl_p()));
-        assert!(app.cmd_open, "面板开着");
-        for c in "自升级".chars() {
-            app.update(Message::Key(keyc(c)));
-        }
-        let n = app.cmd_results_len();
-        assert!(n > 0, "搜得到自升级:{n}");
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        assert_eq!(app.screen, Screen::Settings, "跨屏条目先切屏");
-        assert!(app.upgrade.is_open(), "切过去后浮层真的开了");
-    }
-
-    #[test]
-    fn 面板里执行ctrl_p条目_带的修饰键照登记表() {
-        // 唯一带 CONTROL 的登记行恰是 Ctrl+P 自己:按 NONE 回放会派发成
-        // 裸 `p`(概览屏的 ↑ 别名)——一次静默的语义漂移。
-        let mut app = fake_app();
-        app.splash = false;
-        app.screen = Screen::Overview;
-        app.update(Message::Key(ctrl_p()));
-        for c in "命令面板".chars() {
-            app.update(Message::Key(keyc(c)));
-        }
-        // 选中「命令面板」那一条自己(它不是首行,按名字定位)
-        let idx = crate::ui::commands::offered(&app)
-            .iter()
-            .position(|r| r.code == KeyCode::Char('p'))
-            .expect("搜得到命令面板自己");
-        assert!(
-            crate::ui::commands::offered(&app)[idx]
-                .modifiers
-                .contains(KeyModifiers::CONTROL),
-            "登记表里它带 CONTROL"
-        );
-        app.cmd_sel = idx;
-        // 执行它 = 「按下 Ctrl+P 那一个键」。修饰键照登记表带,所以派发的
-        // 是 Ctrl+P(壳级开关面板),**不是**裸 `p`——后者在概览屏是 ↑ 的
-        // 别名,那会是一次静默的语义漂移。这里钉的就是「别名没被触发」:
-        // 面板先被 `close_cmd_panel` 收起,再被派发的 Ctrl+P 重新打开,
-        // 而选中行一动不动。
-        let sel = app.ov_sel;
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
+    #[tokio::test]
+    async fn 版本对照_打开设置屏才发起一次查询_结论一到就锁latch() {
+        let mut app = release_app(vec![crate::release::ReleaseProbe::Latest("v0.2.0".into())]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // 打开设置屏:主循环每帧调这个,这里连调三次模拟三帧
+        app.ensure_release_probe(&tx);
+        app.ensure_release_probe(&tx);
+        app.ensure_release_probe(&tx);
+        let probe = rx.recv().await.expect("应有一次查询回音");
         assert_eq!(
-            app.ov_sel, sel,
-            "没有偷偷触发 ↑ 别名:{sel} → {}",
-            app.ov_sel
+            probe,
+            crate::release::ReleaseProbe::Latest("v0.2.0".into()),
+            "回音是拿到的 tag"
+        );
+        assert!(rx.try_recv().is_err(), "只发起一次,不轮询");
+        // 结论落账后 latch 锁上:再调也不该发起第二次
+        app.update(Message::Release(probe));
+        app.ensure_release_probe(&tx);
+        app.ensure_release_probe(&tx);
+        assert!(rx.try_recv().is_err(), "结论一到就锁 latch,不轮询");
+    }
+
+    #[tokio::test]
+    async fn 版本对照_不在设置屏不发起查询() {
+        let mut app = release_app(vec![crate::release::ReleaseProbe::Latest("v0.2.0".into())]);
+        app.screen = Screen::Overview;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.ensure_release_probe(&tx);
+        // 给在途任务一个调度机会,再断言什么都没发生
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "概览屏不该对照 release 仓");
+    }
+
+    #[tokio::test]
+    async fn 版本对照_按r重查才清结论再问一次() {
+        let mut app = release_app(vec![
+            crate::release::ReleaseProbe::Latest("v0.2.0".into()),
+            crate::release::ReleaseProbe::Unreachable,
+        ]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.ensure_release_probe(&tx);
+        app.update(Message::Release(rx.recv().await.unwrap()));
+        assert!(app.release_remote.is_some(), "首次结论已入账");
+        // 先按 v 翻开对照页(r 只在该页上有分支),再按 r 清结论
+        app.update(Message::Key(key('v')));
+        app.update(Message::Key(key('r')));
+        assert!(app.release_remote.is_none(), "r 清掉旧结论");
+        app.ensure_release_probe(&tx);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            crate::release::ReleaseProbe::Unreachable,
+            "重查走的是同一条缝"
         );
     }
 
     #[test]
-    fn up回音落地_不熄升级在途的互斥灯() {
-        // 升级点的是同一盏 `assembling`;一笔不相干的 up 回音不该把它解开
-        // (互斥由升级自己收敛)。
-        let mut app = settings_app();
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
+    fn 版本对照_落后时建议命令只进日志区_不代跑() {
+        let mut app = release_app(vec![]);
+        app.update(Message::Release(crate::release::ReleaseProbe::Latest(
+            "v0.2.0".into(),
         )));
-        assert!(app.upgrade.in_flight(), "干跑在途");
-        assert!(app.assembling, "升级点了互斥灯");
-        // 另一笔 up 回音到达:不动互斥灯
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(
-            EngineOutput {
-                args: vec!["up".into(), "--lock".into(), "9f8e".into()],
-                exit_code: crate::engine::ExitCode::Ok,
-                ok: true,
-                stderr_tail: vec![],
-                envelope: None,
-                raw_stdout: String::new(),
-                parse_error: None,
-            },
-        ))));
-        assert!(app.assembling, "up 回音不熄升级的互斥灯");
-        // 升级自己收敛:Finished 才灭
-        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
-            upgrade::UpgradeOutcome {
-                exit_code: 0,
-                reason: String::new(),
-            },
-        )));
-        assert!(!app.assembling, "升级自己收敛互斥");
+        let hint = crate::release::upgrade_hint();
+        assert!(
+            app.log.iter().any(|l| l.contains(hint)),
+            "升级指路进日志区:{:?}",
+            app.log
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("不代跑")),
+            "指路带「不代跑」的口径:{:?}",
+            app.log
+        );
+        // 只给文案:没有任何东西被排进引擎队列
+        assert!(app.queue.is_empty(), "不排引擎命令:{:?}", app.queue);
+        assert!(app.fed_queue.is_empty(), "不排喂入命令:{:?}", app.fed_queue);
     }
 
     #[test]
-    fn 版本输入态_ctrl组合键不当字符_缓冲无上限由输入态机把着() {
-        // 版本输入归通用输入态机 `input::on_key`:CONTROL 组合键被过滤掉,
-        // 缓冲有 `BUF_CAP` 上限——手搓 `Char(c) => push(c)` 两条都失守。
-        let mut app = settings_app();
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Char('p'),
-            KeyModifiers::CONTROL,
+    fn 版本对照_本地版本后到也补判落后() {
+        // 真实时序:release 常比 `--version` 先到,本地还是「探测中」
+        let mut app = release_app(vec![]);
+        app.engine_version = "探测中".into();
+        app.update(Message::Release(crate::release::ReleaseProbe::Latest(
+            "v0.2.0".into(),
         )));
+        let hint = crate::release::upgrade_hint();
         assert!(
-            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest"),
-            "Ctrl+p 不往版本缓冲里塞字符:{:?}",
-            app.upgrade
+            !app.log.iter().any(|l| l.contains(hint)),
+            "本地还没探到版本时不瞎判落后:{:?}",
+            app.log
         );
-        // 普通字符照旧进缓冲
-        type_str(&mut app, "0.4.0");
-        assert!(
-            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest0.4.0"),
-            "键入照旧:{:?}",
-            app.upgrade
-        );
-    }
-
-    #[test]
-    fn u键_只在设置屏在场_别屏按了没反应() {
-        for screen in [
-            Screen::Overview,
-            Screen::Assemble,
-            Screen::Health,
-            Screen::Recipes,
-            Screen::Vps,
-        ] {
-            let mut app = fake_app();
-            app.screen = screen;
-            app.update(Message::Key(keyc('u')));
-            assert_eq!(
-                app.upgrade,
-                UpgradePhase::Idle,
-                "{screen:?} 屏上没有 U 这一键"
-            );
-        }
-        let mut set = settings_app();
-        set.update(Message::Key(keyc('u')));
-        assert!(set.upgrade.is_open(), "设置屏 U 才呼出自升级浮层");
-    }
-
-    #[test]
-    fn 版本态回车_入队一趟干跑_并点装配互斥灯() {
-        let mut app = settings_app();
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        assert!(
-            matches!(&app.upgrade, UpgradePhase::Planning { .. }),
-            "Enter 取安装计划(零下载、零落盘):{:?}",
-            app.upgrade
-        );
-        assert!(app.assembling, "升级在途点全局写互斥(与装配态同款)");
-        assert_eq!(app.upgrade_queue.len(), 1, "入队一趟升级请求");
-        let req = &app.upgrade_queue[0];
-        assert!(req.dry_run, "第一趟是干跑:先摊计划再确认");
-        assert_eq!(req.version, None, "latest 不带 --version(脚本自己解析)");
-    }
-
-    #[test]
-    fn 干跑回音_落计划态_确认才真跑_暂存目录不是落点() {
-        let mut app = settings_app();
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        // 干跑回音:install.sh 的计划原文逐行来
-        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
-            "nwt-install: 安装计划(--dry-run,未做任何改动):".into(),
-        )));
-        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
-            "nwt-install:   版本     v0.9.9".into(),
-        )));
-        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
-            upgrade::UpgradeOutcome {
-                exit_code: 0,
-                reason: String::new(),
-            },
-        )));
-        assert!(
-            matches!(&app.upgrade, UpgradePhase::Plan { version } if version == "latest"),
-            "干跑 rc 0 落计划态:{:?}",
-            app.upgrade
-        );
-        assert!(!app.assembling, "干跑收敛互斥(还没开始下载)");
-        assert!(
-            app.upgrade_log.iter().any(|l| l.contains("安装计划")),
-            "计划原文在进度区:{:?}",
-            app.upgrade_log
-        );
-        // 确认才真跑
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        assert!(
-            matches!(&app.upgrade, UpgradePhase::Running { .. }),
-            "计划态 Enter 才真跑:{:?}",
-            app.upgrade
-        );
-        assert!(app.assembling, "真跑在途点互斥");
-        assert_eq!(app.upgrade_queue.len(), 2, "确认后才入队第二趟");
-        assert!(!app.upgrade_queue[1].dry_run, "第二趟是真跑");
-    }
-
-    #[test]
-    fn 真跑成功_收敛互斥_落完成态并提示重启() {
-        let mut app = settings_app();
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        // 先过干跑(计划态),再确认真跑——与生产同一条两段式
-        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
-            upgrade::UpgradeOutcome {
-                exit_code: 0,
-                reason: String::new(),
-            },
-        )));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
-            "nwt-install: sha256 校验通过(9f8ea1b2c3)".into(),
-        )));
-        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
-            "nwt-install: 安装 nwt v0.9.9 (linux/x86_64) 到 /stage".into(),
-        )));
-        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
-            upgrade::UpgradeOutcome {
-                exit_code: 0,
-                reason: String::new(),
-            },
-        )));
-        assert!(
-            matches!(&app.upgrade, UpgradePhase::Done { version, sha256 }
-                if version == "0.9.9" && sha256 == "9f8ea1b2c3"),
-            "完成态带版本与 sha256:{:?}",
-            app.upgrade
-        );
-        assert!(!app.assembling, "完成即收敛互斥");
-        assert!(
-            app.log.iter().any(|l| l.contains("重启面板")),
-            "提示重启生效:{:?}",
-            app.log.first()
-        );
-    }
-
-    // ---- #117 完成通知:装配收尾三路发 bell/OSC 9,双开关落 config ----
-
-    /// 一路 up 成功回音(无告警 = 收敛)。
-    fn up_echo(rc: i32, json: &str) -> EngineOutput {
-        EngineOutput {
-            args: vec!["up".into(), "--lock".into(), "9f8e".into()],
-            exit_code: crate::engine::ExitCode::from_number(rc),
-            ok: rc == 0,
-            stderr_tail: vec![],
-            envelope: serde_json::from_str(json).ok(),
-            raw_stdout: json.into(),
+        // 版本回音到达:补判一次,指路不遗漏
+        let out = EngineOutput {
+            args: vec!["--version".into()],
+            exit_code: crate::engine::ExitCode::Ok,
+            ok: true,
+            stderr_tail: vec!["0.1.0".into()],
+            envelope: None,
+            raw_stdout: String::new(),
             parse_error: None,
-        }
-    }
-
-    const UP_OK: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","lockId":"9f8e","convergeHash":"abc"}}"#;
-    const UP_WARN: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[{"code":"PROVIDER_NOT_READY","exitCode":0,"message":"provider 未就绪","hint":"补 env","details":{}}],"data":{"profile":"desk","lockId":"9f8e"}}"#;
-    const UP_FAIL: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":false,"errors":[{"code":"APPLY_FAILED","exitCode":4,"message":"sha256 不符","hint":"重新 bake","details":{}}],"warnings":[],"data":null}"#;
-
-    #[test]
-    fn up收敛收尾_发一声bell加一条osc9_话术与日志同源() {
-        let mut app = fake_app();
-        app.assembling = true;
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
-            0, UP_OK,
-        )))));
-        let seq = app.pending_notify.concat();
-        assert!(seq.starts_with('\u{7}'), "bell 打头:{seq:?}");
+        };
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert_eq!(app.engine_version, "0.1.0", "版本入账");
         assert!(
-            seq.contains("\u{1b}]9;装配结束:收敛 (rc 0)\u{7}"),
-            "OSC 9 带收尾话术:{seq:?}"
-        );
-        assert_eq!(app.pending_notify.len(), 1, "一次收尾只入匣一条");
-        assert!(app.log[0].contains("收敛"), "日志与通知同源:{}", app.log[0]);
-    }
-
-    #[test]
-    fn up降级收尾_话术与纯成功可区分() {
-        let mut app = fake_app();
-        app.assembling = true;
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
-            0, UP_WARN,
-        )))));
-        assert!(
-            app.pending_notify.concat().contains("装配结束:降级 (rc 0)"),
-            "ok 但带告警 = 降级,不冒充收敛:{:?}",
-            app.pending_notify
-        );
-        assert!(app.log[0].contains("降级"), "日志同口径:{}", app.log[0]);
-    }
-
-    #[test]
-    fn up失败收尾_发通知且话术是失败() {
-        let mut app = fake_app();
-        app.assembling = true;
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
-            4, UP_FAIL,
-        )))));
-        assert!(
-            app.pending_notify.concat().contains("装配结束:失败 (rc 4)"),
-            "失败也发通知(挂后台时最需要的那一声):{:?}",
-            app.pending_notify
-        );
-    }
-
-    #[test]
-    fn 真跑失败_收敛互斥_落失败态且明示旧二进制未动() {
-        let mut app = settings_app();
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
-            upgrade::UpgradeOutcome {
-                exit_code: 1,
-                reason: "sha256 校验失败(期望 aaa,实得 bbb)——已中止,未安装任何文件".into(),
-            },
-        )));
-        assert!(
-            matches!(&app.upgrade, UpgradePhase::Failed { reason } if reason.contains("sha256 校验失败")),
-            "失败态带人话:{:?}",
-            app.upgrade
-        );
-        assert!(!app.assembling, "失败也收敛互斥");
-        assert!(
-            app.log.iter().any(|l| l.contains("旧二进制原样不动")),
-            "明示旧二进制未动:{:?}",
+            app.log.iter().any(|l| l.contains(hint)),
+            "版本后到也要补指路:{:?}",
             app.log
         );
     }
 
     #[test]
-    fn 中止收尾_发通知_迟到回音不重复发() {
-        let mut app = fake_app();
-        app.assembling = true;
-        app.as_running = true;
-        app.abort_assembling();
-        assert!(
-            app.pending_notify.concat().contains("装配已中止"),
-            "中止也是收尾:{:?}",
-            app.pending_notify
-        );
-        // 迟到的那一程 up 回音:丢弃半个结果,不再补发一次通知
-        let n = app.pending_notify.len();
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
-            0, UP_OK,
-        )))));
-        assert_eq!(app.pending_notify.len(), n, "迟到回音不重复发通知");
-        assert!(
-            app.log[0].contains("已丢弃"),
-            "回音仍按丢弃路:{}",
-            app.log[0]
-        );
+    fn 版本对照_取不到远端时降级为只显示本地_两种理由分开说() {
+        for (probe, needle) in [
+            (
+                crate::release::ReleaseProbe::Unreachable,
+                "取不到引擎 release 仓",
+            ),
+            (crate::release::ReleaseProbe::Garbage, "回话不是可用 tag"),
+        ] {
+            let mut app = release_app(vec![]);
+            app.update(Message::Release(probe));
+            assert!(
+                app.log.iter().any(|l| l.contains(needle)),
+                "{needle} 该出现在日志里:{:?}",
+                app.log
+            );
+            assert!(
+                !app.log
+                    .iter()
+                    .any(|l| l.contains(crate::release::upgrade_hint())),
+                "取不到远端就不该给升级指路:{:?}",
+                app.log
+            );
+        }
     }
 
     #[test]
-    fn 升级在途_其余写动作被锁_与装配态同一道闸() {
-        let mut app = settings_app();
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        // 在途:登记 / 删除 / 装配发射这些写入口一律被既有闸挡住
-        app.screen = Screen::Recipes;
-        app.update(Message::Key(keyc('r')));
-        assert_eq!(app.reg_state, RegState::Idle, "装配互斥下不给开登记");
-        // 升级浮层自己吞键:别的键一个都不受理
-        app.screen = Screen::Settings;
-        app.update(Message::Key(keyc('j')));
-        assert_eq!(app.screen, Screen::Settings, "浮层吞键:j 不切屏");
-        // 在途不给返航(面板不假装能收回一个已发出的下载)
+    fn 版本对照_v键翻开对照页_esc返回_且不排引擎命令() {
+        let mut app = release_app(vec![]);
+        app.update(Message::Key(key('v')));
+        assert_eq!(
+            app.settings_page,
+            crate::app::SettingsPage::Version,
+            "v 翻开版本对照页"
+        );
+        assert!(app.queue.is_empty(), "翻页不排引擎命令:{:?}", app.queue);
         app.update(Message::Key(KeyEvent::new(
             KeyCode::Esc,
             KeyModifiers::NONE,
         )));
-        assert!(app.upgrade.is_open(), "在途 Esc 不收浮层");
-    }
-
-    #[test]
-    fn 升级浮层_常畅与紧凑两档都渲染_且不冒充装配话术() {
-        let mut app = settings_app();
-        app.splash = false;
-        app.update(Message::Key(keyc('u')));
-        for (w, h) in [(110, 30), (80, 50), (66, 50)] {
-            app.size = Rect::new(0, 0, w, h);
-            let s = crate::testutil::frame_display(&app, w, h);
-            assert!(s.contains("自升级 nwt"), "{w}×{h} 浮层标题在场:{s}");
-            assert!(s.contains("目标版本"), "{w}×{h} 版本输入行在场:{s}");
-            assert!(!s.contains("装配中"), "{w}×{h} 升级不冒充装配:{s}");
-        }
-        // 在途态:HUD 说「升级中」,不说「装配中」
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        let s = crate::testutil::frame_display(&app, 110, 30);
-        assert!(s.contains("升级中"), "在途 HUD 说升级中:{s}");
-        assert!(!s.contains("◉ 装配中"), "顶栏灯不冒充装配:{s}");
-    }
-
-    #[test]
-    fn 升级在途_顶栏灯说升级中_不冒充装配() {
-        let mut app = settings_app();
-        app.splash = false;
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        // 顶栏只有 1 行高、宽度按终端算,「◉ 升级中」这段可能被右侧裁掉
-        // (110 列下 NW_HOME 已占掉大半)。所以断言的是 HUD 那句在途提示,
-        // 顶栏灯本身只验「没把装配俩字写进去」。
-        let s = crate::testutil::frame_display(&app, 110, 30);
-        assert!(s.contains("◉"), "顶栏灯亮着:{s}");
-        assert!(!s.contains("装配中"), "升级在途不写装配俩字:{s}");
-        assert!(s.contains("升级中:动作已锁定"), "HUD 说升级中:{s}");
-    }
-
-    #[test]
-    fn 升级浮层_点任意处与_esc同路收起_在途点不动() {
-        let mut app = settings_app();
-        app.size = Rect::new(0, 0, 110, 30);
-        app.update(Message::Key(keyc('u')));
-        let dismiss = hit_target(&app, |t| *t == Target::DismissPopup);
-        click(&mut app, dismiss);
-        assert_eq!(app.upgrade, UpgradePhase::Idle, "点浮层 = Esc 同路收起");
-        // 在途:命中区仍只给浮层(吞点击不穿透),但点了也收不动
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        let hits = hitmap(app.size, &app, size_class(app.size));
-        assert!(
-            hits.iter().all(|(_, t)| *t == Target::DismissPopup),
-            "浮层开着时底层一个命中区都不产:{hits:?}"
-        );
-        click(&mut app, dismiss);
-        assert!(app.upgrade.is_open(), "在途点浮层收不动");
-    }
-
-    #[test]
-    fn 升级进度_上下翻看不越界_且只读不点亮写互斥() {
-        let mut app = settings_app();
-        app.update(Message::Key(keyc('u')));
-        app.update(Message::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-        for i in 0..5 {
-            app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(format!(
-                "nwt-install: 第 {i} 行"
-            ))));
-        }
-        assert_eq!(app.upgrade_log.len(), 5, "逐行进度入日志区");
-        for _ in 0..20 {
-            app.update(Message::Key(KeyEvent::new(
-                KeyCode::Down,
-                KeyModifiers::NONE,
-            )));
-        }
-        app.update(Message::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
-        // 翻看不改升级态、不发命令
-        assert_eq!(app.queue.len(), 0, "升级过程零引擎调用");
-        assert!(app.upgrade_log.len() >= 5, "翻看不清日志");
-    }
-
-    #[test]
-    fn 无装配收尾_一条序列都不出() {
-        let mut app = fake_app();
-        // 开机自举(version + 能力探针 + ls)一路走完
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.bootstrap(&tx);
-        while let Ok(ev) = rx.try_recv() {
-            app.update(Message::Engine(ev));
-        }
-        assert!(app.pending_notify.is_empty(), "自举不发通知");
-        // 其它路径的回音(argv 不是 up)也不发
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(
-            EngineOutput {
-                args: vec!["ls".into(), "--repo".into(), "/tmp".into()],
-                exit_code: crate::engine::ExitCode::Ok,
-                ok: true,
-                stderr_tail: vec![],
-                envelope: None,
-                raw_stdout: String::new(),
-                parse_error: None,
-            },
-        ))));
-        assert!(app.pending_notify.is_empty(), "ls 回音不发通知");
-        // 登记落账回音(带 --yes 的 source register)同样不发
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(
-            EngineOutput {
-                args: vec!["source".into(), "register".into(), "--yes".into()],
-                exit_code: crate::engine::ExitCode::Ok,
-                ok: true,
-                stderr_tail: vec![],
-                envelope: None,
-                raw_stdout: String::new(),
-                parse_error: None,
-            },
-        ))));
-        assert!(app.pending_notify.is_empty(), "登记落账回音不发通知");
-        // 反查回音(tag ls)同样不发
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(
-            EngineOutput {
-                args: vec!["tag".into(), "ls".into(), "--root".into(), "/tmp".into()],
-                exit_code: crate::engine::ExitCode::Ok,
-                ok: true,
-                stderr_tail: vec![],
-                envelope: None,
-                raw_stdout: String::new(),
-                parse_error: None,
-            },
-        ))));
-        assert!(app.pending_notify.is_empty(), "反查回音不发通知");
-    }
-
-    #[test]
-    fn 两个开关各自门控_都关则一个字节都不发() {
-        let mut app = fake_app();
-        app.assembling = true;
-        app.bell_on = false;
-        app.desktop_notify = false;
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
-            0, UP_OK,
-        )))));
-        assert!(
-            app.pending_notify.is_empty(),
-            "都关 = 不出匣:共享终端不扰人"
-        );
-        // 只关桌面:还剩一声 bell
-        let mut only_bell = fake_app();
-        only_bell.assembling = true;
-        only_bell.desktop_notify = false;
-        only_bell.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
-            0, UP_OK,
-        )))));
-        assert_eq!(only_bell.pending_notify.concat(), "\u{7}", "只剩 bell");
-    }
-
-    #[test]
-    fn 设置屏b与o键_两个开关各自翻转并持久化() {
-        let (_g, _cfg) = env_locked();
-        let mut app = settings_app();
-        assert!(app.bell_on && app.desktop_notify, "缺省都开");
-        // b 只翻 bell
-        app.update(Message::Key(key('b')));
-        assert!(!app.bell_on, "b 关 bell");
-        assert!(app.desktop_notify, "b 不动桌面开关");
-        // o 只翻桌面
-        app.update(Message::Key(key('o')));
-        assert!(!app.desktop_notify, "o 关桌面");
-        assert!(!app.bell_on, "o 不动 bell(它已经被 b 关了)");
-        // 落盘:写回再读不丢(重启仍生效)
-        let (back, err) = crate::engine::config::load();
-        assert!(err.is_none());
-        assert_eq!(back.bell, Some(false), "bell 偏好落盘");
-        assert_eq!(back.desktop_notify, Some(false), "桌面偏好落盘");
-        // 再按一次各自回开
-        app.update(Message::Key(key('b')));
-        app.update(Message::Key(key('o')));
-        assert!(app.bell_on && app.desktop_notify, "再按各自回开");
-        let (back2, _) = crate::engine::config::load();
-        assert_eq!(back2.bell, Some(true));
-        assert_eq!(back2.desktop_notify, Some(true));
-    }
-
-    #[test]
-    fn 开关翻转后_收尾序列跟着变() {
-        let (_g, _cfg) = env_locked();
-        let mut app = settings_app();
-        app.update(Message::Key(key('b'))); // 只关 bell
-        app.assembling = true;
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
-            0, UP_OK,
-        )))));
         assert_eq!(
-            app.pending_notify.concat(),
-            "\u{1b}]9;装配结束:收敛 (rc 0)\u{7}",
-            "bell 关 = 只剩桌面通知"
+            app.settings_page,
+            crate::app::SettingsPage::Panel,
+            "Esc 从对照页返航"
+        );
+        app.update(Message::Key(key('v')));
+        app.update(Message::Key(key('v')));
+        assert_eq!(
+            app.settings_page,
+            crate::app::SettingsPage::Panel,
+            "再按 v 也回常驻面板"
         );
     }
 
     #[test]
-    fn 取走出匣后清空_不重复发同一帧() {
-        let mut app = fake_app();
-        app.assembling = true;
-        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
-            0, UP_OK,
-        )))));
-        let first = app.take_pending_notify();
-        assert_eq!(first.len(), 1, "取走那一条");
-        assert!(app.take_pending_notify().is_empty(), "取走即清空");
+    fn 版本对照_引擎没找到时v键不翻页() {
+        let mut app = release_app(vec![]);
+        app.engine.found = false;
+        app.update(Message::Key(key('v')));
+        assert_eq!(
+            app.settings_page,
+            crate::app::SettingsPage::Panel,
+            "没有本地版本可比,对照页不登场"
+        );
     }
 
     fn type_str(app: &mut App, s: &str) {
@@ -5302,7 +5591,11 @@ mod tests {
         app.data_root = None; // 从未设开始
         app.update(Message::Key(key('d')));
         assert!(app.data_input, "d 进入数据仓根手填");
-        let target = std::env::temp_dir().display().to_string();
+        // 定值根:这条路径要**逐字符打进输入态**,而输入态把 `q` 当取消键
+        // (Esc/q 同一出口)。OS 临时目录在 macOS 是 `/var/folders/<随机>/T`,
+        // 随机串含 `q` 的概率不低,一含就整条作废——本机 Linux 上两者同值所以
+        // 从来不红。形状与金色帧同源:三平台逐字节相同。
+        let target = crate::testutil::stable_root();
         type_str(&mut app, &target);
         assert_eq!(app.data_buf, target, "缓冲区回显");
         app.update(Message::Key(KeyEvent::new(
@@ -5486,7 +5779,7 @@ mod tests {
             .unwrap(),
         );
         app.capabilities
-            .record(Capability::RecipeBake, capability::Probe::Available);
+            .record(Capability::RecipeBake, capability::Probe::Available, None);
         app
     }
 
@@ -5506,7 +5799,7 @@ mod tests {
         // 引擎没有 recipe bake 能力
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeBake, capability::Probe::Unavailable);
+            .record(Capability::RecipeBake, capability::Probe::Unavailable, None);
         assert_eq!(
             app.bake_suggest_gate(),
             Err(commands::BakeGate::NoCapability)
@@ -5541,13 +5834,13 @@ mod tests {
         // 翻转只读选中态——只留一句与呈现层同源的指路。
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeBake, capability::Probe::Unavailable);
+            .record(Capability::RecipeBake, capability::Probe::Unavailable, None);
         let n = app.queue.len();
         app.update(Message::Key(key('c')));
         assert!(!app.rc_bake_sel, "引擎无能力时 c 不翻只读选中态");
         assert_eq!(app.queue.len(), n, "闸不过不入队(面板不执行)");
         assert!(
-            app.log[0].contains("引擎缺 recipe bake 能力"),
+            app.log[0].contains("配方烘焙 入口禁用"),
             "缺能力的指路在日志:{:?}",
             app.log[0]
         );
@@ -5582,13 +5875,117 @@ mod tests {
         );
     }
 
+    /// 造一条探针回放(#124 四处单行指路的证据断言用):只碰 argv / stderr 人话 /
+    /// rc 三样——探针无参,证据不可能也不该碰到任何本体(机密纪律)。
+    fn probe_echo(args: &[&str], rc: i32, stderr: &str) -> EngineOutput {
+        EngineOutput {
+            args: args.iter().map(|s| s.to_string()).collect(),
+            exit_code: crate::engine::ExitCode::from_number(rc),
+            ok: rc == 0,
+            stderr_tail: if stderr.is_empty() {
+                Vec::new()
+            } else {
+                vec![stderr.to_string()]
+            },
+            envelope: None,
+            raw_stdout: String::new(),
+            parse_error: None,
+        }
+    }
+
+    /// #124:配方烘焙建议闸的禁用 / 未决回放(缺能力单行指路收口)。闸不过时
+    /// `c` 只给指路、不入队——真禁用才说「升级所配 nw」并带探针证据带;
+    /// 未决只说「修引擎发现后重启重探」,「入口禁用」「缺的是引擎能力」
+    /// 「升级所配 nw」三样一个都不出现(spec #90 故事 22/23:两态互不冒充)。
+    #[test]
+    fn 建议命令_烘焙闸_禁用与未决各给各的下一步_互不冒充() {
+        // 真禁用:所配引擎对 `nw recipe bake` 回「未知子命令」(rc 3)
+        let echo = probe_echo(&["recipe", "bake"], 3, "nw: 未知子命令 \"bake\"");
+        let ev = ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH", "0.1.0");
+        let mut app = bake_app();
+        app.capabilities.record(
+            Capability::RecipeBake,
+            capability::Probe::Unavailable,
+            Some(ev),
+        );
+        app.update(Message::Key(key('c')));
+        assert!(!app.rc_bake_sel, "禁用态 c 不翻只读选中态");
+        let line = app.log[0].clone();
+        assert!(
+            line.contains(
+                "配方烘焙 入口禁用:缺的是引擎能力,不是面板坏了;升级所配 nw 后入口自动开启。"
+            ),
+            "禁用态话术与下一步(单行形态):{line}"
+        );
+        assert!(!line.contains("重启重探"), "禁用态不给未决话术:{line}");
+        assert!(line.contains("/tmp/nw"), "bin 在场:{line}");
+        assert!(line.contains("(PATH, 0.1.0)"), "来源与版本在场:{line}");
+        assert!(
+            line.contains("探针 nw recipe bake"),
+            "探针 argv 在场:{line}"
+        );
+        assert!(
+            line.contains("引擎原话:nw: 未知子命令 \"bake\" (rc 3)"),
+            "引擎原话与 rc 在场:{line}"
+        );
+        // 未决:探测失败,说法与下一步都换一套
+        let mut app = bake_app();
+        app.capabilities
+            .record(Capability::RecipeBake, capability::Probe::Unknown, None);
+        app.update(Message::Key(key('c')));
+        let line = app.log[0].clone();
+        assert!(line.contains("配方烘焙 未决"), "未决话术:{line}");
+        assert!(line.contains("修引擎发现后重启重探"), "未决的下一步:{line}");
+        assert!(!line.contains("入口禁用"), "未决不冒充禁用:{line}");
+        assert!(!line.contains("缺的是引擎能力"), "未决不冒充缺能力:{line}");
+        assert!(!line.contains("升级所配 nw"), "未决不给误导性下一步:{line}");
+    }
+
+    /// #124:配方**新建**建议闸同构(与烘焙同组不同项,各问各的)。
+    ///
+    /// 屏上那一句走共享构造器的单行形态,但详情栏只有 ~34 列,`recipes::wrap`
+    /// 对无空格 CJK 长句硬切——「不是面板 / 坏了;」会分落两行。所以屏上只钉
+    /// **折不坏的单 token**(入口名 + 醒目标记、状态词、证据带的 bin/argv),
+    /// 整句话术与下一步由 [`Self::建议命令_烘焙闸_禁用与未决各给各的下一步_互不冒充`]
+    /// (同一构造器的日志单行原形)与 `capability` 的单行指路单测逐字钉住——
+    /// 两边同一处真相,不为折行列断点写两套期望值。
+    #[test]
+    fn 建议命令_新建闸_禁用与未决各给各的下一步_互不冒充() {
+        let echo = probe_echo(&["recipe", "new"], 3, "nw: 未知子命令 \"new\"");
+        let ev = ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH", "0.1.0");
+        let mut app = bake_app();
+        app.capabilities.record(
+            Capability::RecipeNew,
+            capability::Probe::Unavailable,
+            Some(ev),
+        );
+        app.splash = false; // 不开场画,直接看配方屏
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("⚠ 配方新建"), "禁用态点名是哪一项:{s}");
+        assert!(s.contains("入口禁用"), "说清是入口禁用:{s}");
+        assert!(s.contains("/tmp/nw"), "证据带的 bin 在场:{s}");
+        assert!(s.contains("(PATH, 0.1.0)"), "来源与版本在场:{s}");
+        assert!(s.contains("探针 nw recipe"), "证据带的探针 argv 在场:{s}");
+        assert!(
+            !s.contains("nw recipe new research"),
+            "缺能力不给半条命令:{s}"
+        );
+        // 未决:换一套说法——状态词换掉,且那三样一个都不出现
+        app.capabilities
+            .record(Capability::RecipeNew, capability::Probe::Unknown, None);
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("配方新建 未决"), "未决话术:{s}");
+        assert!(!s.contains("入口禁用"), "未决不冒充禁用:{s}");
+        assert!(!s.contains("升级所配 nw"), "未决不给误导性下一步:{s}");
+    }
+
     #[test]
     fn 建议命令_recipe_new_三前提各有可区分门_互不冒充() {
         // 齐备:门放行(面板仍只读呈现,不执行)
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeNew, capability::Probe::Available);
-        app.data_root = Some("/tmp".into());
+            .record(Capability::RecipeNew, capability::Probe::Available, None);
+        app.data_root = Some(crate::testutil::stable_root());
         assert!(app.recipe_new_suggest_gate().is_ok(), "三前提齐备门放行");
         // 选中行不是配方(配方域为空)
         let mut app = bake_app();
@@ -5607,7 +6004,7 @@ mod tests {
         // 引擎没有 recipe new 能力
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeNew, capability::Probe::Unavailable);
+            .record(Capability::RecipeNew, capability::Probe::Unavailable, None);
         assert_eq!(
             app.recipe_new_suggest_gate(),
             Err(commands::RecipeNewGate::NoCapability)
@@ -5621,8 +6018,8 @@ mod tests {
         // 会把它下发(没有键位、没有命中区、没有队列入口)。
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeNew, capability::Probe::Available);
-        app.data_root = Some("/tmp".into());
+            .record(Capability::RecipeNew, capability::Probe::Available, None);
+        app.data_root = Some(crate::testutil::stable_root());
         // 配方域键面全按一遍(含 bake 的 c 与五域导航/搜索)
         for code in ['h', 'l', 'j', 'k', '/', 'c', 'r', 'n', 'y'] {
             app.update(Message::Key(key(code)));
@@ -5636,9 +6033,12 @@ mod tests {
             app.queue
         );
         // 铁律的另一半:建议命令本身不带任何写旗标
-        let s =
-            crate::engine::commands::recipe_new_suggest(Some("research-desk"), Some("/tmp"), true)
-                .expect("三前提齐备");
+        let s = crate::engine::commands::recipe_new_suggest(
+            Some("research-desk"),
+            Some(&crate::testutil::stable_root()),
+            true,
+        )
+        .expect("三前提齐备");
         for a in &s.argv {
             assert!(!a.contains("--yes"), "建议命令永不带确认闸:{a}");
         }
@@ -5665,7 +6065,7 @@ mod tests {
     /// 配方域两条(bake_app 的夹具即两条配方)+ 数据仓根,便于验 `c` 取用。
     fn filter_app() -> App {
         let mut app = bake_app();
-        app.data_root = Some("/tmp".into());
+        app.data_root = Some(crate::testutil::stable_root());
         app
     }
 
@@ -5763,7 +6163,7 @@ mod tests {
         // 门不放行(引擎无能力):命中区不产出,鼠标点哪儿都不取用
         let mut app = bake_app();
         app.capabilities
-            .record(Capability::RecipeBake, capability::Probe::Unavailable);
+            .record(Capability::RecipeBake, capability::Probe::Unavailable, None);
         app.size = Rect::new(0, 0, 80, 30);
         let hits = hitmap(app.size, &app, size_class(app.size));
         assert!(
@@ -6089,7 +6489,7 @@ mod tests {
             crate::engine::Capability::Key,
         ] {
             app.capabilities
-                .record(cap, crate::engine::Probe::Available);
+                .record(cap, crate::engine::Probe::Available, None);
         }
         app
     }
@@ -6142,6 +6542,90 @@ mod tests {
         wheel(&mut app, row, MouseEventKind::ScrollDown);
         assert_eq!(app.sub_sel, 2, "订阅册滚轮动 sub_sel");
         assert_eq!(app.vps_sel, 0, "订阅册滚轮不误写 vps_sel");
+    }
+
+    // ---- #94 工单 #105:点概览警示带的订阅到期条目直跳订阅册 ----
+
+    /// 点警示带上的到期订阅 = 跳到订阅册并选中那一条(#105 用户故事 12)。
+    /// 三步与键盘 `v` 到编目屏同族(定册内维度 → 切屏 → 落册级选中槽),选中落在
+    /// **可见行**上(#69 过滤的口径);`CAT_SUB_LS` 按名排序后 soon 在投影第 3 条
+    /// (下标 2),无过滤时可见位置就是 2。两档都点得中,全程零引擎调用——回音是
+    /// 既有的 `sub_ls`,面板只换视图。
+    #[test]
+    fn 概览_点警示带到期订阅_跳到订阅册并选中那一条_两档零调用() {
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let mut app = catalog_four_books_app();
+            app.screen = Screen::Overview;
+            app.size = Rect::new(0, 0, w, h);
+            let entry = hit_target(&app, |t| matches!(t, Target::AlertSubEntry(2)));
+            click(&mut app, entry);
+            assert_eq!(app.screen, Screen::Vps, "{w}×{h} 跳到编目屏");
+            assert_eq!(
+                app.catalog_kind,
+                catalog::CatalogKind::Subscription,
+                "{w}×{h} 屏内维度落到订阅册"
+            );
+            assert_eq!(app.sub_sel, 2, "{w}×{h} 选中 soon 那一条");
+            assert_eq!(
+                app.catalog_sel(),
+                2,
+                "{w}×{h} 册级查表读到的就是订阅册的选中槽"
+            );
+            assert!(app.queue.is_empty(), "{w}×{h} 零引擎调用:只换视图");
+            assert!(
+                app.log.iter().any(|l| l.contains("soon")),
+                "{w}×{h} 日志记下选中了哪一条:{:?}",
+                app.log
+            );
+        }
+    }
+
+    /// 册内过滤把这一条筛掉时(#69):点击照旧发生,但不落到一个看不见的选中位上
+    /// ——复现册体「无选中行时点下去给指路」的既有口径,不新造禁用态。
+    #[test]
+    fn 概览_点警示带到期订阅_被册内过滤筛掉时给指路不硬选中() {
+        let mut app = catalog_four_books_app();
+        app.screen = Screen::Overview;
+        app.size = Rect::new(0, 0, 80, 30);
+        // 订阅册的过滤词筛掉 soon(只剩 airport / forever 两条 active)
+        app.catalog_filter[catalog::CatalogKind::Subscription.idx()] = "airport".into();
+        let entry = hit_target(&app, |t| matches!(t, Target::AlertSubEntry(2)));
+        click(&mut app, entry);
+        assert_eq!(app.screen, Screen::Vps, "仍然跳到订阅册");
+        assert_eq!(app.catalog_kind, catalog::CatalogKind::Subscription);
+        assert_eq!(
+            app.catalog_sel(),
+            0,
+            "可见行里没有它:选中钳在可见范围内(2 条可见 → 0),不落在看不见的行上"
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("soon") && l.contains("过滤")),
+            "指路说清它被过滤词挡住了:{:?}",
+            app.log
+        );
+        assert!(app.queue.is_empty(), "零引擎调用");
+    }
+
+    /// 点哪打哪(ADR-0005):命中区不是另推一份几何——坐标取自整帧真显示里
+    /// `soon` 所在的那一列(警示带第一行),点下去落在订阅册并选中它。
+    #[test]
+    fn 概览_点警示带上soon所在列_整帧定位也中_落到订阅册选中它() {
+        let mut app = catalog_four_books_app();
+        app.screen = Screen::Overview;
+        app.splash = false;
+        app.size = Rect::new(0, 0, 80, 30);
+        let (col, row) = locate_col_row(&app, 80, 30, "soon");
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            row,
+        )));
+        assert_eq!(app.screen, Screen::Vps, "整帧定位点下去也跳订阅册");
+        assert_eq!(app.catalog_kind, catalog::CatalogKind::Subscription);
+        assert_eq!(app.sub_sel, 2, "选中 soon 那一条");
+        assert!(app.queue.is_empty(), "零引擎调用");
     }
 
     // ---- #67 正文键位行命中接缝:点「换册」段 = 按 m ----
@@ -6747,7 +7231,7 @@ mod tests {
     fn reg_app(rules: &[(&str, i32, &str)]) -> App {
         let mut app = App::with_runner(Arc::new(FakeRunner::new(rules)));
         app.capabilities
-            .record(Capability::SourceRegister, Probe::Available);
+            .record(Capability::SourceRegister, Probe::Available, None);
         app.splash = false;
         app.screen = Screen::Recipes;
         app.rc_domain = Domain::Sources;
@@ -6755,6 +7239,8 @@ mod tests {
     }
 
     /// r 发起 → 填链 → Enter:走到 kind 选择态(合法链接才走得到)。
+    /// #114 起提交链接先排队一次只读预扫;本助手灌一次「预扫失败」回音
+    /// 走回落路(既有单条登记流)——两段式登记本身的测试不依赖选单。
     fn reg_to_kindpick(app: &mut App, link: &str) {
         app.update(Message::Key(key('r')));
         assert_eq!(app.reg_state, RegState::RepoInput, "入口键进输入态");
@@ -6763,7 +7249,13 @@ mod tests {
             KeyCode::Enter,
             KeyModifiers::NONE,
         )));
-        assert_eq!(app.reg_state, RegState::KindPick, "合法链接进 kind 选择");
+        assert_eq!(app.reg_state, RegState::PreScan, "合法链接进预扫(只读排队)");
+        let slug = crate::scan::repo_slug(link).expect("夹具链接合法");
+        app.update(Message::Scan(crate::scan::ScanEvent::Finished {
+            slug,
+            outcome: crate::scan::ScanOutcome::Failed("测试夹具:预扫不走网".into()),
+        }));
+        assert_eq!(app.reg_state, RegState::KindPick, "预扫失败回落单条登记流");
     }
 
     /// 按当前队尾 argv 回放回音并灌进 update(与 #28 的既有先例同款)。
@@ -6894,7 +7386,7 @@ mod tests {
     fn 引擎无source能力_入口禁用并指路_列表行可见禁用() {
         let mut app = reg_app(&[]);
         app.capabilities
-            .record(Capability::SourceRegister, Probe::Unavailable);
+            .record(Capability::SourceRegister, Probe::Unavailable, None);
         app.ls = Some(
             serde_json::from_str(
                 r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
@@ -6937,7 +7429,10 @@ mod tests {
             KeyCode::Enter,
             KeyModifiers::NONE,
         )));
-        assert_eq!(app.reg_state, RegState::KindPick, "改对了就放行");
+        // #114:合法链接的下一站是预扫(只读排队),不是直接 kind 选择
+        assert_eq!(app.reg_state, RegState::PreScan, "改对了进预扫(只读排队)");
+        assert_eq!(app.scan_pending, vec!["owner/tiny-skills".to_string()]);
+        assert!(app.queue.is_empty(), "预扫不走引擎队列");
     }
 
     #[test]
@@ -7346,6 +7841,283 @@ mod tests {
         assert_eq!(app.reg_state, RegState::Idle, "Esc 返航不漂移");
     }
 
+    /// 同 [`reg_app`],但把 runner 交回调用方(断言零引擎调用用)。
+    fn reg_app_with(runner: Arc<FakeRunner>) -> App {
+        let mut app = App::with_runner(runner);
+        app.capabilities
+            .record(Capability::SourceRegister, Probe::Available, None);
+        app.splash = false;
+        app.screen = Screen::Recipes;
+        app.rc_domain = Domain::Sources;
+        app
+    }
+
+    // ---- 外部源登记向导·预扫选单(工单 #114)----
+
+    /// 预扫选单夹具:两条 skill + 一条 extension。
+    fn scan_entries() -> Vec<crate::scan::ScannedEntry> {
+        vec![
+            crate::scan::ScannedEntry {
+                path: "skills/greeter".into(),
+                kind: crate::scan::ScanKind::Skill,
+            },
+            crate::scan::ScannedEntry {
+                path: "skills/scanner".into(),
+                kind: crate::scan::ScanKind::Skill,
+            },
+            crate::scan::ScannedEntry {
+                path: "extensions/foo".into(),
+                kind: crate::scan::ScanKind::Extension,
+            },
+        ]
+    }
+
+    /// 灌一次预扫回音(与生产同一条路:`Message::Scan`)。
+    fn scan_feed(app: &mut App, outcome: crate::scan::ScanOutcome) {
+        let slug = app.reg_scan_slug.clone().expect("在途预扫有 slug");
+        app.update(Message::Scan(crate::scan::ScanEvent::Finished {
+            slug,
+            outcome,
+        }));
+    }
+
+    /// r → 填链 → Enter:进预扫在途(只读排队,引擎零调用)。
+    fn reg_to_prescan(app: &mut App, link: &str) {
+        app.update(Message::Key(key('r')));
+        type_str(app, link);
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::PreScan, "合法链接进预扫在途");
+    }
+
+    #[tokio::test]
+    async fn 登记向导_贴链接进预扫_只读排队且零引擎调用() {
+        let runner = Arc::new(FakeRunner::new(&[]));
+        let mut app = reg_app_with(runner.clone());
+        reg_to_prescan(&mut app, "https://github.com/owner/tiny-skills");
+        assert_eq!(
+            app.scan_pending,
+            vec!["owner/tiny-skills".to_string()],
+            "只读预扫排队(gh api),不进引擎队列"
+        );
+        assert!(app.queue.is_empty(), "预扫不下发任何引擎命令");
+        assert!(
+            runner.call_argvs().is_empty(),
+            "零引擎调用:预扫不调 nw:{:?}",
+            runner.call_argvs()
+        );
+        // 在途态 Esc 返航:连排队的只读扫描一并撤掉——退出零副作用
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Idle, "在途可返航");
+        assert!(app.scan_pending.is_empty(), "撤掉未跑的只读扫描");
+        assert!(
+            runner.call_argvs().is_empty(),
+            "全程零引擎调用:{:?}",
+            runner.call_argvs()
+        );
+    }
+
+    #[test]
+    fn 登记向导_预扫回选单_默认全勾_空格与方向键改勾选() {
+        let mut app = reg_app(&[]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        assert_eq!(app.reg_state, RegState::PreScanPick, "回音进选单态");
+        assert_eq!(app.reg_scan_entries.len(), 3, "三条待勾选");
+        assert!(
+            app.reg_scan_checks.iter().all(|c| *c),
+            "默认全勾:菜单答「这仓有什么」"
+        );
+        // 空格取消当前条(第 0 条)
+        app.update(Message::Key(key(' ')));
+        assert_eq!(
+            app.reg_scan_checks,
+            vec![false, true, true],
+            "空格切换当前条勾选"
+        );
+        // ↓ 移选中再勾回来
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_scan_sel, 1);
+        app.update(Message::Key(key(' ')));
+        assert_eq!(app.reg_scan_checks, vec![false, false, true]);
+        // Enter 带着勾选进 kind 选择(登记仍走引擎两段式)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::KindPick, "选单确认进 kind 选择");
+        assert!(
+            app.log[0].contains("预扫选单确认"),
+            "勾选结论留证据:{}",
+            app.log[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn 登记向导_预扫失败与空选单_都回落单条登记流() {
+        // 失败路(私有仓/网络/gh 缺失):回落,不报死
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        reg_to_prescan(&mut app, "owner/private-repo");
+        scan_feed(
+            &mut app,
+            crate::scan::ScanOutcome::Failed("预扫失败:gh 退出码 1".into()),
+        );
+        assert_eq!(app.reg_state, RegState::KindPick, "失败回落单条登记流");
+        assert!(app.log[0].contains("预扫失败"), "回落理由留证据");
+        // 回落路就是既有两段式:Enter 下发预审,argv 不带 --yes
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let argv = app.queue.last().expect("回落路仍走引擎预审").clone();
+        assert_eq!(argv[..2], ["source", "register"]);
+        assert!(!argv.iter().any(|s| s == "--yes"), "回落路同样不旁路闸");
+        // 空选单路:没什么可勾,同样回落
+        let mut app2 = reg_app(&[]);
+        reg_to_prescan(&mut app2, "owner/empty-repo");
+        scan_feed(&mut app2, crate::scan::ScanOutcome::Entries(vec![]));
+        assert_eq!(app2.reg_state, RegState::KindPick, "空选单回落");
+        assert!(app2.reg_scan_entries.is_empty(), "空选单不留在状态里");
+    }
+
+    #[tokio::test]
+    async fn 登记向导_全路径_勾选后两段式argv仍由引擎闸把守() {
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        // 选单 → kind → 预审(勾选只影响呈现,不改 argv)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::PreAudit);
+        let pre = app.queue.last().expect("预审入队").clone();
+        assert_eq!(pre[..2], ["source", "register"]);
+        assert!(!pre.iter().any(|s| s == "--yes"), "预审铁律:不带 --yes");
+        assert!(
+            pre.windows(2).any(|w| w[0] == "--root"),
+            "--root 指数据仓根"
+        );
+        assert!(pre.iter().any(|s| s == "--kind"), "kind 槽位在");
+        // 预审回音 → 确认态:勾选结论随拟落账摊开
+        reg_feed(&mut app, REG_OK, 0).await;
+        assert_eq!(app.reg_state, RegState::Review);
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("预扫勾选"), "确认态摊开面板侧勾选:{s}");
+        assert!(s.contains("skills/greeter"), "勾选的条目路径可见:{s}");
+        // 图形确认后才可能带 --yes(落账闸把守不变)
+        assert!(app.reg_can_commit());
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let commit = app.queue.last().expect("落账入队").clone();
+        assert!(commit.iter().any(|s| s == "--yes"), "落账段才带 --yes");
+    }
+
+    #[test]
+    fn 登记向导_选单与在途_两档快照不炸() {
+        let mut app = reg_app(&[]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        for (w, h) in [(110u16, 30u16), (66, 50)] {
+            let f = crate::testutil::frame_display(&app, w, h);
+            assert!(f.contains("正在预扫"), "{w}×{h} 在途态说明在场:{f}");
+            assert!(f.contains("不落文件"), "{w}×{h} 只读纪律可见:{f}");
+        }
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        for (w, h) in [(110u16, 30u16), (66, 50)] {
+            let f = crate::testutil::frame_display(&app, w, h);
+            assert!(f.contains("预扫选单"), "{w}×{h} 选单标题在场:{f}");
+            assert!(f.contains("skills/greeter"), "{w}×{h} 条目在列:{f}");
+            assert!(f.contains("extensions/foo"), "{w}×{h} 扩展组在列:{f}");
+            assert!(f.contains("[x]"), "{w}×{h} 勾选框在列:{f}");
+            assert!(f.contains("Enter 继续"), "{w}×{h} 键位行在列:{f}");
+            assert!(f.contains("空格 勾选"), "{w}×{h} HUD 给勾选键位:{f}");
+        }
+    }
+
+    #[test]
+    fn 登记向导_选单esc返航_数据仓与编目零变化() {
+        let runner = Arc::new(FakeRunner::new(&[]));
+        let mut app = reg_app_with(runner.clone());
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Idle, "选单态 Esc 返航");
+        assert!(app.reg_scan_entries.is_empty(), "选单清空");
+        assert!(app.reg_scan_checks.is_empty(), "勾选态清空");
+        assert!(app.reg_scan_slug.is_none(), "在途对账清空");
+        assert!(app.scan_pending.is_empty(), "无残留排队");
+        assert!(
+            runner.call_argvs().is_empty(),
+            "全程零引擎调用(登记落账从未发生):{:?}",
+            runner.call_argvs()
+        );
+    }
+
+    #[test]
+    fn 登记向导_迟到预扫回音_丢弃不幽灵重开() {
+        let mut app = reg_app(&[]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        // 先返航(Idle),回音才迟到
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        let slug = "owner/tiny-skills".to_string();
+        app.update(Message::Scan(crate::scan::ScanEvent::Finished {
+            slug,
+            outcome: crate::scan::ScanOutcome::Entries(scan_entries()),
+        }));
+        assert_eq!(app.reg_state, RegState::Idle, "迟到回音不重开流程");
+        assert!(app.reg_scan_entries.is_empty(), "迟到选单不入状态树");
+    }
+
+    #[test]
+    fn 登记向导_鼠标点行勾选_与空格同路() {
+        let mut app = reg_app(&[]);
+        app.size = Rect::new(0, 0, 110, 30);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        // 命中区与渲染同源:点第 1 行 = 勾选/取消第 1 条
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        click(&mut app, row);
+        assert_eq!(
+            app.reg_scan_checks,
+            vec![true, false, true],
+            "点行与空格同一后果"
+        );
+        assert_eq!(app.reg_scan_sel, 1, "点行顺带移选中");
+    }
+
+    #[test]
+    fn 登记向导_选单滚轮只移选中_不改勾选() {
+        let mut app = reg_app(&[]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        app.wheel_sel(ScrollDir::Down);
+        assert_eq!(app.reg_scan_sel, 1, "滚轮移选中(与 ↑/↓ 同路)");
+        assert!(
+            app.reg_scan_checks.iter().all(|c| *c),
+            "滚轮不改勾选(勾选归空格/点行)"
+        );
+    }
+
     #[test]
     fn 换根后旧根ls回音_不入账_新根回音照常() {
         let mut app = fake_app();
@@ -7428,8 +8200,11 @@ mod tests {
             )
             .unwrap(),
         );
-        app.capabilities
-            .record(Capability::SourceRecheck, capability::Probe::Available);
+        app.capabilities.record(
+            Capability::SourceRecheck,
+            capability::Probe::Available,
+            None,
+        );
         app
     }
 
@@ -7455,7 +8230,7 @@ mod tests {
                 "source".to_string(),
                 "recheck".into(),
                 "--root".into(),
-                std::env::temp_dir().display().to_string()
+                crate::testutil::stable_root()
             ],
             "全查:不带 --name"
         );
@@ -7480,8 +8255,11 @@ mod tests {
         assert!(app.log[0].contains("数据仓根未设"), "{:?}", app.log);
         // 引擎无 source 能力
         let mut app = recheck_app();
-        app.capabilities
-            .record(Capability::SourceRecheck, capability::Probe::Unavailable);
+        app.capabilities.record(
+            Capability::SourceRecheck,
+            capability::Probe::Unavailable,
+            None,
+        );
         let n = app.queue.len();
         app.run_recheck(None);
         assert_eq!(app.queue.len(), n, "缺能力不下发");
@@ -7659,12 +8437,15 @@ mod tests {
         screen: Screen,
         catalog_kind: crate::screens::CatalogKind,
         ov_sel: usize,
+        as_history: Option<crate::datarepo::HistoryView>,
+        ah_sel: usize,
         as_sel: usize,
         as_confirm: bool,
         hl_mode: HealthMode,
         hl_sel: usize,
         rc_domain: Domain,
         rc_sel: usize,
+        rc_landing: Option<crate::screens::recipes::LandingTrace>,
         rc_bake_sel: bool,
         reg_state: RegState,
         help: bool,
@@ -7675,8 +8456,10 @@ mod tests {
         rc_filter: String,
         catalog_filter_on: bool,
         catalog_filter: [String; 4],
+        ah_filter_on: bool,
         pending_editor: bool,
         mouse_enabled: bool,
+        settings_page: SettingsPage,
         nw_home: String,
         cmd_open: bool,
         cmd_query: String,
@@ -7691,6 +8474,8 @@ mod tests {
             ov_sel: a.ov_sel,
             as_sel: a.as_sel,
             as_confirm: a.as_confirm,
+            as_history: a.as_history.clone(),
+            ah_sel: a.ah_sel,
             hl_mode: a.hl_mode,
             hl_sel: a.hl_sel,
             rc_domain: a.rc_domain,
@@ -7703,11 +8488,14 @@ mod tests {
             home_input: a.home_input,
             data_input: a.data_input,
             rc_filter_on: a.rc_filter_on,
+            rc_landing: a.rc_landing.clone(),
             rc_filter: a.rc_filter.clone(),
             catalog_filter_on: a.catalog_filter_on,
             catalog_filter: a.catalog_filter.clone(),
+            ah_filter_on: a.ah_filter_on,
             pending_editor: a.pending_editor,
             mouse_enabled: a.mouse_enabled,
+            settings_page: a.settings_page,
             nw_home: a.nw_home.clone(),
             cmd_open: a.cmd_open,
             cmd_query: a.cmd_query.clone(),
@@ -7732,7 +8520,7 @@ mod tests {
         app.splash = false;
         app.data_root = Some(dir.to_string());
         for cap in Capability::ALL {
-            app.capabilities.record(cap, Probe::Available);
+            app.capabilities.record(cap, Probe::Available, None);
         }
         app.ls = Some(
             serde_json::from_str(
@@ -7774,6 +8562,12 @@ mod tests {
             if row.prep == Prep::HelpOpen {
                 app.help = true;
             }
+            if row.prep == Prep::HistoryView {
+                // 装配历史次级视图(#101):`/` 过滤与 `r` 重读只在这个上下文
+                // 里有分支,帮助对照表因此要能把它布出来(与 `running` 旗同级)。
+                app.screen = Screen::Assemble;
+                app.open_history();
+            }
             let before = key_snap(&app);
             // 修饰键照登记表派发(#119):`Ctrl+P` 这类带 CONTROL 的键位,按
             // `NONE` 派发在任何屏都没有分支,会让这条测试对已实现的键假红。
@@ -7800,7 +8594,11 @@ mod tests {
         // + 尾注已超过它——所以这条测试**滚完整个浮层**再断言,顺带守「没有
         // 一行是因为放不下被静默丢掉的」。滚到底仍看不到的行 = 真丢了。
         let mut seen = String::new();
-        for _ in 0..HELP_ROWS.len() + MOUSE_LINES.len() + 4 {
+        // 滚的步数要够走到最后一行:可见行数由 80×44 下的浮层内层决定
+        // (HELP_H 30 去掉边框与末行提示),而总行数 = 登记表 + 鼠标章 + 尾注。
+        // 步数按「总行数」给,再留 4 步余量——少一步就有行滚不到,
+        // 这条测试会把它当成「真丢了」而假红。
+        for _ in 0..(HELP_ROWS.len() + MOUSE_LINES.len() + 8) {
             seen.push_str(&crate::testutil::frame_display(&app, 80, 44));
             seen.push('\n');
             app.update(Message::Key(KeyEvent::new(
@@ -7810,8 +8608,10 @@ mod tests {
         }
         for row in HELP_ROWS {
             assert!(seen.contains(row.key), "帮助应显示键位 `{}`", row.key);
-            // 说明可能被内层宽度截断(截断不折行,见 help_lines 的 clip 纪律),
-            // 所以按前缀断言——整句在,或整句被截到可见宽度的前缀在。
+            // 说明可能被浮层内层宽度截断(帮助行**不折行、不 clip**,超宽就被
+            // Paragraph 裁掉尾巴——见 help_lines),所以按前缀断言:整句在,或
+            // 整句被裁到可见宽度的前缀在。#121 的「U 自升级」那一行说明有 63
+            // 格宽、超过 58 格内层,正是这条纪律的现行证据。
             let head: String = row.desc.chars().take(28).collect();
             assert!(
                 seen.contains(&head),
@@ -7990,8 +8790,6 @@ mod tests {
                     KeyCode::Esc => "Esc".to_string(),
                     _ => unreachable!(),
                 };
-                // `u` 的自升级键(#121)在 HELP_ROWS 里写作 `U`(屏上呈现的
-                // 就是大写 U,与 README 键列同粒度),所以比对时大小写不敏感。
                 (*c, KeyModifiers::NONE, tok.clone(), vec![tok])
             })
             .collect();
@@ -8101,4 +8899,732 @@ mod tests {
             );
         }
     }
+
+    /// 装配历史的鼠标接线(#101):点行选中(与 ↑/↓ 同路,可见行下标)、
+    /// 点任意处关清单原文浮层(与 Esc 同路)。命中区几何由
+    /// `layout::assemble_hits` 与渲染共用(ADR-0005),这里只验分派后果。
+    #[test]
+    fn 装配历史_点行选中与点任意处关原文() {
+        let dir = std::env::temp_dir().join(format!("nwt-hist-mouse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let profiles = dir.join("profiles");
+        std::fs::create_dir_all(profiles.join("desk")).unwrap();
+        std::fs::write(
+            profiles.join("desk/.nw-manifest"),
+            r#"{"schema":"nw/manifest.v1","lockId":"desk-1.0.0-8f3a1c2","installedAt":"2026-10-01T12:00:00Z","recipe":{"name":"research-desk","version":"1.0.0"},"profile":"desk","runtime":{"runtimeKey":"node-24.21.0+pi-1.0.0"},"components":[],"convergeHash":"9f2c","engine":{"nw":"0.1.0"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(profiles.join("lab")).unwrap(); // 第二个派:点第二行用
+        let mut app = fake_app();
+        app.screen = Screen::Assemble;
+        app.splash = false;
+        app.size = Rect::new(0, 0, 110, 30);
+        app.nw_home = dir.to_str().unwrap().to_string();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.as_history.is_some(), "h 开历史");
+        // 点第二行(可见行 idx 1):与按一次 ↓ 同后果
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            row.x + 2,
+            row.y,
+        )));
+        assert_eq!(app.ah_sel, 1, "点行选中的是历史列表,不是锁定集");
+        assert_eq!(app.as_sel, 0, "锁定集选中不被历史视图串味");
+        // 回到 desk(就绪态)开原文浮层,点任意处:与 Esc 同路关掉
+        app.update(Message::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.ah_raw.is_some(), "Enter 看原文");
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            60,
+            15,
+        )));
+        assert!(app.ah_raw.is_none(), "点任意处关原文");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- #96 UX 补全:完成通知 / 全局命令面板 / 反查跳转 / 自升级 ----
+
+    /// Ctrl+P:命令面板的呼出键(唯一带 CONTROL 修饰键的登记行)。
+    fn ctrl_p() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
+    }
+
+    /// 按一个字符键(带 NONE 修饰键,与其余测试同口径)。
+    fn keyc(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// 一路 up 成功回音(无告警 = 收敛)。
+    fn up_echo(rc: i32, json: &str) -> EngineOutput {
+        EngineOutput {
+            args: vec!["up".into(), "--lock".into(), "9f8e".into()],
+            exit_code: crate::engine::ExitCode::from_number(rc),
+            ok: rc == 0,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(json).ok(),
+            raw_stdout: json.into(),
+            parse_error: None,
+        }
+    }
+
+    #[test]
+    fn up回音落地_不熄升级在途的互斥灯() {
+        // 升级点的是同一盏 `assembling`;一笔不相干的 up 回音不该把它解开
+        // (互斥由升级自己收敛)。
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.upgrade.in_flight(), "干跑在途");
+        assert!(app.assembling, "升级点了互斥灯");
+        // 另一笔 up 回音到达:不动互斥灯
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["up".into(), "--lock".into(), "9f8e".into()],
+                exit_code: crate::engine::ExitCode::Ok,
+                ok: true,
+                stderr_tail: vec![],
+                envelope: None,
+                raw_stdout: String::new(),
+                parse_error: None,
+            },
+        ))));
+        assert!(app.assembling, "up 回音不熄升级的互斥灯");
+        // 升级自己收敛:Finished 才灭
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 0,
+                reason: String::new(),
+            },
+        )));
+        assert!(!app.assembling, "升级自己收敛互斥");
+    }
+
+    #[test]
+    fn up失败收尾_发通知且话术是失败() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            4, UP_FAIL,
+        )))));
+        assert!(
+            app.pending_notify.concat().contains("装配结束:失败 (rc 4)"),
+            "失败也发通知(挂后台时最需要的那一声):{:?}",
+            app.pending_notify
+        );
+    }
+
+    #[test]
+    fn up收敛收尾_发一声bell加一条osc9_话术与日志同源() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        let seq = app.pending_notify.concat();
+        assert!(seq.starts_with('\u{7}'), "bell 打头:{seq:?}");
+        assert!(
+            seq.contains("\u{1b}]9;装配结束:收敛 (rc 0)\u{7}"),
+            "OSC 9 带收尾话术:{seq:?}"
+        );
+        assert_eq!(app.pending_notify.len(), 1, "一次收尾只入匣一条");
+        assert!(app.log[0].contains("收敛"), "日志与通知同源:{}", app.log[0]);
+    }
+
+    #[test]
+    fn up降级收尾_话术与纯成功可区分() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_WARN,
+        )))));
+        assert!(
+            app.pending_notify.concat().contains("装配结束:降级 (rc 0)"),
+            "ok 但带告警 = 降级,不冒充收敛:{:?}",
+            app.pending_notify
+        );
+        assert!(app.log[0].contains("降级"), "日志同口径:{}", app.log[0]);
+    }
+
+    #[test]
+    fn u键_只在设置屏在场_别屏按了没反应() {
+        for screen in [
+            Screen::Overview,
+            Screen::Assemble,
+            Screen::Health,
+            Screen::Recipes,
+            Screen::Vps,
+        ] {
+            let mut app = fake_app();
+            app.screen = screen;
+            app.update(Message::Key(keyc('u')));
+            assert_eq!(
+                app.upgrade,
+                UpgradePhase::Idle,
+                "{screen:?} 屏上没有 U 这一键"
+            );
+        }
+        let mut set = settings_app();
+        set.update(Message::Key(keyc('u')));
+        assert!(set.upgrade.is_open(), "设置屏 U 才呼出自升级浮层");
+    }
+
+    #[test]
+    fn u键_呼出与收起_版本输入态预填latest_归零不留半句() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest"),
+            "U 呼出,预填 latest(可改成钉版本):{:?}",
+            app.upgrade
+        );
+        // 改成一个钉版本
+        app.update(Message::Key(keyc('0')));
+        app.update(Message::Key(keyc('.')));
+        app.update(Message::Key(keyc('4')));
+        app.update(Message::Key(keyc('.')));
+        app.update(Message::Key(keyc('0')));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest0.4.0"),
+            "键入归版本缓冲:{:?}",
+            app.upgrade
+        );
+        // Esc 收起:状态归零,不留半句版本号
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.upgrade, UpgradePhase::Idle, "Esc 收起");
+    }
+
+    #[test]
+    fn 两个开关各自门控_都关则一个字节都不发() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.bell_on = false;
+        app.desktop_notify = false;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        assert!(
+            app.pending_notify.is_empty(),
+            "都关 = 不出匣:共享终端不扰人"
+        );
+        // 只关桌面:还剩一声 bell
+        let mut only_bell = fake_app();
+        only_bell.assembling = true;
+        only_bell.desktop_notify = false;
+        only_bell.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        assert_eq!(only_bell.pending_notify.concat(), "\u{7}", "只剩 bell");
+    }
+
+    #[test]
+    fn 中止收尾_发通知_迟到回音不重复发() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.as_running = true;
+        app.abort_assembling();
+        assert!(
+            app.pending_notify.concat().contains("装配已中止"),
+            "中止也是收尾:{:?}",
+            app.pending_notify
+        );
+        // 迟到的那一程 up 回音:丢弃半个结果,不再补发一次通知
+        let n = app.pending_notify.len();
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        assert_eq!(app.pending_notify.len(), n, "迟到回音不重复发通知");
+        assert!(
+            app.log[0].contains("已丢弃"),
+            "回音仍按丢弃路:{}",
+            app.log[0]
+        );
+    }
+
+    #[test]
+    fn 升级在途_其余写动作被锁_与装配态同一道闸() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        // 在途:登记 / 删除 / 装配发射这些写入口一律被既有闸挡住
+        app.screen = Screen::Recipes;
+        app.update(Message::Key(keyc('r')));
+        assert_eq!(app.reg_state, RegState::Idle, "装配互斥下不给开登记");
+        // 升级浮层自己吞键:别的键一个都不受理
+        app.screen = Screen::Settings;
+        app.update(Message::Key(keyc('j')));
+        assert_eq!(app.screen, Screen::Settings, "浮层吞键:j 不切屏");
+        // 在途不给返航(面板不假装能收回一个已发出的下载)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.upgrade.is_open(), "在途 Esc 不收浮层");
+    }
+
+    #[test]
+    fn 升级在途_顶栏灯说升级中_不冒充装配() {
+        let mut app = settings_app();
+        app.splash = false;
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        // 顶栏只有 1 行高、宽度按终端算,「◉ 升级中」这段可能被右侧裁掉
+        // (110 列下 NW_HOME 已占掉大半)。所以断言的是 HUD 那句在途提示,
+        // 顶栏灯本身只验「没把装配俩字写进去」。
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("◉"), "顶栏灯亮着:{s}");
+        assert!(!s.contains("装配中"), "升级在途不写装配俩字:{s}");
+        assert!(s.contains("升级中:动作已锁定"), "HUD 说升级中:{s}");
+    }
+
+    #[test]
+    fn 升级浮层_常畅与紧凑两档都渲染_且不冒充装配话术() {
+        let mut app = settings_app();
+        app.splash = false;
+        app.update(Message::Key(keyc('u')));
+        for (w, h) in [(110, 30), (80, 50), (66, 50)] {
+            app.size = Rect::new(0, 0, w, h);
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("自升级 nwt"), "{w}×{h} 浮层标题在场:{s}");
+            assert!(s.contains("目标版本"), "{w}×{h} 版本输入行在场:{s}");
+            assert!(!s.contains("装配中"), "{w}×{h} 升级不冒充装配:{s}");
+        }
+        // 在途态:HUD 说「升级中」,不说「装配中」
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("升级中"), "在途 HUD 说升级中:{s}");
+        assert!(!s.contains("◉ 装配中"), "顶栏灯不冒充装配:{s}");
+    }
+
+    #[test]
+    fn 升级浮层_点任意处与_esc同路收起_在途点不动() {
+        let mut app = settings_app();
+        app.size = Rect::new(0, 0, 110, 30);
+        app.update(Message::Key(keyc('u')));
+        let dismiss = hit_target(&app, |t| *t == Target::DismissPopup);
+        click(&mut app, dismiss);
+        assert_eq!(app.upgrade, UpgradePhase::Idle, "点浮层 = Esc 同路收起");
+        // 在途:命中区仍只给浮层(吞点击不穿透),但点了也收不动
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let hits = hitmap(app.size, &app, size_class(app.size));
+        assert!(
+            hits.iter().all(|(_, t)| *t == Target::DismissPopup),
+            "浮层开着时底层一个命中区都不产:{hits:?}"
+        );
+        click(&mut app, dismiss);
+        assert!(app.upgrade.is_open(), "在途点浮层收不动");
+    }
+
+    #[test]
+    fn 升级进度_上下翻看不越界_且只读不点亮写互斥() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        for i in 0..5 {
+            app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(format!(
+                "nwt-install: 第 {i} 行"
+            ))));
+        }
+        assert_eq!(app.upgrade_log.len(), 5, "逐行进度入日志区");
+        for _ in 0..20 {
+            app.update(Message::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )));
+        }
+        app.update(Message::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        // 翻看不改升级态、不发命令
+        assert_eq!(app.queue.len(), 0, "升级过程零引擎调用");
+        assert!(app.upgrade_log.len() >= 5, "翻看不清日志");
+    }
+
+    #[test]
+    fn 取走出匣后清空_不重复发同一帧() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        let first = app.take_pending_notify();
+        assert_eq!(first.len(), 1, "取走那一条");
+        assert!(app.take_pending_notify().is_empty(), "取走即清空");
+    }
+
+    #[test]
+    fn 干跑回音_落计划态_确认才真跑_暂存目录不是落点() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        // 干跑回音:install.sh 的计划原文逐行来
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
+            "nwt-install: 安装计划(--dry-run,未做任何改动):".into(),
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
+            "nwt-install:   版本     v0.9.9".into(),
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 0,
+                reason: String::new(),
+            },
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Plan { version } if version == "latest"),
+            "干跑 rc 0 落计划态:{:?}",
+            app.upgrade
+        );
+        assert!(!app.assembling, "干跑收敛互斥(还没开始下载)");
+        assert!(
+            app.upgrade_log.iter().any(|l| l.contains("安装计划")),
+            "计划原文在进度区:{:?}",
+            app.upgrade_log
+        );
+        // 确认才真跑
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Running { .. }),
+            "计划态 Enter 才真跑:{:?}",
+            app.upgrade
+        );
+        assert!(app.assembling, "真跑在途点互斥");
+        assert_eq!(app.upgrade_queue.len(), 2, "确认后才入队第二趟");
+        assert!(!app.upgrade_queue[1].dry_run, "第二趟是真跑");
+    }
+
+    #[test]
+    fn 开关翻转后_收尾序列跟着变() {
+        let (_g, _cfg) = env_locked();
+        let mut app = settings_app();
+        app.update(Message::Key(key('b'))); // 只关 bell
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        assert_eq!(
+            app.pending_notify.concat(),
+            "\u{1b}]9;装配结束:收敛 (rc 0)\u{7}",
+            "bell 关 = 只剩桌面通知"
+        );
+    }
+
+    #[test]
+    fn 无装配收尾_一条序列都不出() {
+        let mut app = fake_app();
+        // 开机自举(version + 能力探针 + ls)一路走完
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.bootstrap(&tx);
+        while let Ok(ev) = rx.try_recv() {
+            app.update(Message::Engine(ev));
+        }
+        assert!(app.pending_notify.is_empty(), "自举不发通知");
+        // 其它路径的回音(argv 不是 up)也不发
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["ls".into(), "--repo".into(), "/tmp".into()],
+                exit_code: crate::engine::ExitCode::Ok,
+                ok: true,
+                stderr_tail: vec![],
+                envelope: None,
+                raw_stdout: String::new(),
+                parse_error: None,
+            },
+        ))));
+        assert!(app.pending_notify.is_empty(), "ls 回音不发通知");
+        // 登记落账回音(带 --yes 的 source register)同样不发
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["source".into(), "register".into(), "--yes".into()],
+                exit_code: crate::engine::ExitCode::Ok,
+                ok: true,
+                stderr_tail: vec![],
+                envelope: None,
+                raw_stdout: String::new(),
+                parse_error: None,
+            },
+        ))));
+        assert!(app.pending_notify.is_empty(), "登记落账回音不发通知");
+        // 反查回音(tag ls)同样不发
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["tag".into(), "ls".into(), "--root".into(), "/tmp".into()],
+                exit_code: crate::engine::ExitCode::Ok,
+                ok: true,
+                stderr_tail: vec![],
+                envelope: None,
+                raw_stdout: String::new(),
+                parse_error: None,
+            },
+        ))));
+        assert!(app.pending_notify.is_empty(), "反查回音不发通知");
+    }
+
+    #[test]
+    fn 版本态回车_入队一趟干跑_并点装配互斥灯() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Planning { .. }),
+            "Enter 取安装计划(零下载、零落盘):{:?}",
+            app.upgrade
+        );
+        assert!(app.assembling, "升级在途点全局写互斥(与装配态同款)");
+        assert_eq!(app.upgrade_queue.len(), 1, "入队一趟升级请求");
+        let req = &app.upgrade_queue[0];
+        assert!(req.dry_run, "第一趟是干跑:先摊计划再确认");
+        assert_eq!(req.version, None, "latest 不带 --version(脚本自己解析)");
+    }
+
+    #[test]
+    fn 版本输入态_ctrl组合键不当字符_缓冲无上限由输入态机把着() {
+        // 版本输入归通用输入态机 `input::on_key`:CONTROL 组合键被过滤掉,
+        // 缓冲有 `BUF_CAP` 上限——手搓 `Char(c) => push(c)` 两条都失守。
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest"),
+            "Ctrl+p 不往版本缓冲里塞字符:{:?}",
+            app.upgrade
+        );
+        // 普通字符照旧进缓冲
+        type_str(&mut app, "0.4.0");
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest0.4.0"),
+            "键入照旧:{:?}",
+            app.upgrade
+        );
+    }
+
+    #[test]
+    fn 真跑失败_收敛互斥_落失败态且明示旧二进制未动() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 1,
+                reason: "sha256 校验失败(期望 aaa,实得 bbb)——已中止,未安装任何文件".into(),
+            },
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Failed { reason } if reason.contains("sha256 校验失败")),
+            "失败态带人话:{:?}",
+            app.upgrade
+        );
+        assert!(!app.assembling, "失败也收敛互斥");
+        assert!(
+            app.log.iter().any(|l| l.contains("旧二进制原样不动")),
+            "明示旧二进制未动:{:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn 真跑成功_收敛互斥_落完成态并提示重启() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        // 先过干跑(计划态),再确认真跑——与生产同一条两段式
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 0,
+                reason: String::new(),
+            },
+        )));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
+            "nwt-install: sha256 校验通过(9f8ea1b2c3)".into(),
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
+            "nwt-install: 安装 nwt v0.9.9 (linux/x86_64) 到 /stage".into(),
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 0,
+                reason: String::new(),
+            },
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Done { version, sha256 }
+                if version == "0.9.9" && sha256 == "9f8ea1b2c3"),
+            "完成态带版本与 sha256:{:?}",
+            app.upgrade
+        );
+        assert!(!app.assembling, "完成即收敛互斥");
+        assert!(
+            app.log.iter().any(|l| l.contains("重启面板")),
+            "提示重启生效:{:?}",
+            app.log.first()
+        );
+    }
+
+    #[test]
+    fn 装配在途按u_被写互斥拒_留证据且面板也不透出它() {
+        // 写互斥(ADR-0009 §4 / 规格故事 9):自升级要落盘,与装配同一族。
+        // 两条路都要被拒——设置屏直接按 U,以及命令面板里搜到它。
+        let mut app = settings_app();
+        app.assembling = true;
+        app.update(Message::Key(keyc('u')));
+        assert_eq!(app.upgrade, UpgradePhase::Idle, "装配在途不给开自升级");
+        assert!(
+            app.log.iter().any(|l| l.contains("自升级与装配互斥")),
+            "拒绝留证据:{:?}",
+            app.log.first()
+        );
+        // 面板路:装配态下写动作整批收起,U 是其中之一
+        let offered = crate::ui::commands::offered(&app);
+        assert!(
+            !offered.iter().any(|r| r.code == KeyCode::Char('u')),
+            "装配态下面板不透出 U:{:?}",
+            offered.iter().map(|r| r.key).collect::<Vec<_>>()
+        );
+        assert_eq!(crate::ui::commands::hidden_write_count(&app), 5);
+    }
+
+    #[test]
+    fn 设置屏b与o键_两个开关各自翻转并持久化() {
+        let (_g, _cfg) = env_locked();
+        let mut app = settings_app();
+        assert!(app.bell_on && app.desktop_notify, "缺省都开");
+        // b 只翻 bell
+        app.update(Message::Key(key('b')));
+        assert!(!app.bell_on, "b 关 bell");
+        assert!(app.desktop_notify, "b 不动桌面开关");
+        // o 只翻桌面
+        app.update(Message::Key(key('o')));
+        assert!(!app.desktop_notify, "o 关桌面");
+        assert!(!app.bell_on, "o 不动 bell(它已经被 b 关了)");
+        // 落盘:写回再读不丢(重启仍生效)
+        let (back, err) = crate::engine::config::load();
+        assert!(err.is_none());
+        assert_eq!(back.bell, Some(false), "bell 偏好落盘");
+        assert_eq!(back.desktop_notify, Some(false), "桌面偏好落盘");
+        // 再按一次各自回开
+        app.update(Message::Key(key('b')));
+        app.update(Message::Key(key('o')));
+        assert!(app.bell_on && app.desktop_notify, "再按各自回开");
+        let (back2, _) = crate::engine::config::load();
+        assert_eq!(back2.bell, Some(true));
+        assert_eq!(back2.desktop_notify, Some(true));
+    }
+
+    #[test]
+    fn 面板里执行ctrl_p条目_带的修饰键照登记表() {
+        // 唯一带 CONTROL 的登记行恰是 Ctrl+P 自己:按 NONE 回放会派发成
+        // 裸 `p`(概览屏的 ↑ 别名)——一次静默的语义漂移。
+        let mut app = fake_app();
+        app.splash = false;
+        app.screen = Screen::Overview;
+        app.update(Message::Key(ctrl_p()));
+        for c in "命令面板".chars() {
+            app.update(Message::Key(keyc(c)));
+        }
+        // 选中「命令面板」那一条自己(它不是首行,按名字定位)
+        let idx = crate::ui::commands::offered(&app)
+            .iter()
+            .position(|r| r.code == KeyCode::Char('p'))
+            .expect("搜得到命令面板自己");
+        assert!(
+            crate::ui::commands::offered(&app)[idx]
+                .modifiers
+                .contains(KeyModifiers::CONTROL),
+            "登记表里它带 CONTROL"
+        );
+        app.cmd_sel = idx;
+        // 执行它 = 「按下 Ctrl+P 那一个键」。修饰键照登记表带,所以派发的
+        // 是 Ctrl+P(壳级开关面板),**不是**裸 `p`——后者在概览屏是 ↑ 的
+        // 别名,那会是一次静默的语义漂移。这里钉的就是「别名没被触发」:
+        // 面板先被 `close_cmd_panel` 收起,再被派发的 Ctrl+P 重新打开,
+        // 而选中行一动不动。
+        let sel = app.ov_sel;
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.ov_sel, sel,
+            "没有偷偷触发 ↑ 别名:{sel} → {}",
+            app.ov_sel
+        );
+    }
+
+    #[test]
+    fn 面板里执行跨屏条目_先切到那一屏再派发() {
+        // 规格故事 9 的执行面:面板执行 = 「搜到并按下那个键」。跨屏条目
+        // (U 在设置屏)不在当前屏根本没有分支,所以先切屏再派发——否则
+        // 操作者在概览屏执行「U 自升级」会得到零反馈。
+        let mut app = fake_app();
+        app.splash = false;
+        app.screen = Screen::Overview;
+        app.update(Message::Key(ctrl_p()));
+        assert!(app.cmd_open, "面板开着");
+        for c in "自升级".chars() {
+            app.update(Message::Key(keyc(c)));
+        }
+        let n = app.cmd_results_len();
+        assert!(n > 0, "搜得到自升级:{n}");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.screen, Screen::Settings, "跨屏条目先切屏");
+        assert!(app.upgrade.is_open(), "切过去后浮层真的开了");
+    }
+
+    const UP_OK: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","lockId":"9f8e","convergeHash":"abc"}}"#;
+
+    const UP_WARN: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[{"code":"PROVIDER_NOT_READY","exitCode":0,"message":"provider 未就绪","hint":"补 env","details":{}}],"data":{"profile":"desk","lockId":"9f8e"}}"#;
+
+    const UP_FAIL: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":false,"errors":[{"code":"APPLY_FAILED","exitCode":4,"message":"sha256 不符","hint":"重新 bake","details":{}}],"warnings":[],"data":null}"#;
 }

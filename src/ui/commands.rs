@@ -364,8 +364,9 @@ mod tests {
         assert!(by_screen.contains(&"i"), "屏名可搜:{by_screen:?}");
         // 键位「Ctrl+P」按字面命中自己
         assert_eq!(find("Ctrl+P"), vec!["Ctrl+P"], "键位可搜");
-        // 动作名「刷新」命中概览 r
-        assert_eq!(find("刷新"), vec!["r"], "动作名可搜");
+        // 动作名「刷新」命中概览 r;装配历史行说明词含「显式刷新」(#101),
+        // 同词也命中——两条 r 都名副其实,不是重复登记。
+        assert_eq!(find("刷新"), vec!["r", "r"], "动作名可搜");
     }
 
     // ---- 装配态下破坏性动作不透出 ----

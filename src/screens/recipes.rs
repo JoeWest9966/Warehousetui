@@ -22,6 +22,10 @@ pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
     // 登记两段式的浮层(#30):盖在屏体之上(几何与 layout::register_hits
     // 共用 popup_rect 与同一组常量,点哪打哪)。
     render_register_overlay(frame, area, app);
+    // 落点溯源浮层(#115):与登记浮层同层覆盖(它在场时键位/命中都被吞,
+    // 见 on_key 守卫与 layout::recipes_hits;两个浮层不会同时在场的语义由
+    // dismiss_popup 的受理次序保证)。
+    render_landing_overlay(frame, area, app);
 }
 
 /// 常畅态:五域轨(定宽 14)/ 列表 / 详情三栏,既有外观逐像素不变。
@@ -445,12 +449,25 @@ fn bake_suggest_lines(
             }
         }
         Err(g) => {
-            lines.push(Line::from(Span::styled(
-                format!("  ⚠ {}", g.title()),
-                p.warn().bold(),
-            )));
-            for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
-                lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+            // #124:缺能力那一支**整句**交给共享构造器的单行形态(三态措辞 +
+            // 探针证据带,与册体 #122 / 日志结论句 #118 同一处真相),并且不再
+            // 另铺 `title()`——那句「引擎缺 X 能力」对未决态是冒充(引擎这一跑
+            // 根本没答上,不是没有这个能力,spec #90 故事 23)。另两支(数据仓根
+            // 未设 / 没有选中的配方)仍是纯函数层自己的标题 + 说法。
+            if g == crate::engine::commands::BakeGate::NoCapability {
+                // 不按 take(3) 收口:裁掉尾部等于把证据带切掉,操作者正好看不到
+                // 引擎那一跑的原话。
+                for ln in wrap(&app.bake_gate_line(g), w.saturating_sub(4)) {
+                    lines.push(Line::from(Span::styled(format!("  {ln}"), p.warn().bold())));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", g.title()),
+                    p.warn().bold(),
+                )));
+                for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
+                    lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+                }
             }
         }
     }
@@ -466,12 +483,21 @@ fn bake_empty_lines(p: &crate::theme::Palette, app: &App, w: usize) -> Vec<Line<
         p.dim(),
     ))];
     if let Some(g) = gate {
-        lines.push(Line::from(Span::styled(
-            format!("  ⚠ {}", g.title()),
-            p.warn().bold(),
-        )));
-        for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
-            lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+        // 同 bake_suggest_lines:缺能力那一支整句走共享构造器的单行形态
+        // (带证据),不另铺 title、不按 take(3) 收口;另两支仍是纯函数层
+        // 自己的标题 + 说法。
+        if g == crate::engine::commands::BakeGate::NoCapability {
+            for ln in wrap(&app.bake_gate_line(g), w.saturating_sub(4)) {
+                lines.push(Line::from(Span::styled(format!("  {ln}"), p.warn().bold())));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ {}", g.title()),
+                p.warn().bold(),
+            )));
+            for ln in wrap(&g.advice(), w.saturating_sub(4)).into_iter().take(3) {
+                lines.push(Line::from(Span::styled(format!("  {ln}"), p.dim())));
+            }
         }
     }
     lines
@@ -521,11 +547,21 @@ fn recipe_new_suggest_lines(
             );
         }
         Err(g) => {
-            head.push(Line::from(Span::styled(
-                format!("  ⚠ {}", g.title()),
-                p.warn().bold(),
-            )));
-            notes.push(g.advice());
+            // #124:与 bake 同一收口——缺能力那一支整句交给共享构造器的单行
+            // 形态(带证据),不另铺 `title()`(对未决是冒充);另两支仍是纯函数层
+            // 自己的标题 + 说法。折行进 head:它替代了原来的标题行,视觉重量
+            // 不能比原标题轻;竖向仍由下面的 room 收口,放不下整块不渲染。
+            if g == crate::engine::commands::RecipeNewGate::NoCapability {
+                for ln in wrap(&app.recipe_new_gate_line(g), w.saturating_sub(4)) {
+                    head.push(Line::from(Span::styled(format!("  {ln}"), p.warn().bold())));
+                }
+            } else {
+                head.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", g.title()),
+                    p.warn().bold(),
+                )));
+                notes.push(g.advice());
+            }
         }
     }
     if head.len() > room {
@@ -735,6 +771,199 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+// ---- #115 反向溯源:选中行的派落点(只读知识呈现) ----
+
+/// 选中行「铺进派后落哪」的快照:打开浮层时从当次 ls 五域数据算定,之后
+/// 不随刷新漂(呈现的是操作者选中那一刻的事实)。
+///
+/// 两类分列的来源(上游 docs/external-sources.md,只读知识、面板不另造规则):
+/// - 本地组件住 `nw/components/<组件名>/`(「机制不同,家就不同」,2026-10-03 裁定);
+/// - 外部源一条记录 = 一个仓库,条目按记录 kind 分派:skill 落
+///   `skills/<仓库名>/<条目名>/`(仓库名即命名空间),extension 落
+///   `nw/extensions/<仓库名>/<条目名>/`(与本地组件同一屋檐但不进 components/)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LandingTrace {
+    /// 选中一个本地组件(ls 的 components 域:上游 `ls.go` 的 readComponents
+    /// 只扫 `<root>/components/<名>/component.yaml`,这一域恒为本地组件)。
+    Local { name: String },
+    /// 选中一条外部源记录(ls 的 sources 域:一条记录 = 一个仓库 + 一次扫描的
+    /// 条目清单)。`kind` 取引擎原文(skill/extension;缺 None 时呈现侧明说)。
+    External {
+        repo: String,
+        kind: Option<String>,
+        entries: Vec<String>,
+    },
+}
+
+/// 本地组件的派落点(相对派目录):上游 external-sources.md「本地组件的 skill
+/// 仍住 `nw/components/<组件>/` 里」。
+pub fn local_component_landing(name: &str) -> String {
+    format!("nw/components/{name}/")
+}
+
+/// 外部源条目的派落点(相对派目录):kind = `extension` 落
+/// `nw/extensions/<仓库名>/<条目名>/`;其余(含 kind 缺省)按 skill 落
+/// `skills/<仓库名>/<条目名>/` —— 上游编目两条数组必居其一(skills[] /
+/// extensions[]),kind 缺省时呈现侧在标题明说,不静默冒充。
+pub fn external_entry_landing(repo: &str, entry: &str, kind: Option<&str>) -> String {
+    match kind {
+        Some("extension") => format!("nw/extensions/{repo}/{entry}/"),
+        _ => format!("skills/{repo}/{entry}/"),
+    }
+}
+
+/// 当前选中行的落点快照(纯计算):只读,不碰文件系统、不发引擎命令。
+/// 门与五域同源:数据仓根不就绪(`data_root_cause`)时不摆;无落点语义的域
+/// (recipes/profiles/locks)不给;选中行取过滤后「看得见的那一行」(#61 同源)。
+pub fn landing_trace(app: &App) -> Option<LandingTrace> {
+    if app.data_root_cause().is_some() {
+        return None;
+    }
+    let l = app.ls.as_ref()?;
+    let i = *app.rc_visible().get(app.rc_sel)?;
+    match app.rc_domain {
+        Domain::Components => l.components.get(i).map(|c| LandingTrace::Local {
+            name: c.name.clone(),
+        }),
+        Domain::Sources => l.sources.get(i).map(|s| LandingTrace::External {
+            repo: s.name.clone(),
+            kind: s.kind.clone(),
+            entries: s.entries.iter().map(|e| e.name.clone()).collect(),
+        }),
+        _ => None,
+    }
+}
+
+/// 浮层宽:要容得下 `nw/extensions/<仓库名>/<条目名>/` 的实指行(常畅/紧凑
+/// 两档都放得下;`popup_rect` 再按终端收窄)。
+const LANDING_W: u16 = 64;
+
+/// 外部源条目的实指行上限:一仓扫出几十条时浮层不无限长,超出明说条数
+///(与健康屏证据面板 20 条上限同一种「不收进无限列表」的纪律)。
+const LANDING_MAX_ENTRIES: usize = 6;
+
+/// 落点溯源浮层矩形:宽 [`LANDING_W`],高随内容(内容行 + 2 边框,与
+/// `vps_reverse_popup_rect` 同法,钳在终端内)。渲染与命中共用这一几何。
+pub(crate) fn landing_popup_rect(area: Rect, trace: &LandingTrace) -> Option<Rect> {
+    let content = match trace {
+        // 标签 + 实指 + 规则标签 + 两条规则 + 收口
+        LandingTrace::Local { .. } => 6,
+        // 标签 + 条目(含溢出说明)+ 规则标签 + 规则行 + 收口
+        LandingTrace::External { entries, .. } => {
+            4 + entries.len().min(LANDING_MAX_ENTRIES)
+                + usize::from(entries.len() > LANDING_MAX_ENTRIES)
+        }
+    };
+    let h = u16::try_from(content).unwrap_or(u16::MAX).saturating_add(2);
+    let popup = crate::layout::popup_rect(area, LANDING_W, h);
+    (popup.width > 0 && popup.height > 0).then_some(popup)
+}
+
+/// 落点溯源浮层(#115):纯只读呈现 —— 不读派目录、不发引擎命令、不落文件;
+/// 两类分列:选中行所属那类摊实指,另一类给上游规则作对照(规格故事 19:
+/// 两类组件的落点差异一目了然)。Esc 或点任意处关闭(键盘路由见
+/// `App::on_key` 的浮层守卫,鼠标见 `layout::recipes_hits` 的弹层分支)。
+fn render_landing_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(trace) = app.rc_landing.as_ref() else {
+        return;
+    };
+    let Some(popup) = landing_popup_rect(area, trace) else {
+        return;
+    };
+    let p = &app.palette;
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    match trace {
+        LandingTrace::Local { name } => {
+            lines.push(Line::from(Span::styled(
+                " 本地组件(选中) ",
+                p.text().bold(),
+            )));
+            lines.push(Line::from(vec![
+                Span::raw("   ▸ "),
+                Span::styled(local_component_landing(name), p.info()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                " 外部源组件 · 规则(上游落点) ",
+                p.dim().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "   · skill      →  skills/<仓库名>/<条目名>/",
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "   · extension →  nw/extensions/<仓库名>/<条目名>/",
+                p.dim(),
+            )));
+        }
+        LandingTrace::External {
+            repo,
+            kind,
+            entries,
+        } => {
+            lines.push(Line::from(Span::styled(
+                " 外部源组件(选中) ",
+                p.text().bold(),
+            )));
+            if entries.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "   该仓库还没有扫出条目(register 预审时才有)。",
+                    p.dim(),
+                )));
+            }
+            for e in entries.iter().take(LANDING_MAX_ENTRIES) {
+                lines.push(Line::from(vec![
+                    Span::raw("   ▸ "),
+                    Span::styled(clip(e, 18), p.info()),
+                    Span::raw("  →  "),
+                    Span::styled(
+                        clip(
+                            &external_entry_landing(repo, e, kind.as_deref()),
+                            inner_w.saturating_sub(26),
+                        ),
+                        p.info(),
+                    ),
+                ]));
+            }
+            let rest = entries.len().saturating_sub(LANDING_MAX_ENTRIES);
+            if rest > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("   …其余 {rest} 条按同一规则落 skills/<仓库名>/<条目名>/"),
+                    p.dim(),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                " 本地组件 · 规则(上游落点) ",
+                p.dim().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "   · 铺到 nw/components/<组件名>/",
+                p.dim(),
+            )));
+        }
+    }
+    lines.push(Line::from(Span::styled(" Esc 或点击任意处关闭", p.dim())));
+    let budget = popup.height.saturating_sub(2) as usize;
+    lines.truncate(budget);
+    // 标题带 kind 原文;缺 kind 明说按 skill 呈现,不静默冒充
+    let title = match trace {
+        LandingTrace::Local { name } => format!(" 落点溯源 · {name} "),
+        LandingTrace::External { repo, kind, .. } => match kind.as_deref() {
+            Some(k) => format!(" 落点溯源 · {repo} · kind: {k} "),
+            None => format!(" 落点溯源 · {repo} · kind 未给出(按 skill) "),
+        },
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_style(p.accent())
+                .title(Span::styled(title, p.accent().bold())),
+        ),
+        popup,
+    );
+}
+
 // ---- 登记两段式浮层(spec #25 / 工单 #30):输入 → kind → 预审回音 → 确认 ----
 
 /// 按显示宽截断(不切宽字符,防 CJK 混排错位)。
@@ -868,6 +1097,8 @@ fn render_register_overlay(frame: &mut Frame, area: Rect, app: &App) {
     match app.reg_state {
         RegState::Idle => {}
         RegState::RepoInput => render_reg_input(frame, area, app),
+        RegState::PreScan => render_reg_prescan(frame, area, app),
+        RegState::PreScanPick => render_reg_pick(frame, area, app),
         RegState::KindPick => render_reg_kind(frame, area, app),
         RegState::PreAudit => render_reg_preaudit(frame, area, app),
         RegState::Review => render_reg_review(frame, area, app),
@@ -906,7 +1137,122 @@ fn render_reg_input(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// ② kind 二选一:两行选项(选中标记 + 高亮)钉在内层第 1/2 行,
+/// ②·预扫在途(#114):只读拉目标仓条目清单(`gh api`),说清这段在干什么;
+/// 鼠标惰性(命中侧同款,见 `layout::register_hits` 的 `PreScan` 臂)。
+fn render_reg_prescan(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup =
+        crate::layout::popup_rect(area, crate::layout::REG_INPUT_W, crate::layout::REG_INPUT_H);
+    frame.render_widget(Clear, popup);
+    let slug = app.reg_scan_slug.as_deref().unwrap_or("—");
+    let lines = vec![
+        Line::from(Span::styled(format!("  正在预扫 {slug} 的条目…"), p.text())),
+        Line::from(Span::styled(
+            "  只读 GitHub(gh api):不落文件、不调引擎。",
+            p.dim(),
+        )),
+        Line::from(Span::styled("  Esc 可返航(回音将丢弃)。", p.dim())),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记外部源 · 预扫 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ③·预扫选单(#114):勾选要登记的条目。按 kind 分组列条,每条一个
+/// 勾选框(默认全勾——菜单答「这仓有什么」,作者改「我要登记哪些」);
+/// 键位行钉内层末行(与 `layout::register_hits` 同几何同文案)。
+/// **本段只改面板侧勾选态**:不落文件、不下发任何命令;勾选结论随
+/// 确认态呈现,登记仍按仓整体走引擎两段式。
+fn render_reg_pick(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup =
+        crate::layout::popup_rect(area, crate::layout::REG_PICK_W, crate::layout::REG_PICK_H);
+    frame.render_widget(Clear, popup);
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let slug = app.reg_scan_slug.as_deref().unwrap_or("—");
+    let total = app.reg_scan_entries.len();
+    let checked = app.reg_scan_checks.iter().filter(|c| **c).count();
+    lines.push(Line::from(Span::styled(
+        format!("  预扫 {slug}:{total} 条,已勾选 {checked}"),
+        p.text(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  空格 勾选/取消 · ↑/↓ 移选中(面板侧选单,引擎扫描仍为准)",
+        p.dim(),
+    )));
+    lines.push(Line::from(""));
+    // 分组列条(skill 组在前,与 scan::parse_tree 的确定序一致)
+    for kind in [
+        crate::scan::ScanKind::Skill,
+        crate::scan::ScanKind::Extension,
+    ] {
+        let idxs: Vec<usize> = app
+            .reg_scan_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == kind)
+            .map(|(i, _)| i)
+            .collect();
+        if idxs.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {}({}):", kind.word(), idxs.len()),
+            p.accent(),
+        )));
+        for i in idxs {
+            let on = app.reg_scan_checks.get(i).copied().unwrap_or(false);
+            let cur = i == app.reg_scan_sel;
+            lines.push(Line::from(vec![
+                Span::raw(if cur { "  ▸ " } else { "    " }),
+                Span::styled(
+                    if on { "[x] " } else { "[ ] " },
+                    if on { p.info() } else { p.dim() },
+                ),
+                Span::styled(
+                    clip(&app.reg_scan_entries[i].path, inner_w.saturating_sub(8)),
+                    if cur { p.sel() } else { p.text() },
+                ),
+            ]));
+        }
+    }
+    // 内容钉进内层:超量截断、欠量垫空,键位行恒在内层最后一行
+    // (与 layout::register_hits 的 key_y = popup.y + height - 2 同约定)。
+    let budget = inner_h.saturating_sub(1);
+    if lines.len() > budget {
+        lines.truncate(budget.saturating_sub(1));
+        lines.push(Line::from(Span::styled("  …(屏内未全显)", p.dim())));
+    }
+    while lines.len() < budget {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(crate::layout::REG_KEY_PICK_CONTINUE, p.accent().bold()),
+        Span::raw(crate::layout::RITUAL_KEY_GAP),
+        Span::styled(crate::layout::RITUAL_KEY_RETURN, p.dim()),
+    ]));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记外部源 · 预扫选单 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ③ kind 二选一:两行选项(选中标记 + 高亮)钉在内层第 1/2 行,
 /// 键位行钉在内层末行——与 `layout::register_hits` 的行序同约定。
 fn render_reg_kind(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
@@ -1041,6 +1387,30 @@ fn render_reg_review(frame: &mut Frame, area: Rect, app: &App) {
             if d.entries.len() > 4 {
                 lines.push(Line::from(Span::styled(
                     format!("   … 共 {} 条,屏内未全显", d.entries.len()),
+                    p.dim(),
+                )));
+            }
+            // #114 预扫勾选(面板侧选单结论)随确认态摊开:登记按仓整体
+            // 进行、引擎扫描为准,这里只是把作者在选单上勾的结论给人看。
+            if !app.reg_scan_entries.is_empty() {
+                let picked: Vec<&str> = app
+                    .reg_scan_entries
+                    .iter()
+                    .zip(&app.reg_scan_checks)
+                    .filter(|(_, on)| **on)
+                    .map(|(e, _)| e.path.as_str())
+                    .collect();
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  预扫勾选(面板侧) {}/{}:{}",
+                        picked.len(),
+                        app.reg_scan_entries.len(),
+                        if picked.is_empty() {
+                            " 未勾选".to_string()
+                        } else {
+                            format!(" {}", clip(&picked.join(" · "), inner_w.saturating_sub(24)))
+                        }
+                    ),
                     p.dim(),
                 )));
             }

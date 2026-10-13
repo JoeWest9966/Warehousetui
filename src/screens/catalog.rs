@@ -2843,16 +2843,34 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
     let p = &app.palette;
     let kind = app.catalog_kind;
     let mut lines: Vec<Line> = Vec::new();
-    // 引擎没有这一本的能力:入口禁用并指路(既有门控语义不变,面板不自造替代品)
-    if !app.capabilities.enabled(kind.capability()) {
-        lines.push(Line::from(Span::styled(
-            format!(" ⚠ {} 册入口禁用:{}", kind.label(), capability::GATE_HINT),
-            p.warn().bold(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  缺的是引擎能力,不是面板坏了;编目册内容此时不可信也不呈现。",
-            p.dim(),
-        )));
+    // 能力门(#122):关门指路按探测三态如实分措辞 + 证据带。措辞与字段
+    // 一处真相——共享纯行构造器 `engine::capability::gate_signpost`,日志
+    // 结论句(#118)与设置屏能力节(#123)调的是同一个,册体不再自己排一遍。
+    //
+    // 三态互不冒充:真禁用才出现「缺的是引擎能力…升级所配 nw」;未决只说
+    // 「引擎这一跑没答上」+ 引擎发现素材 + 重启重探,那三样字样一个都不
+    // 出现;可用态不产指路(下面的 `if let` 直接落空),册体与改前逐字节
+    // 相同——健康时零噪音。
+    //
+    // 优先级不变:能力门仍先于数据仓根指路(能力那句不抢跑,根那句也不被
+    // 能力盖掉——两态互不冒充,既有测试钉着)。
+    if let Some(signpost) = capability::gate_signpost(
+        kind.label(),
+        kind.capability(),
+        &app.capabilities,
+        &app.engine_facts(),
+    ) {
+        // 真相行:第一行 warn 加粗(这一态开不开),其余 dim。证据带同 dim——
+        // 它是引擎原文,不是面板的结论,不抢真相行的视觉重量。每条单行,
+        // 超宽按册体既有纪律 `clip` 收(截断不折行:折行会多占一行,
+        // 键位行末行几何即失真)。
+        for (i, v) in signpost.verdict.iter().enumerate() {
+            let style = if i == 0 { p.warn().bold() } else { p.dim() };
+            lines.push(Line::from(Span::styled(clip(v, w), style)));
+        }
+        for e in &signpost.evidence {
+            lines.push(Line::from(Span::styled(clip(e, w), p.dim())));
+        }
     } else if app.data_root_cause().is_some() {
         lines.extend(data_root_signpost(app));
     } else {
@@ -3851,11 +3869,186 @@ fn sub_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
     )
 }
 
+/// 钥匙轮换账龄的 amber 阈值(天,spec #94 第 5 项)。**照订阅到期 7 天的
+/// 先例,不配置化**;订阅那 7 天是上游 `status.go` 算好随回音下发的,这一条
+/// 是面板自己的展示阈值——两处不同源,不许互相「对齐」成一套。只标记不治理:
+/// 不碰退出码、不提醒、不自动轮换。
+const KEY_AGE_WARN_DAYS: u32 = 7;
+
+/// UTC 日历日——账龄运算的唯一时间粒度(整天,不涉时刻)。
+///
+/// 面板不引 chrono:账龄是**纯展示运算**(`rotated-at` 是静态登记字段,引擎
+/// 不下发账龄;订阅三态「引擎在回音里算好、面板零日期运算」那条口径讲的是
+/// 订阅,不禁这一处——spec #94 实现决策点名开了这个口子)。要的只是两个日历
+/// 日之间的整天数,整数运算就够,不值得为一个差引一整个时区库。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct UtcDay {
+    y: i32,
+    m: u32,
+    d: u32,
+}
+
+impl UtcDay {
+    /// 严格 `YYYY-MM-DD`(引擎 `rotatedAt` 的契约形状)**且真是日历日**;
+    /// 空串 / 形状不认 / `2026-02-30` 这种不存在的日子 = None。
+    ///
+    /// 形状那一层与登记表单共用同一条 strict 校验([`valid_expires`]);这里
+    /// 多要一层「真是日历日」,是因为账龄要把日期换成天数——`2026-02-30`
+    /// 会被静默滚成 3 月 2 日,印一个看着精确、其实无依据的天数。算不出就
+    /// 说算不出,不猜(与 `days_left_line` 同一口径)。
+    fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() || !valid_expires(s) {
+            return None;
+        }
+        let y: i32 = s.get(0..4)?.parse().ok()?;
+        let m: u32 = s.get(5..7)?.parse().ok()?;
+        let d: u32 = s.get(8..10)?.parse().ok()?;
+        if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
+            return None;
+        }
+        Some(Self { y, m, d })
+    }
+
+    /// 日历日 → Unix 纪元天数(Howard Hinnant `days_from_civil`,纯整数,
+    /// 无时区无库)。
+    fn epoch_days(self) -> i64 {
+        let y = i64::from(self.y) - i64::from(self.m <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400; // [0, 399]
+        let m = i64::from(self.m);
+        let d = i64::from(self.d);
+        let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+        let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+        era * 146_097 + doe - 719_468
+    }
+
+    /// Unix 纪元天数 → 日历日(Hinnant `civil_from_days`)。
+    fn from_epoch_days(z: i64) -> Self {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097; // [0, 146096]
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+        let mp = (5 * doy + 2) / 153; // [0, 11]
+        let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1); // [1, 31]
+        let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1); // [1, 12]
+        Self {
+            y: i32::try_from(if m <= 2 { y + 1 } else { y }).unwrap_or(1970),
+            m,
+            d,
+        }
+    }
+
+    /// 今天(UTC):本模块唯一读时钟的地方。
+    ///
+    /// 每帧每条目读一次(廉价,`clock_gettime` 而已);要收成「一帧一次」得把
+    /// today 传进 [`EntryDetail`] 签名,那是动骨架,本票不做。时钟早于 1970
+    /// (不存在的机器)按纪元日算,账龄会大得离谱 → 亮 amber,方向安全。
+    fn today() -> Self {
+        #[cfg(test)]
+        if let Some(d) = pinned_today() {
+            return d;
+        }
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self::from_epoch_days(i64::try_from(secs).unwrap_or(i64::MAX) / 86_400)
+    }
+}
+
+// 测试钉死的「今天」。账龄随墙钟走,而 golden 是逐字节的字面量——不钉的话
+// 同一帧每天都漂一次,钥匙册两档 golden 会天天红。thread_local 让并行测试
+// 各钉各的,不必像 env 那样上串行锁(`testutil::ConfigGuard` 的取舍)。
+#[cfg(test)]
+thread_local! {
+    static PINNED_TODAY: std::cell::Cell<Option<UtcDay>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn pinned_today() -> Option<UtcDay> {
+    PINNED_TODAY.with(|c| c.get())
+}
+
+/// 钉死「今天」,见 `PINNED_TODAY`。
+#[cfg(test)]
+fn pin_today_for_test(y: i32, m: u32, d: u32) {
+    PINNED_TODAY.with(|c| c.set(Some(UtcDay { y, m, d })));
+}
+
+/// 某年某月有几天(含闰年)。月越界返回 0——调用方据此判「不是真日历日」。
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// 钥匙册的轮换账龄(spec #94 第 5 项):`rotated-at` 至今的 UTC 整天数。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RotationAge {
+    /// 算得出:0 = 今天刚轮换。
+    Days(u32),
+    /// 算不出:没给轮换日 / 形状或日历日不认 / 轮换日在未来。**不拿 0 冒充**
+    /// (规格用户故事 16:0 天是「今天刚换」,与「不知道」是两件事)。
+    Unknown,
+}
+
+impl RotationAge {
+    fn of(e: &CatalogEntryView, today: UtcDay) -> Self {
+        let Some(r) = e.rotated_at.as_deref().and_then(UtcDay::parse) else {
+            return Self::Unknown;
+        };
+        let days = today.epoch_days() - r.epoch_days();
+        if days < 0 {
+            // 轮换日在未来(时钟漂移或预登记):印负数没有意义,拿 0 冒充
+            // 「今天刚换」更是假话——两类都归未知。
+            return Self::Unknown;
+        }
+        // 现实中到不了(天数溢出 u32 等于一千多万年);真到了也读成 amber,
+        // 比 panic 或悄悄截断成小数好。
+        Self::Days(u32::try_from(days).unwrap_or(u32::MAX))
+    }
+
+    /// 「账龄 N 天」/「账龄 未知」——算不出就说算不出,不拿 0 占位。
+    fn line(self) -> String {
+        match self {
+            Self::Days(n) => format!("账龄 {n} 天"),
+            Self::Unknown => "账龄 未知".to_string(),
+        }
+    }
+
+    /// 超阈(见 [`KEY_AGE_WARN_DAYS`]);「超」是严格大于,7 天本身不算超。
+    /// 未知不算超:没有依据就不亮。
+    fn over_threshold(self) -> bool {
+        matches!(self, Self::Days(n) if n > KEY_AGE_WARN_DAYS)
+    }
+}
+
 /// 钥匙册的条目明细:名字行后缀给 kind(条目级,恒 `github-key`),之下给
-/// **主机 / 作用域 / 轮换日**(缺字段显式「——」)。**没有本体槽,也不印
+/// **主机 / 作用域 / 轮换日 + 账龄**(缺字段显式「——」)。**没有本体槽,也不印
 /// 指纹**——投影里就没有这两格(上游 `KeySummary` 五键冻结),面板连「这像是
 /// 哪把钥匙」都不该让人推断出来。作用域**原样逐条报**(只登记不设闸,面板不代管、
 /// 不提醒、不评审;它们是登记元数据,与 secret 槽的「不印指纹」是两回事)。
+///
+/// 账龄那一列(#106):轮换日之后跟「账龄 N 天」,超 [`KEY_AGE_WARN_DAYS`] 天
+/// 亮 amber、其余 dim。**只标记不治理**——不动退出码、不动 doctor 档位、不
+/// 提醒、不自动轮换;册面其余读法逐字节不变。宽度上给它留位:超宽先砍日期
+/// (截断,不折行),账龄文案一个字节不砍——砍了等于这一列白加。
+///
+/// 两档 golden 里的 345 / 271 天是**钉出来的**:测试经 `pin_today_for_test`
+/// 把「今天」钉在 2026-10-13(见 `PINNED_TODAY`),所以这两帧不随墙钟漂。
 fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDetailOut {
     let kind = e
         .kind
@@ -3863,6 +4056,11 @@ fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
         .map(str::trim)
         .filter(|k| !k.is_empty())
         .unwrap_or("——");
+    let age = RotationAge::of(e, UtcDay::today());
+    let age_line = age.line();
+    let date_w = width
+        .saturating_sub(12) // 字段标签的既有预算(与另外两行同一口径)
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(age_line.as_str()) + 2); // 两个空格 + 账龄文案
     (
         Some(format!("kind {kind}")),
         vec![
@@ -3879,9 +4077,15 @@ fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
             ]),
             Line::from(vec![
                 Span::raw("    轮换日 "),
+                Span::styled(clip(&e.rotated_at_line(), date_w), p.text()),
+                Span::raw("  "),
                 Span::styled(
-                    clip(&e.rotated_at_line(), width.saturating_sub(12)),
-                    p.text(),
+                    age_line,
+                    if age.over_threshold() {
+                        p.warn()
+                    } else {
+                        p.dim()
+                    },
                 ),
             ]),
         ],
@@ -5500,6 +5704,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         app.vps_ls = Some(serde_json::from_str(ls).unwrap());
         for (w, h) in [(80u16, 30u16), (66, 50), (100, 40)] {
@@ -5699,6 +5904,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Tag,
             crate::engine::Probe::Available,
+            None,
         );
         app
     }
@@ -5841,6 +6047,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         app.run_tag_ls(Some("pi"));
         feed(&mut app);
@@ -6557,6 +6764,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Subscription,
             crate::engine::Probe::Available,
+            None,
         );
         (app, runner)
     }
@@ -6958,6 +7166,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         app.vps_ls = Some(serde_json::from_str(CAT_VPS_LS).unwrap());
         tap(&mut app, KeyCode::Char('d'));
@@ -7203,6 +7412,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Subscription,
             crate::engine::Probe::Unavailable,
+            None,
         );
         assert!(!app.sub_entry_enabled());
         tap(&mut app, KeyCode::Char('r'));
@@ -7252,6 +7462,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Key,
             crate::engine::Probe::Available,
+            None,
         );
         (app, runner)
     }
@@ -7731,6 +7942,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Key,
             crate::engine::Probe::Unavailable,
+            None,
         );
         assert!(!app.key_entry_enabled());
         tap(&mut app, KeyCode::Char('r'));
@@ -7739,6 +7951,218 @@ mod tests {
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(s.contains("入口禁用"), "{s}");
         assert!(s.contains("缺的是引擎能力"), "{s}");
+    }
+
+    // ---- 工单 #122:册体关门指路三态如实分呈 + 证据带 ----
+
+    /// 一本「能力关门」的册(#122):判据与那一跑的探测证据一并入账(生产
+    /// 同路),引擎身份走 `App::engine` / `engine_version` 两个既有槽——
+    /// 共享构造器只读这两个槽加能力账,不自己再探一次。
+    fn gated_book(
+        kind: CatalogKind,
+        cap: crate::engine::Capability,
+        verdict: crate::engine::Probe,
+        ev: Option<crate::engine::ProbeEvidence>,
+    ) -> crate::app::App {
+        let mut app =
+            crate::app::App::with_runner(std::sync::Arc::new(crate::engine::FakeRunner::new(&[])));
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.catalog_kind = kind;
+        app.capabilities.record(cap, verdict, ev);
+        app
+    }
+
+    /// 一条探针证据(字段即 #118 立的 schema,直接立,不再跑一次引擎)。
+    fn probe_ev(bin: &str, words: &str, rc: i32) -> crate::engine::ProbeEvidence {
+        crate::engine::ProbeEvidence {
+            argv: vec!["vps".into()],
+            bin: bin.into(),
+            source: "PATH",
+            version: "0.1.0".into(),
+            words: words.into(),
+            exit_code: rc,
+        }
+    }
+
+    /// 真禁用:禁用话术 + 证据带四要素(引擎 bin / 来源 / 版本、探针 argv、
+    /// 引擎原话 + rc)都在册体可见,且册体内容不呈现(不可信不呈现)。
+    #[test]
+    fn 册体关门_真禁用_给禁用话术与证据带四要素() {
+        let app = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unavailable,
+            Some(probe_ev("/tmp/nw", "nw: 未知子命令 \"vps\"", 3)),
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("入口禁用"), "禁用态说清是入口禁用:{s}");
+        assert!(
+            s.contains("缺的是引擎能力,不是面板坏了;升级所配 nw 后入口自动开启。"),
+            "禁用话术整句在场(不被 clip 从中间吃掉):{s}"
+        );
+        assert!(s.contains("/tmp/nw"), "问的是哪个引擎(bin):{s}");
+        assert!(s.contains("(PATH, 0.1.0)"), "来源与版本在场:{s}");
+        assert!(s.contains("探针 nw vps"), "探针 argv 在场:{s}");
+        assert!(
+            s.contains("引擎原话:nw: 未知子命令 \"vps\" (rc 3)"),
+            "引擎原话与 rc 在场:{s}"
+        );
+        assert!(
+            s.contains("编目册内容此时不可信也不呈现。"),
+            "不开门就不呈现册体内容:{s}"
+        );
+    }
+
+    /// 未决:不冒充禁用——「入口禁用」「缺的是引擎能力」「升级所配 nw」三样
+    /// 一个都不出现;改走未决话术 + 引擎身份 + 重启重探,证据带同构在场。
+    #[test]
+    fn 册体关门_未决_不冒充禁用_给未决话术与重启重探() {
+        let mut app = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unknown,
+            Some(probe_ev("/tmp/nw", "引擎未给出可解回答", 2)),
+        );
+        // 生产同形:真相行读开机发现结论,证据带读探针那一跑,两边同一个引擎。
+        app.engine.bin = Some("/tmp/nw".into());
+        app.engine.source = "PATH";
+        app.engine_version = "0.1.0".into();
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("未决"), "无响应回未决:{s}");
+        assert!(!s.contains("入口禁用"), "未决不冒充禁用:{s}");
+        assert!(!s.contains("缺的是引擎能力"), "未决不给缺能力指路:{s}");
+        assert!(
+            !s.contains("升级所配 nw"),
+            "未决绝不出现「升级 nw」这类误导性下一步:{s}"
+        );
+        assert!(s.contains("引擎这一跑没答上"), "未决话说清是没答上:{s}");
+        assert!(s.contains("问的是 /tmp/nw"), "未决也点名问的是哪个引擎:{s}");
+        assert!(s.contains("重启重探"), "未决的最短下一步:{s}");
+        assert!(
+            s.contains("引擎原话:引擎未给出可解回答 (rc 2)"),
+            "没答上就如实说没答上,证据带同构:{s}"
+        );
+    }
+
+    /// 未决且根本没找到二进制:attempted 素材摊开(故事 15),操作者按图索骥;
+    /// 没收到的证据不编造——证据带整条不出现。
+    #[test]
+    fn 册体关门_未决且没找到二进制_摊开引擎发现素材且不编造证据() {
+        let mut app = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unknown,
+            None,
+        );
+        app.engine.bin = None;
+        app.engine.source = "未发现";
+        app.engine.attempted = vec!["--nw-bin /nope/nw(不可执行)".into(), "PATH(无 nw)".into()];
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("没找到 nw 二进制"), "如实说没找到:{s}");
+        assert!(
+            s.contains("PATH(无 nw)"),
+            "引擎发现 attempted 素材在场(故事 15):{s}"
+        );
+        assert!(s.contains("重启重探"), "{s}");
+        assert!(!s.contains("引擎原话"), "没收到证据就不编造一条:{s}");
+    }
+
+    /// 双构建回放(立项实证):两个都自称 0.1.0 的引擎,问 `/usr/local/bin/nw`
+    /// 回 envelope 判可用、问 `/tmp/nw` 回「未知子命令」判禁用。版本号一样,
+    /// 册体却点名了「问的是哪个二进制、引擎自己怎么答的」——「问错二进制」
+    /// 与「引擎旧」在册体上一眼可分。
+    #[test]
+    fn 册体关门_双构建同版本号_证据分辨问错二进制() {
+        // 指着对的构建:可用,册体照常呈现(无指路、无噪音)
+        let good = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+            Some(probe_ev("/usr/local/bin/nw", "nw/vps-register.v1", 3)),
+        );
+        let s_good = crate::testutil::frame_display(&good, 80, 30);
+        assert!(!s_good.contains("入口禁用"), "可用态册体无指路:{s_good}");
+        assert!(!s_good.contains("引擎原话"), "可用态不占证据行:{s_good}");
+        // 指着旧的构建:禁用,册体点名那个二进制与它的原话
+        let bad = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unavailable,
+            Some(probe_ev("/tmp/nw", "nw: 未知子命令 \"vps\"", 3)),
+        );
+        let s_bad = crate::testutil::frame_display(&bad, 80, 30);
+        assert!(s_bad.contains("/tmp/nw"), "点名问错了的那个二进制:{s_bad}");
+        assert!(
+            s_bad.contains("nw: 未知子命令 \"vps\""),
+            "引擎原话可分辨:{s_bad}"
+        );
+        assert!(
+            s_bad.contains("0.1.0"),
+            "两个构建同版本号,版本照实呈现但不作为能力依据:{s_bad}"
+        );
+    }
+
+    /// 四本册同一套心智模型(故事 8):任一关门都拿到同构的指路与证据带。
+    #[test]
+    fn 册体关门_四本册同构指路与证据带() {
+        for (kind, cap) in [
+            (CatalogKind::Vps, crate::engine::Capability::Vps),
+            (CatalogKind::Tag, crate::engine::Capability::Tag),
+            (
+                CatalogKind::Subscription,
+                crate::engine::Capability::Subscription,
+            ),
+            (CatalogKind::Key, crate::engine::Capability::Key),
+        ] {
+            let app = gated_book(
+                kind,
+                cap,
+                crate::engine::Probe::Unavailable,
+                Some(probe_ev("/tmp/nw", "nw: 未知子命令", 3)),
+            );
+            let s = crate::testutil::frame_display(&app, 80, 30);
+            let book = kind.label();
+            assert!(
+                s.contains(&format!("⚠ {book} 册入口禁用")),
+                "{book} 册点名自己:{s}"
+            );
+            assert!(s.contains("缺的是引擎能力"), "{book} 册同构话术:{s}");
+            assert!(
+                s.contains("引擎 /tmp/nw (PATH, 0.1.0)"),
+                "{book} 册同构证据带:{s}"
+            );
+        }
+    }
+
+    /// 动作边界(#122 验收最后一条):鼠标点到关门指路区仍只给指路、不发任何
+    /// 命令。关门态把屏上每一个命中区都点一遍,一条引擎调用都不许发。
+    #[test]
+    fn 册体关门_鼠标点指路区只给指路不发命令() {
+        let mut app = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unavailable,
+            Some(probe_ev("/tmp/nw", "nw: 未知子命令 \"vps\"", 3)),
+        );
+        let size = Rect::new(0, 0, 80, 30);
+        app.size = size;
+        let hits = crate::layout::hitmap(size, &app, crate::layout::size_class(size));
+        assert!(!hits.is_empty(), "键位行段仍可点(点哪打哪不断)");
+        for (r, _t) in hits {
+            let ev = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: r.x + r.width / 2,
+                row: r.y + r.height / 2,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.update(crate::app::Message::Mouse(ev));
+        }
+        assert!(
+            app.fed_queue.is_empty(),
+            "关门态点任何区都不发命令:{:?}",
+            app.fed_queue
+        );
     }
 
     // ---- 工单 #70:反查上浮(机器册上一个键问「什么标签引用了这一条」) ----
@@ -7840,6 +8264,10 @@ mod tests {
     /// 自造:门禁顺序钉死「先根、再能力、最后才发那一次只读调用」,任缺一条
     /// 给各自指路且**一次引擎调用都不发**。
     ///
+    /// `tag_cap = false` 记的是**真禁用**(`Unavailable`,引擎没有 tag 命令组),
+    /// 不是「没探测过」——未决(探测失败)是另一种真相、另一种下一步
+    /// (#124 三态互不冒充),要单造一条回放来钉,别复用这一档。
+    ///
     /// 返回 runner 是为了探针:`call_argvs()` 是「发没发命令」唯一可观察的
     /// 证据(FakeRunner 只记 argv、绝不存 stdin 本体,守「面板侧不留副本」铁律)。
     fn reverse_app(
@@ -7858,11 +8286,21 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         if tag_cap {
             app.capabilities.record(
                 crate::engine::Capability::Tag,
                 crate::engine::Probe::Available,
+                None,
+            );
+        } else {
+            // 真禁用:引擎这一跑亲口说「未知子命令」——与「没探测过」(未决)
+            // 是两种真相,指路的下一步也不同(升级所配 nw vs 修引擎发现)。
+            app.capabilities.record(
+                crate::engine::Capability::Tag,
+                crate::engine::Probe::Unavailable,
+                None,
             );
         }
         app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
@@ -7877,7 +8315,7 @@ mod tests {
     ) -> (std::sync::Arc<crate::engine::FakeRunner>, crate::app::App) {
         // 数据仓根钉成临时目录:门禁第一道(根)因此确确过得去,第二道(能力)
         // 由 `tag_cap` 另造。不钉就会随跑测试那台机器的配置漂,门禁测不准。
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         reverse_app(machines, rules, Some(&root), true)
     }
 
@@ -7886,6 +8324,24 @@ mod tests {
     /// 鼠标触发完全同路(见 `反查触发段_有鼠标命中_点它等于按键`)。
     fn 反查这台(app: &mut crate::app::App) {
         tap(app, KeyCode::Enter);
+    }
+
+    /// 造一条探针回放(#124 四处单行指路的证据断言用):只碰 argv / stderr
+    /// 人话 / rc 三样——探针无参,证据不可能也不该碰到任何本体(机密纪律)。
+    fn probe_echo(args: &[&str], rc: i32, stderr: &str) -> crate::engine::EngineOutput {
+        crate::engine::EngineOutput {
+            args: args.iter().map(|s| s.to_string()).collect(),
+            exit_code: crate::engine::ExitCode::from_number(rc),
+            ok: rc == 0,
+            stderr_tail: if stderr.is_empty() {
+                Vec::new()
+            } else {
+                vec![stderr.to_string()]
+            },
+            envelope: None,
+            raw_stdout: String::new(),
+            parse_error: None,
+        }
     }
 
     /// 直接灌一条 `tag ls` 回音(不经 FakeRunner):用来造「迟到的第二条回音」
@@ -7901,7 +8357,7 @@ mod tests {
                 "tag".into(),
                 "ls".into(),
                 "--root".into(),
-                std::env::temp_dir().to_string_lossy().to_string(),
+                crate::testutil::stable_root(),
             ],
             exit_code: crate::engine::ExitCode::from_number(rc),
             ok: rc == 0,
@@ -7938,7 +8394,7 @@ mod tests {
                 "tag".to_string(),
                 "ls".to_string(),
                 "--root".to_string(),
-                std::env::temp_dir().to_string_lossy().to_string()
+                crate::testutil::stable_root()
             ]],
             "反查复用既有的 tag ls 无参全列(不新增调用形状)"
         );
@@ -8068,7 +8524,7 @@ mod tests {
     /// 条钉的是第二道门真的在管事,不是被第一道顺手挡掉的。
     #[test]
     fn 反查门禁_标签组能力不可用_指路且零引擎调用() {
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         let (runner, mut app) = reverse_app(
             REVERSE_MACHINES,
             &[("tag ls", 0, TAG_LS_GATE3)],
@@ -8090,6 +8546,92 @@ mod tests {
         assert!(!s.contains("没有标签引用"), "门禁不过不进结果浮层:{s}");
     }
 
+    /// #124:反查未下发的**真禁用**回放——三态里只有这一态说「升级所配 nw」,
+    /// 并且带上探针证据带(问的是哪个引擎、探针 argv、引擎那一跑的原话与 rc)。
+    /// 操作者据此分清「引擎旧」与「问错了二进制」,不必跳设置屏翻日志
+    /// (spec #90 故事 3/4/5/6/9)。
+    #[test]
+    fn 反查未下发_标签组真禁用_升级指路带探针证据带() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            Some(&root),
+            false,
+        );
+        // 同机双构建同版本号的实证形态:这个构建对 `nw tag` 回「未知子命令」。
+        let echo = probe_echo(&["tag"], 3, "nw: 未知子命令 \"tag\"");
+        let ev = crate::engine::ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH", "0.1.0");
+        app.capabilities.record(
+            crate::engine::Capability::Tag,
+            crate::engine::Probe::Unavailable,
+            Some(ev),
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "能力不可用:一条 argv 都不发:{:?}",
+            runner.call_argvs()
+        );
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("反查未下发"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            line.contains("缺的是引擎能力,不是面板坏了;升级所配 nw 后入口自动开启。"),
+            "禁用态下一步:{line}"
+        );
+        assert!(!line.contains("重启重探"), "禁用态不给未决话术:{line}");
+        assert!(line.contains("/tmp/nw"), "bin 在场:{line}");
+        assert!(line.contains("(PATH, 0.1.0)"), "来源与版本在场:{line}");
+        assert!(line.contains("探针 nw tag"), "探针 argv 在场:{line}");
+        assert!(
+            line.contains("引擎原话:nw: 未知子命令 \"tag\" (rc 3)"),
+            "引擎原话与 rc 在场:{line}"
+        );
+    }
+
+    /// #124:反查未下发的**未决**回放——探测失败(引擎没答上)时走未决话术:
+    /// 问的是哪个引擎 + 修引擎发现后重启重探。「入口禁用」「缺的是引擎能力」
+    /// 「升级所配 nw」三样一个都不出现:未决与禁用是两种真相,下一步正好
+    /// 相反(盲目升级对未决未必管用,spec #90 故事 2/22/23)。
+    #[test]
+    fn 反查未下发_标签组能力未决_走未决话术_不给升级下一步() {
+        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let (runner, mut app) = reverse_app(
+            REVERSE_MACHINES,
+            &[("tag ls", 0, TAG_LS_GATE3)],
+            Some(&root),
+            false,
+        );
+        // 夹具那一档是真禁用;这里改记未决(没探测过 = 探测失败,不冒充任何一种)
+        app.capabilities.record(
+            crate::engine::Capability::Tag,
+            crate::engine::Probe::Unknown,
+            None,
+        );
+        反查这台(&mut app);
+        assert!(
+            runner.call_argvs().is_empty(),
+            "未决同样一条 argv 都不发:{:?}",
+            runner.call_argvs()
+        );
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("反查未下发"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(line.contains("标签 未决"), "未决话术:{line}");
+        assert!(line.contains("问的是"), "说清问的是哪个引擎:{line}");
+        assert!(line.contains("修引擎发现后重启重探"), "未决的下一步:{line}");
+        assert!(!line.contains("入口禁用"), "未决不冒充禁用:{line}");
+        assert!(!line.contains("缺的是引擎能力"), "未决不冒充缺能力:{line}");
+        assert!(!line.contains("升级所配 nw"), "未决不给误导性下一步:{line}");
+    }
+
     /// 故事 39 的**鼠标那一侧**(「反查要求标签组能力可用,缺能力时入口禁用并
     /// 指路」):标签组能力缺席时「Enter 反查」段**照画、照给命中**,画成 dim
     /// (禁用态);点它仍走 `App::vps_reverse_lookup` 的同一条门禁——给人话、
@@ -8102,7 +8644,7 @@ mod tests {
     /// (`frame_display` 只拚符号、不带样式),由渲染侧 `key_line` 的分叉承载。
     #[test]
     fn 反查段_标签组能力缺席_段照画点得中_指路且零调用() {
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         let (runner, mut app) = reverse_app(
             REVERSE_MACHINES,
             &[("tag ls", 0, TAG_LS_GATE3)],
@@ -8199,7 +8741,7 @@ mod tests {
     /// 就是「没有这一行」而不是「门挡掉了」。
     #[test]
     fn 反查边界_订阅册与钥匙册上同一个键不做反查() {
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         for (name, mk) in [
             (
                 "订阅",
@@ -8216,6 +8758,7 @@ mod tests {
             app.capabilities.record(
                 crate::engine::Capability::Tag,
                 crate::engine::Probe::Available,
+                None,
             );
             tap(&mut app, KeyCode::Char('l')); // 先把册体读出来(有行可选)
             feed(&mut app);
@@ -8236,7 +8779,7 @@ mod tests {
     /// 不新增写路径,`tags.json` 因此一个字节都不会被碰。
     #[test]
     fn 反查_复用既有只读调用_队里argv逐字节是tag_ls_root() {
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
         tap(&mut app, KeyCode::Down);
         反查这台(&mut app);
@@ -8374,7 +8917,7 @@ mod tests {
                 "tag".to_string(),
                 "ls".to_string(),
                 "--root".to_string(),
-                std::env::temp_dir().to_string_lossy().to_string()
+                crate::testutil::stable_root()
             ]),
             "点段与按 Enter 下同一条只读 argv"
         );
@@ -8715,10 +9258,11 @@ mod tests {
         empty.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         empty.vps_ls =
             Some(serde_json::from_str(r#"{"catalogPath":"/r/vps.json","machines":[]}"#).unwrap());
-        empty.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        empty.data_root = Some(crate::testutil::stable_root());
         assert_eq!(empty.catalog_len(), 0, "确实是空册");
         let ef = crate::testutil::frame_display(&empty, 110, 30);
         let empty_line = ef
@@ -8841,24 +9385,25 @@ mod tests {
             app.capabilities.record(
                 crate::engine::Capability::Vps,
                 crate::engine::Probe::Available,
+                None,
             );
             app.vps_ls = Some(serde_json::from_str(ls).unwrap());
-            app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+            app.data_root = Some(crate::testutil::stable_root());
             app.nw_home = "/nw".into(); // 顶栏 NW_HOME 也钉死(别的测试会写进程环境)
             app
         };
         let mut tag = tag_app(&[("tag ls", 0, TAG_LS_ALL)]);
-        tag.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        tag.data_root = Some(crate::testutil::stable_root());
         tag.nw_home = "/nw".into();
         tap(&mut tag, KeyCode::Char('l'));
         feed(&mut tag);
         let (mut sub, _r) = sub_app(&[("subscription ls", 0, SUB_LS_ALL)]);
-        sub.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        sub.data_root = Some(crate::testutil::stable_root());
         sub.nw_home = "/nw".into();
         tap(&mut sub, KeyCode::Char('l'));
         feed(&mut sub);
         let (mut key, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
-        key.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        key.data_root = Some(crate::testutil::stable_root());
         key.nw_home = "/nw".into();
         tap(&mut key, KeyCode::Char('l'));
         feed(&mut key);
@@ -9128,18 +9673,19 @@ mod tests {
 │  ↑/↓ 选订阅 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤    │
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
-    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动)。
+    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动;
+    /// #106 轮换日那一行加了账龄列——本轮唯二变动,来历记在这里)。
     const KEY_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                      │
 │  ⚙ 装配  ││  ▸ ci  kind github-key                                           │
 │  ✚ 健康  ││    主机 ghe.internal                                             │
 │  ▤ 配方  ││    作用域 未声明(0 条)                                           │
-│▸ ▩ 编目  ││    轮换日 2025-11-02                                             │
+│▸ ▩ 编目  ││    轮换日 2025-11-02  账龄 345 天                                │
 │  ✦ 设置  ││    deploy  kind github-key                                       │
 │          ││    主机 github.com                                               │
 │          ││    作用域 repo · read:org                                        │
-│          ││    轮换日 2026-01-15                                             │
+│          ││    轮换日 2026-01-15  账龄 271 天                                │
 │          ││  取回钥匙(面板不代跑,按 g 收进日志):                             │
 │          ││nw key get --name ci --root /tmp | jq -r .data.key                │
 │          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
@@ -9159,7 +9705,7 @@ mod tests {
 │          ││  ↑/↓ 选钥匙 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤      │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 t 主题 ? 帮助 Ctrl+P 命令   q 退出主题:暗色仓库            "####;
-    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
+    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档;#106 同因加账龄列)。
     const KEY_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
 ┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
@@ -9167,11 +9713,11 @@ mod tests {
 │  ▸ ci  kind github-key                                         │
 │    主机 ghe.internal                                           │
 │    作用域 未声明(0 条)                                         │
-│    轮换日 2025-11-02                                           │
+│    轮换日 2025-11-02  账龄 345 天                              │
 │    deploy  kind github-key                                     │
 │    主机 github.com                                             │
 │    作用域 repo · read:org                                      │
-│    轮换日 2026-01-15                                           │
+│    轮换日 2026-01-15  账龄 271 天                              │
 │  取回钥匙(面板不代跑,按 g 收进日志):                           │
 │nw key get --name ci --root /tmp | jq -r .data.key              │
 │  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
@@ -9246,9 +9792,163 @@ mod tests {
     /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
     #[test]
     fn 钥匙册整帧golden_两档golden() {
+        pin_today_for_test(2026, 10, 13);
         let app = book("钥匙");
         assert_book_frame(&app, 80, 30, KEY_80X30);
         assert_book_frame(&app, 66, 50, KEY_66X50);
+    }
+
+    // ---- 钥匙轮换账龄(spec #94 第 5 项 / 工单 #106) ----
+
+    /// 造一条只填了轮换日的钥匙条目——账龄只依赖这一格(其余槽与本票无关)。
+    fn key_entry(rotated_at: Option<&str>) -> CatalogEntryView {
+        CatalogEntryView {
+            name: "ci".into(),
+            rotated_at: rotated_at.map(str::to_string),
+            ..CatalogEntryView::default()
+        }
+    }
+
+    fn age_of(rotated_at: Option<&str>, today: UtcDay) -> RotationAge {
+        RotationAge::of(&key_entry(rotated_at), today)
+    }
+
+    /// 账龄是 UTC **日历日**差(不是 30 天月、不是 365 天年)。期望值取自独立
+    /// 算法(python3 `datetime.date` 减法),不按实现里的同一套公式反推。
+    #[test]
+    fn 轮换账龄_按日历日差算_同一天为0() {
+        let today = UtcDay {
+            y: 2026,
+            m: 10,
+            d: 13,
+        };
+        assert_eq!(age_of(Some("2026-10-13"), today), RotationAge::Days(0));
+        assert_eq!(age_of(Some("2026-10-12"), today), RotationAge::Days(1));
+        assert_eq!(age_of(Some("2026-10-06"), today), RotationAge::Days(7));
+        assert_eq!(age_of(Some("2026-01-15"), today), RotationAge::Days(271));
+        assert_eq!(age_of(Some("2025-11-02"), today), RotationAge::Days(345));
+        // 跨闰年与闰日本身:2024-02-29 是真日子,2025-02-29 不是
+        assert_eq!(age_of(Some("2024-02-29"), today), RotationAge::Days(957));
+        assert_eq!(age_of(Some("2025-02-29"), today), RotationAge::Unknown);
+    }
+
+    /// 算不出的五类(没这一格 / 空 / 形状不认 / 不是真日历日 / 未来日)全归
+    /// 未知,**没有一类拿 0 冒充**——0 天只有「今天刚轮换」一种来路。
+    #[test]
+    fn 轮换账龄_算不出就说未知_不拿0冒充() {
+        let today = UtcDay {
+            y: 2026,
+            m: 10,
+            d: 13,
+        };
+        for r in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("2026-1-5"),
+            Some("2026-13-01"),
+            Some("2026-02-30"),
+            Some("2025-02-29"),
+            Some("昨天"),
+        ] {
+            assert_eq!(age_of(r, today), RotationAge::Unknown, "{r:?} 应算不出");
+        }
+        assert_eq!(
+            age_of(Some("2026-10-14"), today),
+            RotationAge::Unknown,
+            "轮换日在未来:不印负数,也不拿 0 冒充今天刚换"
+        );
+    }
+
+    #[test]
+    fn 账龄一行_算得出报天数_算不出说未知() {
+        assert_eq!(RotationAge::Days(0).line(), "账龄 0 天");
+        assert_eq!(RotationAge::Days(345).line(), "账龄 345 天");
+        assert_eq!(RotationAge::Unknown.line(), "账龄 未知");
+    }
+
+    /// 阈值为 7 天、「超」是严格大于:7 天本身不亮,8 天亮;未知不亮
+    /// (没有依据就不标记)。
+    #[test]
+    fn 账龄超7天才亮_未知与7天本身不亮() {
+        assert!(!RotationAge::Days(0).over_threshold());
+        assert!(!RotationAge::Days(7).over_threshold(), "7 天本身不算超");
+        assert!(RotationAge::Days(8).over_threshold());
+        assert!(
+            !RotationAge::Unknown.over_threshold(),
+            "算不出不亮:没有依据就不标记"
+        );
+    }
+
+    /// 一把老钥匙 + 一把新钥匙:老的那把亮 amber,新的那把不亮(今天钉在
+    /// 2026-10-13,账龄 345 天 / 1 天)。
+    const KEY_LS_AGE_MIX: &str = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[{"name":"old","kind":"github-key","host":"github.com","scopes":[],"rotatedAt":"2025-11-02"},{"name":"fresh","kind":"github-key","host":"github.com","scopes":[],"rotatedAt":"2026-10-12"}]}}"#;
+
+    /// 册面真画出了账龄,且两档都不溢宽(66×50 是响应式下限)。
+    #[test]
+    fn 钥匙册_轮换日行带账龄_两档都在且不溢宽() {
+        pin_today_for_test(2026, 10, 13);
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        app.nw_home = "/nw".into();
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("账龄 345 天"), "{w}×{h} 老钥匙的账龄应在场:{s}");
+            assert!(s.contains("账龄 271 天"), "{w}×{h} 另一把的账龄应在场:{s}");
+            assert!(
+                s.contains("轮换日 2025-11-02"),
+                "{w}×{h} 轮换日原文应在场:{s}"
+            );
+            for ln in s.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 有行超宽:{ln}"
+                );
+            }
+        }
+    }
+
+    /// 账龄列只标记不治理:超阈的那条亮 amber,未超的那条不亮,册面其余读法
+    /// (主机 / 作用域 / 轮换日原文)逐字节不变。
+    #[test]
+    fn 钥匙册_账龄超阈亮amber_未超不亮() {
+        pin_today_for_test(2026, 10, 13);
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_AGE_MIX)]);
+        app.nw_home = "/nw".into();
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        let p = app.palette;
+        assert_ne!(
+            p.warn().fg,
+            p.dim().fg,
+            "两种样式得能分辨,否则这条什么都没测"
+        );
+        let old = crate::testutil::frame_span_fg(&app, 80, 30, "账龄 345 天");
+        let fresh = crate::testutil::frame_span_fg(&app, 80, 30, "账龄 1 天");
+        assert_eq!(old, p.warn().fg, "超阈账龄应亮 amber");
+        assert_eq!(fresh, p.dim().fg, "未超阈账龄不应亮");
+        assert_ne!(fresh, p.warn().fg);
+        // 轮换日原文不跟着变色(只标记账龄,不动册面其余读法)
+        assert_eq!(
+            crate::testutil::frame_span_fg(&app, 80, 30, "2025-11-02"),
+            p.text().fg,
+            "轮换日原文仍是正文色"
+        );
+    }
+
+    /// 没给轮换日 = 「账龄 未知」,不是「账龄 0 天」;也不该把整册带炸。
+    #[test]
+    fn 钥匙册_没给轮换日_账龄未知且不顶替0天() {
+        pin_today_for_test(2026, 10, 13);
+        let ls = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"ghe.internal","scopes":[]}]}}"#;
+        let (mut app, _r) = key_app(&[("key ls", 0, ls)]);
+        app.nw_home = "/nw".into();
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("账龄 未知"), "没给轮换日应说未知:{s}");
+        assert!(!s.contains("账龄 0 天"), "不许拿 0 天冒充不知道:{s}");
     }
 
     /// 四本册走同一条键位路径(#66 验收第 4 条):对四本册各驱动一次**相同**
@@ -9464,6 +10164,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
         app
@@ -9617,8 +10318,9 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
-        app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        app.data_root = Some(crate::testutil::stable_root());
         // 真刷新一次:入队并回放,让 FakeRunner 记到一条 argv
         tap(&mut app, KeyCode::Char('l'));
         feed(&mut app);
@@ -9715,6 +10417,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Key,
             crate::engine::Probe::Available,
+            None,
         );
         // 机器册筛 gate
         过滤敲词(&mut app, "gate");
@@ -10041,6 +10744,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Subscription,
             crate::engine::Probe::Available,
+            None,
         );
         app.sub_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
         app

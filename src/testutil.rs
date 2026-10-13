@@ -7,6 +7,9 @@
 
 use std::path::PathBuf;
 
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+
 pub struct ConfigGuard {
     prev: Option<String>,
     dir: PathBuf,
@@ -36,19 +39,67 @@ impl Drop for ConfigGuard {
     }
 }
 
+/// 测试夹具共用的「真能读的数据仓根」——**字符串三平台逐字节相同**。
+///
+/// 之所以不直接用 `std::env::temp_dir()`:macOS 上它是 `/var/folders/…`、
+/// Windows 上是 `C:\Users\…\AppData\Local\Temp`,长度形状各不同;而
+/// 80 列金色帧与建议命令断言把这条路径原样烘在输出里(根一长就把命令尾
+/// 的 `| jq …` 挤出屏外),同一帧于是只在 Linux 绿。CI 三平台因此全红。
+///
+/// Unix 上 `/tmp` 天生是个能读的目录;Windows 没有这一条,于是在当期盘根
+/// 下建一个(建不动就建不动——`path_usable` 会如实判不可用、测试如实红,
+/// 不装过得去)。
+pub fn stable_root() -> String {
+    #[cfg(windows)]
+    let _ = std::fs::create_dir_all("/tmp");
+    "/tmp".to_string()
+}
+
 /// 整帧的真显示内容(逐格拚行;字节级 golden 与列级命中断言共用)。
 /// `TestBackend::to_string` 带引号与隐藏格注记,不能当裸行用;宽字符
 /// 占两格,第二格是隐藏延续格,跳过——拼出的行即肉眼所见(ADR-0005
 /// 「渲染与命中同源」的测量基准)。
 pub fn frame_display(app: &crate::app::App, w: u16, h: u16) -> String {
+    render_frame(app, w, h).1.join("\n")
+}
+
+/// 帧上某段文案所在格的**前景色**(None = 这句不在帧上)。
+///
+/// 文本断言走 [`frame_display`],颜色断言走这里:一行里前后格的样式可能
+/// 不同(钥匙册「轮换日」那行的日期与账龄就是两种色),按文案定位才说得清
+/// 「哪一段是什么色」,而不是「这一行有个 warn 格」。取第一个命中——测试
+/// 里的文案都钉在唯一一处。
+pub fn frame_span_fg(
+    app: &crate::app::App,
+    w: u16,
+    h: u16,
+    needle: &str,
+) -> Option<ratatui::style::Color> {
+    let (term, lines) = render_frame(app, w, h);
+    let buf = term.backend().buffer();
+    for (y, line) in lines.iter().enumerate() {
+        let Some(at) = line.find(needle) else {
+            continue;
+        };
+        // 宽字符占两格:显示列 = 缓冲区列(续格被 `render_frame` 跳过),
+        // 所以前缀的显示宽就是 needle 首格的 x。
+        let x = unicode_width::UnicodeWidthStr::width(&line[..at]);
+        return buf
+            .cell((u16::try_from(x).ok()?, u16::try_from(y).ok()?))
+            .and_then(|c| c.style().fg);
+    }
+    None
+}
+
+/// 渲染一帧,连同一行一格的显示文本一起交出来(两条公开断言共用,免得
+/// 各写一份逐格拚行的逻辑)。
+fn render_frame(app: &crate::app::App, w: u16, h: u16) -> (Terminal<TestBackend>, Vec<String>) {
     use crate::ui::render;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use unicode_width::UnicodeWidthStr;
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| render(f, app)).unwrap();
     let buf = term.backend().buffer();
-    (0..h)
+    let lines = (0..h)
         .map(|y| {
             let mut line = String::new();
             let mut x: u16 = 0;
@@ -66,8 +117,8 @@ pub fn frame_display(app: &crate::app::App, w: u16, h: u16) -> String {
             }
             line
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Vec<_>>();
+    (term, lines)
 }
 
 #[cfg(test)]

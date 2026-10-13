@@ -12,6 +12,7 @@
 use ratatui::layout::Rect;
 
 use crate::app::{App, Screen};
+use crate::engine::State;
 
 /// 常畅态/紧凑态互换的宽度断点:单一常量,不散值。
 /// 固定 80 = 原 `MIN_W`——旧常态一字不变,变窄才换装(ADR-0004)。
@@ -106,6 +107,19 @@ pub enum Target {
     /// **只标签册、且反查跳转浮层在场时**由 `catalog_hits` 产出;浮层外的
     /// 正文是「点任意处关闭」(`DismissPopup`),与 Esc 同路。
     TagJump(usize),
+    /// 点概览警示带上的**订阅到期条目** = 跳到订阅册并选中那一条(#94 工单
+    /// #105,用户故事 12:「从发现到处理一步到位」)。载荷是这一条在**订阅册
+    /// 投影**里的下标(`CatalogSheet::entries`,与册体同一排序)。
+    ///
+    /// 与 [`Target::SelectRow`] 的可见行下标**是两件事**(#69 册内过滤在场时
+    /// 两者要换算),故单立一个变体而不是复用:命中侧拿投影下标经
+    /// `catalog_visible()` 换成可见行再落选中槽,换算不出来(这一条被过滤词
+    /// 挡在可见行外)走指路日志,不新造禁用态(与册体「无选中行时点下去复现
+    /// 既有指路」同口径)。
+    ///
+    /// **零引擎调用**:回音是既有的 `app.sub_ls`,点它只换视图(定册内维度 →
+    /// 切屏 → 落选中槽),与键盘 `v` 到编目屏同族。
+    AlertSubEntry(usize),
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -113,6 +127,101 @@ pub enum Target {
 pub enum ScrollDir {
     Up,
     Down,
+}
+
+/// 概览警示带**一段**的输入形状(与 [`KeyPart`] 同族:一段文案 + 一个可选
+/// 命中目标),多带一个 [`AlertTone`]。
+///
+/// 为什么不复用 [`KeyPart`]:警示带历来是**一行 `Paragraph` 的一段段 `Span`**
+/// (段间无空隙、不是键位行的分段),且各段各有自己的既定配色——引擎缺失红 /
+/// 数据仓根与漂移琥珀 / 装配进行中强调 / 提示暗,订阅条目还要按引擎下发的
+/// 到期三态上四态色。配色归渲染侧,布局侧只量宽、只发目标,`tone` 原样透传。
+#[derive(Clone, Debug)]
+pub struct AlertPart {
+    pub text: String,
+    /// 命中目标;`None` = 只画不点(提示段与各档的警示头)。
+    pub target: Option<Target>,
+    pub tone: AlertTone,
+}
+
+/// 警示带一段的呈现角色(渲染侧据此取色;布局侧不解释它)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlertTone {
+    /// 红:引擎二进制找不到(既有话术一字不变)。
+    Alarm,
+    /// 琥珀:数据仓根三态 / 漂移派 / 订阅到期三态的警示面。
+    Warn,
+    /// 强调色:装配进行中(既有话术一字不变)。
+    Busy,
+    /// 暗:提示尾巴与「一切平静」。
+    Hint,
+    /// 订阅条目名:按引擎回音的 `status` 上四态色(expiring 警 / expired 败,
+    /// 只标记不治理——不改退出码、不提醒)。
+    Entry(State),
+}
+
+/// 警示带**一段**的产物(与 [`KeySegment`] 同族):文案 + 目标 + 角色 + 矩形。
+#[derive(Debug)]
+pub struct AlertSegment {
+    pub text: String,
+    pub target: Option<Target>,
+    pub tone: AlertTone,
+    /// 段在屏上的矩形(宽 = `unicode_width(文案)`,高 1 行)。
+    pub rect: Rect,
+}
+
+/// 把一串 [`AlertPart`] 从 `anchor.x` 左起**紧贴**铺成一行(段间无空隙:
+/// 警示带是一行 `Paragraph` 的一段段 `Span`,不是键位行的分段)。
+///
+/// 段宽 = `unicode_width(文案)`,与渲染逐字同源。放不下的收口分两种,
+/// 判据是**这一段点不点得中**:
+/// - **可点段**(`target.is_some()`):整段收口——这一段及后续既不画也不给命中
+///   (与 [`key_line_segments`] 同一条纪律,#69)。屏上画得出却点不中的段比不画
+///   更糟,订阅条目宁可少点名一条,也不画一截点不到的残名。
+/// - **只画不点的提示段**:按剩余宽度**截断**后收口(与改动前 `Paragraph`
+///   靠终端裁尾逐字同源)。数据仓根那串带路径的指路在 66×50 下限内本来就被裁过,
+///   裁掉的是尾巴不是整句——若整段收口,窄终端下操作者连收到的路径都看不见。
+pub fn alert_segments(anchor: Rect, parts: &[AlertPart]) -> Vec<AlertSegment> {
+    use unicode_width::UnicodeWidthStr;
+    let right = anchor.x.saturating_add(anchor.width);
+    let mut out = Vec::new();
+    let mut x = anchor.x;
+    for part in parts {
+        let w = u16::try_from(UnicodeWidthStr::width(part.text.as_str())).unwrap_or(0);
+        let end = x.saturating_add(w);
+        if w == 0 {
+            break;
+        }
+        if end > right {
+            match part.target {
+                // 可点段放不下:这一段及后续都不画不命中。
+                Some(_) => break,
+                // 提示段放不下:裁到剩余宽度(终端宽字符不切半,
+                // 与 `recipes::clip` 同一把尺),画完即收口。
+                None => {
+                    let room = usize::from(right.saturating_sub(x));
+                    let text = crate::screens::recipes::clip(&part.text, room);
+                    if !text.is_empty() {
+                        out.push(AlertSegment {
+                            text,
+                            target: None,
+                            tone: part.tone,
+                            rect: Rect::new(x, anchor.y, right.saturating_sub(x), 1),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        out.push(AlertSegment {
+            text: part.text.clone(),
+            target: part.target,
+            tone: part.tone,
+            rect: Rect::new(x, anchor.y, w, 1),
+        });
+        x = end;
+    }
+    out
 }
 
 /// 呈现态:宽 ≥ [`BREAKPOINT`] 为常畅态,否则紧凑态(仍不低于 66×50 下限)。
@@ -169,6 +278,12 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
     // 自升级浮层(#121):与帮助浮层同级的吞点击纪律——底层一个命中区都不产。
     if app.upgrade.is_open() {
         upgrade_hits(body, &mut hits);
+        return hits;
+    }
+    // 清单原文浮层(#101):与帮助同款「点任意处关」——弹层优先级,
+    // 底层历史列表不产出命中(点浮层外不误选行)。
+    if app.ah_raw.is_some() {
+        hits.push((body, Target::DismissPopup));
         return hits;
     }
     if app.as_confirm {
@@ -472,6 +587,16 @@ fn overview_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         let line = Rect::new(cmd_inner.x, cmd_inner.y + 4, cmd_inner.width, 1);
         hits.push((line, Target::NavTo(Screen::Vps)));
     }
+    // #94 工单 #105:警示带上的订阅到期条目可点(点它 = 跳到订阅册并选中那
+    // 一条)。几何与 `overview::render_alert` **同一份段清单**
+    // (`screens::overview::alert_parts` → [`alert_segments`]):屏上画出的段才
+    // 给命中,放不下的整段两厢都不出现——一处几何真相(ADR-0005)。
+    // 只画不点的段(警示头 / 提示尾巴 / 分隔号)不进命中区。
+    for seg in alert_segments(rows[0], &crate::screens::alert_parts(app)) {
+        if let Some(t) = seg.target {
+            hits.push((seg.rect, t));
+        }
+    }
 }
 
 /// 装配屏:装配运行中给 stderr 日志区产滚轮命中区(#21,几何与
@@ -531,6 +656,17 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
     }
     let (cols, _) = h_split2(area, 55, 45);
     let lst = shrink_border(cols);
+    // 装配历史次级视图(#101):点行选中的是历史列表。几何与渲染侧
+    // `assemble::render_history` 同一个 55/45 分栏 + 缩边框——渲染与
+    // 命中共用一份(ADR-0005)。行数是**可见行**(过滤后),索引即
+    // `on_mouse` 的 SelectRow 入参(可见下标,与册内过滤同族)。
+    if let Some(view) = app.as_history.as_ref() {
+        // 安装根不在时视图整块换成指路,不产命中(与渲染侧同一口径)。
+        if !view.root_missing {
+            row_hits(lst, 0, app.ah_visible().len(), hits, Target::SelectRow);
+        }
+        return;
+    }
     let Some(ls) = app.ls.as_ref() else {
         return;
     };
@@ -610,6 +746,19 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
 /// (45% 栏),紧凑态在 Tab 行之下(52% 栏)。两支都用与渲染同一套
 /// ratatui `Layout` 常量,几何零分歧(#18 收起内层栏后命中自动跟随)。
 fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    // 落点溯源浮层(#115):与反查浮层同一条弹层纪律 —— 在场时整块正文只有
+    // 一个「点任意处返航」命中区,底层列表行与键位行(含「Enter 落点」之外
+    // 的一切)一段都不产:浮层吞点击、不穿透底层。
+    //
+    // 命中区取**整块正文**而不是浮层矩形:规格钉的是「Esc 或点任意处关闭」,
+    // 点浮层外的空白也算返航;只给浮层矩形会变成「点外面没反应」,与规格
+    // 原文相反(#70 反查浮层同款,渲染与命中共用 `landing_open()` 判据)。
+    if app.landing_open() {
+        if area.width > 0 && area.height > 0 {
+            hits.push((area, Target::DismissPopup));
+        }
+        return;
+    }
     let list = match class {
         SizeClass::Comfy => ratatui::layout::Layout::horizontal([
             ratatui::layout::Constraint::Length(14),
@@ -688,6 +837,10 @@ pub const REG_KEY_KIND_LAUNCH: &str = "  Enter 预审 ";
 /// 只在落账闸放行时铺——不可落账时整屏仍归返航(命中侧同条件分叉)。
 pub const REG_KEY_REVIEW_COMMIT: &str = "  Enter 落账 ";
 
+/// 预扫选单键位行的左段(#114「Enter 继续」):渲染
+/// (`recipes::render_reg_pick`)与命中(`register_hits`)同一份文案。
+pub const REG_KEY_PICK_CONTINUE: &str = "  Enter 继续 ";
+
 /// 编目册删除确认的键位行左段(#53,ADR-0009 §2 的图形确认):
 /// 渲染(`catalog::render_rm_confirm`)与命中(`catalog_hits`)同一份文案。
 pub const REG_KEY_RM_CONFIRM: &str = "  Enter 确认删除 ";
@@ -696,6 +849,9 @@ pub const REG_KEY_RM_CONFIRM: &str = "  Enter 确认删除 ";
 /// 几何零分歧;`popup_rect` 的收窄规则两边同用。
 pub const REG_INPUT_W: u16 = 64;
 pub const REG_INPUT_H: u16 = 7;
+/// 预扫选单浮层(#114):说明两行 + 分组勾选清单 + 键位行。
+pub const REG_PICK_W: u16 = 64;
+pub const REG_PICK_H: u16 = 20;
 pub const REG_KIND_W: u16 = 56;
 pub const REG_KIND_H: u16 = 9;
 pub const REG_REVIEW_W: u16 = 76;
@@ -831,10 +987,12 @@ pub fn key_line_segments(
     out
 }
 
-/// 登记浮层(#30 #31):几何与 `recipes::render_register_overlay` 同一组
+/// 登记浮层(#30 #31 #114):几何与 `recipes::render_register_overlay` 同一组
 /// 常量、同一 `popup_rect` 居中基准。输入/等回音态鼠标惰性(同手填
 /// 浮层先例);kind 选项两行产 [`Target::SelectRow`] 选中 + 键位行两段
-/// (Activate 预审 / Dismiss 返航);确认态按落账闸分叉——放行时
+/// (Activate 预审 / Dismiss 返航);预扫选单(#114)条目行产 SelectRow
+/// (app 侧按 reg_state 分派成勾选/取消)+ 键位行两段(Activate 继续 /
+/// Dismiss 返航);确认态按落账闸分叉——放行时
 /// 键位行两段(Activate 落账 / Dismiss 返航),不放行时整屏点任意处
 /// = 返航(不可落账不可达);结果屏整屏点任意处 = 返航。浮层外不产出
 /// 任何命中区(弹层优先级)。
@@ -849,6 +1007,42 @@ fn register_hits(
     };
     match app.reg_state {
         crate::app::RegState::Idle | crate::app::RegState::RepoInput => {}
+        crate::app::RegState::PreScan => {} // 等回音:无处可点,同惰性
+        crate::app::RegState::PreScanPick => {
+            // 预扫选单(#114):条目行 = 勾选/取消(与空格同路,经
+            // Target::SelectRow 在 app 侧按 reg_state 分派);键位行两段
+            // (Enter 继续 / Esc 返航)。只给「键位行以上真的画出来了」
+            // 的行产命中——与渲染同序:内层 0/1 行说明、2 行空,其后按
+            // kind 分组(组头一行 + 条目行),超量截断。
+            let popup = popup_rect(content, REG_PICK_W, REG_PICK_H);
+            if popup.height < REG_PICK_H || popup.width == 0 {
+                return; // 收窄后行序不再可信,不产命中
+            }
+            let inner = shrink_border(popup);
+            let key_y = popup.y + popup.height - 2;
+            let mut y = inner.y + 3;
+            'outer: for kind in [
+                crate::scan::ScanKind::Skill,
+                crate::scan::ScanKind::Extension,
+            ] {
+                let mut any = false;
+                for (i, e) in app.reg_scan_entries.iter().enumerate() {
+                    if e.kind != kind {
+                        continue;
+                    }
+                    if !any {
+                        y += 1; // 组头占一行
+                        any = true;
+                    }
+                    if y >= key_y {
+                        break 'outer; // 截断线以下没画,不给命中
+                    }
+                    hits.push((Rect::new(inner.x, y, inner.width, 1), Target::SelectRow(i)));
+                    y += 1;
+                }
+            }
+            two_key_segments(popup, key_y, REG_KEY_PICK_CONTINUE, RITUAL_KEY_RETURN, hits);
+        }
         crate::app::RegState::PreAudit => {} // 等回音:无处可点,同惰性
         crate::app::RegState::KindPick => {
             let popup = popup_rect(content, REG_KIND_W, REG_KIND_H);
@@ -1460,7 +1654,7 @@ mod tests {
         app.screen = Screen::Health;
         app.hl_mode = crate::app::HealthMode::Recheck;
         app.capabilities
-            .record(Capability::SourceRecheck, Probe::Available);
+            .record(Capability::SourceRecheck, Probe::Available, None);
         app.ls = Some(
             serde_json::from_str::<crate::engine::LsData>(
                 r#"{"domain":"all","recipes":[],"components":[],"sources":[{"name":"web-search","kind":"skill","entries":[]},{"name":"theme-pack","kind":"extension","entries":[]}],"profiles":[],"locks":[]}"#,

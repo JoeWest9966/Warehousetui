@@ -308,12 +308,18 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
             "装配中:动作已锁定"
         };
         spans.push(Span::styled(hint, p.dim()));
-    } else if app.home_input || app.data_input || app.rc_filter_on {
+    } else if app.home_input || app.data_input || app.rc_filter_on || app.ah_filter_on {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
     } else if app.reg_state == crate::app::RegState::RepoInput {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记填链:Enter 继续 · Esc/q 放弃", p.accent()));
+    } else if app.reg_state == crate::app::RegState::PreScanPick {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "预扫选单:空格勾选 · Enter 继续 · Esc 返航",
+            p.accent(),
+        ));
     } else if app.reg_state != crate::app::RegState::Idle {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记中:Esc 返航", p.accent()));
@@ -341,6 +347,10 @@ pub(crate) enum Prep {
     Shell,
     /// 先打开帮助浮层再派发(验证 Esc/q 关浮层)。
     HelpOpen,
+    /// 先布成装配历史次级视图在场(#101):`/` 过滤与 `r` 重读只在这个
+    /// 上下文里有分支,帮助对照表因此要能把它布出来(与 `running` 旗同级
+    /// 的布场口,不是新浮层)。
+    HistoryView,
 }
 
 /// 帮助浮层的一行键位,同时是**全局命令面板**(#119)的命令清单——
@@ -457,6 +467,19 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         write: true,
     },
     HelpRow {
+        key: "h",
+        desc: "装配:开/关装配历史(清单存档)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('h'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
         key: "x",
         desc: "装配:中止在途子进程(进程真止,日志不清)",
         screen: Some(Screen::Assemble),
@@ -466,6 +489,32 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: true,
         prep: Prep::Shell,
         code: KeyCode::Char('x'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "/",
+        desc: "装配历史:按派过滤(本地筛选,Esc 清词)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('/'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "r",
+        desc: "装配历史:重读存档快照(显式刷新,不自动跑)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('r'),
         modifiers: KeyModifiers::NONE,
         write: false,
     },
@@ -546,6 +595,19 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('r'),
         modifiers: KeyModifiers::NONE,
         write: true,
+    },
+    HelpRow {
+        key: "Enter",
+        desc: "配方:看选中组件的落点(只读)",
+        screen: Some(Screen::Recipes),
+        domain: Some(Domain::Sources),
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "/",
@@ -785,6 +847,19 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         write: false,
     },
     HelpRow {
+        key: "v",
+        desc: "设置:引擎版本对照(v / Esc 返回,r 重查)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('v'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
         key: "Esc",
         desc: "返回 / 关闭浮层",
         screen: None,
@@ -854,6 +929,7 @@ pub(crate) const MOUSE_LINES: &[&str] = &[
     "取回段只订阅/钥匙册:点它 = 按 g(只收建议命令,不代跑)",
     "删除段四本册可点 = 按 d(先确认;标签册是「d 摘/删」)",
     "自升级浮层点任意处关 = 按 Esc(在途点不动,其余动作已锁)",
+    "概览警示带点名到期订阅,点那一条 = 跳到订阅册并选中它",
     "捕获默认开的代价:复制要按 Shift",
     "逃逸:--no-mouse / 设置屏 m 关(重启生效)",
 ];

@@ -7,6 +7,7 @@ use ratatui::Frame;
 use serde_json::Value;
 
 use crate::app::App;
+use crate::datarepo::{archive_lamp, ArchiveState};
 use crate::engine::{EngineOutput, ExitCode};
 use crate::layout::{size_class, SizeClass};
 use crate::screens::{body, data_root_signpost};
@@ -47,16 +48,31 @@ pub fn render_assemble(frame: &mut Frame, area: Rect, app: &App) {
         render_launch_ritual(frame, area, app);
         return;
     }
-    let block = body(app, "七步幂等装配");
+    // 右上注脚随次级视图换(#101):历史视图是只读档案,不是七步装配——
+    // 不换的话屏上一直挂着「七步幂等装配」,讲一件此刻没发生的事。
+    let note = if app.as_history.is_some() {
+        "只读 · 清单存档"
+    } else {
+        "七步幂等装配"
+    };
+    let block = body(app, note);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // 装配历史次级视图(#101)排在 assembling 之后:在途屏面是七步+日志,
+    // 历史是只读浏览,互不抢占(键位侧同样只在非在途开历史)。
     if app.assembling {
         render_running(frame, inner, app);
+    } else if app.as_history.is_some() {
+        render_history(frame, inner, app);
     } else if let Some(out) = app.as_result.as_ref() {
         render_result(frame, inner, app, out);
     } else {
         render_picker(frame, inner, app);
+    }
+    // 清单原文浮层(#101)最后画:盖住历史视图(与发射仪式同一款式)。
+    if app.ah_raw.is_some() {
+        render_manifest_raw(frame, inner, app);
     }
 }
 
@@ -150,6 +166,277 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
                 .title(Span::styled(" 仪式说明 ", p.dim())),
         ),
         cols[1],
+    );
+}
+
+/// 装配历史次级视图(票 #101):按派列出清单存档(lockId / installedAt /
+/// convergeHash),回车看清单原文。数据全部来自 `app.as_history`
+/// (`datarepo::HistoryView`)——本函数零路径知识(接缝纪律,由
+/// `datarepo::tests::屏幕层零路径_api` 钉死)。
+///
+/// 两档排布跟选锁定集同宗(百分比双栏,不按尺寸类另开一套):窄终端
+/// 下双栏自然收窄,快照两档各守一次不溢出(工单 #101 验收)。
+fn render_history(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let Some(view) = app.as_history.as_ref() else {
+        return;
+    };
+    let cols =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
+
+    // NW_HOME 安装根不存在:指路,不摆一个骗人的空列表(与数据仓根
+    // 三态指路同族——「没在读」与「没有数据」不许互相冒充)。
+    if view.root_missing {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(" ⚠ NW_HOME 下没有安装根 ", p.warn().bold())),
+                Line::from(Span::styled(
+                    format!("NW_HOME:{} 不存在——没有装配记录。", app.nw_home),
+                    p.dim(),
+                )),
+                Line::from(Span::styled(
+                    "先装配一个派再回来看;或去设置屏按 n 轮换 / i 手填 NW_HOME。",
+                    p.dim(),
+                )),
+            ])
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    let vis = app.ah_visible();
+    let items: Vec<Line> = if vis.is_empty() {
+        vec![Line::from(Span::styled(
+            if app.ah_filter.trim().is_empty() {
+                "这个安装根下一个派都还没有——先装配一个派,历史就有第一行。"
+            } else {
+                "没有派命中过滤词(按 Esc 清词看全部)"
+            },
+            p.dim(),
+        ))]
+    } else {
+        vis.iter()
+            .map(|&i| history_row(view.rows[i].clone(), p))
+            .collect()
+    };
+    let mut st = ListState::default();
+    if !vis.is_empty() {
+        st.select(Some(app.ah_sel.min(vis.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::bordered()
+                    .border_style(p.dim())
+                    .title(Span::styled(" 装配历史(清单存档) ", p.accent())),
+            )
+            .highlight_style(p.sel()),
+        cols[0],
+        &mut st,
+    );
+    frame.render_widget(
+        Paragraph::new(history_detail(app, view))
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(
+                Block::bordered()
+                    .border_style(p.dim())
+                    .title(Span::styled(" 存档详情 ", p.dim())),
+            ),
+        cols[1],
+    );
+}
+
+/// 历史列表一行:结果灯 + 派名 + 一行摘要(就绪给锁定集/时刻/收敛;
+/// 缺失/破损给状态词)。灯用 `engine::State` 同一套(健康屏怎么画,
+/// 这里怎么画),映射在 `datarepo::archive_lamp`(工单 #101:缺失=
+/// 降级、损坏=破损)。
+fn history_row(a: crate::datarepo::ProfileArchive, p: &crate::theme::Palette) -> Line<'static> {
+    let st = archive_lamp(&a.state);
+    let lamp = Span::styled(p.lamp(st), p.state(st));
+    let name = Span::styled(format!("{:<12}", a.profile), p.info());
+    let tail = match &a.state {
+        ArchiveState::Ready(m) => Span::styled(
+            format!(
+                "{}  {}  {}",
+                if m.lock_id.is_empty() {
+                    "—"
+                } else {
+                    &m.lock_id
+                },
+                if m.installed_at.is_empty() {
+                    "—"
+                } else {
+                    &m.installed_at
+                },
+                if m.converge_hash.is_empty() {
+                    "—"
+                } else {
+                    &m.converge_hash
+                }
+            ),
+            p.dim(),
+        ),
+        ArchiveState::Missing => Span::styled("清单缺失(上一轮没提交完)", p.warn()),
+        ArchiveState::Broken(why) => Span::styled(format!("清单破损:{why}"), p.fail()),
+    };
+    Line::from(vec![lamp, Span::raw(" "), name, Span::raw(" "), tail])
+}
+
+/// 存档详情(右栏):选中行的全字段 + 键位说明 + 后续票挂点占位。
+/// 键位说明学选锁定集的「仪式说明」栏——屏上写着,帮助浮层同源。
+fn history_detail(app: &App, view: &crate::datarepo::HistoryView) -> Vec<Line<'static>> {
+    let p = &app.palette;
+    let vis = app.ah_visible();
+    let Some(&i) = vis.get(app.ah_sel.min(vis.len().saturating_sub(1))) else {
+        return vec![Line::from(Span::styled("没有选中的派(↑/↓ 选行)", p.dim()))];
+    };
+    let a = &view.rows[i];
+    let mut lines: Vec<Line> = Vec::new();
+    match &a.state {
+        ArchiveState::Ready(m) => {
+            lines.push(Line::from(vec![
+                Span::styled(" 派       ", p.dim()),
+                Span::raw(a.profile.clone()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(" 锁定集   ", p.dim()),
+                Span::styled(
+                    if m.lock_id.is_empty() {
+                        "—".into()
+                    } else {
+                        m.lock_id.clone()
+                    },
+                    p.info(),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(" 时刻     ", p.dim()),
+                Span::raw(if m.installed_at.is_empty() {
+                    "—".into()
+                } else {
+                    m.installed_at.clone()
+                }),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(" 收敛     ", p.dim()),
+                Span::raw(if m.converge_hash.is_empty() {
+                    "—".into()
+                } else {
+                    m.converge_hash.clone()
+                }),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(" 配方     ", p.dim()),
+                Span::raw(format!(
+                    "{} {}",
+                    if m.recipe_name.is_empty() {
+                        "—"
+                    } else {
+                        &m.recipe_name
+                    },
+                    m.recipe_version
+                )),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(" 运行期   ", p.dim()),
+                Span::raw(if m.runtime_key.is_empty() {
+                    "—".into()
+                } else {
+                    m.runtime_key.clone()
+                }),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(" 引擎     ", p.dim()),
+                Span::raw(if m.engine_nw.is_empty() {
+                    "—".into()
+                } else {
+                    m.engine_nw.clone()
+                }),
+                Span::raw(format!(" · 组件 {} 条", m.components)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                " Enter 看清单原文;组件全貌在原文里。",
+                p.dim(),
+            )));
+            // 后续票挂点先占位(工单 #101):跳转入口在本票不实现,
+            // 位置与话说清,免得操作者到处找。
+            lines.push(Line::from(Span::styled(
+                " 回收站浏览 / 存档日志 的跳转入口预留给 #102 / #103。",
+                p.dim(),
+            )));
+        }
+        ArchiveState::Missing => {
+            lines.push(Line::from(Span::styled(
+                format!(" {}:清单缺失——上一轮没提交完的未完成态。", a.profile),
+                p.warn(),
+            )));
+            lines.push(Line::from(Span::styled(
+                " 重跑同一命令收敛(up 幂等);没有原文可看。",
+                p.dim(),
+            )));
+        }
+        ArchiveState::Broken(why) => {
+            lines.push(Line::from(Span::styled(
+                format!(" {}:清单破损——{}", a.profile, why),
+                p.fail(),
+            )));
+            lines.push(Line::from(Span::styled(
+                " Enter 仍可看原文(解析失败恰恰最该看);修不好先重跑 up。",
+                p.dim(),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" ↑/↓ 选行 · / 过滤", p.dim())));
+    lines.push(Line::from(Span::styled(
+        " Enter 看清单原文 · Esc/h 返回选锁定集",
+        p.dim(),
+    )));
+    lines
+}
+
+/// 清单原文浮层(工单 #101 故事 3):居中大浮层,原文逐行呈现;
+/// Esc / 点任意处关(命中侧 `Target::DismissPopup` 同路)。原文即
+/// 数据仓里那个文件的字节内容——面板不改写、不排版、不猜测。
+fn render_manifest_raw(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(raw) = app.ah_raw.as_ref() else {
+        return;
+    };
+    let p = &app.palette;
+    let profile = app
+        .as_history
+        .as_ref()
+        .and_then(|h| {
+            app.ah_visible()
+                .get(app.ah_sel)
+                .map(|&i| h.rows[i].profile.clone())
+        })
+        .unwrap_or_default();
+    let w = 72u16.min(area.width.saturating_sub(2));
+    let h = area.height.saturating_sub(2).min(20);
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(Clear, popup);
+    let lines: Vec<Line> = raw.lines().map(Line::from).collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(
+                        format!(" 清单原文 · {profile} "),
+                        p.accent().bold(),
+                    ))
+                    .title_bottom(Line::from(Span::styled(" Esc 关 ", p.dim()))),
+            )
+            .style(p.surface()),
+        popup,
     );
 }
 

@@ -5,9 +5,12 @@
 #![allow(dead_code)] // 契约层/屏幕类型按票分期接线,#3–#7 施工期间整体放开;V1 收口时收紧
 
 mod app;
+mod datarepo;
 mod engine;
 mod input;
 pub mod layout;
+mod release;
+mod scan;
 mod screens;
 mod term;
 #[cfg(test)]
@@ -91,9 +94,15 @@ async fn main() -> Result<()> {
 
     // 引擎事件通道 + 开机自举(版本探测 + 首次 ls)。
     let (etx, mut erx) = mpsc::unbounded_channel::<engine::EngineEvent>();
+    // 预扫通道(工单 #114):外部源登记向导的只读 GitHub 查询回音,
+    // 与引擎回音分两条路——预扫不调引擎,也不冒充引擎回音。
+    let (stx, mut srx) = mpsc::unbounded_channel::<scan::ScanEvent>();
     app.bootstrap(&etx);
-
-    // 自升级事件通道(#121):与引擎事件并列,主循环在 select 里一起收。
+    // 引擎版本对照(#108)的回音通道:与引擎通道并列而不同路——release 查询
+    // 不是 `nw` 的进程输出,不借道 EngineEvent(见 `Message::Release`)。
+    let (rtx, mut rrx) = mpsc::unbounded_channel::<release::ReleaseProbe>();
+    // 自升级事件通道(#121):与引擎 / 版本对照 / 扫描三条回音通道并列,主循环
+    // 在同一个 select 里一起收。install.sh 的逐行进度与终结结论都走这条。
     let (utx, mut urx) = mpsc::unbounded_channel::<upgrade::UpgradeEvent>();
 
     let result = run_loop(
@@ -102,8 +111,12 @@ async fn main() -> Result<()> {
         &mut rx,
         &mut erx,
         &etx,
-        &mut urx,
+        &rtx,
+        &mut rrx,
+        &stx,
+        &mut srx,
         &utx,
+        &mut urx,
     )
     .await;
 
@@ -111,14 +124,19 @@ async fn main() -> Result<()> {
     result
 }
 
+#[allow(clippy::too_many_arguments)] // 四条回音通道(引擎/版本对照/扫描/自升级)并列,参数随接缝累加
 async fn run_loop(
     terminal: &mut term::Term,
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<Event>,
     erx: &mut mpsc::UnboundedReceiver<engine::EngineEvent>,
     etx: &mpsc::UnboundedSender<engine::EngineEvent>,
-    urx: &mut mpsc::UnboundedReceiver<upgrade::UpgradeEvent>,
+    rtx: &mpsc::UnboundedSender<release::ReleaseProbe>,
+    rrx: &mut mpsc::UnboundedReceiver<release::ReleaseProbe>,
+    stx: &mpsc::UnboundedSender<scan::ScanEvent>,
+    srx: &mut mpsc::UnboundedReceiver<scan::ScanEvent>,
     utx: &mpsc::UnboundedSender<upgrade::UpgradeEvent>,
+    urx: &mut mpsc::UnboundedReceiver<upgrade::UpgradeEvent>,
 ) -> Result<()> {
     let mut tick = interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -168,10 +186,22 @@ async fn run_loop(
         for (args, body) in std::mem::take(&mut app.fed_queue) {
             app.spawn_engine_fed(args, body, etx);
         }
+        // 预扫队列(#114):键位处理器没有 tx,只排队 slug;这里取出后跑
+        // 只读 `gh api`(不落文件、不调引擎),回音走扫描通道回流。
+        for slug in std::mem::take(&mut app.scan_pending) {
+            let stx = stx.clone();
+            tokio::spawn(async move {
+                let outcome = scan::scan_repo(&slug).await;
+                let _ = stx.send(scan::ScanEvent::Finished { slug, outcome });
+            });
+        }
         // 外部编辑器逃逸口:挂起我们的终端,让 $EDITOR 用,完事再点火。
         if std::mem::take(&mut app.pending_editor) {
             open_editor(terminal, app)?;
         }
+        // 引擎版本对照(#108):打开设置屏才对照一次(spec 把定时轮询划在范围外)。
+        // 闸是幂等的——结论一到就锁 latch,不重查;按 r 才清结论重来。
+        app.ensure_release_probe(rtx);
         tokio::select! {
             Some(ev) = rx.recv() => match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Press => app.update(Message::Key(k)),
@@ -182,6 +212,9 @@ async fn run_loop(
             Some(ev) = erx.recv() => app.update(Message::Engine(ev)),
             // 自升级推进(#121):install.sh 的逐行进度 + 终结结论。
             Some(ev) = urx.recv() => app.update(Message::Upgrade(ev)),
+            // 版本对照回音:与引擎回音并列收,不借道 EngineEvent
+            Some(p) = rrx.recv() => app.update(Message::Release(p)),
+            Some(ev) = srx.recv() => app.update(Message::Scan(ev)),
             _ = tick.tick(), if app.assembling => app.update(Message::Tick),
         }
     }

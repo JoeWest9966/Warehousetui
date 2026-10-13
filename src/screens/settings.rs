@@ -7,9 +7,17 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
+use crate::engine::capability;
 use crate::engine::config;
 use crate::engine::{Capability, Probe, GATE_HINT};
 use crate::screens::body;
+use crate::screens::recipes::clip;
+
+/// 逐项证据的竖向封顶(#123):能力节既有 3 行(入口行 + 归组行 + 指路行)之外
+/// 只许 +3,与 #29 钉的「110×30 内层 24 行」是同一条红线。第 4 项起的逐项
+/// 证据不占设置屏行——归组行仍点名全部非可用项,同一条结论句连同证据已进
+/// 最近日志(#118 收账处),操作者翻日志可逐项复看。
+const EVIDENCE_LINES_MAX: usize = 3;
 
 pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let block = body(app, "NW_HOME · 数据仓根 · 引擎发现");
@@ -17,9 +25,13 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if !app.engine.found {
+        // 指路屏优先:没有本地版本可比,版本对照页在场只会多一块空信息
         render_signpost(frame, inner, app);
     } else {
-        render_panel(frame, inner, app);
+        match app.settings_page {
+            crate::app::SettingsPage::Panel => render_panel(frame, inner, app),
+            crate::app::SettingsPage::Version => render_version(frame, inner, app),
+        }
     }
     // 浮层优先级最低的常屏之上:手填输入浮层盖在指路屏上也成立
     if app.home_input {
@@ -49,6 +61,11 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
     // 三条组级探针),常畅态 96 列仍是一行;紧凑态内层 64 列放不下时按显示
     // 宽度折行——竖向只多一行(紧凑态 66×50 内层 40+ 行,放得下),**不许
     // 截掉入口**:截掉等于面板对操作者隐瞒引擎有或没有的能力。
+    //
+    // #123 逐项证据的账:入口行(紧凑态折成两行)+ 归组行 + 指路行 = 能力节
+    // 既有 3 行,逐项证据每项一行、整块封顶 3 行(见 [`EVIDENCE_LINES_MAX`])
+    // —— 同一条 +3 红线,且**只随非可用项出现**:全部可用时归组行 / 指路行 /
+    // 证据行一块都不占,呈现与 #123 之前逐字节相同(健康时零噪音)。
     let verdicts: Vec<(Capability, Probe)> = Capability::ALL
         .into_iter()
         .map(|c| (c, app.capabilities.get(c)))
@@ -104,6 +121,59 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
     // 指路:只在真有「引擎没这能力」时给(未决不冒充禁用,指路屏另管)。
     if !disabled.is_empty() {
         lines.push(Line::from(Span::styled(format!("  {GATE_HINT}"), p.dim())));
+    }
+    // 逐项证据(#123):归组行只说「谁关着」,这一段说「凭什么」——每个非可用
+    // 项一段紧凑片段:入口标记 + 入口名 + 探针 argv + 引擎那一跑的原话或
+    // schema + rc。可用性判据与证据带都走共享纯行构造器
+    // (`engine::capability::gate_signpost`,#122 立的唯一新缝针),设置屏不另写
+    // 一套三态判据、也不重写证据措辞:未决项的片段里自然不出现「入口禁用」,
+    // 也不出现那句「缺的是引擎能力…」——它仍只由上面的指路行出,唯一出处是
+    // `capability::GATE_HINT`。
+    //
+    // 一段一行、按显示宽度 `clip` 收宽,不折行:折行会多吃竖向预算,而 +3 是
+    // 钉死的。标记紧贴入口名(与上面入口行同一写法)、缩进 4 列,都是紧凑态 62
+    // 列的横向预算让出来的——「标记 + 入口 + 探针 + 原话 + rc」要在一行内全须
+    // 全尾,rc 被 clip 吃掉等于证据缺一角(常畅态 94 列同样不折行)。
+    //
+    // 引擎身份三项(二进制 / 来源 / 版本)在本屏上一节「引擎」里,与逐项证据
+    // 同屏对照(故事 11:「问错二进制」与「引擎旧」一眼可分);内层 24 行的竖向
+    // 预算不允许每项再重复一遍,所以逐项只带「问的是哪条命令面 + 引擎怎么答」。
+    let mut evidence_shown = 0usize;
+    for (cap, v) in &verdicts {
+        if evidence_shown >= EVIDENCE_LINES_MAX {
+            break;
+        }
+        // 没收证据(未探测过 / 记账时没带)就不摆:不编造一份证据。
+        let Some(ev) = app.capabilities.evidence(*cap) else {
+            continue;
+        };
+        // 可用性判据走共享构造器:`Available` 不产指路(返回 None),天然落空。
+        let Some(signpost) =
+            capability::gate_signpost(cap.label(), *cap, &app.capabilities, &app.engine_facts())
+        else {
+            continue;
+        };
+        // 尾段原样接构造器证据带的末行「引擎原话:… (rc N)」:措辞一处真相,
+        // 设置屏不重写一遍。
+        let Some(words) = signpost.evidence.last() else {
+            continue;
+        };
+        let mark = match v {
+            Probe::Unavailable => "✗",
+            _ => "?",
+        };
+        lines.push(Line::from(Span::styled(
+            clip(
+                &format!(
+                    "    {mark}{} · 探针 {} · {words}",
+                    cap.label(),
+                    ev.probe_display(),
+                ),
+                inner.width as usize,
+            ),
+            p.dim(),
+        )));
+        evidence_shown += 1;
     }
     lines.extend(vec![
         Line::from(""),
@@ -182,6 +252,89 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
         }
         None => lines.push(Line::from(Span::styled("  config 状态  解析正常", p.dim()))),
     }
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().border_style(p.dim())),
+        inner,
+    );
+}
+
+/// 引擎版本对照页(#108,spec #94 用户故事 24/25/26):本地 `nw` 版本 ↔ 引擎
+/// release 仓最新 tag,并排两行摊开。
+///
+/// 四态互不冒充:拿到 tag 才判词;取不到就明说「本地版本 + 取不到远端」——
+/// 离线机器上不报错、只少一块信息;落后才给升级指路(ADR-0003:只给可复制的
+/// 命令文案,执行权留给操作者,面板不代跑)。
+fn render_version(frame: &mut Frame, inner: Rect, app: &App) {
+    use crate::release::{upgrade_hint, verdict, ReleaseProbe, Verdict};
+    let p = &app.palette;
+    // 本地版本的原话与常驻面板 / 顶栏同一拼法(`nw {}`),不造第二种说法
+    let local = format!("nw {}", app.engine_version);
+    let mut lines = vec![
+        Line::from(Span::styled("版本对照", p.accent())),
+        Line::from(format!("  本地     {local}")),
+    ];
+    // 落后与否只在这里判一次:判词行与升级指路共用同一个结论
+    let behind = match &app.release_remote {
+        Some(ReleaseProbe::Latest(tag)) => {
+            lines.push(Line::from(format!("  远端     {tag}")));
+            let v = verdict(&app.engine_version, Some(tag));
+            let (word, style) = match v {
+                Verdict::Same => ("一致:本地就是引擎 release 仓最新 tag", p.ok()),
+                Verdict::Behind => ("落后:引擎 release 仓有更新的 tag", p.warn()),
+                Verdict::Ahead => ("领先:本地比最新 tag 还新(自编或预发布)", p.dim()),
+                // 比不了就把两边原话并排摆着,不猜大小
+                Verdict::Incomparable => ("比不了:两边不都是 x.y.z 形态,原话并排不猜", p.dim()),
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  判词     {word}"),
+                style,
+            )));
+            v == Verdict::Behind
+        }
+        // 在途:不拿旧结论冒充本次,也不说「取不到」
+        None if app.release_probing => {
+            lines.push(Line::from(Span::styled("  远端     对照中…", p.dim())));
+            false
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "  远端     未对照(打开本屏即对照;r 重查)",
+                p.dim(),
+            )));
+            false
+        }
+        // 两种「取不到」理由分开说,都不报错、都不猜(spec 用户故事 25)
+        Some(ReleaseProbe::Garbage) => {
+            lines.push(Line::from(Span::styled(
+                "  远端     取不到:回话不是可用 tag",
+                p.dim(),
+            )));
+            false
+        }
+        Some(ReleaseProbe::Unreachable) => {
+            lines.push(Line::from(Span::styled(
+                "  远端     取不到:gh 不在 PATH 或没网",
+                p.dim(),
+            )));
+            false
+        }
+    };
+    lines.push(Line::from(Span::styled(
+        "  只标记不治理:判词不改退出码、不自动升级",
+        p.dim(),
+    )));
+    if behind {
+        // 指路拆两行:命令文案独占一行,紧凑态 62 列也放得下整条
+        lines.push(Line::from(Span::styled(
+            "  升级指路(不代跑,升不升你定):",
+            p.warn(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", upgrade_hint()),
+            p.warn(),
+        )));
+    }
+    lines.push(Line::from(Span::styled("  r 重查 · v / Esc 返回", p.dim())));
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().border_style(p.dim())),
         inner,

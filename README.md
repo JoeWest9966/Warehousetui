@@ -10,9 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/JoeWest9966/Warehousetui/main/install.sh | sh
 ```
 
-> 本仓是**私有仓**:匿名请求这条 raw URL 会 404。带凭证装:
-> `curl -H "Authorization: token $GH_TOKEN" -fsSL https://raw.githubusercontent.com/JoeWest9966/Warehousetui/main/install.sh | sh`
-> (install.sh 随后也要带同一个 token 才能读到 release 资产;`export GH_TOKEN=…` 即可,install.sh 透传环境。)
+> 匿名安装开箱即用。若 GitHub API 限流(未认证 60 次/小时)导致版本探测不稳,可 `export GH_TOKEN=…`(或 `GITHUB_TOKEN`)走 API 资产面——install.sh 检测到 token 会自动切换。
 
 默认装到 `~/.local/bin/nwt`。装完敲 `nwt` 没反应,就是它不在 `PATH`:
 
@@ -43,12 +41,12 @@ cargo build --release
 
 | 屏 | 干什么 | 键 |
 |---|---|---|
-| 概览 | 警示带 + 派四态表 + 四域计数卡 + 指令栏 + 最近日志 | `↑/↓` 选派,`r` 刷 ls,`a`/`h`/`l`/`v` 跳屏 |
-| 装配 | 选锁定集 → 发射仪式 → 七步 + stderr 实时日志 | `↑/↓` 选锁,`Enter` 发射仪式,再 `Enter` 发射,`x` 中止在途装配 |
+| 概览 | 警示带(点名到期订阅)+ 派四态表 + 四域计数卡 + 指令栏 + 最近日志 | `↑/↓` 选派,`r` 刷 ls,`a`/`h`/`l`/`v` 跳屏 |
+| 装配 | 选锁定集 → 发射仪式 → 七步 + stderr 实时日志;**装配历史**(各派清单存档,只读) | `↑/↓` 选锁,`Enter` 发射仪式,再 `Enter` 发射,`x` 中止在途装配,`h` 翻装配历史(再按退出),历史里 `/` 过滤、`r` 重读快照、`Enter` 看清单原文 |
 | 健康 | doctor 七面卡片 / validate 27 项清单 + 证据五字段 | `r` 复核,`m` 切模式,`Enter` 复核选中条,`↑/↓` 翻阅 |
-| 配方 | 五域两栏只读浏览(recipes/components/sources/profiles/locks) | `h/l` 切域,`↑/↓` 选行,`c` 取用烘焙建议命令(只读),`/` 过滤五域(本地筛选),`r` 登记外部源(外部源域) |
+| 配方 | 五域两栏只读浏览(recipes/components/sources/profiles/locks) | `h/l` 切域,`↑/↓` 选行,`c` 取用烘焙建议命令(只读),`Enter` 看选中组件铺进派的落点(只读,外部/本地两类分列),`/` 过滤五域(本地筛选),`r` 登记外部源(外部源域) |
 | 编目 | 四本编目册(机器 / 标签 / 订阅 / 钥匙,`m` 换册):登记 / 看编目 / 删除 / 反查 / 册内过滤 | `m` 换册,`r` 登记,`l` 重读编目,`↑/↓` 选行,`d` 删除(先确认;键位行「d 删除」段可点),`g` 取回本体的建议命令(订阅 / 钥匙册;键位行「g 取回」段可点),`Enter` 反查选中的这条(机器册问什么标签引用了它 / 标签册反查选中的那条),`/` 册内过滤(本地筛选,Esc 清词) |
-| 设置 | 引擎发现状态、NW_HOME、数据仓根、主题、配置入口 | `n` 轮换 NW_HOME,`i` 手填 NW_HOME,`d` 手填数据仓根,`e` 拉起 $EDITOR,`m` 切换鼠标捕获,`b` bell 提示音开关,`o` OSC 9 桌面通知开关,`U` 自升级 nwt(sha256 同款闸),`t` 主题 |
+| 设置 | 引擎发现状态、NW_HOME、数据仓根、主题、配置入口、引擎版本对照 | `n` 轮换 NW_HOME,`i` 手填 NW_HOME,`d` 手填数据仓根,`e` 拉起 $EDITOR,`m` 切换鼠标捕获,`b` bell 提示音开关,`o` OSC 9 桌面通知开关,`U` 自升级 nwt(sha256 同款闸),`v` 引擎版本对照(对照 release 仓最新 tag,落后只给升级指路不代跑),`t` 主题 |
 
 通用:`j/k` 切屏 · `Enter` 确认 · `Esc` 返回 · `?` 帮助 · `Ctrl+P` 命令面板(模糊搜全部键位,回车执行) · `q` 退出(装配态禁用)。
 
@@ -62,6 +60,7 @@ cargo build --release
 - 订阅 / 钥匙册键位行的「g 取回」段可点 = 按 `g`(当前选中那条的建议命令收进日志,执行权留给操作者;面板不代跑 get、不碰剪贴板。只这两本册的非空册体有这一段,空册与登记 / 删除浮层态都没有)。
 - 四本编目册键位行的「d 删除」段可点 = 按 `d`(选中行 → ADR-0009 图形确认闸 → 确认才 `rm`;标签册段面是「d 摘/删」,点它进同一条摘引用 / 删标签表单流。空册与登记 / 删除浮层态都没有这一段)。
 - 自升级浮层(`U` 呼出)点任意处关 = 按 `Esc`;**下载 / 校验在途时点不动**——那会儿其余动作已锁(与装配态同款互斥),面板不假装能收回一个已经发出去的下载。
+- 概览警示带点名 expiring / expired 的订阅(三态与剩余天数由引擎 `subscription ls` 回音给,面板不算日期;active 不占带)。点那一条 = 跳到订阅册并选中它——册内过滤把它筛掉时只给一行指路,不硬选中、也不新造禁用态。
 - 捕获默认开启的代价:终端原生「拖拽选中 / 右键复制」需按 **Shift**。要还给终端:`--no-mouse` 旗标启动,或设置屏按 `m` 关(写入 `config.mouse_capture`,下次启动生效)。
 
 ## 行为纪律
@@ -80,7 +79,7 @@ cargo test --all-targets     # 单测:契约解析 / 发现策略 / 六屏快照
 cargo build --release
 ```
 
-本仓不跑 CI(GitHub Actions 被账号级计费挡住全部 job,业主裁定不付钱,见 [docs/release.md](./docs/release.md));闸门在本地,两条路任选:
+CI(GitHub Actions,公库免费额度):push 到 main / 开 PR 时三平台(ubuntu / macos / windows)自动跑齐上面四项,红了就挡住;公库公开后计费门槛消失,见 [docs/release.md](./docs/release.md)。本地闸门保留,两条路任选:
 
 - **自动(推荐)**:`git config core.hooksPath githooks` 启用 `githooks/pre-push`——每次 push 前自动跑齐上面四项,红了就挡住(恢复默认:`git config --unset core.hooksPath`)
 - **手动**:改动合入前,上面四项在开发机上跑齐即闸门
@@ -92,7 +91,9 @@ cargo build --release
 ## 文档
 
 - 领域词汇:[CONTEXT.md](./CONTEXT.md)
-- 架构决策:[docs/adr/](./docs/adr/)(0001 子进程契约 / 0002 技术栈 / 0003 动作边界 / 0004 响应式双态 / 0005 鼠标命中区 / 0006 外部源登记两段式 / 0007 面板跟随引擎 / 0008 跟随引擎三层 / 0009 编目册写动作边界与机密纪律)
+- 架构决策:[docs/adr/](./docs/adr/)(0001 子进程契约 / 0002 技术栈 / 0003 动作边界 / 0004 响应式双态 / 0005 鼠标命中区 / 0006 外部源登记两段式 / 0007 面板跟随引擎 / 0008 跟随引擎三层 / 0009 编目册写动作边界与机密纪律 / 0010 数据仓安装根访问层与装配历史 / 0011 面板写数据仓的边界与写侧接缝)
 - 调研底稿:[docs/research/](./docs/research/)(nw CLI 契约面 / 用户旅程 / 环境验证)
 - 发布矩阵:[docs/release.md](./docs/release.md)(安装 / 校验 / 打 tag 发布)
 - 工单:[GitHub Issues](https://github.com/JoeWest9966/Warehousetui/issues)(wayfinder 蓝图 #1)
+
+[![CI](https://github.com/JoeWest9966/Warehousetui/actions/workflows/ci.yml/badge.svg)](https://github.com/JoeWest9966/Warehousetui/actions/workflows/ci.yml)
