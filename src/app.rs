@@ -377,13 +377,14 @@ pub struct App {
     /// 待扫 slug 队列(工单 #114):键位处理器没有 tx,只排队;主循环
     /// 取出后跑只读 `gh api`,回音经扫描通道回流。
     pub scan_pending: Vec<String>,
-    /// 作者侧脚手架表单流(spec #95 工单 #110,含首套模板):与登记两段式
+    /// 作者侧脚手架表单流(spec #95 工单 #110,含内置模板清单):与登记两段式
     /// 同级的顶层浮层——表单 → 拟落账预览 → 图形确认 → datarepo 写侧原子
     /// 落盘。与规格无关的骨架(#111 extension 复用);规格自己的表单在
     /// [`scaffold_form`](Self::scaffold_form)。
     pub scaffold_flow: crate::screens::ScaffoldFlow,
-    /// skill 脚手架表单(名称 / 描述 / 触发词 + 模板起步开关)。#111 追加
-    /// extension 表单时,在此旁添一份并让表单流按 kind 分派。
+    /// skill 脚手架表单(名称 / 描述 / 触发词 + 模板起步:存内置模板 id,
+    /// `None` = 空白骨架)。#111 追加 extension 表单时,在此旁添一份并让表单流
+    /// 按 kind 分派。
     pub scaffold_form: crate::screens::SkillForm,
     /// 脚手架的目标规格(#111):skill 与 extension 共用[`scaffold_flow`](Self::scaffold_flow)
     /// 那一条表单流,表单各一份,按它取哪份在场。

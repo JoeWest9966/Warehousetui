@@ -1,4 +1,4 @@
-//! 作者侧脚手架表单流(spec #95 工单 #110 skill 含首套模板 / #111
+//! 作者侧脚手架表单流(spec #95 工单 #110 skill 含模板清单 / #111
 //! extension pi-extension 契约)。
 //!
 //! 面板第一次**自己写文件**的消费方之一(ADR-0010):图形表单生成 `SKILL.md`
@@ -23,7 +23,9 @@
 //!
 //! 字段形状校验**分别对齐上游对相应文件的检查**:skill 侧
 //! `SKILL.md` frontmatter 必填 `name` + `description`(见上游
-//! `docs/external-sources.md` 注册验收第 2 条);skill 身份 = frontmatter 的
+//! `docs/external-sources.md` 注册验收第 2 条);正文可按内置模板清单
+//! ([`SKILL_TEMPLATES`],面板静态资产:agent skill / MCP server / TUI 工具,
+//! 空白仍是默认一路)起步;skill 身份 = frontmatter 的
 //! `name`,故名字按引擎 `validName` 同款口径校验(它同时是落点目录名
 //! `skills/<名>/`)。extension 侧对齐 #21 的第六条验收:条目子树自带
 //! `package.json` 且 `pi.extensions` 非空、清单里每条路径真实存在
@@ -192,7 +194,7 @@ impl SkillField {
     }
 }
 
-/// skill 脚手架表单:名称 / 描述 / 触发词 + 模板起步开关。
+/// skill 脚手架表单:名称 / 描述 / 触发词 + 模板起步。
 /// `name` = skill 身份(= SKILL.md frontmatter 的 name,也是落点目录名)。
 #[derive(Clone, Default)]
 pub struct SkillForm {
@@ -200,8 +202,9 @@ pub struct SkillForm {
     pub description: String,
     /// 触发词:一行,逗号 / 顿号 / 分号分隔(面板侧便利,进骨架正文)。
     pub triggers: String,
-    /// 从内置 agent skill 模板起步(true)还是空白骨架(false)。
-    pub template: bool,
+    /// 从哪套内置模板起步(`None` = 空白骨架,默认一路;存 id 不存下标——
+    /// 模板清单往后加,旧状态不会悄悄改指向)。
+    pub template: Option<&'static str>,
     pub field: SkillField,
 }
 
@@ -279,33 +282,135 @@ fn split_triggers(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// 一套内置模板:稳定 id(表单状态里存它,清单扩了不改旧状态的语义),加屏上
+/// 标签与正文生成器(**面板静态资产**,ADR-0010 §1:产出内容是面板自有资产,
+/// 不是引擎逻辑复刻)。正文生成器收「名 + 描述 + 触发词」,frontmatter 由
+/// [`skill_md`] 统一补(上游 validate 盯着 name + description 两项,哪套模板都
+/// 不许缺)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SkillTemplate {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub body: fn(&str, &str, &[String]) -> String,
+}
+
+/// 内置模板清单:**面板定义、可扩展**——加一套模板只在这里加一行,表单 / 落点 /
+/// 表单流一字不改。「空白」不是清单里的一项,它是默认一路(`template = None`)。
+///
+/// 首套就是 #110 的 agent skill(何时触发 / 用法 / 备注);后两套按 spec #95
+/// 第 6 项「内置几套常用模板」补:MCP server 与 TUI 工具。都是 skill(一份带
+/// frontmatter 的 markdown),换的只有正文骨架。
+pub const SKILL_TEMPLATES: &[SkillTemplate] = &[
+    SkillTemplate {
+        id: "agent-skill",
+        label: "agent skill(何时触发/用法/备注)",
+        body: agent_skill_body,
+    },
+    SkillTemplate {
+        id: "mcp-server",
+        label: "MCP server(工具/资源/起步)",
+        body: mcp_server_body,
+    },
+    SkillTemplate {
+        id: "tui-tool",
+        label: "TUI 工具(界面/键位/起步)",
+        body: tui_tool_body,
+    },
+];
+
+/// 按 id 取内置模板(不认的 id 当空白,不猜、不按序号猜)。
+pub fn skill_template(id: &str) -> Option<&'static SkillTemplate> {
+    SKILL_TEMPLATES.iter().find(|t| t.id == id)
+}
+
+/// 空格轮转:空白 → 第一套 → … → 最后一套 → 空白。表单里选模板起步,
+/// 空白永远是默认一路(第一下空格给第一套,再一下从最后一套回空白)。
+fn next_skill_template(cur: Option<&str>) -> Option<&'static str> {
+    let idx = match cur {
+        None => 0,
+        Some(id) => match SKILL_TEMPLATES.iter().position(|t| t.id == id) {
+            Some(i) => i + 1,
+            None => 0, // 不认的 id(清单动过)当空白重来
+        },
+    };
+    SKILL_TEMPLATES.get(idx).map(|t| t.id)
+}
+
+/// agent skill 正文(#110 首套):「何时触发 / 用法 / 备注」的起步段落。
+fn agent_skill_body(name: &str, _description: &str, triggers: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str("\n## 何时触发\n\n");
+    if triggers.is_empty() {
+        s.push_str("- (补充:什么时候该启用这个 skill)\n");
+    } else {
+        for t in triggers {
+            s.push_str(&format!("- {t}\n"));
+        }
+    }
+    s.push_str("\n## 用法\n\n(说明这个 skill 做什么、怎么用)\n");
+    s.push_str("\n## 备注\n\n- 由 nwt 脚手架生成(agent skill 模板起步);按需增删。\n");
+    let _ = name;
+    s
+}
+
+/// MCP server 正文(spec #95 第 6 项第二套):起一个 MCP server 该交代的事 ——
+/// 暴露哪些工具 / 资源、怎么起、凭据从哪来。
+fn mcp_server_body(_name: &str, _description: &str, triggers: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str("\n## 何时触发\n\n");
+    if triggers.is_empty() {
+        s.push_str("- (补充:什么时候该走这个 MCP server)\n");
+    } else {
+        for t in triggers {
+            s.push_str(&format!("- {t}\n"));
+        }
+    }
+    s.push_str("\n## 暴露的工具\n\n- (列出工具名 + 一句话用途)\n");
+    s.push_str("\n## 暴露的资源\n\n- (列出资源 URI + 一句话用途)\n");
+    s.push_str("\n## 怎么起\n\n(入口命令 / 传输方式 / 端口或 stdio)\n");
+    s.push_str("\n## 凭据\n\n- (从环境变量读,别把密钥写进本文件)\n");
+    s
+}
+
+/// TUI 工具正文(spec #95 第 6 项第三套):起一个终端界面该交代的事 —— 界面布局、
+/// 键位、刷新节奏。
+fn tui_tool_body(_name: &str, _description: &str, triggers: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str("\n## 何时触发\n\n");
+    if triggers.is_empty() {
+        s.push_str("- (补充:什么时候该起这个界面)\n");
+    } else {
+        for t in triggers {
+            s.push_str(&format!("- {t}\n"));
+        }
+    }
+    s.push_str("\n## 界面\n\n- (几块区 / 各摆什么 / 常驻哪条提示栏)\n");
+    s.push_str("\n## 键位\n\n- (主操作 + 返航 + 帮助,别占运行环境已有的键)\n");
+    s.push_str("\n## 刷新\n\n- (什么触发重画 / 慢查询怎么不卡界面)\n");
+    s
+}
+
 /// 生成 `SKILL.md` 字节。**frontmatter 必填 `name` + `description`**(上游
 /// validate 对 skill 的检查项);正文按空白 / 模板两路给——模板是面板自有的
-/// 「首套 agent skill 模板」静态资产,不是引擎逻辑复刻。
-fn skill_md(name: &str, description: &str, triggers: &[String], template: bool) -> String {
+/// 静态资产(见 [`SKILL_TEMPLATES`]),不是引擎逻辑复刻。
+fn skill_md(name: &str, description: &str, triggers: &[String], template: Option<&str>) -> String {
     let mut s = String::new();
     s.push_str("---\n");
     s.push_str(&format!("name: {name}\n"));
     s.push_str(&format!("description: {description}\n"));
     s.push_str("---\n");
     s.push_str(&format!("\n# {name}\n\n{description}\n"));
-    if template {
-        // 首套 agent skill 模板:给「何时触发 / 用法 / 备注」的起步段落。
-        s.push_str("\n## 何时触发\n\n");
-        if triggers.is_empty() {
-            s.push_str("- (补充:什么时候该启用这个 skill)\n");
-        } else {
-            for t in triggers {
-                s.push_str(&format!("- {t}\n"));
-            }
-        }
-        s.push_str("\n## 用法\n\n(说明这个 skill 做什么、怎么用)\n");
-        s.push_str("\n## 备注\n\n- 由 nwt 脚手架生成(agent skill 模板起步);按需增删。\n");
-    } else if !triggers.is_empty() {
+    match template.and_then(skill_template) {
+        // 模板路:正文由那一套内置模板给(加模板只加清单一行)。
+        Some(t) => s.push_str(&(t.body)(name, description, triggers)),
         // 空白骨架:只在前置必填之外补一个触发词段(有触发词才补)。
-        s.push_str("\n## 触发词\n\n");
-        for t in triggers {
-            s.push_str(&format!("- {t}\n"));
+        None => {
+            if !triggers.is_empty() {
+                s.push_str("\n## 触发词\n\n");
+                for t in triggers {
+                    s.push_str(&format!("- {t}\n"));
+                }
+            }
         }
     }
     s
@@ -324,9 +429,10 @@ pub fn on_key_skill_form(form: &mut SkillForm, k: KeyEvent) -> FormAction {
             form.field = form.field.moved(true);
             return FormAction::Edited;
         }
-        // 模板开关:焦点在模板字段时,空格切换(空格在文本字段里仍是普通字符)。
+        // 模板起步:焦点在模板字段时,空格在「空白 → 各套模板 → 空白」间轮转
+        // (空格在文本字段里仍是普通字符)。
         KeyCode::Char(' ') if form.field == SkillField::Template => {
-            form.template = !form.template;
+            form.template = next_skill_template(form.template);
             return FormAction::Edited;
         }
         _ => {}
@@ -682,14 +788,24 @@ fn render_skill_form(frame: &mut Frame, area: Rect, app: &App) {
     for field in SkillField::ALL.iter().copied() {
         let on = field == f.field;
         if field == SkillField::Template {
-            let mark = if f.template { "[x]" } else { "[ ]" };
+            // 当前选中哪一路(空白 / 哪套模板);下面把可选项逐行摊开 —— 清单由
+            // 面板定义,加模板只加清单一行,渲染这里一行都不用改。
+            let cur = f.template.and_then(skill_template);
             lines.push(Line::from(vec![
                 Span::raw(format!("  {} ", field.label())),
                 Span::styled(
-                    format!("{mark} 从内置 agent skill 模板起步"),
+                    format!("[{}] 空格切换", cur.map(|t| t.label).unwrap_or("空白")),
                     if on { p.sel().bold() } else { p.text() },
                 ),
             ]));
+            let mut opts: Vec<(&str, bool)> = vec![("空白", cur.is_none())];
+            opts.extend(SKILL_TEMPLATES.iter().map(|t| (t.label, cur == Some(t))));
+            for (label, chosen) in opts {
+                lines.push(Line::from(Span::styled(
+                    format!("    {} {label}", if chosen { "▸" } else { "·" }),
+                    if chosen { p.sel() } else { p.dim() },
+                )));
+            }
             continue;
         }
         let value = match field {
@@ -944,10 +1060,16 @@ mod tests {
         // 到底不绕回
         on_key_skill_form(&mut f, down());
         assert_eq!(f.field, SkillField::Template);
-        // 模板字段:空格切换起步方式
-        assert!(!f.template);
+        // 模板字段:空格在「空白 → 各套模板 → 空白」间轮转
+        assert_eq!(f.template, None, "空白是默认一路");
         on_key_skill_form(&mut f, press(' '));
-        assert!(f.template);
+        assert_eq!(f.template, Some("agent-skill"), "第一下空格给第一套模板");
+        on_key_skill_form(&mut f, press(' '));
+        assert_eq!(f.template, Some("mcp-server"));
+        on_key_skill_form(&mut f, press(' '));
+        assert_eq!(f.template, Some("tui-tool"));
+        on_key_skill_form(&mut f, press(' '));
+        assert_eq!(f.template, None, "轮转一圈回空白(空白永远是默认一路)");
         // 键入进当前文本字段
         f.field = SkillField::Name;
         on_key_skill_form(&mut f, press('a'));
@@ -1009,6 +1131,114 @@ mod tests {
         );
     }
 
+    /// 模板库(spec #95 第 6 项):面板定义的清单,至少 agent skill / MCP server /
+    /// TUI 工具三套;表单里可选模板起步,空白仍是默认一路。
+    #[test]
+    fn 模板清单_三套可选_空白是默认一路_每套正文不同且都过必填两项() {
+        // ① 清单:三套,id 稳定、标签非空、正文生成器都在
+        assert!(SKILL_TEMPLATES.len() >= 3, "至少三套:{SKILL_TEMPLATES:?}");
+        let ids: Vec<&str> = SKILL_TEMPLATES.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec!["agent-skill", "mcp-server", "tui-tool"]);
+        for t in SKILL_TEMPLATES {
+            assert!(!t.label.is_empty(), "{} 要有屏上标签", t.id);
+            assert_eq!(
+                skill_template(t.id).map(|x| x.id),
+                Some(t.id),
+                "按 id 取得回来"
+            );
+        }
+        assert!(skill_template("nope").is_none(), "不认的 id 不当模板(不猜)");
+        // ② 表单默认 = 空白;清单里每套都有屏上标签(表单逐行摊开它们)
+        assert_eq!(SkillForm::default().template, None, "空白是默认一路");
+        for t in SKILL_TEMPLATES {
+            assert!(!t.label.is_empty(), "{} 要有屏上标签", t.id);
+        }
+        // ③ 每套模板:正文互不相同,且 frontmatter 必填两项都过(上游 validate 盯的)
+        let mut bodies: Vec<String> = Vec::new();
+        for t in SKILL_TEMPLATES {
+            let f = SkillForm {
+                name: "web-scout".into(),
+                description: "从网页检索资料".into(),
+                triggers: "查网页".into(),
+                template: Some(t.id),
+                ..SkillForm::default()
+            };
+            let md = String::from_utf8(f.planned_writes().unwrap()[0].content.clone()).unwrap();
+            assert!(
+                md.starts_with("---\n"),
+                "{} 也要 YAML frontmatter 开头:{md}",
+                t.id
+            );
+            assert!(
+                md.contains("name: web-scout"),
+                "{} frontmatter 有 name:{md}",
+                t.id
+            );
+            assert!(
+                md.contains("description: 从网页检索资料"),
+                "{} frontmatter 有 description:{md}",
+                t.id
+            );
+            bodies.push(md);
+        }
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                assert_ne!(bodies[i], bodies[j], "两套模板正文不同({i} vs {j})");
+            }
+        }
+        // 空白路与任何一套模板路都不同
+        let blank = String::from_utf8(
+            SkillForm {
+                name: "web-scout".into(),
+                description: "从网页检索资料".into(),
+                triggers: "查网页".into(),
+                ..SkillForm::default()
+            }
+            .planned_writes()
+            .unwrap()[0]
+                .content
+                .clone(),
+        )
+        .unwrap();
+        for (i, b) in bodies.iter().enumerate() {
+            assert_ne!(&blank, b, "空白路与第 {i} 套模板路不同");
+        }
+    }
+
+    /// 表单里轮转模板:空格从空白起,一圈回到空白;落点不随模板改(只有正文改)。
+    #[test]
+    fn 表单_轮转模板_落点不变只换正文() {
+        let mut f = SkillForm {
+            name: "web-scout".into(),
+            description: "d".into(),
+            ..SkillForm::default()
+        };
+        let mut seen: Vec<Option<&str>> = vec![f.template];
+        let mut paths: Vec<String> = Vec::new();
+        for _ in 0..=SKILL_TEMPLATES.len() {
+            let w = f.planned_writes().unwrap();
+            paths.push(w[0].path.as_str().to_string());
+            f.field = SkillField::Template;
+            on_key_skill_form(&mut f, press(' '));
+            seen.push(f.template);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                None,
+                Some("agent-skill"),
+                Some("mcp-server"),
+                Some("tui-tool"),
+                None
+            ],
+            "一圈轮转:空白起、空白收"
+        );
+        assert!(
+            paths.iter().all(|p| p == "skills/web-scout/SKILL.md"),
+            "模板只换正文,落点恒定:{paths:?}"
+        );
+    }
+
     #[test]
     fn 空白与模板两路_产出不同骨架() {
         let base = SkillForm {
@@ -1019,7 +1249,7 @@ mod tests {
         };
         let blank = String::from_utf8(base.planned_writes().unwrap()[0].content.clone()).unwrap();
         let mut tmpl = base.clone();
-        tmpl.template = true;
+        tmpl.template = Some("agent-skill");
         let tmpl_md = String::from_utf8(tmpl.planned_writes().unwrap()[0].content.clone()).unwrap();
         assert_ne!(blank, tmpl_md, "两路骨架不同");
         assert!(blank.contains("## 触发词"), "空白路给触发词段:{blank}");
@@ -1149,6 +1379,11 @@ mod tests {
             let f = snap(&app, w, h);
             assert!(f.contains("新建 skill"), "{w}×{h} 表单标题:{f}");
             assert!(f.contains("web-scout"), "{w}×{h} 名称回显:{f}");
+            // 模板那一栏把可选项逐行摊开(面板定义的清单,加模板不改渲染)
+            assert!(f.contains("agent skill"), "{w}×{h} 模板可选项:{f}");
+            assert!(f.contains("MCP server"), "{w}×{h} 模板可选项:{f}");
+            assert!(f.contains("TUI 工具"), "{w}×{h} 模板可选项:{f}");
+            assert!(f.contains("[空白]"), "{w}×{h} 空白是默认一路:{f}");
             for ln in frame_display(&app, w, h).lines() {
                 assert!(
                     unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
