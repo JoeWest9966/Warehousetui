@@ -1424,16 +1424,20 @@ fn 配方域建议命令_选中即给出recipe_new_骨架名与out_dir同源() {
     let mut app = bake_app();
     app.capabilities
         .record(Capability::RecipeNew, Probe::Available);
-    app.data_root = Some("/tmp".to_string());
+    app.data_root = Some(crate::testutil::stable_root());
     // 常畅态:新建骨架命令整段在场(详情内层窄,按宽折行是真设计;
     // 旗标一段都不少,拼回来的串与纯函数层逐字相同)
     let s = draw(&app, 110, 30);
     assert!(s.contains("nw recipe new research-desk"), "命令起头:{s}");
     assert!(s.contains("--out-dir"), "--out-dir 填数据仓根:{s}");
     assert!(
-        crate::engine::commands::recipe_new_suggest(Some("research-desk"), Some("/tmp"), true)
-            .expect("三前提齐备")
-            .display
+        crate::engine::commands::recipe_new_suggest(
+            Some("research-desk"),
+            Some(&crate::testutil::stable_root()),
+            true,
+        )
+        .expect("三前提齐备")
+        .display
             == "nw recipe new research-desk --out-dir /tmp",
         "展示串由 argv 拼出(与屏上折行片段同一处真相)"
     );
@@ -2072,7 +2076,7 @@ fn 过滤后选中行不错位_c取用建议命令作用于看得见的那一行
     app.rc_domain = crate::app::Domain::Recipes;
     app.capabilities
         .record(Capability::RecipeBake, Probe::Available);
-    app.data_root = Some("/tmp".into());
+    app.data_root = Some(crate::testutil::stable_root());
     // 不过滤时第 0 条是 research-desk:先钉住过滤前的口径
     let plain = draw(&app, 110, 30);
     assert!(

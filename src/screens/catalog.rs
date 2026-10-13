@@ -8063,7 +8063,7 @@ mod tests {
     ) -> (std::sync::Arc<crate::engine::FakeRunner>, crate::app::App) {
         // 数据仓根钉成临时目录:门禁第一道(根)因此确确过得去,第二道(能力)
         // 由 `tag_cap` 另造。不钉就会随跑测试那台机器的配置漂,门禁测不准。
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         reverse_app(machines, rules, Some(&root), true)
     }
 
@@ -8087,7 +8087,7 @@ mod tests {
                 "tag".into(),
                 "ls".into(),
                 "--root".into(),
-                std::env::temp_dir().to_string_lossy().to_string(),
+                crate::testutil::stable_root(),
             ],
             exit_code: crate::engine::ExitCode::from_number(rc),
             ok: rc == 0,
@@ -8124,7 +8124,7 @@ mod tests {
                 "tag".to_string(),
                 "ls".to_string(),
                 "--root".to_string(),
-                std::env::temp_dir().to_string_lossy().to_string()
+                crate::testutil::stable_root()
             ]],
             "反查复用既有的 tag ls 无参全列(不新增调用形状)"
         );
@@ -8254,7 +8254,7 @@ mod tests {
     /// 条钉的是第二道门真的在管事,不是被第一道顺手挡掉的。
     #[test]
     fn 反查门禁_标签组能力不可用_指路且零引擎调用() {
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         let (runner, mut app) = reverse_app(
             REVERSE_MACHINES,
             &[("tag ls", 0, TAG_LS_GATE3)],
@@ -8288,7 +8288,7 @@ mod tests {
     /// (`frame_display` 只拚符号、不带样式),由渲染侧 `key_line` 的分叉承载。
     #[test]
     fn 反查段_标签组能力缺席_段照画点得中_指路且零调用() {
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         let (runner, mut app) = reverse_app(
             REVERSE_MACHINES,
             &[("tag ls", 0, TAG_LS_GATE3)],
@@ -8385,7 +8385,7 @@ mod tests {
     /// 就是「没有这一行」而不是「门挡掉了」。
     #[test]
     fn 反查边界_订阅册与钥匙册上同一个键不做反查() {
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         for (name, mk) in [
             (
                 "订阅",
@@ -8422,7 +8422,7 @@ mod tests {
     /// 不新增写路径,`tags.json` 因此一个字节都不会被碰。
     #[test]
     fn 反查_复用既有只读调用_队里argv逐字节是tag_ls_root() {
-        let root = std::env::temp_dir().to_string_lossy().to_string();
+        let root = crate::testutil::stable_root();
         let (_r, mut app) = reverse_ready(REVERSE_MACHINES, &[("tag ls", 0, TAG_LS_GATE3)]);
         tap(&mut app, KeyCode::Down);
         反查这台(&mut app);
@@ -8560,7 +8560,7 @@ mod tests {
                 "tag".to_string(),
                 "ls".to_string(),
                 "--root".to_string(),
-                std::env::temp_dir().to_string_lossy().to_string()
+                crate::testutil::stable_root()
             ]),
             "点段与按 Enter 下同一条只读 argv"
         );
@@ -8904,7 +8904,7 @@ mod tests {
         );
         empty.vps_ls =
             Some(serde_json::from_str(r#"{"catalogPath":"/r/vps.json","machines":[]}"#).unwrap());
-        empty.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        empty.data_root = Some(crate::testutil::stable_root());
         assert_eq!(empty.catalog_len(), 0, "确实是空册");
         let ef = crate::testutil::frame_display(&empty, 110, 30);
         let empty_line = ef
@@ -9029,22 +9029,22 @@ mod tests {
                 crate::engine::Probe::Available,
             );
             app.vps_ls = Some(serde_json::from_str(ls).unwrap());
-            app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+            app.data_root = Some(crate::testutil::stable_root());
             app.nw_home = "/nw".into(); // 顶栏 NW_HOME 也钉死(别的测试会写进程环境)
             app
         };
         let mut tag = tag_app(&[("tag ls", 0, TAG_LS_ALL)]);
-        tag.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        tag.data_root = Some(crate::testutil::stable_root());
         tag.nw_home = "/nw".into();
         tap(&mut tag, KeyCode::Char('l'));
         feed(&mut tag);
         let (mut sub, _r) = sub_app(&[("subscription ls", 0, SUB_LS_ALL)]);
-        sub.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        sub.data_root = Some(crate::testutil::stable_root());
         sub.nw_home = "/nw".into();
         tap(&mut sub, KeyCode::Char('l'));
         feed(&mut sub);
         let (mut key, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
-        key.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        key.data_root = Some(crate::testutil::stable_root());
         key.nw_home = "/nw".into();
         tap(&mut key, KeyCode::Char('l'));
         feed(&mut key);
@@ -9959,7 +9959,7 @@ mod tests {
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
         );
-        app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
+        app.data_root = Some(crate::testutil::stable_root());
         // 真刷新一次:入队并回放,让 FakeRunner 记到一条 argv
         tap(&mut app, KeyCode::Char('l'));
         feed(&mut app);
