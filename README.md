@@ -10,9 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/JoeWest9966/Warehousetui/main/install.sh | sh
 ```
 
-> 本仓是**私有仓**:匿名请求这条 raw URL 会 404。带凭证装:
-> `curl -H "Authorization: token $GH_TOKEN" -fsSL https://raw.githubusercontent.com/JoeWest9966/Warehousetui/main/install.sh | sh`
-> (install.sh 随后也要带同一个 token 才能读到 release 资产;`export GH_TOKEN=…` 即可,install.sh 透传环境。)
+> 匿名安装开箱即用。若 GitHub API 限流(未认证 60 次/小时)导致版本探测不稳,可 `export GH_TOKEN=…`(或 `GITHUB_TOKEN`)走 API 资产面——install.sh 检测到 token 会自动切换。
 
 默认装到 `~/.local/bin/nwt`。装完敲 `nwt` 没反应,就是它不在 `PATH`:
 

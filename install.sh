@@ -26,10 +26,9 @@ BIN_NAME="nwt"
 DOWNLOAD_BASE="${NWT_DOWNLOAD_BASE:-https://github.com/$REPO/releases/download}"
 API_BASE="${NWT_API_BASE:-https://api.github.com}"
 
-# ---------- 凭证(私有仓必读)----------
-# 本仓是私有仓:release 资产的 **web 下载面对 token 也返回 404**,匿名更不必说。
-# 唯一可用的下载面是带 token 的 API 资产面,所以有 token 时全部下载走 API。
-# GH_TOKEN / GITHUB_TOKEN 任选其一;都没有 = 匿名(公开仓够用,私有仓会明说)。
+# ---------- 凭证(可选)----------
+# 公开仓匿名即可装:web 下载面免凭证。带上 GH_TOKEN/GITHUB_TOKEN 时走 API
+# 资产面(避开未认证 60 次/小时的 API 限流);都没有 = 匿名,走 web 下载面。
 GH_TOK="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 # gh_curl:统一的 curl 出口。有 token 就带 Authorization 头,没有就裸跑。
@@ -150,7 +149,7 @@ resolve_latest() {
       | sed 's#.*/releases/##; s#^tag/##; s#^download/##; s#/.*##')
   fi
 
-  [ -n "$LATEST_TAG" ] || die "取不到 latest 版本号(API 与重定向两条路都失败了:网络不通、仓库没有 release,或私有仓没有凭证 —— 私有仓请先 export GH_TOKEN=… 或 gh auth login)"
+  [ -n "$LATEST_TAG" ] || die "取不到 latest 版本号(API 与重定向两条路都失败了:网络不通、仓库没有 release,或 API 限流 —— 可 export GH_TOKEN=… / gh auth login 后重试)"
 }
 
 # ---------- 下载与校验 ----------
@@ -170,7 +169,7 @@ asset_id() {
 }
 
 # fetch <url> <落盘路径>:失败即中止(调用方 trap 负责清理)。
-# 有 token(私有仓)时走 API 资产面;匿名(公开仓)走 web 下载面。
+# 有 token 时走 API 资产面(避开 API 限流);匿名走 web 下载面。
 fetch() {
   [ -n "$1" ] && [ -n "$2" ] || die "内部错误:fetch 参数不全"
   name=${1##*/}
@@ -183,7 +182,7 @@ fetch() {
     return 0
   fi
   curl -fsSL --retry 2 -o "$2" "$1" \
-    || die "下载失败: $1(网络问题、版本不存在,或被限流?私有仓请设 GH_TOKEN/GITHUB_TOKEN)"
+    || die "下载失败: $1(网络问题、版本不存在,或 GitHub 限流?设 GH_TOKEN/GITHUB_TOKEN 走 API 面重试)"
 }
 
 # sha256_of <文件>:两种常见实现择一,输出纯哈希
@@ -240,9 +239,9 @@ if [ "$DRY_RUN" = "1" ]; then
   info "  校验     $CK_URL"
   info "  装到     $PREFIX/$BIN_NAME"
   if [ -n "$GH_TOK" ]; then
-    info "  凭证     用 GH_TOKEN/GITHUB_TOKEN 走 API 资产面(私有仓唯一可用面)"
+    info "  凭证     用 GH_TOKEN/GITHUB_TOKEN 走 API 资产面(避开限流)"
   else
-    info "  凭证     匿名(私有仓会失败;export GH_TOKEN=… 后重试)"
+    info "  凭证     匿名(公开仓开箱即用;限流时 export GH_TOKEN=… 走 API)"
   fi
   exit 0
 fi
