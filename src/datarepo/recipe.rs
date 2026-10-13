@@ -886,7 +886,7 @@ metadata:\n  owner: me\nlabels:\n  tier: prod\n";
         let slot = ScratchSlot::stage(&repo(&old_root), &doc, "recipes/research-desk/recipe.yaml")
             .unwrap();
         assert!(old_root.join(slot.rel.as_str()).exists(), "暂存落在旧根");
-        // 清的时候用的是新根(当前设置态),残档仍必须从旧根消失
+        // 此刻设置态若指向新根(调用方拿的是新句柄),slot 仍按暂存时那个根清
         slot.clear();
         assert!(
             !old_root.join(slot.rel.as_str()).exists(),

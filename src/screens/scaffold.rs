@@ -337,7 +337,7 @@ fn next_skill_template(cur: Option<&str>) -> Option<&'static str> {
 }
 
 /// agent skill 正文(#110 首套):「何时触发 / 用法 / 备注」的起步段落。
-fn agent_skill_body(name: &str, _description: &str, triggers: &[String]) -> String {
+fn agent_skill_body(_name: &str, _description: &str, triggers: &[String]) -> String {
     let mut s = String::new();
     s.push_str("\n## 何时触发\n\n");
     if triggers.is_empty() {
@@ -349,7 +349,6 @@ fn agent_skill_body(name: &str, _description: &str, triggers: &[String]) -> Stri
     }
     s.push_str("\n## 用法\n\n(说明这个 skill 做什么、怎么用)\n");
     s.push_str("\n## 备注\n\n- 由 nwt 脚手架生成(agent skill 模板起步);按需增删。\n");
-    let _ = name;
     s
 }
 
