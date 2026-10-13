@@ -30,36 +30,36 @@ use std::path::PathBuf;
 use crate::engine::discover::expand_tilde;
 
 /// 清单文件名(上游 `internal/manifest` 的原子提交点,永远最后写)。
-pub const MANIFEST_FILE: &str = ".nw-manifest";
+pub(crate) const MANIFEST_FILE: &str = ".nw-manifest";
 
 /// 面板唯一认得的清单 schema(上游既有事实;不认识的走契约守卫同款
 /// 「需升级 nw」话术,不按旧形状降级解析)。
-pub const MANIFEST_SCHEMA: &str = "nw/manifest.v1";
+pub(crate) const MANIFEST_SCHEMA: &str = "nw/manifest.v1";
 
 /// 内嵌锁定集 schema(上游 `nw/lock.v1`:bake 的 `data.lock` 与
 /// `$NW_HOME/locks/*.nwlock` 同一个形状)。
-pub const LOCK_SCHEMA: &str = "nw/lock.v1";
+pub(crate) const LOCK_SCHEMA: &str = "nw/lock.v1";
 
 /// 安装根下的派目录(每个派一部,清单住在其根部)。
-pub const PROFILES_DIR: &str = "profiles";
+pub(crate) const PROFILES_DIR: &str = "profiles";
 
 /// 安装根下的锁定集目录(引擎 `ls` 的 locks 域与装配命令交锁段的同一落点)。
-pub const LOCKS_DIR: &str = "locks";
+pub(crate) const LOCKS_DIR: &str = "locks";
 
 /// 安装根下的回收站目录(引擎把换下的旧组件**整目录移进来**,只移不删;
 /// `--allow-prune` 才真删)。上游布局见 `docs/research/nw-cli-surface.md` §4:
 /// `pruned/<时间戳>/` 住在**安装根根部**,不在某个派底下——面板不按派另造一层。
-pub const PRUNED_DIR: &str = "pruned";
+pub(crate) const PRUNED_DIR: &str = "pruned";
 /// 数据仓根的配方目录(每本配方一部,`recipe.yaml` 住在其根部;
 /// 引擎 `ls` 的 recipes 域给的就是 `<根>/recipes/<名>/recipe.yaml`)。
-pub const RECIPES_DIR: &str = "recipes";
+pub(crate) const RECIPES_DIR: &str = "recipes";
 
 /// 配方文件名(上游既有事实;面板只读,永不写)。
-pub const RECIPE_FILE: &str = "recipe.yaml";
+pub(crate) const RECIPE_FILE: &str = "recipe.yaml";
 
 /// 数据仓根的组件目录:skill / 扩展 / 模型配置 / agent 模板都住在这里
 /// (CONTEXT.md 的「组件」词条),每部一个目录、`component.yaml` 住在其根部。
-pub const COMPONENTS_DIR: &str = "components";
+pub(crate) const COMPONENTS_DIR: &str = "components";
 
 /// 安装根不可用的两种原因(与数据仓根的
 /// [`crate::app::DataRootCause`] 同口径:各有各的说法、互不冒充)。
@@ -109,11 +109,50 @@ pub fn lock_carrier(nw_home: &str, lock_id: &str) -> String {
     )
 }
 
+/// `profiles/` 这一层读下来是什么情形:**两种,没有第三种**。
+///
+/// 为什么要单列一种:`profiles/` **不是目录或列不出**与「一个派都还没装」在
+/// 屏上是两件事——后者是一句正常的话,前者是一句指路的话。压成一个空 `Vec`
+/// 会让后者冒充前者(#107 验收:派目录异常降级呈现,规格故事 28 同款纪律)。
+///
+/// `profiles/` **不在**算 [`ProfilesCause::Readable`]:一座从没装配过的安装根
+/// 本来就没有这个目录,它的诚实形状就是「还没有任何派」——把「不在」算成读不到,
+/// 等于每台新机器都在报错。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProfilesCause {
+    /// 读到了(可能一部都没有——那是真的「还没有任何派」)。
+    Readable,
+    /// 读不到,附原因。
+    Unreadable { reason: String },
+}
+
+/// `profiles/` 能不能读(不在 / 不是目录 / 列不出都给出原因)。
+pub fn profiles_cause(nw_home: &str) -> ProfilesCause {
+    let dir = expand_tilde(nw_home).join(PROFILES_DIR);
+    match std::fs::metadata(&dir) {
+        Ok(md) if md.is_dir() => match std::fs::read_dir(&dir) {
+            Ok(_) => ProfilesCause::Readable,
+            Err(e) => ProfilesCause::Unreadable {
+                reason: format!("目录 {} 列不出内容:{e}", dir.display()),
+            },
+        },
+        Ok(_) => ProfilesCause::Unreadable {
+            reason: format!("{} 不是目录", dir.display()),
+        },
+        // 不在 = 从没装配过:诚实形状是「还没有任何派」,不是「读不到」。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProfilesCause::Readable,
+        Err(e) => ProfilesCause::Unreadable {
+            reason: format!("目录 {} 读不出:{e}", dir.display()),
+        },
+    }
+}
+
 /// 枚举安装根下的派目录名(**确定性字典序**)。
 ///
-/// `profiles/` 不在 / 读不通 → 空 `Vec`:调用方照「没有派」呈现。但
-/// **安装根本身不在**要另问 [`home_cause`]——「一个派都还没装」与
-/// 「NW_HOME 指错了」在屏上是两件事,不共用一个空列表(规格故事 28)。
+/// `profiles/` 不在 / 读不通 → 空 `Vec`;**这一层能不能读要另问
+/// [`profiles_cause`]**——「一个派都还没装」与「派目录读不了」在屏上是
+/// 两件事,不共用一个空列表(规格故事 28)。而**安装根本身不在**要问
+/// [`home_cause`],那是第三件事。
 /// 只收目录:落在 `profiles/` 里的散落文件不算一部派。
 pub fn list_profiles(nw_home: &str) -> Vec<String> {
     let dir = expand_tilde(nw_home).join(PROFILES_DIR);
@@ -133,7 +172,7 @@ pub fn list_profiles(nw_home: &str) -> Vec<String> {
 ///
 /// 全仓唯一知道这个形状的地方(#101 收口);屏幕层要显示路径时问这里,
 /// 不自己拼。
-pub fn manifest_path(nw_home: &str, profile: &str) -> PathBuf {
+fn manifest_path(nw_home: &str, profile: &str) -> PathBuf {
     expand_tilde(nw_home)
         .join(PROFILES_DIR)
         .join(profile)
@@ -387,8 +426,11 @@ pub fn list_pruned(nw_home: &str) -> Vec<PrunedEntry> {
         let Ok(inner) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // 只收目录:落在退场时刻里的散落文件不是一部被换下的组件(与
+        // `list_profiles` / `component_dirs` 同一条 `is_dir` 判据)。
         let mut comps: Vec<String> = inner
             .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
         comps.sort();
@@ -856,6 +898,33 @@ mod tests {
     }
 
     #[test]
+    fn profiles读不到_与一个派都没有分开说() {
+        // 从没装配过:profiles/ 不在 → Readable(屏上说「还没有任何派」)
+        let fresh = fixture_home("profiles-missing");
+        assert_eq!(
+            profiles_cause(fresh.to_str().unwrap()),
+            ProfilesCause::Readable,
+            "从没装配过的安装根不该被说成「读不到」"
+        );
+        // profiles/ 是个文件 → Unreadable(屏上给指路,不拿空列表冒充)
+        let broken = fixture_home("profiles-is-file");
+        std::fs::write(broken.join(PROFILES_DIR), "x").unwrap();
+        match profiles_cause(broken.to_str().unwrap()) {
+            ProfilesCause::Unreadable { reason } => {
+                assert!(reason.contains("不是目录"), "原因说清是哪一种:{reason}")
+            }
+            other => panic!("profiles 是文件该报读不到,实得 {other:?}"),
+        }
+        // 正常目录 → Readable
+        let ok = fixture_home("profiles-ok");
+        std::fs::create_dir_all(ok.join(PROFILES_DIR).join("desk")).unwrap();
+        assert_eq!(
+            profiles_cause(ok.to_str().unwrap()),
+            ProfilesCause::Readable
+        );
+    }
+
+    #[test]
     fn 枚举派_没有profiles目录时是空() {
         let home = fixture_home("no-profiles");
         assert!(list_profiles(home.to_str().unwrap()).is_empty());
@@ -1180,6 +1249,28 @@ mod tests {
         std::fs::write(home.join(PRUNED_DIR).join("stray.txt"), "x").unwrap();
         let got = list_pruned(home.to_str().unwrap());
         assert_eq!(got.len(), 3, "散落文件不该混进回收站:{got:?}");
+    }
+
+    #[test]
+    fn 回收站_退场目录里的散落文件也不是组件() {
+        let home = fixture_pruned("pruned-stray-inner");
+        // 组件是**整目录**移进来的(上游事实),落在退场时刻里的散落文件不是
+        // 一部被换下的组件——与 `list_profiles` / `component_dirs` 同一条
+        // `is_dir` 判据(双轴评审发现 8:内层循环原先什么都收)。
+        std::fs::write(
+            home.join(PRUNED_DIR)
+                .join("20261009T030007Z")
+                .join("loose.txt"),
+            "x",
+        )
+        .unwrap();
+        let got = list_pruned(home.to_str().unwrap());
+        assert_eq!(
+            got.iter().filter(|e| e.component == "loose.txt").count(),
+            0,
+            "散落文件混进了回收站:{got:?}"
+        );
+        assert_eq!(got.len(), 3, "其余组件一个不少:{got:?}");
     }
 
     #[test]

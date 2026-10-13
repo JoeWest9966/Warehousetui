@@ -502,7 +502,7 @@ fn push_sheet_rows(inner: Rect, n: usize, per: u16, hits: &mut Vec<(Rect, Target
 
 /// 与 `render_*` 同款的二分分栏:直接用同一个 ratatui `Layout`,几何零分歧
 /// (cassowary 的取整由渲染与命中共用,点哪打哪)。
-fn h_split2(area: Rect, a: u16, b: u16) -> (Rect, Rect) {
+pub(crate) fn h_split2(area: Rect, a: u16, b: u16) -> (Rect, Rect) {
     let cols = ratatui::layout::Layout::horizontal([
         ratatui::layout::Constraint::Percentage(a),
         ratatui::layout::Constraint::Percentage(b),
@@ -604,22 +604,21 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
         }
         return;
     }
-    // 装配历史次级视图(#101):一行一派,命中区与渲染的 `history_list` 同一组
-    // Layout 常量(常畅 55/45 左栏 / 紧凑上下两块的上一块),点行 = 选中
-    // (与 ↑/↓ 同语义,`on_mouse` 的 `SelectRow` 臂按 `as_history` 分派到
-    // `as_history_sel`)。安装根不在时视图整块换成指路,不产命中。
-    // 回收站次级视图(#102):与历史视图同一组 Layout 常量(常畅 55/45 左栏 /
-    // 紧凑上下两块的上一块),点行 = 选中(与 ↑/↓ 同语义)。安装根不在时视图
-    // 整块换成指路,不产命中。
+    // 装配历史 / 回收站两个次级视图(#101 / #102):一行一派(或一条旧组件),
+    // 命中区与渲染的 `history_list` / bin 列表同一组 Layout 常量(常畅 55/45
+    // 左栏 / 紧凑上下两块的上一块),点行 = 选中(与 ↑/↓ 同语义,`on_mouse` 的
+    // `SelectRow` 臂按 `as_bin` / `as_history` 分派到各自的选中槽)。
+    //
+    // **安装根不在时两个视图整块换成指路,于是一个命中区都不产**——渲染在
+    // `render_assemble` 里就此早退(指路屏没有行),命中侧若跟着落到下面锁定集
+    // 选择器的行命中,点指路屏就会悄悄改 `as_sel`(ADR-0005:一处几何真相,
+    // 画得出才点得到)。所以这一道门是 `home_cause()` 为 None 才进列表,否则
+    // 直接 return:指路屏上除了键位行什么都不该可点。
+    if (app.as_bin || app.as_history) && app.home_cause().is_some() {
+        return;
+    }
     if app.as_bin && app.home_cause().is_none() {
-        let list = match class {
-            SizeClass::Comfy => h_split2(area, 55, 45).0,
-            SizeClass::Compact => ratatui::layout::Layout::vertical([
-                ratatui::layout::Constraint::Min(6),
-                ratatui::layout::Constraint::Length(12),
-            ])
-            .split(area)[0],
-        };
+        let list = subview_list(area, class);
         let lst = shrink_border(list);
         row_hits(lst, 0, app.bin_total(), hits, Target::SelectRow);
         return;
@@ -636,14 +635,7 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
         return;
     }
     if app.as_history && app.home_cause().is_none() {
-        let list = match class {
-            SizeClass::Comfy => h_split2(area, 55, 45).0,
-            SizeClass::Compact => ratatui::layout::Layout::vertical([
-                ratatui::layout::Constraint::Min(6),
-                ratatui::layout::Constraint::Length(12),
-            ])
-            .split(area)[0],
-        };
+        let list = subview_list(area, class);
         let lst = shrink_border(list);
         row_hits(lst, 0, app.history_visible().len(), hits, Target::SelectRow);
         return;
@@ -657,6 +649,33 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
         return;
     };
     row_hits(lst, 0, ls.locks.len(), hits, Target::SelectRow);
+}
+
+/// 装配屏两个只读次级视图(装配历史 #101 / 回收站 #102)共用的列表几何。
+///
+/// 渲染侧(`assemble::render_history_*` / `render_bin_*`)与命中侧
+/// (`assemble_hits`)都调它——ADR-0005 的一处几何真相:两份 `match class`
+/// 各写一遍,迟早有一份先改(双轴评审发现 7)。常畅 55/45 取左栏,紧凑取
+/// 上下两块里的上一块。
+/// 紧凑态下两个只读次级视图的上下两块(上一块列表、下一块明细)。
+pub(crate) fn subview_rows(area: Rect) -> (Rect, Rect) {
+    let rows = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Min(6),
+        ratatui::layout::Constraint::Length(12),
+    ])
+    .split(area);
+    (rows[0], rows[1])
+}
+
+/// 装配屏两个只读次级视图(装配历史 #101 / 回收站 #102)共用的列表几何。
+///
+/// 常畅取 55/45 的左栏,紧凑取上下两块的上一块——两块几何都由本函数与
+/// [`subview_rows`] 给出,渲染侧与命中侧都不自己写 Layout。
+pub(crate) fn subview_list(area: Rect, class: SizeClass) -> Rect {
+    match class {
+        SizeClass::Comfy => h_split2(area, 55, 45).0,
+        SizeClass::Compact => subview_rows(area).0,
+    }
 }
 
 /// recheck 屏四块几何(#40):渲染侧 `health::render_recheck` 与命中侧
@@ -1218,6 +1237,32 @@ mod tests {
             Some(Rect::new(14, 3, 34, 1)),
             "选锁定集首行:屏体边框 → 55% 左栏 → 列表边框,首行即数据"
         );
+    }
+
+    /// 安装根不在、装配历史次级视图在场(双轴评审发现 10):渲染整块换成指路,
+    /// 于是**一个行命中区都不该有**——否则点指路屏会悄悄改锁定集选择器的
+    /// `as_sel`(ADR-0005:画得出才点得到,一处几何真相)。
+    #[test]
+    fn hitmap_装配历史_安装根不在_指路屏上不产行命中() {
+        let mut app = test_app();
+        app.screen = Screen::Assemble;
+        app.as_history = true;
+        // 指一座不存在的安装根:历史视图整块走指路
+        app.nw_home = std::env::temp_dir()
+            .join(format!("nwt-layout-nohome-{}", std::process::id()))
+            .display()
+            .to_string();
+        app.load_history();
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let a = area(w, h);
+            let hits = hitmap(a, &app, size_class(a));
+            check(&hits, a, "安装根不在 指路屏");
+            let rows = hits
+                .iter()
+                .filter(|(_, t)| matches!(t, Target::SelectRow(_)))
+                .count();
+            assert_eq!(rows, 0, "{w}×{h} 指路屏上不该有行命中(实得 {rows})");
+        }
     }
 
     #[test]
