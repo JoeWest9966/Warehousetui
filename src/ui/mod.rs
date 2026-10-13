@@ -204,6 +204,10 @@ pub(crate) enum Prep {
     /// 上下文里有分支,帮助对照表因此要能把它布出来(与 `running` 旗同级
     /// 的布场口,不是新浮层)。
     HistoryView,
+    /// 先布成回收站次级视图在场(#102):`Enter` 复制恢复路径与 `r` 重读只在
+    /// 这个上下文里有分支(且要求回收站非空,否则复制动作无从下手),帮助
+    /// 对照表因此要能把它布出来(与 `HistoryView` 同级的布场口)。
+    BinView,
 }
 
 /// 帮助浮层的一行键位:渲染与「帮助↔实现不脱节」测试共用这一份
@@ -329,6 +333,39 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         book: None,
         running: false,
         prep: Prep::HistoryView,
+        code: KeyCode::Char('r'),
+    },
+    HelpRow {
+        key: "p",
+        desc: "装配历史:翻回收站(旧组件只读,再按退出)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('p'),
+    },
+    HelpRow {
+        key: "Enter",
+        desc: "回收站:复制选中条目的完整恢复路径",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::BinView,
+        code: KeyCode::Enter,
+    },
+    HelpRow {
+        key: "r",
+        desc: "回收站:重读回收站快照(显式刷新,不自动跑)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::BinView,
         code: KeyCode::Char('r'),
     },
     HelpRow {

@@ -2221,6 +2221,119 @@ fn 装配历史屏_两档不溢出_列出锁装于收敛() {
     }
 }
 
+// ---- #102 回收站次级视图:只读档案,两档快照,空态不报错 ----
+
+/// fixture 安装根(#102):一部派 + 两个退场时刻的回收站。
+fn bin_home(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nwt-bin-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let prof = dir.join("profiles").join("research-desk");
+    std::fs::create_dir_all(&prof).unwrap();
+    std::fs::write(
+        prof.join(crate::datarepo::MANIFEST_FILE),
+        HISTORY_MANIFEST_OK,
+    )
+    .unwrap();
+    for (stamp, comps) in [
+        (
+            "20261009T030007Z",
+            vec!["retention", "satoshi-localeselector"],
+        ),
+        ("20261012T101500Z", vec!["hyva-ai-tools"]),
+    ] {
+        for c in comps {
+            std::fs::create_dir_all(dir.join(crate::datarepo::PRUNED_DIR).join(stamp).join(c))
+                .unwrap();
+        }
+    }
+    dir
+}
+
+fn bin_app(tag: &str) -> App {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.nw_home = bin_home(tag).display().to_string();
+    app.as_history = true;
+    app.load_history();
+    app.as_bin_from = Some("research-desk".into());
+    app.as_bin = true;
+    app.load_bin();
+    app
+}
+
+/// 两档都在场、无行超宽,且换下的旧组件与其退场时刻都列得出(#102 验收:
+/// 常畅/紧凑两档快照)。
+#[test]
+fn 回收站屏_两档不溢出_列出换下的旧组件() {
+    let app = bin_app("snap");
+    let wide = draw(&app, 110, 30);
+    assert!(wide.contains("hyva-ai-tools"), "组件名:{wide:?}");
+    assert!(wide.contains("20261012T101500Z"), "退场时刻目录名:{wide:?}");
+    assert!(wide.contains("只读"), "注脚标明只读:{wide:?}");
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(s.contains("hyva-ai-tools"), "{w}×{h} 组件名:{s:?}");
+        // 宽度不变量走 frame_display:draw() 的 TestBackend 串带隐藏格注记,
+        // 拿它量宽度会把自己撑爆(既有两档测试同一把尺)
+        for line in crate::testutil::frame_display(&app, w, h).lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line) <= w as usize,
+                "{w}×{h} 有行超宽:{line:?}"
+            );
+        }
+    }
+}
+
+/// 空态(#102 验收:空/缺失目录呈空态不报错):从没换下过组件与 pruned/ 被清过
+/// 是同一件事——没有可恢复的地址。不画错误、不画「读了个空目录」的假列表。
+#[test]
+fn 回收站_pruned不在时呈空态_不报错() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.nw_home = history_home("bin-empty").display().to_string();
+    app.as_history = true;
+    app.load_history();
+    app.as_bin = true;
+    app.load_bin();
+    for (w, h) in [(110u16, 30u16), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(s.contains("回收站是空的"), "{w}×{h} 空态:{s:?}");
+        assert!(!s.contains("读不出"), "{w}×{h} 不报错:{s:?}");
+    }
+}
+
+/// 安装根不在时走指路(#102 与 #101 同一条门):不拿空列表冒充「没有旧组件」。
+#[test]
+fn 回收站_安装根不在走指路_不画空列表() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.nw_home = std::env::temp_dir()
+        .join(format!("nwt-bin-gone-{}", std::process::id()))
+        .display()
+        .to_string();
+    app.as_history = true;
+    app.load_history();
+    app.as_bin = true;
+    app.load_bin();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("NW_HOME 目录不在"), "给指路:{s:?}");
+    assert!(!s.contains("回收站是空的"), "不拿空态冒充:{s:?}");
+}
+
+/// 明细给出选中条目的恢复地址(规格故事 6):退场时刻、组件名、路径前缀都
+/// 在屏上,只读立场也写在屏上。**完整路径不靠细栏塞下**——它在回车那一刻
+/// 原样进日志区(见 `app::tests::回收站_回车复制完整恢复路径进日志区`),
+/// 细栏里按 `clip` 截断(与历史视图的清单落点同口径)。
+#[test]
+fn 回收站_明细给选中条目的恢复地址() {
+    let app = bin_app("detail");
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("pruned/20261009"), "路径前缀在屏:{s:?}");
+    assert!(s.contains("组件"), "组件名在屏:{s:?}");
+    assert!(s.contains("回车复制这条路径"), "复制入口在屏:{s:?}");
+    assert!(s.contains("面板不代恢复"), "只读立场写在屏上:{s:?}");
+}
+
 // ---- #108 引擎版本对照(设置屏次级页) ----
 
 /// 版本对照页的就绪态:注入回放式查询(零网络),本地版本给定。
