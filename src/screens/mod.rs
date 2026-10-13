@@ -13,7 +13,7 @@ mod overview;
 pub(crate) mod recipes;
 mod settings;
 
-pub use assemble::render_assemble;
+pub use assemble::{render_assemble, HistoryRow};
 #[allow(unused_imports)]
 pub use catalog::{
     new_form, new_key_form, new_sub_form, new_tag_form, on_key_form, on_key_key_form,
@@ -64,5 +64,40 @@ pub(crate) fn data_root_signpost(app: &App) -> Vec<ratatui::text::Line<'static>>
             cause.advice(app.data_root.as_deref()),
             p.dim(),
         )),
+    ]
+}
+
+/// 安装根(NW_HOME)三态指路的共用渲染(#101,与 [`data_root_signpost`] 同口径:
+/// 各有各的说法、互不冒充)。
+///
+/// 为什么单有一条:派枚举在安装根不在时天然返回空,而「空」在屏上与
+/// 「一个派都还没装」长得一样——操作者会以为面板读了、只是没数据
+/// (规格故事 28:不出现拼错路径读空目录的假象)。所以可用性单独问一次
+/// (问 [`crate::datarepo`]),不可用走指路,不走空列表。
+pub(crate) fn home_signpost(app: &App) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::text::{Line, Span};
+    let Some(cause) = app.home_cause() else {
+        return Vec::new();
+    };
+    let p = &app.palette;
+    let (title, advice) = match cause {
+        crate::datarepo::HomeCause::Missing => (
+            "NW_HOME 目录不在",
+            format!(
+                "安装根 {} 不在:可能还没装过派,也可能 NW_HOME 指错了。到设置屏按 n 轮换 / i 手填。",
+                app.nw_home
+            ),
+        ),
+        crate::datarepo::HomeCause::Unreadable { reason } => (
+            "NW_HOME 读不了",
+            format!(
+                "安装根 {} 读不了({reason}):不是没装。到设置屏按 n 轮换 / i 手填。",
+                app.nw_home
+            ),
+        ),
+    };
+    vec![
+        Line::from(Span::styled(format!(" ⚠ {title} "), p.warn().bold())),
+        Line::from(Span::styled(advice, p.dim())),
     ]
 }

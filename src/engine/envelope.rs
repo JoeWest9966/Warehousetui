@@ -64,6 +64,35 @@ fn is_known_schema(schema: &str) -> bool {
     KNOWN_SCHEMAS.contains(&schema)
 }
 
+/// 「需升级 nw」五字段证据的**唯一措辞工厂**(envelope 与清单文件共用)。
+///
+/// `subject` 说明这是哪种契约面不认得(envelope / 清单),`rc` 是引擎的
+/// 退出码——读文件没有退出码可报,那一格留空(`None`),不编一个 rc 冒充
+/// 引擎说的(#101:清单的契约守卫与 envelope 的同款,但 rc 这一格不许造假)。
+fn schema_guard_evidence(subject: &str, schema: &str, nw: &str, rc: Option<i32>) -> Evidence {
+    Evidence {
+        code: Some("SCHEMA_UNKNOWN".into()),
+        exit_code: rc,
+        message: format!("需升级 nw:面板不认识{subject} \"{schema}\"(引擎 nw {nw})"),
+        hint: Some("升级 nw 与本面板,使两端 schema 对齐;收到的原文在 details".into()),
+        details: Some(serde_json::json!({
+            "schema": schema,
+            "nw": nw,
+        })),
+    }
+}
+
+/// 清单文件(`.nw-manifest`)的契约守卫证据(spec #94 / 工单 #101)。
+///
+/// 与 [`Envelope::apply_schema_guard`] 同一处措辞工厂、同一种结论:
+/// 清单 schema 也是上游契约面,面板只认
+/// [`crate::datarepo::MANIFEST_SCHEMA`];收到不认识的 schema 时合成
+/// 五字段证据(带收到的原文与引擎版本),**不猜、不按旧形状降级解析**。
+/// 差别只有一处:读文件没有引擎退出码,`exit_code` 留空。
+pub fn manifest_schema_guard(schema: &str, nw: &str) -> Evidence {
+    schema_guard_evidence("清单 schema", schema, nw, None)
+}
+
 /// 错误/警告条目五字段。warnings 的 code 可缺。
 #[derive(Clone, Debug, Deserialize)]
 pub struct Evidence {
@@ -112,19 +141,12 @@ impl Envelope {
         if self.schema_guard.is_some() || self.schema_known() {
             return;
         }
-        self.schema_guard = Some(Evidence {
-            code: Some("SCHEMA_UNKNOWN".into()),
-            exit_code: Some(rc),
-            message: format!(
-                "需升级 nw:面板不认识 envelope schema \"{}\"(引擎 nw {})",
-                self.schema, self.nw
-            ),
-            hint: Some("升级 nw 与本面板,使两端 schema 对齐;收到的原文在 details".into()),
-            details: Some(serde_json::json!({
-                "schema": self.schema,
-                "nw": self.nw,
-            })),
-        });
+        self.schema_guard = Some(schema_guard_evidence(
+            "envelope schema",
+            &self.schema,
+            &self.nw,
+            Some(rc),
+        ));
     }
 
     /// 按 schema 拆出 data 的定型视图;schema 不在认识集合(契约守卫)

@@ -200,6 +200,10 @@ pub(crate) enum Prep {
     Shell,
     /// 先打开帮助浮层再派发(验证 Esc/q 关浮层)。
     HelpOpen,
+    /// 先布成装配历史次级视图在场(#101):`/` 过滤与 `r` 重读只在这个
+    /// 上下文里有分支,帮助对照表因此要能把它布出来(与 `running` 旗同级
+    /// 的布场口,不是新浮层)。
+    HistoryView,
 }
 
 /// 帮助浮层的一行键位:渲染与「帮助↔实现不脱节」测试共用这一份
@@ -293,6 +297,39 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: true,
         prep: Prep::Shell,
         code: KeyCode::Char('x'),
+    },
+    HelpRow {
+        key: "h",
+        desc: "装配:翻装配历史(各派清单存档,只读;再按退出)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('h'),
+    },
+    HelpRow {
+        key: "/",
+        desc: "装配历史:按派过滤(本地筛选,Esc 清词)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('/'),
+    },
+    HelpRow {
+        key: "r",
+        desc: "装配历史:重读存档快照(显式刷新,不自动跑)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('r'),
     },
     HelpRow {
         key: "m",
