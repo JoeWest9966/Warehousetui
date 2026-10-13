@@ -315,9 +315,20 @@ fn render_profiles(frame: &mut Frame, inner: Rect, app: &App) {
     let p = &app.palette;
     // 头部三行:页名 + 读的是哪座安装根 + 本页的只读口径。写在列表外面,
     // 选中行因此永远不会落在一行说明上(说明不该被「选中」)。
+    // NW_HOME 那行按显示宽截断:紧凑态内层 64 列,长路径不折行也不越界
+    // (折行会多占一行,与命中区几何无关但会把列表挤下去)。
     let mut head: Vec<Line> = vec![
         Line::from(Span::styled("多派总览", p.accent())),
-        Line::from(Span::styled(format!("  NW_HOME  {}", app.nw_home), p.dim())),
+        Line::from(Span::styled(
+            format!(
+                "  NW_HOME  {}",
+                crate::screens::recipes::clip(
+                    &app.nw_home,
+                    inner.width.saturating_sub(14) as usize
+                )
+            ),
+            p.dim(),
+        )),
     ];
     // 安装根三态门:不可用时整块换成指路,不画列表(与装配历史同口径)
     let signpost = crate::screens::home_signpost(app);
@@ -332,6 +343,12 @@ fn render_profiles(frame: &mut Frame, inner: Rect, app: &App) {
     )));
     head.push(Line::from(Span::styled(
         "  ↑/↓ 选派 · Enter 跳这一派的装配历史",
+        p.dim(),
+    )));
+    // 回收站的挂点(#102 在途):明写「等 #102 落地」,不画一个假动作段——
+    // 点不到一个当前不存在的动作,比点得到更糟(#67 纪律,ADR-0010 §7 同款)。
+    head.push(Line::from(Span::styled(
+        "  回收站入口等 #102 落地:现在点不到,好过点到一个不存在的动作",
         p.dim(),
     )));
     let Some(rows) = app.mp_rows.as_ref() else {

@@ -4717,6 +4717,43 @@ mod tests {
         );
     }
 
+    /// 常畅/紧凑两档快照(#107 验收):页在场、枚举到的派在场、无行超宽。
+    ///
+    /// 安装根故意给一条长路径:紧凑态内层 64 列,NW_HOME 那一行该按显示宽
+    /// 截断(不折行、不越界)——长路径把末列顶出屏外,是本页唯一会溢宽的
+    /// 地方,所以这一条两档都量。
+    #[test]
+    fn 多派总览页_两档快照不溢宽() {
+        let deep = std::env::temp_dir()
+            .join(format!("nwt-mp-deep-{}", std::process::id()))
+            .join("a-deliberately-long-install-root-name-for-the-clip-check");
+        let _ = std::fs::remove_dir_all(deep.parent().unwrap());
+        std::fs::create_dir_all(deep.join("profiles").join("alpha")).unwrap();
+        let mut app = settings_app();
+        app.splash = false;
+        app.nw_home = deep.display().to_string();
+        app.update(Message::Key(key('p')));
+        assert_eq!(app.mp_rows.as_ref().map(|r| r.len()), Some(1));
+        for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("多派总览"), "{w}×{h} 页名在场:{s}");
+            assert!(s.contains("alpha"), "{w}×{h} 枚举到的派在场:{s}");
+            assert!(s.contains("未查"), "{w}×{h} 未刷新前说未查:{s}");
+            for l in s.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(l) <= usize::from(w),
+                    "{w}×{h} 有行超宽:{l}"
+                );
+            }
+        }
+        // 紧凑态:长路径的尾巴被截断(不越界);常畅态放得下就不截
+        let compact = crate::testutil::frame_display(&app, 66, 50);
+        assert!(
+            !compact.contains("clip-check"),
+            "紧凑态长路径该被截断:{compact}"
+        );
+    }
+
     // ---- #108 引擎版本对照(数据面在 release 模块,这里只钉 App 行为缝) ----
 
     /// 对照用的就绪态:注入回放式查询(零网络),本地版本给定。
