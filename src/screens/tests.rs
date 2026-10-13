@@ -3242,3 +3242,441 @@ fn 打包_浮层吞键_五域键位不受理() {
     );
     std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
 }
+
+// ---- 配方编辑器(spec #95 工单 #113)----
+
+/// 夹具配方:带未知字段(顶层 metadata/labels、组件项 notes/tuning、env 项
+/// purpose)——往返保真的断言基准。
+const RECIPE_SAMPLE: &str = "apiVersion: nw/v1\n\
+kind: recipe\n\
+name: research-desk\n\
+version: 0.2.0\n\
+profile: desk\n\
+runtime:\n  node: 22\n  pi: 0.84\n  chezmoi: 2\n\
+components:\n  - component: scout\n    version: 1.0.0\n    notes: 主检索\n  - component: hello-world\n    source: external\n    tuning:\n      temperature: 0.3\n\
+models:\n  defaults:\n    id: base\n  providers: []\n\
+env:\n  - name: OPENAI_API_KEY\n    required: true\n    usedBy: [openai]\n    purpose: 调大模型\n  - name: OPTIONAL_FLAG\n    required: false\n\
+metadata:\n  owner: me\nlabels:\n  tier: prod\n";
+
+/// ls 回音的 **data 对象**(直接塞 `app.ls`,同 `LS_FULL` 先例):一条带 path
+/// 的配方行(配方编辑器要从数据仓读它)。
+const LS_RECIPE_EDIT: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0","path":"recipes/research-desk/recipe.yaml"}],"components":[],"sources":[],"profiles":[],"locks":[]}"#;
+
+/// 预跑 validate 的两态回音(四态里 fail=0 才放行写回)。
+const VALIDATE_PASS: &str = r#"{"schema":"nw/validate.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"target":"recipe.yaml","results":[{"id":"recipe.schema","status":"pass","message":"形状合"}],"summary":{"total":1,"pass":1,"warn":0,"fail":0,"skip":0}}}"#;
+const VALIDATE_FAIL: &str = r#"{"schema":"nw/validate.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"组件引用不存在","hint":"补上组件或改引用","details":{}}],"warnings":[],"data":{"target":"recipe.yaml","results":[{"id":"recipe.components_exist","status":"fail","message":"组件不存在"}],"summary":{"total":1,"pass":0,"warn":0,"fail":1,"skip":0}}}"#;
+
+/// 夹具数据仓:recipes/research-desk/recipe.yaml(带未知字段)。
+fn recipe_fixture(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nwt-recipe-fix-{}-{}", std::process::id(), tag));
+    let _ = std::fs::remove_dir_all(&dir);
+    let recipe_dir = dir.join("recipes/research-desk");
+    std::fs::create_dir_all(&recipe_dir).unwrap();
+    std::fs::write(recipe_dir.join("recipe.yaml"), RECIPE_SAMPLE).unwrap();
+    dir
+}
+
+/// 编辑器 App:数据仓根指夹具、ls 带配方行、假引擎认 ls + validate 两态。
+fn recipe_app(tag: &str, validate_rc: i32, validate_json: &str) -> (App, Arc<FakeRunner>) {
+    let ls_env = format!(
+        r#"{{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{LS_RECIPE_EDIT}}}"#
+    );
+    let runner = Arc::new(FakeRunner::new(&[
+        ("ls", 0, ls_env.as_str()),
+        ("validate", validate_rc, validate_json),
+    ]));
+    let mut app = App::with_runner(runner.clone());
+    app.screen = Screen::Recipes;
+    app.splash = false;
+    app.rc_domain = crate::app::Domain::Recipes;
+    app.rc_sel = 0;
+    app.data_root = Some(recipe_fixture(tag).to_string_lossy().to_string());
+    app.ls = Some(serde_json::from_str(LS_RECIPE_EDIT).unwrap());
+    (app, runner)
+}
+
+/// 开编辑器(配方域按 e)。
+fn open_editor(app: &mut App) {
+    key(app, crossterm::event::KeyCode::Char('e'));
+    assert!(app.recipe_edit_open(), "配方域按 e 开编辑器");
+}
+
+/// 驱动一组编辑:加组件 retention、删第一个组件 scout、把 OPTIONAL_FLAG 的
+/// required 打开并设默认 on。
+fn drive_edits(app: &mut App) {
+    // 加组件 retention(组件区,a → 键入 → Enter)
+    key(app, crossterm::event::KeyCode::Char('a'));
+    type_str(app, "retention");
+    key(app, crossterm::event::KeyCode::Enter);
+    // 光标回到第一个组件(scout)删掉
+    key(app, crossterm::event::KeyCode::Up);
+    key(app, crossterm::event::KeyCode::Up);
+    key(app, crossterm::event::KeyCode::Char('x'));
+    // 切到 env 区,选中 OPTIONAL_FLAG,开 required、设默认
+    key(app, crossterm::event::KeyCode::Tab);
+    key(app, crossterm::event::KeyCode::Down);
+    key(app, crossterm::event::KeyCode::Char(' '));
+    key(app, crossterm::event::KeyCode::Enter);
+    type_str(app, "on");
+    key(app, crossterm::event::KeyCode::Enter);
+}
+
+/// 喂一次预跑 validate 回音(走 app 的假引擎解析点,与生产同一条路)。
+async fn feed_validate(app: &mut App, runner: &FakeRunner) {
+    let argv = app.queue.last().expect("队尾有 validate argv").clone();
+    let o = runner.run(&argv).await;
+    app.update(Message::Engine(EngineEvent::Finished(Box::new(o))));
+}
+
+/// 规格验收 1:加/删组件槽、改 env 的编辑往返不丢未知字段(fixture 断言)。
+/// 全流程:编辑 → 拟落账+预跑(通过)→ 确认写回,落盘的 recipe.yaml 保留全部
+/// 未知字段(metadata/labels/notes/tuning/purpose),编辑确已生效。
+#[tokio::test]
+async fn 配方编辑_加删槽改env_往返不丢未知字段() {
+    let (mut app, runner) = recipe_app("roundtrip", 0, VALIDATE_PASS);
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    let recipe = root.join("recipes/research-desk/recipe.yaml");
+    let original = std::fs::read_to_string(&recipe).unwrap();
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    assert!(
+        matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::PreRun)
+        ),
+        "s 后进预跑在途"
+    );
+    // 预跑在途:recipe.yaml 仍未动,scratch 已暂存
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "预跑不碰 recipe.yaml"
+    );
+    feed_validate(&mut app, &runner).await;
+    assert!(
+        matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::Review)
+        ),
+        "回音落地进确认态"
+    );
+    // 确认前仍不落盘
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "确认前不落盘"
+    );
+    // Enter 写回
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(
+        matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::Done)
+        ),
+        "确认后写回进结论态"
+    );
+    let written = std::fs::read_to_string(&recipe).unwrap();
+    // 编辑生效
+    assert!(
+        written.contains("component: retention"),
+        "新组件槽在场:{written}"
+    );
+    assert!(!written.contains("component: scout"), "旧槽已删:{written}");
+    assert!(
+        written.contains("component: hello-world"),
+        "存活槽还在:{written}"
+    );
+    assert!(written.contains("default: on"), "env 默认已设:{written}");
+    // 未知字段一个不丢
+    assert!(written.contains("metadata:"), "顶层未知块不丢:{written}");
+    assert!(
+        written.contains("owner: me"),
+        "顶层未知子字段不丢:{written}"
+    );
+    assert!(written.contains("labels:"), "另一未知顶层块不丢:{written}");
+    assert!(
+        written.contains("tuning:"),
+        "存活项里的未知块不丢:{written}"
+    );
+    assert!(
+        written.contains("temperature: 0.3"),
+        "未知块子字段不丢:{written}"
+    );
+    assert!(
+        written.contains("purpose: 调大模型"),
+        "env 未知字段不丢:{written}"
+    );
+    // scratch 已清
+    assert!(
+        !root
+            .join("recipes/research-desk/.nwt-validate.yaml")
+            .exists(),
+        "预跑暂存已清"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 规格验收 2:写回前预跑 argv 与健康屏 validate 同源(同一 `commands::validate_recipe`
+/// 构造函数,即 `["validate","--recipe",<路径>]`;路径指向 scratch 编辑态,因 recipe.yaml
+/// 确认前不动)。
+#[tokio::test]
+async fn 配方编辑_预跑argv与健康屏validate同源() {
+    let (mut app, _runner) = recipe_app("argv", 0, VALIDATE_PASS);
+    let root = app.data_root.clone().unwrap();
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    let argv = app.queue.last().expect("s 入队了 validate").clone();
+    // 与健康屏同一构造函数:commands::validate_recipe(abs)
+    let scratch_abs = format!(
+        "{}/{}",
+        root.trim_end_matches('/'),
+        crate::datarepo::recipe::scratch_rel("recipes/research-desk/recipe.yaml")
+    );
+    assert_eq!(
+        argv,
+        crate::engine::commands::validate_recipe(&scratch_abs),
+        "预跑 argv = commands::validate_recipe(scratch),与健康屏 validate 同源(同一构造函数)"
+    );
+    assert_eq!(argv[0], "validate", "命令族是 validate");
+    assert_eq!(
+        argv[1], "--recipe",
+        "子形状是 --recipe(非 --lock / 非面板自造检查)"
+    );
+}
+
+/// 规格验收 3:预跑失败可放弃写回,数据仓状态不变(recipe.yaml 逐字节原样,scratch 已清)。
+#[tokio::test]
+async fn 配方编辑_预跑失败可放弃_数据仓不变() {
+    let (mut app, runner) = recipe_app("fail", 3, VALIDATE_FAIL);
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    let recipe = root.join("recipes/research-desk/recipe.yaml");
+    let original = std::fs::read_to_string(&recipe).unwrap();
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    feed_validate(&mut app, &runner).await;
+    // 预跑未过:写回闸关着
+    assert!(
+        matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::Review)
+        ),
+        "回音落地进确认态"
+    );
+    assert!(
+        !app.rc_edit_flow.as_ref().unwrap().validate_pass,
+        "预跑未过:validate_pass=false"
+    );
+    // Enter 不被受理(闸关着),Esc 放弃
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "预跑未过时 Enter 不写回"
+    );
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.recipe_edit_open(), "Esc 收起浮层");
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "放弃写回:recipe.yaml 逐字节原样"
+    );
+    assert!(
+        !root
+            .join("recipes/research-desk/.nwt-validate.yaml")
+            .exists(),
+        "放弃也清 scratch"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 规格验收 4:确认前不落盘 —— 拟落账 + 预跑通过都不写;只有 Enter 确认后才写。
+#[tokio::test]
+async fn 配方编辑_确认前一个字节都不落() {
+    let (mut app, runner) = recipe_app("gate", 0, VALIDATE_PASS);
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    let recipe = root.join("recipes/research-desk/recipe.yaml");
+    let original = std::fs::read_to_string(&recipe).unwrap();
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    feed_validate(&mut app, &runner).await;
+    // 预跑通过、拟落账在手,但确认前一个字节都不落
+    assert!(
+        app.rc_edit_flow.as_ref().unwrap().plan.is_some(),
+        "拟落账在手"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "拟落账+预跑通过仍不落盘"
+    );
+    // Esc 返航(未确认):连拟落账一起丢,磁盘干净
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.recipe_edit_open(), "Esc 收起");
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "返航不落盘"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 规格验收 5:常畅 / 紧凑两档快照 —— 表单(组件槽/env 清单 + 键位行)与确认闸
+/// (预跑四态 + 拟落账 + 写回闸)两档都在阵、不炸。
+#[tokio::test]
+async fn 配方编辑_两档快照() {
+    let (mut app, runner) = recipe_app("snap", 0, VALIDATE_PASS);
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    // 表单两档
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("配方编辑器"), "{w}×{h} 标题:{f}");
+        assert!(f.contains("组件槽"), "{w}×{h} 组件槽区:{f}");
+        assert!(f.contains("env 声明"), "{w}×{h} env 区:{f}");
+        assert!(f.contains("拟落账+预跑"), "{w}×{h} 表单键位行:{f}");
+        assert!(!f.contains("panic"), "{w}×{h} 不炸:{f}");
+    }
+    // 进确认闸(预跑通过)
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    feed_validate(&mut app, &runner).await;
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("配方编辑器"), "{w}×{h} 确认闸标题:{f}");
+        assert!(f.contains("预跑"), "{w}×{h} 预跑四态在场:{f}");
+        assert!(f.contains("recipe.yaml"), "{w}×{h} 将写文件在场:{f}");
+        assert!(f.contains("Enter 写回"), "{w}×{h} 写回键位行:{f}");
+        assert!(!f.contains("panic"), "{w}×{h} 不炸:{f}");
+    }
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+}
+
+/// 三道门:数据仓根不就绪 / 装配互斥 / 非配方域都不开浮层(只留指路)。
+#[test]
+fn 配方编辑_三道门_根不就绪装配互斥非配方域() {
+    // 数据仓根未设
+    let (mut app, _r) = recipe_app("gate-root", 0, VALIDATE_PASS);
+    app.data_root = None;
+    key(&mut app, crossterm::event::KeyCode::Char('e'));
+    assert!(!app.recipe_edit_open(), "根未设:指路,不开编辑器");
+    assert!(
+        app.log.iter().any(|l| l.contains("数据仓")),
+        "根未设只留指路:{:?}",
+        app.log
+    );
+    // 装配互斥
+    let (mut app2, _r2) = recipe_app("gate-asm", 0, VALIDATE_PASS);
+    app2.assembling = true;
+    key(&mut app2, crossterm::event::KeyCode::Char('e'));
+    assert!(!app2.recipe_edit_open(), "装配互斥");
+    // 非配方域静默不摆(与 r 只外部源域、p 只组件域同构)
+    let (mut app3, _r3) = recipe_app("gate-dom", 0, VALIDATE_PASS);
+    app3.rc_domain = crate::app::Domain::Components;
+    key(&mut app3, crossterm::event::KeyCode::Char('e'));
+    assert!(!app3.recipe_edit_open(), "非配方域不给编辑器入口");
+    for a in [&app, &app2, &app3] {
+        if let Some(root) = a.data_root.as_ref() {
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+}
+
+/// 浮层在场吞键:五域键位(切域/选行/过滤/建议命令/落点/打包)一个都不受理,
+/// 配方屏原选中行原样不动。
+#[test]
+fn 配方编辑_浮层吞键_五域键位不受理() {
+    let (mut app, _r) = recipe_app("swallow", 0, VALIDATE_PASS);
+    open_editor(&mut app);
+    let before = (app.rc_domain, app.rc_sel, app.rc_filter.clone());
+    for code in [
+        crossterm::event::KeyCode::Char('h'),
+        crossterm::event::KeyCode::Char('l'),
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyCode::Char('/'),
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyCode::Char('p'),
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyCode::Char('j'),
+        crossterm::event::KeyCode::Char('t'),
+    ] {
+        key(&mut app, code);
+    }
+    assert_eq!(
+        (app.rc_domain, app.rc_sel, app.rc_filter.clone()),
+        before,
+        "浮层吞键:五域与壳级切屏/主题状态一个都不改"
+    );
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+}
+
+/// 预跑在途直接返航:迟到的 validate 回音应丢弃,不污染健康屏 hl_result
+/// (按 argv 暂存标记分流,不是靠浮层在不在场)。
+#[tokio::test]
+async fn 配方编辑_预跑在途返航_迟到回音不污染健康屏() {
+    let (mut app, runner) = recipe_app("abandon-inflight", 0, VALIDATE_PASS);
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    // 预跑在途直接返航(scratch 随返航清)
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.recipe_edit_open(), "返航收起编辑器");
+    assert!(app.hl_result.is_none(), "前置:健康屏无结论");
+    // 迟到回音到达:指向 scratch 暂存,应丢弃
+    feed_validate(&mut app, &runner).await;
+    assert!(
+        app.hl_result.is_none(),
+        "编辑器的迟到预跑回音不污染健康屏 hl_result"
+    );
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+}
+
+/// 规格验收的鼠标一侧:确认段点「Enter 写回」段 = 写回(与键盘 Enter 同一条路),
+/// 渲染与命中共源(屏上「Enter 写回」那几个字落进 Activate 命中区,ADR-0005)。
+#[tokio::test]
+async fn 配方编辑_确认闸写回段_点哪打哪() {
+    use ratatui::layout::{Position, Rect};
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let (mut app, runner) = recipe_app(&format!("mouse-{w}x{h}"), 0, VALIDATE_PASS);
+        let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+        let recipe = root.join("recipes/research-desk/recipe.yaml");
+        let original = std::fs::read_to_string(&recipe).unwrap();
+        open_editor(&mut app);
+        drive_edits(&mut app);
+        key(&mut app, crossterm::event::KeyCode::Char('s'));
+        feed_validate(&mut app, &runner).await;
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("Enter 写回"), "{w}×{h} 写回段在场:{f}");
+        app.size = Rect::new(0, 0, w, h);
+        let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+        let act = hits
+            .iter()
+            .find(|(_, t)| *t == crate::layout::Target::Activate)
+            .map(|(r, _)| *r)
+            .expect("确认段产「Enter 写回」命中区");
+        let (row, col) = locate(&f, "Enter 写回");
+        assert!(
+            act.contains(Position::new(col, row)),
+            "{w}×{h} 渲染与命中共源:屏上「Enter 写回」落进 Activate 命中区:{f}"
+        );
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }));
+        assert_ne!(
+            std::fs::read_to_string(&recipe).unwrap(),
+            original,
+            "{w}×{h} 点写回段 = 落盘(与键盘 Enter 同路)"
+        );
+        assert!(matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::Done)
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

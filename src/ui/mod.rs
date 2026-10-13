@@ -405,6 +405,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('p'),
     },
     HelpRow {
+        key: "e",
+        desc: "配方:编辑选中配方(组件槽/env,写回前预跑)",
+        screen: Some(Screen::Recipes),
+        domain: Some(Domain::Recipes),
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('e'),
+    },
+    HelpRow {
         key: "Enter",
         desc: "配方:看选中组件的落点(只读)",
         screen: Some(Screen::Recipes),

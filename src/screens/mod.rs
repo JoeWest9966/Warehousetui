@@ -27,6 +27,7 @@ pub use catalog::{
 pub use health::render_health;
 pub use overview::render_overview;
 pub use recipes::render_recipes;
+pub use recipes::{RecipeEditFlow, RecipeEditInput, RecipeEditPhase, RecipeEditSection};
 pub use scaffold::{on_key_skill_form, ScaffoldFlow, ScaffoldPhase, ScaffoldSpec, SkillForm};
 pub use settings::render_settings;
 
