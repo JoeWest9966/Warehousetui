@@ -218,6 +218,10 @@ pub(crate) enum Prep {
     Shell,
     /// 先打开帮助浮层再派发(验证 Esc/q 关浮层)。
     HelpOpen,
+    /// 先布成装配历史次级视图在场(#101):`/` 过滤与 `r` 重读只在这个
+    /// 上下文里有分支,帮助对照表因此要能把它布出来(与 `running` 旗同级
+    /// 的布场口,不是新浮层)。
+    HistoryView,
 }
 
 /// 帮助浮层的一行键位,同时是**全局命令面板**(#119)的命令清单——
@@ -347,6 +351,39 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('x'),
         modifiers: KeyModifiers::NONE,
         write: false,
+    },
+    HelpRow {
+        key: "h",
+        desc: "装配:翻装配历史(各派清单存档,只读;再按退出)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('h'),
+    },
+    HelpRow {
+        key: "/",
+        desc: "装配历史:按派过滤(本地筛选,Esc 清词)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('/'),
+    },
+    HelpRow {
+        key: "r",
+        desc: "装配历史:重读存档快照(显式刷新,不自动跑)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('r'),
     },
     HelpRow {
         key: "m",
@@ -622,6 +659,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         write: false,
     },
     HelpRow {
+        key: "v",
+        desc: "设置:引擎版本对照(v / Esc 返回,r 重查)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('v'),
+    },
+    HelpRow {
         key: "Esc",
         desc: "返回 / 关闭浮层",
         screen: None,
@@ -690,6 +738,7 @@ pub(crate) const MOUSE_LINES: &[&str] = &[
     "编目册键位行可点段:换册 / 过滤 / 反查(点它 = 按对应键)",
     "取回段只订阅/钥匙册:点它 = 按 g(只收建议命令,不代跑)",
     "删除段四本册可点 = 按 d(先确认;标签册是「d 摘/删」)",
+    "概览警示带点名到期订阅,点那一条 = 跳到订阅册并选中它",
     "捕获默认开的代价:复制要按 Shift",
     "逃逸:--no-mouse / 设置屏 m 关(重启生效)",
 ];
