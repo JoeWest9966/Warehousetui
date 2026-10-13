@@ -154,6 +154,12 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         help_hits(body, &mut hits);
         return hits;
     }
+    // 清单原文浮层(#101):与帮助同款「点任意处关」——弹层优先级,
+    // 底层历史列表不产出命中(点浮层外不误选行)。
+    if app.ah_raw.is_some() {
+        hits.push((body, Target::DismissPopup));
+        return hits;
+    }
     if app.as_confirm {
         ritual_hits(body, class, &mut hits);
         return hits;
@@ -490,6 +496,16 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
     }
     let (cols, _) = h_split2(area, 55, 45);
     let lst = shrink_border(cols);
+    // 装配历史次级视图(#101):点行选中的是历史列表。几何与渲染侧
+    // `assemble::render_history` 同一个 55/45 分栏 + 缩边框——渲染与
+    // 命中共用一份(ADR-0005)。行数是**可见行**(过滤后),索引即
+    // `on_mouse` 的 SelectRow 入参(可见下标,与册内过滤同族)。
+    if app.as_history.is_some() {
+        if !app.as_history.as_ref().unwrap().root_missing {
+            row_hits(lst, 0, app.ah_visible().len(), hits, Target::SelectRow);
+        }
+        return;
+    }
     let Some(ls) = app.ls.as_ref() else {
         return;
     };

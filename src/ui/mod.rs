@@ -167,7 +167,7 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
             "装配中:动作已锁定"
         };
         spans.push(Span::styled(hint, p.dim()));
-    } else if app.home_input || app.data_input || app.rc_filter_on {
+    } else if app.home_input || app.data_input || app.rc_filter_on || app.ah_filter_on {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
     } else if app.reg_state == crate::app::RegState::RepoInput {
@@ -282,6 +282,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+    },
+    HelpRow {
+        key: "h",
+        desc: "装配:开/关装配历史(清单存档)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('h'),
     },
     HelpRow {
         key: "x",

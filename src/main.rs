@@ -5,6 +5,7 @@
 #![allow(dead_code)] // 契约层/屏幕类型按票分期接线,#3–#7 施工期间整体放开;V1 收口时收紧
 
 mod app;
+mod datarepo;
 mod engine;
 mod input;
 pub mod layout;

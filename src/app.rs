@@ -297,6 +297,20 @@ pub struct App {
     /// 在途那一程是被**中止**掉的(#59):进程可能已写了一半,迟到的回音
     /// 按它丢弃——不替引擎宣布成功,也不假装失败。下一次 up 下发时清零。
     pub as_aborted: bool,
+    /// 装配历史次级视图(票 #101,datarepo 读侧):`None` = 不在场
+    /// (屏上还是选锁定集)。在场时装配屏改渲染历史;数据一次打开读
+    /// 一批(`HistoryView`),屏幕层只消费形状、零路径拼接(接缝纪律)。
+    pub as_history: Option<crate::datarepo::HistoryView>,
+    /// 历史列表选中行:**可见行**下标(经 [`App::ah_visible`] 映射回
+    /// 存档行),与编目册册内选中同一族口径(#69)。
+    pub ah_sel: usize,
+    /// 历史过滤输入态(与 `rc_filter_on` 同构:`/` 进,键入归输入态)。
+    pub ah_filter_on: bool,
+    pub ah_filter: String,
+    /// 清单原文浮层(工单 #101 故事 3):`Some` = 在场,内容即原文;
+    /// Esc / 点任意处关。破损态也给原文——解析失败恰恰是最该看
+    /// 原文的时候;缺失态没有原文,不开空浮层。
+    pub ah_raw: Option<String>,
 
     // ---- 健康 ----
     pub hl_mode: HealthMode,
@@ -538,6 +552,11 @@ impl App {
             as_result: None,
             as_running: false,
             as_aborted: false,
+            as_history: None,
+            ah_sel: 0,
+            ah_filter_on: false,
+            ah_filter: String::new(),
+            ah_raw: None,
             hl_mode: HealthMode::Doctor,
             hl_sel: 0,
             hl_result: None,
@@ -792,6 +811,11 @@ impl App {
                 }
                 match self.screen {
                     Screen::Overview => self.ov_sel = i,
+                    // 装配历史视图在场(#101):点行选中的是历史列表,
+                    // 不是锁定集列表——同一块区域两种列表,按视图分流。
+                    Screen::Assemble if self.as_history.is_some() => {
+                        self.ah_sel = i.min(self.ah_visible().len().saturating_sub(1));
+                    }
                     Screen::Assemble => self.as_sel = i,
                     Screen::Health => self.hl_sel = i,
                     Screen::Recipes => self.rc_sel = i,
@@ -867,8 +891,15 @@ impl App {
                 (&mut self.ov_sel, n)
             }
             Screen::Assemble => {
-                let n = self.ls.as_ref().map(|l| l.locks.len()).unwrap_or(0);
-                (&mut self.as_sel, n)
+                // 装配历史视图在场(#101):滚轮移历史选中;锁定集
+                // 列表的滚轮语义原样保留(视图不在场时)。
+                if self.as_history.is_some() {
+                    let n = self.ah_visible().len();
+                    (&mut self.ah_sel, n)
+                } else {
+                    let n = self.ls.as_ref().map(|l| l.locks.len()).unwrap_or(0);
+                    (&mut self.as_sel, n)
+                }
             }
             Screen::Health => {
                 let n = self
@@ -947,6 +978,10 @@ impl App {
         if self.help {
             self.help = false;
             self.help_offset = 0; // 关浮层即归零:重开总是从首行看起
+        } else if self.ah_raw.is_some() {
+            // 清单原文浮层(#101):Esc 与点任意处同路关掉。帮助浮层可能
+            // 叠在它上面(? 随时可开),故 `help` 分支在前。
+            self.ah_raw = None;
         } else if self.as_confirm {
             self.as_confirm = false;
             self.push_log("发射取消");
@@ -1225,6 +1260,13 @@ impl App {
             self.on_key_catalog_filter(k);
             return;
         }
+        // 装配历史过滤输入态(#101):与 rc_filter/catalog_filter 同级的顶层
+        // 输入态(优先于屏键位,但只在历史视图在场时吞键——Esc 收词/清词,
+        // 关视图即退输入态)。
+        if self.ah_filter_on && self.as_history.is_some() {
+            self.on_key_ah_filter(k);
+            return;
+        }
         // 编目册登记两段式(#53):与外部源登记同级的浮层优先级,
         // 骨架件同构(`screens::catalog::RegisterFlow`)。四本册各一道守卫,
         // 受理次序固定(与 `CatalogKind::overlay` 逐字对齐:哪一本的哪道浮层
@@ -1363,6 +1405,13 @@ impl App {
     }
 
     fn key_assemble(&mut self, k: KeyEvent) {
+        // 装配历史次级视图在场(票 #101):视图内键位自成一套——↑/↓ 选行、
+        // `/` 过滤、Enter 看清单原文、Esc/`h` 返航回选锁定集。与选锁定集
+        // 的键位不共一套(那里 Enter 是发射仪式),所以整段早退,不纠缠。
+        if self.as_history.is_some() {
+            self.key_history(k);
+            return;
+        }
         let n = self.ls.as_ref().map(|l| l.locks.len()).unwrap_or(0);
         match k.code {
             KeyCode::Down => {
@@ -1382,7 +1431,139 @@ impl App {
             // 发射前「返航」的既有语义(还没下发,什么都没发生),两个取消
             // 不许共用一键——按下去之前操作者就该知道会停的是什么。
             KeyCode::Char('x') if self.as_running => self.abort_assembling(),
+            // 装配历史(票 #101):又一个次级视图(与选锁定集/发射仪式/在途
+            // 互斥),键位取本屏未占用的 `h`——装配屏原有键只有
+            // ↑/↓/Enter/x。装配在途不开:在途屏面是七步+日志,历史是
+            // 浏览,两个不相干(想看历史等这一程跑完)。
+            KeyCode::Char('h') if !self.assembling => self.open_history(),
             _ => {}
+        }
+    }
+
+    /// 装配历史次级视图的键位(票 #101): Esc/`h` 返航、↑/↓ 选行、
+    /// `/` 进过滤输入态、Enter 看清单原文。原文浮层在场时只收 Esc
+    /// (与反查结果浮层同款:点任意处关由鼠标侧负责)。
+    fn key_history(&mut self, k: KeyEvent) {
+        if self.ah_raw.is_some() {
+            // 原文浮层只收 Esc:其他键一律吞掉(不穿透回列表),与
+            // `vps_reverse_open()` 反查浮层同一纪律。
+            if k.code == KeyCode::Esc {
+                self.ah_raw = None;
+            }
+            return;
+        }
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('h') => self.close_history(),
+            KeyCode::Down => {
+                let n = self.ah_visible().len();
+                if n > 0 {
+                    self.ah_sel = (self.ah_sel + 1) % n;
+                }
+            }
+            KeyCode::Up => {
+                let n = self.ah_visible().len();
+                if n > 0 {
+                    self.ah_sel = (self.ah_sel + n - 1) % n;
+                }
+            }
+            KeyCode::Char('/') => self.ah_filter_on = true,
+            KeyCode::Enter => self.open_manifest_raw(),
+            _ => {}
+        }
+    }
+
+    /// 打开装配历史(票 #101):经 datarepo 读侧读一批存档。安装根不存在
+    /// 也开——「NW_HOME 未设」与「有根没派」是两态,屏上分开说
+    /// (前者指路,后者空列表),不摆一个骗人的空列表。
+    pub fn open_history(&mut self) {
+        self.as_history = Some(crate::datarepo::HistoryView::default());
+        self.ah_sel = 0;
+        self.ah_filter.clear();
+        self.ah_filter_on = false;
+        self.ah_raw = None;
+        self.reload_history();
+    }
+
+    /// 重读历史数据(NW_HOME 切换时同步,票 #101):选中行按新行数钳位,
+    /// 原文浮层关掉(旧根的原文不冒充新根的)。
+    fn reload_history(&mut self) {
+        if self.as_history.is_none() {
+            return;
+        }
+        let root = crate::datarepo::InstallRoot::new(&self.nw_home);
+        let rows = root.archives();
+        let root_missing = !root.exists();
+        if let Some(h) = self.as_history.as_mut() {
+            h.rows = rows;
+            h.root_missing = root_missing;
+        }
+        let n = self.ah_visible().len();
+        self.ah_sel = self.ah_sel.min(n.saturating_sub(1));
+        self.ah_raw = None;
+    }
+
+    /// 关历史返航:视图与它的交互态(选中/过滤/原文)一并清,不留给下次。
+    fn close_history(&mut self) {
+        self.as_history = None;
+        self.ah_sel = 0;
+        self.ah_filter.clear();
+        self.ah_filter_on = false;
+        self.ah_raw = None;
+    }
+
+    /// 历史可见行(过滤后下标进 `as_history.rows`):无关键词时全量;
+    /// 命中按派名包含(大小写不敏感)——与册内过滤同一族口径(#69)。
+    pub fn ah_visible(&self) -> Vec<usize> {
+        let Some(h) = self.as_history.as_ref() else {
+            return Vec::new();
+        };
+        let q = self.ah_filter.trim().to_lowercase();
+        (0..h.rows.len())
+            .filter(|&i| q.is_empty() || h.rows[i].profile.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// Enter 看清单原文(工单 #101 故事 3):经 datarepo 读原文;缺失态
+    /// 没有原文,只留一句指路,不开空浮层。
+    fn open_manifest_raw(&mut self) {
+        let Some(h) = self.as_history.as_ref() else {
+            return;
+        };
+        let Some(&i) = self.ah_visible().get(self.ah_sel) else {
+            return;
+        };
+        let profile = h.rows[i].profile.clone();
+        match crate::datarepo::InstallRoot::new(&self.nw_home).manifest_raw(&profile) {
+            Some(raw) => self.ah_raw = Some(raw),
+            None => self.push_log(format!("{profile} 没有清单原文(缺失态:上一轮没提交完)")),
+        }
+    }
+
+    /// 历史过滤输入态(与 `on_key_rc_filter` 同一形态、同一后果链):
+    /// 键入归通用态机,本函数只接过滤这一条的后果。纯本地:改的只有
+    /// 过滤词一个字符串,不入队、不下发。Enter 收词退输入态;Esc/q
+    /// 取消并清空;每改一个词选中回顶。
+    fn on_key_ah_filter(&mut self, k: KeyEvent) {
+        match input::on_key(&mut self.ah_filter, k) {
+            InputAction::Submit => {
+                self.ah_filter_on = false;
+                self.ah_sel = 0;
+                let n = self.ah_visible().len();
+                self.push_log(format!(
+                    "过滤词「{}」:{} 个派命中(本地筛选,未入队)",
+                    self.ah_filter.trim(),
+                    n
+                ));
+            }
+            InputAction::Cancel => {
+                self.ah_filter_on = false;
+                self.ah_filter.clear();
+                self.ah_sel = 0;
+                self.push_log("已清空过滤词:回到全部派".to_string());
+            }
+            // 每改一个词,选中回顶:行数变了,旧下标可能指向另一条
+            InputAction::Edited => self.ah_sel = 0,
+            InputAction::Ignored => {}
         }
     }
 
@@ -2967,6 +3148,9 @@ impl App {
         }
         self.push_log(format!("NW_HOME 切换到 {next}"));
         self.refresh_ls();
+        // 装配历史视图在场就跟着重读(#101):NW_HOME 变了,旧根的存档不
+        // 冒充新根的。不在场不读——开视图时自然会读一次。
+        self.reload_history();
     }
 
     /// 数据仓根门控:已设且目录存在可读才放行;否则给可区分的原因。
@@ -6279,6 +6463,8 @@ mod tests {
         screen: Screen,
         catalog_kind: crate::screens::CatalogKind,
         ov_sel: usize,
+        as_history: Option<crate::datarepo::HistoryView>,
+        ah_sel: usize,
         as_sel: usize,
         as_confirm: bool,
         hl_mode: HealthMode,
@@ -6308,6 +6494,8 @@ mod tests {
             ov_sel: a.ov_sel,
             as_sel: a.as_sel,
             as_confirm: a.as_confirm,
+            as_history: a.as_history.clone(),
+            ah_sel: a.ah_sel,
             hl_mode: a.hl_mode,
             hl_sel: a.hl_sel,
             rc_domain: a.rc_domain,
@@ -6673,5 +6861,55 @@ mod tests {
                 "README 鼠标小节漏了可点段 `{seg}`(屏上点得中,README 却没写)"
             );
         }
+    }
+
+    /// 装配历史的鼠标接线(#101):点行选中(与 ↑/↓ 同路,可见行下标)、
+    /// 点任意处关清单原文浮层(与 Esc 同路)。命中区几何由
+    /// `layout::assemble_hits` 与渲染共用(ADR-0005),这里只验分派后果。
+    #[test]
+    fn 装配历史_点行选中与点任意处关原文() {
+        let dir = std::env::temp_dir().join(format!("nwt-hist-mouse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let profiles = dir.join("profiles");
+        std::fs::create_dir_all(profiles.join("desk")).unwrap();
+        std::fs::write(
+            profiles.join("desk/.nw-manifest"),
+            r#"{"schema":"nw/manifest.v1","lockId":"desk-1.0.0-8f3a1c2","installedAt":"2026-10-01T12:00:00Z","recipe":{"name":"research-desk","version":"1.0.0"},"profile":"desk","runtime":{"runtimeKey":"node-24.21.0+pi-1.0.0"},"components":[],"convergeHash":"9f2c","engine":{"nw":"0.1.0"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(profiles.join("lab")).unwrap(); // 第二个派:点第二行用
+        let mut app = fake_app();
+        app.screen = Screen::Assemble;
+        app.splash = false;
+        app.size = Rect::new(0, 0, 110, 30);
+        app.nw_home = dir.to_str().unwrap().to_string();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.as_history.is_some(), "h 开历史");
+        // 点第二行(可见行 idx 1):与按一次 ↓ 同后果
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            row.x + 2,
+            row.y,
+        )));
+        assert_eq!(app.ah_sel, 1, "点行选中的是历史列表,不是锁定集");
+        assert_eq!(app.as_sel, 0, "锁定集选中不被历史视图串味");
+        // 回到 desk(就绪态)开原文浮层,点任意处:与 Esc 同路关掉
+        app.update(Message::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.ah_raw.is_some(), "Enter 看原文");
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            60,
+            15,
+        )));
+        assert!(app.ah_raw.is_none(), "点任意处关原文");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

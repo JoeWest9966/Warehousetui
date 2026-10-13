@@ -1996,3 +1996,192 @@ fn 不过滤时渲染与过滤前逐字节相同() {
         "无过滤词时 Esc 空动作"
     );
 }
+
+// ---- 装配历史次级视图(#101,datarepo 读侧)----
+
+/// 就绪派的一份清单(字段集对齐上游 internal/manifest/manifest.go 样本)。
+const MANIFEST_FIXTURE: &str = r#"{"schema":"nw/manifest.v1","lockId":"desk-1.0.0-8f3a1c2","installedAt":"2026-10-01T12:00:00Z","recipe":{"name":"research-desk","version":"1.0.0"},"profile":"desk","runtime":{"runtimeKey":"node-24.21.0+pi-1.0.0","node":"24.21.0","pi":"1.0.0","chezmoi":"2.73.0","nodeSource":"bundled"},"components":[{"name":"retention","version":"0.4.1","landing":{"path":"nw/components/retention","kind":"pi-local-package"}},{"name":"scout","version":"0.2.0","landing":{"path":"nw/components/scout","kind":"pi-local-package"}}],"skeletonFiles":["AGENTS.md"],"configKeys":["/settings/theme"],"env":[{"name":"TAVILY_API_KEY","required":true,"present":true}],"convergeHash":"9f2c","engine":{"nw":"0.1.0","schema":"nw/manifest.v1"}}"#;
+
+/// 一次性 NW_HOME fixture:三个派三种态——desk 就绪、lab 缺失(派目录在、
+/// 清单不在=上一轮没提交完)、broken 破损(清单不是合法 JSON)。
+fn history_fixture(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nwt-hist-{}-{}", std::process::id(), tag));
+    let _ = std::fs::remove_dir_all(&dir);
+    let profiles = dir.join("profiles");
+    std::fs::create_dir_all(profiles.join("desk")).unwrap();
+    std::fs::write(profiles.join("desk/.nw-manifest"), MANIFEST_FIXTURE).unwrap();
+    std::fs::create_dir_all(profiles.join("lab")).unwrap();
+    std::fs::create_dir_all(profiles.join("broken")).unwrap();
+    std::fs::write(profiles.join("broken/.nw-manifest"), "{not json").unwrap();
+    dir
+}
+
+/// 打开装配历史的就绪态 App(NW_HOME 指向 fixture)。
+fn history_app(tag: &str) -> App {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.splash = false;
+    app.nw_home = history_fixture(tag).to_str().unwrap().to_string();
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
+    app
+}
+
+#[test]
+fn 装配历史_三态两档渲染不炸且锚点在阵() {
+    let app = history_app("snap");
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("装配历史"), "{w}×{h} 应有次级视图标题:{f}");
+        for name in ["broken", "desk", "lab"] {
+            assert!(f.contains(name), "{w}×{h} 派 {name} 上表:{f}");
+        }
+        assert!(
+            f.contains("desk-1.0.0-8f3a1c2"),
+            "{w}×{h} 就绪派的锁定集上表:{f}"
+        );
+        assert!(f.contains("清单缺失"), "{w}×{h} 缺失态措辞:{f}");
+        assert!(f.contains("清单破损"), "{w}×{h} 破损态措辞:{f}");
+        assert!(!f.contains("panic"), "{w}×{h} 不炸:{f}");
+    }
+}
+
+#[test]
+fn 装配历史_就绪行详情给全字段_含后续票占位() {
+    let mut app = history_app("detail");
+    // 排序 broken → desk → lab:按一次到 desk(就绪态)看详情
+    key(&mut app, crossterm::event::KeyCode::Down);
+    let f = draw(&app, 110, 30);
+    for anchor in [
+        "desk-1.0.0-8f3a1c2",
+        "2026-10-01T12:00:00Z",
+        "9f2c",
+        "research-desk",
+        "node-24.21.0+pi-1.0.0",
+        "0.1.0",
+    ] {
+        assert!(f.contains(anchor), "详情应有 {anchor}:{f}");
+    }
+    assert!(f.contains("组件 2 条"), "组件条数:{f}");
+    assert!(f.contains("Enter 看清单原文"), "键位说明:{f}");
+    assert!(
+        f.contains("#102") && f.contains("#103"),
+        "回收站/存档日志挂点占位(#101):{f}"
+    );
+}
+
+#[test]
+fn 装配历史_回车看清单原文_esc关() {
+    let mut app = history_app("raw");
+    // 排序 broken → desk → lab:按一次到 desk(就绪态,有原文)
+    key(&mut app, crossterm::event::KeyCode::Down);
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    let raw = app.ah_raw.clone().expect("回车应开原文浮层");
+    assert_eq!(raw, MANIFEST_FIXTURE, "原文即数据仓里那个文件的字节");
+    let f = draw(&app, 110, 30);
+    assert!(f.contains("清单原文"), "浮层标题:{f}");
+    assert!(f.contains("nw/manifest.v1"), "原文内容上屏:{f}");
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(app.ah_raw.is_none(), "Esc 关原文");
+}
+
+#[test]
+fn 装配历史_缺失态回车不开空浮层只留指路() {
+    let mut app = history_app("raw-missing");
+    // 排序 broken → desk → lab:按两次到 lab(缺失态)
+    key(&mut app, crossterm::event::KeyCode::Down);
+    key(&mut app, crossterm::event::KeyCode::Down);
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.ah_raw.is_none(), "缺失态没有原文,不开空浮层");
+    assert!(
+        app.log.iter().any(|l| l.contains("没有清单原文")),
+        "留一句指路:{:?}",
+        app.log.iter().take(3).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn 装配历史_nwhome未设走指路不摆空列表() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.splash = false;
+    // 一个不存在的安装根:未设/不存在态
+    app.nw_home = std::env::temp_dir()
+        .join(format!("nwt-hist-nope-{}", std::process::id()))
+        .to_str()
+        .unwrap()
+        .to_string();
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
+    assert!(app.as_history.as_ref().unwrap().root_missing, "根缺失标记");
+    let f = draw(&app, 110, 30);
+    assert!(f.contains("没有安装根"), "指路标题:{f}");
+    assert!(f.contains("不存在"), "指路带事实:{f}");
+    assert!(
+        !f.contains("一个派都还没有"),
+        "不摆「空列表」那种骗人话:{f}"
+    );
+}
+
+#[test]
+fn 装配历史_有根没派_与未设两态可区分() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.splash = false;
+    let dir = std::env::temp_dir().join(format!("nwt-hist-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    app.nw_home = dir.to_str().unwrap().to_string();
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
+    assert!(!app.as_history.as_ref().unwrap().root_missing, "根在");
+    let f = draw(&app, 110, 30);
+    assert!(f.contains("一个派都还没有"), "有根没派说空列表:{f}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn 装配历史_开关与选中_键位自成一套() {
+    let mut app = history_app("keys");
+    assert!(app.as_history.is_some(), "h 开");
+    key(&mut app, crossterm::event::KeyCode::Down);
+    assert_eq!(app.ah_sel, 1, "↓ 选下一行");
+    key(&mut app, crossterm::event::KeyCode::Up);
+    assert_eq!(app.ah_sel, 0, "↑ 选上一行");
+    // 视图内 Enter 是看原文,不是发射仪式
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.ah_raw.is_some(), "Enter 看原文(选中行=broken,也有原文)");
+    assert!(!app.as_confirm, "不误打开发射仪式");
+    key(&mut app, crossterm::event::KeyCode::Esc); // 关原文
+    key(&mut app, crossterm::event::KeyCode::Esc); // 关视图
+    assert!(app.as_history.is_none(), "Esc 返航");
+    // 关后键位回归选锁定集:h 再开
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
+    assert!(app.as_history.is_some(), "h 再开");
+}
+
+#[test]
+fn 装配历史_过滤本地筛_esc清词() {
+    let mut app = history_app("filter");
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    assert!(app.ah_filter_on, "/ 进过滤输入态");
+    for c in ['d', 'e', 's'] {
+        key(&mut app, crossterm::event::KeyCode::Char(c));
+    }
+    assert_eq!(app.ah_visible().len(), 1, "只命中 desk");
+    key(&mut app, crossterm::event::KeyCode::Enter); // 收词退输入态
+    assert!(!app.ah_filter_on, "Enter 收词");
+    assert_eq!(app.ah_visible().len(), 1, "词仍生效");
+    key(&mut app, crossterm::event::KeyCode::Esc); // 视图内 Esc = 返航(不过滤输入态)
+    assert!(app.as_history.is_none(), "无过滤输入态时 Esc 返航");
+}
+
+#[test]
+fn 装配历史_过滤无命中给可区分空态() {
+    let mut app = history_app("filter-empty");
+    key(&mut app, crossterm::event::KeyCode::Char('/'));
+    for c in ['z', 'z', 'z'] {
+        key(&mut app, crossterm::event::KeyCode::Char(c));
+    }
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.ah_visible().is_empty(), "无命中");
+    let f = draw(&app, 110, 30);
+    assert!(f.contains("没有派命中过滤词"), "空态与真空册可区分:{f}");
+}
