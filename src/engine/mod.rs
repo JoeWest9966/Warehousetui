@@ -14,9 +14,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-pub use capability::{Capability, Gate, Probe, GATE_HINT};
-/// 清单文件的契约守卫证据(#101):与 `Envelope::apply_schema_guard` 同一处
-/// 措辞工厂,供 `datarepo` 读 `.nw-manifest` 时合成同款五字段证据。
+pub use capability::{Capability, EngineFacts, Gate, Probe, ProbeEvidence, GATE_HINT};
 #[allow(unused_imports)]
 pub use envelope::{
     CatalogAddr, CatalogEntryView, CatalogGate, CatalogLogin, CatalogRef, CatalogSheet,
