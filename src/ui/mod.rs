@@ -526,6 +526,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('m'),
     },
     HelpRow {
+        key: "v",
+        desc: "设置:引擎版本对照(v / Esc 返回,r 重查)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('v'),
+    },
+    HelpRow {
         key: "Esc",
         desc: "返回 / 关闭浮层",
         screen: None,

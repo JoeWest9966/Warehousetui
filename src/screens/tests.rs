@@ -1996,3 +1996,131 @@ fn 不过滤时渲染与过滤前逐字节相同() {
         "无过滤词时 Esc 空动作"
     );
 }
+
+// ---- #108 引擎版本对照(设置屏次级页) ----
+
+/// 版本对照页的就绪态:注入回放式查询(零网络),本地版本给定。
+fn version_app(remote: Option<crate::release::ReleaseProbe>) -> App {
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Settings;
+    app.settings_page = crate::app::SettingsPage::Version;
+    app.engine_version = "0.1.0".into();
+    app.release_remote = remote;
+    app.release_lookup = Arc::new(crate::release::FakeReleaseLookup::new(vec![
+        crate::release::ReleaseProbe::Unreachable,
+    ]));
+    app
+}
+
+#[test]
+fn 版本对照页_本地与远端并排_两档不溢出() {
+    let app = version_app(Some(crate::release::ReleaseProbe::Latest("v0.2.0".into())));
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(s.contains("版本对照"), "{w}×{h} 页标题在场:{s}");
+        assert!(s.contains("本地"), "{w}×{h} 本地版本在场:{s}");
+        assert!(s.contains("nw 0.1.0"), "{w}×{h} 本地版本原话:{s}");
+        assert!(s.contains("v0.2.0"), "{w}×{h} 远端 tag 在场:{s}");
+        // 宽度不变量走 frame_display:draw() 的 TestBackend 串带隐藏格注记,
+        // 拿它量宽度会把自己撑爆(既有两档测试同一把尺)
+        let f = crate::testutil::frame_display(&app, w, h);
+        for l in f.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= usize::from(w),
+                "{w}×{h} 行不超宽:{l}"
+            );
+        }
+    }
+}
+
+#[test]
+fn 版本对照页_落后时给升级指路_只标记不治理() {
+    let app = version_app(Some(crate::release::ReleaseProbe::Latest("v0.2.0".into())));
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("落后"), "判词点名落后:{s}");
+    assert!(
+        s.contains(crate::release::upgrade_hint()),
+        "建议命令可复制:{s}"
+    );
+    assert!(s.contains("不代跑"), "执行权留给操作者:{s}");
+    assert!(s.contains("不改退出码"), "只标记不治理的口径:{s}");
+    // 紧凑态(保证最小 66×50)指路两行都放得下
+    let c = draw(&app, 66, 50);
+    assert!(c.contains("落后"), "紧凑态判词在场:{c}");
+    assert!(c.contains("升级指路"), "紧凑态指路在场:{c}");
+}
+
+#[test]
+fn 版本对照页_取不到远端降级为只显示本地_不报错() {
+    for (remote, needle) in [
+        (
+            crate::release::ReleaseProbe::Unreachable,
+            "gh 不在 PATH 或没网",
+        ),
+        (crate::release::ReleaseProbe::Garbage, "回话不是可用 tag"),
+    ] {
+        let app = version_app(Some(remote));
+        for (w, h) in [(110, 30), (66, 50)] {
+            let s = draw(&app, w, h);
+            assert!(s.contains("nw 0.1.0"), "{w}×{h} 本地版本仍在:{s}");
+            assert!(s.contains(needle), "{w}×{h} 取不到的理由在场:{s}");
+            assert!(!s.contains("升级指路"), "{w}×{h} 不给升级指路:{s}");
+            assert!(!s.contains("✗"), "{w}×{h} 不画成错误:{s}");
+        }
+    }
+}
+
+#[test]
+fn 版本对照页_上游tag不是版本号就判比不了_不猜() {
+    // 上游真会发出来的 tag(带前缀 + commit 短 hash)
+    let app = version_app(Some(crate::release::ReleaseProbe::Latest(
+        "bake/research-desk-1.0.0-360ae68".into(),
+    )));
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("比不了"), "判词说比不了:{s}");
+    assert!(s.contains("nw 0.1.0"), "本地原话并排:{s}");
+    assert!(
+        s.contains("bake/research-desk-1.0.0-360ae68"),
+        "远端原话并排:{s}"
+    );
+    assert!(!s.contains("升级指路"), "比不了就不给升级指路:{s}");
+    assert!(!s.contains("一致"), "不冒充已是最新:{s}");
+}
+
+#[test]
+fn 版本对照页_一致与领先都不是问题态() {
+    for (tag, word) in [("v0.1.0", "一致"), ("v0.0.9", "领先")] {
+        let app = version_app(Some(crate::release::ReleaseProbe::Latest(tag.into())));
+        let s = draw(&app, 110, 30);
+        assert!(s.contains(word), "tag {tag} 该判 {word}:{s}");
+        assert!(!s.contains("升级指路"), "{word} 不给升级指路:{s}");
+    }
+}
+
+#[test]
+fn 版本对照页_在途不拿旧结论冒充本次() {
+    let mut app = version_app(None);
+    app.release_probing = true;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("对照中"), "在途明说在对照:{s}");
+    assert!(!s.contains("取不到"), "在途不冒充取不到:{s}");
+}
+
+#[test]
+fn 版本对照页_常驻面板逐字节不动() {
+    // v 翻开的是新页:常驻面板那一棵扁平行向量一个字节都不该变
+    let mut app = version_app(Some(crate::release::ReleaseProbe::Latest("v0.2.0".into())));
+    app.settings_page = crate::app::SettingsPage::Panel;
+    let panel = draw(&app, 110, 30);
+    key(&mut app, crossterm::event::KeyCode::Char('v'));
+    let page = draw(&app, 110, 30);
+    assert_ne!(panel, page, "翻开对照页后画面该变");
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert_eq!(draw(&app, 110, 30), panel, "Esc 返回常驻面板,逐字节相同");
+    // 常驻面板的节与末行都还在原处(版本行 / 能力 / 环境 / config)
+    assert!(panel.contains("版本"), "引擎节的版本行在场");
+    assert!(panel.contains("能力"), "能力节在场");
+    assert!(panel.contains("数据仓根"), "环境节在场");
+    assert!(panel.contains("config 状态"), "配置节末行在场");
+}
