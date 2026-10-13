@@ -15,7 +15,7 @@ use crate::layout::{hitmap, size_class, ScrollDir, Target};
 use crate::screens::{catalog, RegisterSpec};
 use crate::term::{self, ColorCap};
 use crate::theme::{cached_degrade, Palette, ThemeKind};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 /// 五块屏幕,左竖导航的顺序即数组顺序。
@@ -457,6 +457,14 @@ pub struct App {
     pub data_buf: String,
     /// config.toml 解析失败的人话证据;None = 配置健康。
     pub config_error: Option<String>,
+    /// 全局命令面板(#119):`Ctrl+P` 呼出的叠加浮层在不在场。
+    /// **面板是叠加层不是模式劫持**:它只收自己的键(查询键入 / ↑/↓ /
+    /// Enter / Esc / Ctrl+P),其余键一律不拦、照旧路由到当前屏(规格故事 7)。
+    pub cmd_open: bool,
+    /// 命令面板的查询词(模糊匹配的输入面;键入即筛,清空即回到全清单)。
+    pub cmd_query: String,
+    /// 命令面板里选中的结果行(呈示清单的下标,钳在 [0, 命中数))。
+    pub cmd_sel: usize,
     /// 鼠标捕获是否开启(默认开;两联 = 配置 mouse_capture + --no-mouse,
     /// 见 ADR-0005)。term::init 按此门控捕获序列。
     pub mouse_enabled: bool,
@@ -600,6 +608,9 @@ impl App {
             data_buf: String::new(),
             config_error,
             mouse_enabled: true,
+            cmd_open: false,
+            cmd_query: String::new(),
+            cmd_sel: 0,
             size: Rect::default(),
         }
     }
@@ -852,6 +863,9 @@ impl App {
             // 路径逐字同一处),所以鼠标与键盘不可能给出两种后果;无选中行 /
             // 入口门不过 / 装配在途时,复现键盘 `d` 的既有日志,不新造行为。
             Target::CatalogDelete => self.catalog_delete(),
+            // 点命令面板结果行(#119)= 选中那一行(与 ↑/↓ 同义)。执行留给
+            // Enter——鼠标只是叠加,不新增「点一下就开火」这条语义。
+            Target::CmdRow(i) => self.cmd_select(i),
         }
     }
 
@@ -1192,6 +1206,15 @@ impl App {
             self.on_key_confirm(k);
             return;
         }
+        // 全局命令面板(#119):叠加层,只收自己的键。`on_key_cmd` 返回 false =
+        // 这个键不归面板,**不 return**——照旧落进后面的分派(规格故事 7:
+        // 面板是叠加层不是模式劫持,其它按键照旧路由到当前屏)。
+        // 位置在帮助浮层之后:帮助浮层开着时其余键一律不收(它是最外层的
+        // 查询型浮层),所以 Ctrl+P 在帮助浮层开着时无效——与其它未列键位
+        // 同等待遇,不为面板单开一条缝。
+        if self.cmd_open && crate::ui::commands::on_key(self, k) {
+            return;
+        }
         // 反查上浮结果浮层(#70):与帮助浮层同级的**顶层浮层**——它在场时吞键,
         // 只有 Esc 返航;册体键位(↑/↓ / r / d / l / Enter / m)一个都不受理,
         // 机器册原选中行因此原样不动(规格故事 37:返航后回到原选中行)。
@@ -1310,6 +1333,16 @@ impl App {
             KeyCode::Char('j') | KeyCode::Tab => self.next_screen(),
             KeyCode::Char('k') | KeyCode::BackTab => self.prev_screen(),
             KeyCode::Char('t') => self.cycle_theme(),
+            // 全局命令面板(#119):Ctrl+P 呼出 / 再按一次收起。壳级一支,
+            // 与 `?` 帮助同族——所以面板开着时这一支也到得了(面板不收
+            // 带 CONTROL 的字符键)。
+            KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.cmd_open {
+                    self.close_cmd_panel();
+                } else {
+                    self.open_cmd_panel();
+                }
+            }
             _ => self.screen_key(k),
         }
     }
@@ -1321,6 +1354,67 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
             _ => {}
         }
+    }
+
+    // ---- 全局命令面板(#119):一处登记、面板与帮助浮层同源 ----
+
+    /// 呼出命令面板:查询词与选中行都归零(重开总是从全清单首行看起,与帮助
+    /// 浮层 `help_offset` 归零同一条纪律)。
+    pub fn open_cmd_panel(&mut self) {
+        self.cmd_open = true;
+        self.cmd_query.clear();
+        self.cmd_sel = 0;
+        self.push_log("命令面板:键入即筛 · Enter 执行 · ↑/↓ 选 · Esc 关(其余键照旧路由到当前屏)");
+    }
+
+    /// 收起命令面板:状态一并归零,不留半句查询词( Esc / Ctrl+P 再按一次 /
+    /// 鼠标点浮层外都走这一条同路)。
+    pub fn close_cmd_panel(&mut self) {
+        self.cmd_open = false;
+        self.cmd_query.clear();
+        self.cmd_sel = 0;
+    }
+
+    /// 当前面板该呈示的条数(渲染 / 命中 / 执行三处共用 `ui::commands::offered`,
+    /// 此处只把条数递给命中区——`layout` 不反向依赖 `ui`)。
+    pub fn cmd_results_len(&self) -> usize {
+        crate::ui::commands::offered(self).len()
+    }
+
+    /// 面板里移选中(`down` = 向下;到界停住不绕回,与滚轮同口径)。
+    pub fn cmd_move(&mut self, down: bool) {
+        let n = self.cmd_results_len();
+        if n == 0 {
+            self.cmd_sel = 0;
+            return;
+        }
+        self.cmd_sel = if down {
+            (self.cmd_sel + 1).min(n - 1)
+        } else {
+            self.cmd_sel.saturating_sub(1)
+        };
+    }
+
+    /// 鼠标点面板结果行 = 选中那一行(与 ↑/↓ 同义,不执行)。
+    pub fn cmd_select(&mut self, i: usize) {
+        let n = self.cmd_results_len();
+        self.cmd_sel = i.min(n.saturating_sub(1));
+    }
+
+    /// 执行面板里选中的那一条:**复用既有按键分派入口**——把它的代表性键码
+    /// 当一次真实按键重新喂进 [`App::on_key`](等于「搜到并按下那个键」)。
+    /// 面板自己不设第二套动作通道,装配态 / 浮层态的互斥由那条路上的既有闸
+    /// 自然兜住(规格故事 9)。
+    pub fn run_cmd_selected(&mut self) {
+        let offered = crate::ui::commands::offered(self);
+        let Some(row) = offered.get(self.cmd_sel) else {
+            // 空态:没有可执行的那一条。给人话,不炸、不静默无反应。
+            self.push_log("命令面板:没有可执行的命令(换个词试试)");
+            return;
+        };
+        let code = row.code;
+        self.close_cmd_panel();
+        self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
     fn screen_key(&mut self, k: KeyEvent) {
@@ -5948,6 +6042,40 @@ mod tests {
         );
     }
 
+    // ---- #119 全局命令面板:叠加层的鼠标与吞点击纪律 ----
+
+    /// 面板开着时底层一个命中区都不产(浮层吞点击不穿透,README 鼠标小节
+    /// 既有纪律);面板自己的命中区只有结果行,点行 = 选中(与 ↑/↓ 同义),
+    /// **不执行**——执行留给 Enter,免得误点就开火。
+    #[test]
+    fn 命令面板_鼠标点结果行选中_与上下键同义_且吞点击不穿透底层() {
+        let mut app = mouse_ls_app();
+        app.splash = false;
+        app.size = Rect::new(0, 0, 80, 30);
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.cmd_open, "面板先开着");
+        let hits = hitmap(app.size, &app, size_class(app.size));
+        assert!(
+            hits.iter().all(|(_, t)| matches!(t, Target::CmdRow(_))),
+            "面板开着时底层导航/列表不产命中区(吞点击不穿透)"
+        );
+        assert!(!hits.is_empty(), "结果行要有命中区");
+        // 点第二行 = 选中第二行
+        let row2 = hit_target(&app, |t| matches!(t, Target::CmdRow(1)));
+        click(&mut app, row2);
+        assert_eq!(app.cmd_sel, 1, "点行选中");
+        assert!(app.cmd_open, "点行不关面板");
+        // 键盘 ↓ 接着往下走:鼠标与键盘同一条选中态
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.cmd_sel, 2, "↓ 与点行同源");
+    }
+
     // ---- PR #32 评审修复:q 返航 / 旧根回音 / 最小终端登记浮层 ----
 
     #[test]
@@ -6298,6 +6426,9 @@ mod tests {
         pending_editor: bool,
         mouse_enabled: bool,
         nw_home: String,
+        cmd_open: bool,
+        cmd_query: String,
+        cmd_sel: usize,
         log_len: usize,
         queue_len: usize,
     }
@@ -6326,6 +6457,9 @@ mod tests {
             pending_editor: a.pending_editor,
             mouse_enabled: a.mouse_enabled,
             nw_home: a.nw_home.clone(),
+            cmd_open: a.cmd_open,
+            cmd_query: a.cmd_query.clone(),
+            cmd_sel: a.cmd_sel,
             log_len: a.log.len(),
             queue_len: a.queue.len(),
         }
@@ -6389,7 +6523,9 @@ mod tests {
                 app.help = true;
             }
             let before = key_snap(&app);
-            app.update(Message::Key(KeyEvent::new(row.code, KeyModifiers::NONE)));
+            // 修饰键照登记表派发(#119):`Ctrl+P` 这类带 CONTROL 的键位,按
+            // `NONE` 派发在任何屏都没有分支,会让这条测试对已实现的键假红。
+            app.update(Message::Key(KeyEvent::new(row.code, row.modifiers)));
             assert_ne!(
                 key_snap(&app),
                 before,
@@ -6560,6 +6696,16 @@ mod tests {
     /// 凡使状态改变者即「实现里有分支」,断言帮助对照表必有兼容行覆盖它。
     /// 概览 `n/p` 是 ↑/↓ 的别名(帮助只呈现 ↑/↓,同 README 粒度),显式排除免误报。
     /// 新增实现键若忘加进 HELP_ROWS,此测试当场红。
+    ///
+    /// #119 起补 **Ctrl 组合键**一遍:壳级 `Ctrl+P`(命令面板)是第一个带修饰键
+    /// 的键位,裸键清点扫不到它——只扫裸键的话,将来看见「Ctrl+X 有分支但没
+    /// 登记」照样漏。所以这里对每屏再扫一遍 Ctrl+a…z:凡有分支者,必须有一条
+    /// 登记行覆盖它。
+    ///
+    /// 覆盖口径故意宽一档:既有屏键位一律按 `k.code` 匹配、不看修饰键(概览
+    /// `a/h/l/v` 就是),所以 `Ctrl+a` 在概览屏有分支、而登记行写的是裸 `a`。
+    /// 因此这里认「登记行含 `Ctrl+x`」或「含裸 `x`」任一——真正要盯的是
+    /// 「实现里有这个键、登记表里一个字都没有」。
     #[test]
     fn 实现每个屏的按键_帮助都写了() {
         use crate::ui::HELP_ROWS;
@@ -6573,32 +6719,52 @@ mod tests {
         let mut candidates: Vec<KeyCode> =
             (b'a'..=b'z').map(|b| KeyCode::Char(b as char)).collect();
         candidates.extend([KeyCode::Up, KeyCode::Down, KeyCode::Enter, KeyCode::Esc]);
-        for screen in Screen::ALL {
-            for code in &candidates {
-                if aliases.contains(&(screen, *code)) {
-                    continue;
-                }
-                let mut app = help_ready_app(&dir);
-                app.screen = screen;
-                let before = key_snap(&app);
-                app.update(Message::Key(KeyEvent::new(*code, KeyModifiers::NONE)));
-                if key_snap(&app) == before {
-                    continue; // 该屏此键无分支
-                }
-                let token = match code {
-                    KeyCode::Char(c) => c.to_string(),
+        // (键码, 修饰键, 人话令牌, 认得的登记写法)
+        let mut probes: Vec<(KeyCode, KeyModifiers, String, Vec<String>)> = candidates
+            .iter()
+            .map(|c| {
+                let tok = match c {
+                    KeyCode::Char(ch) => ch.to_string(),
                     KeyCode::Up => "↑".to_string(),
                     KeyCode::Down => "↓".to_string(),
                     KeyCode::Enter => "Enter".to_string(),
                     KeyCode::Esc => "Esc".to_string(),
                     _ => unreachable!(),
                 };
+                (*c, KeyModifiers::NONE, tok.clone(), vec![tok])
+            })
+            .collect();
+        for b in b'a'..=b'z' {
+            let c = b as char;
+            probes.push((
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL,
+                format!("Ctrl+{c}"),
+                vec![format!("Ctrl+{c}"), c.to_string()],
+            ));
+        }
+        for screen in Screen::ALL {
+            for (code, mods, token, accepted) in &probes {
+                // 别名排除与修饰键无关:概览 `n/p`(及其 Ctrl 变体,屏键位一律
+                // 按 `k.code` 匹配、不看修饰键)是 ↑/↓ 的别名,帮助只呈现 ↑/↓。
+                if aliases.contains(&(screen, *code)) {
+                    continue;
+                }
+                let mut app = help_ready_app(&dir);
+                app.screen = screen;
+                let before = key_snap(&app);
+                app.update(Message::Key(KeyEvent::new(*code, *mods)));
+                if key_snap(&app) == before {
+                    continue; // 该屏此键无分支
+                }
                 let documented = HELP_ROWS.iter().any(|r| {
                     (r.screen == Some(screen) || r.screen.is_none())
                         && r.key
                             .split(['/', ' '])
                             .filter(|t| !t.is_empty())
-                            .any(|t| t == token)
+                            // 字母键大小写不敏感:登记表写 `Ctrl+P`,这里生成的是
+                            // `Ctrl+p`(crossterm 给小写字母),两处必须对得上。
+                            .any(|t| accepted.iter().any(|a| t.eq_ignore_ascii_case(a)))
                 });
                 assert!(
                     documented,
