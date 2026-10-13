@@ -46,7 +46,7 @@ Status: accepted
 - **引擎仓**：上游 `JoeWest9966/Nous-Warehouse` 与本面板仓都算——面板不写任何代码仓。
 - **NW_HOME**：安装根是目标侧的地盘，写侧不碰。唯一例外是 spec #94 已特批的**日志落盘**（读侧范畴、另一篇已裁的口径，不走写侧接口、不因本篇开任何新口子）。
 - **装配产物**：`.nw-manifest`、派目录、`pruned/` 退场区——装配的写只归 `nw up`（ADR-0003 六类之一）。
-- **机密编目文件**：`keys.json` / `subscriptions.json` / `tags.json` 仍只走引擎命令（ADR-0009 的写入口纪律一字不动）；`catalog.json`（外部源编目）同样只走 `nw source register` 两段式。编目是信任闸，手写即开后门。
+- **机密编目文件**：`keys.json` / `subscriptions.json` / `tags.json` 仍只走引擎命令（ADR-0009 的写入口纪律一字不动）；`catalog.json`（外部源编目）同样只走 `nw source register` 两段式。编目是信任闸，手写即开后门。这五类名字（外加 `vps.json`）在类型层就构造不出相对路径——`RepoRelPath` 的末段禁名单，写侧连一个越界的值都造不出来。
 - **git**：数据仓是 git 托管的，但面板不 commit、不 push、不 init；改动经 PR + 家长审，同编目纪律（「改编目 = 改信任边界，审查规格同改代码」）。
 
 ### 3. 为什么不直接给引擎加命令（显式回答）

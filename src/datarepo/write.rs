@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 /// 数据仓根之下的相对路径:写侧方法唯一的指认形态。
 ///
 /// 构造时挡掉:空值、绝对路径、任一 `..` 段、`/` 与 `\` 混用、NUL、
-/// `~` 开头段(家目录简写,NW_HOME 的默认形状不许以相对路径还魂)。
-/// 于是「写去 NW_HOME」「写去引擎仓」「写去根之外」在类型层就过不来——
+/// `~` 开头段(家目录简写,NW_HOME 的默认形状不许以相对路径还魂),
+/// 以及末段是**编目册文件名**([`RESERVED_FILES`])。于是「写去 NW_HOME」
+/// 「写去引擎仓」「写去根之外」「手写编目」在类型层就过不来——
 /// 调用方连一个越界的值都造不出来,更别说递进写侧方法(ADR-0010 §4)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoRelPath(String);
@@ -44,6 +45,13 @@ impl RepoRelPath {
                 _ => {}
             }
         }
+        // 末段是编目册文件名也不行(编目是信任闸,手写即开后门,ADR-0010 §2)。
+        // 只挡**文件**:目录叫 `catalog.json` 不写这几个文件,不误伤。
+        if let Some(last) = raw.rsplit('/').next() {
+            if RESERVED_FILES.contains(&last) {
+                return Err(RepoRelPathError::ReservedName(last.to_string()));
+            }
+        }
         Ok(Self(raw.to_string()))
     }
 
@@ -52,6 +60,16 @@ impl RepoRelPath {
         &self.0
     }
 }
+
+/// 五本编目册的文件名(上游事实,模块外不出现第二处):编目是信任闸,
+/// 面板写侧一个字节都不碰(ADR-0009 / ADR-0010 §2 第五类)。
+const RESERVED_FILES: [&str; 5] = [
+    "catalog.json",
+    "keys.json",
+    "subscriptions.json",
+    "tags.json",
+    "vps.json",
+];
 
 /// 拟落账的一条:相对路径 + 将写内容(字节级确定)。
 /// 单文件(#112 / #113)与多文件(#110 / #111)同一种形状。
@@ -217,6 +235,8 @@ pub enum RepoRelPathError {
     EmptySegment,
     DotSegment(String),
     TildeSegment,
+    /// 末段是编目册文件名(ADR-0010 §2 第五类):编目是信任闸,手写即开后门。
+    ReservedName(String),
 }
 
 impl RepoRelPathError {
@@ -229,6 +249,9 @@ impl RepoRelPathError {
             Self::EmptySegment => "路径有空段(连续斜杠或首尾斜杠)".into(),
             Self::DotSegment(s) => format!("路径含 `{s}` 段:相对路径不含 `.` / `..`"),
             Self::TildeSegment => "路径含 `~` 开头段:家目录简写不进数据仓相对路径".into(),
+            Self::ReservedName(n) => {
+                format!("`{n}` 是编目册文件:编目只走引擎命令(ADR-0009),面板写侧一个字节都不碰")
+            }
         }
     }
 }
@@ -310,6 +333,45 @@ mod tests {
             RepoRelPath::new("skills/hello/SKILL.md").unwrap().as_str(),
             "skills/hello/SKILL.md"
         );
+    }
+
+    /// ADR-0010 §2 第五类「机密编目文件」在类型层闭合:五本编目册的名字
+    /// 直接构造不出相对路径——手写编目即开后门(编目是信任闸)。
+    #[test]
+    fn 编目册文件名_类型层就拒() {
+        for bad in [
+            "catalog.json",
+            "keys.json",
+            "subscriptions.json",
+            "tags.json",
+            "vps.json",
+            "recipes/catalog.json",
+            "a/b/c/keys.json",
+        ] {
+            let err = RepoRelPath::new(bad).unwrap_err();
+            assert!(
+                matches!(err, RepoRelPathError::ReservedName(_)),
+                "{bad} 应被拒:{err:?}"
+            );
+            assert!(
+                err.why().contains("编目册"),
+                "{bad} 的人话点题:{}",
+                err.why()
+            );
+        }
+        // 同名的**目录**不挡:编目册是文件,目录叫什么都不写这几个文件
+        assert!(RepoRelPath::new("catalog.json/component.yaml").is_ok());
+        // 现有四个消费方写的都不是这些名字(#110 / #111 / #112 / #113)
+        for ok in [
+            "skills/hello/SKILL.md",
+            "extensions/ribbon/package.json",
+            "extensions/ribbon/index.ts",
+            "payloads/web-scout/component.yaml",
+            "recipes/research-desk/recipe.yaml",
+            "recipes/research-desk/.nwt-validate.yaml",
+        ] {
+            assert!(RepoRelPath::new(ok).is_ok(), "{ok} 照常收");
+        }
     }
 
     #[test]
