@@ -1023,6 +1023,186 @@ fn 设置屏能力_无响应回未决不冒充禁用() {
         "未决不给「缺能力」指路(那是禁用组的):{s}"
     );
 }
+
+// ---- #123 设置屏能力清单逐项证据(共享行构造器的紧凑片段密度) ----
+
+/// 探针回音的夹具:stderr 原文进 `stderr_tail`(与 `FakeRunner::with_stderr`
+/// 回放同口径),经 `feed` 走与生产同一条收账路(`on_engine_finished` 的能力
+/// 回音兜底分支)——证据由 #118 的收账处入账,设置屏只读取、不重新采集。
+fn probe_out<S: AsRef<str>>(args: &[S], rc: i32, stderr: &str) -> EngineOutput {
+    EngineOutput {
+        args: args.iter().map(|s| s.as_ref().to_string()).collect(),
+        exit_code: ExitCode::from_number(rc),
+        ok: rc == 0,
+        stderr_tail: stderr.lines().map(|l| l.to_string()).collect(),
+        envelope: None,
+        raw_stdout: String::new(),
+        parse_error: None,
+    }
+}
+
+/// 喂两条真实形态的探针回音:老引擎对 `nw tag` 回「未知子命令」(判禁用)、
+/// 引擎无回答(判未决)。版本在喂之前落真值,证据带的版本字段才不是「探测中」。
+fn evidence_app() -> App {
+    let mut app = fake_app();
+    app.splash = false; // 整帧壳渲染走 splash 优先,先交棒
+    app.screen = Screen::Settings;
+    app.engine_version = "0.1.0".into();
+    feed(&mut app, probe_out(&["tag"], 3, "nw: 未知子命令 \"tag\""));
+    feed(&mut app, probe_out(&["vps"], 0, ""));
+    app
+}
+
+#[test]
+fn 设置屏能力清单_逐项证据_常畅态与紧凑态两档证据字段在场() {
+    let app = evidence_app();
+    // 常畅态 110×30:归组行之下每个非可用项一段紧凑片段,四要素一个不少
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    assert!(
+        s.contains("✗标签 · 探针 nw tag · 引擎原话:nw: 未知子命令 \"tag\" (rc 3)"),
+        "禁用项带齐 入口/探针/原话/rc:{s}"
+    );
+    assert!(
+        s.contains("?vps · 探针 nw vps · 引擎原话:引擎未给出可解回答 (rc 0)"),
+        "未决项同构在场,且如实说没答上:{s}"
+    );
+    // 故事 11:引擎身份三项与逐项证据同屏可对照(「问错二进制」与「引擎旧」
+    // 一眼可分)——二进制/来源/版本就在上一节,逐项不必每项重复一遍。
+    assert!(s.contains("二进制   <fake>"), "问的是哪个引擎同屏在场:{s}");
+    assert!(s.contains("来源     测试注入"), "来源同屏在场:{s}");
+    assert!(s.contains("版本     nw 0.1.0"), "版本同屏在场:{s}");
+    // 可用项不占证据行(八项里只有这两个非可用)
+    assert_eq!(
+        s.lines().filter(|l| l.contains(" · 探针 ")).count(),
+        2,
+        "只有非可用项出证据:{s}"
+    );
+    // 紧凑态 66×50:同两条证据一段一行、不被 clip 咬掉 rc,也不折行
+    let c = crate::testutil::frame_display(&app, 66, 50);
+    for line in [
+        "✗标签 · 探针 nw tag · 引擎原话:nw: 未知子命令 \"tag\" (rc 3)",
+        "?vps · 探针 nw vps · 引擎原话:引擎未给出可解回答 (rc 0)",
+    ] {
+        assert!(c.contains(line), "紧凑态证据整段在场:{c}");
+    }
+    for l in c.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(l) <= 66,
+            "66×50 设置行不溢出:{l}"
+        );
+    }
+    // 紧凑态能力入口行照旧按显示宽度折行,八项一个不许被折掉
+    for cap in crate::engine::Capability::ALL {
+        assert!(c.contains(cap.label()), "紧凑态 {cap:?} 入口不许被折掉:{c}");
+    }
+    // 三档主题下证据可辨(故事 27):同一段证据在真彩 / 256 / 16 三档都整段在场
+    // ——只用既有 palette 档 `dim()`,不引新颜色。
+    for cap in [
+        crate::term::ColorCap::Truecolor,
+        crate::term::ColorCap::C256,
+        crate::term::ColorCap::C16,
+    ] {
+        let mut a = evidence_app();
+        a.cap = cap;
+        a.palette = crate::theme::Palette::resolve(a.theme, cap);
+        let t = crate::testutil::frame_display(&a, 110, 30);
+        assert!(
+            t.contains("✗标签 · 探针 nw tag · 引擎原话:nw: 未知子命令 \"tag\" (rc 3)"),
+            "{cap:?} 档逐项证据可辨:{t}"
+        );
+    }
+}
+
+#[test]
+fn 设置屏能力清单_全部可用_零噪音_不占归组行与证据行() {
+    use crate::engine::{Capability, Probe};
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Settings;
+    for cap in Capability::ALL {
+        app.capabilities.record(cap, Probe::Available, None);
+    }
+    // 全部可用:能力节只剩入口行(八项一排),归组行 / 指路行 / 逐项证据一块都不占
+    // ——健康时零噪音,与 #123 之前逐字节相同(证据只随非可用项出现)。
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    assert!(
+        s.contains("  能力 ✓外部源登记 ✓外部源复核 ✓配方烘焙 ✓配方新建 ✓vps ✓key ✓订阅 ✓标签"),
+        "八项一排:{s}"
+    );
+    assert!(!s.contains("入口禁用"), "全可用不占归组行:{s}");
+    assert!(!s.contains("未决"), "全可用不占归组行:{s}");
+    assert!(!s.contains("缺的是引擎能力"), "全可用不给指路:{s}");
+    assert!(!s.contains("探针 "), "全可用不出证据行:{s}");
+    assert!(!s.contains("引擎原话"), "全可用不出证据行:{s}");
+    let c = crate::testutil::frame_display(&app, 66, 50);
+    assert!(!c.contains("探针 "), "紧凑态同样零证据:{c}");
+}
+
+#[test]
+fn 设置屏能力清单_未决不冒充禁用_逐项证据也不给缺能力指路() {
+    use crate::engine::Capability;
+    let mut app = evidence_app();
+    // 全部探针都无回答:八项全未决,证据照出(每项都「引擎未给出可解回答」)
+    for cap in Capability::ALL {
+        feed(&mut app, probe_out(&cap.probe_args(), 0, ""));
+    }
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    assert!(s.contains("未决"), "无响应回未决:{s}");
+    assert!(!s.contains("入口禁用"), "未决不冒充禁用:{s}");
+    assert!(
+        !s.contains("缺的是引擎能力"),
+        "未决的逐项证据也不碰那句缺能力指路(唯一出处是 GATE_HINT 常量):{s}"
+    );
+    assert!(
+        s.contains("?外部源登记 · 探针 nw source register · 引擎原话:引擎未给出可解回答 (rc 0)"),
+        "未决项证据如实说没答上:{s}"
+    );
+    assert_eq!(
+        s.lines().filter(|l| l.contains(" · 探针 ")).count(),
+        3,
+        "逐项证据整块封顶 3 行(+3 红线):{s}"
+    );
+}
+
+#[test]
+fn 设置屏能力清单_逐项证据_竖向封顶三行_归组行仍点名全部非可用项() {
+    let mut app = evidence_app();
+    // 五项非可用(tag/key/subscription/recipe new 禁用 + vps 未决),全部带证据:
+    // 逐项证据整块封顶 3 行,第 4 项起不占设置屏行——归组行仍把五项全点名,
+    // 同一条结论句连同证据已进最近日志(#118 收账处)。
+    feed(&mut app, probe_out(&["key"], 3, "nw: 未知子命令 \"key\""));
+    feed(
+        &mut app,
+        probe_out(&["subscription"], 3, "nw: 未知子命令 \"subscription\""),
+    );
+    feed(
+        &mut app,
+        probe_out(&["recipe", "new"], 3, "nw: 未知子命令 \"new\""),
+    );
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    let ev_lines: Vec<&str> = s.lines().filter(|l| l.contains(" · 探针 ")).collect();
+    assert_eq!(ev_lines.len(), 3, "逐项证据封顶 3 行:{s}");
+    // 归组行不受封顶影响:五项非可用全在里面(互不冒充两组)
+    assert!(
+        s.contains("入口禁用:配方新建、key、订阅、标签"),
+        "禁用组点名四项:{s}"
+    );
+    assert!(s.contains("未决:"), "未决组在场:{s}");
+    // 顺序即入口清单顺序:前三位是配方新建 / vps / key,订阅与标签让位给 +3 红线
+    assert!(
+        ev_lines[0].contains("✗配方新建"),
+        "首项即清单中首个非可用项:{ev_lines:?}"
+    );
+    assert!(
+        ev_lines[1].contains("?vps"),
+        "次项是未决的 vps:{ev_lines:?}"
+    );
+    assert!(ev_lines[2].contains("✗key"), "第三项是 key:{ev_lines:?}");
+    let ev_all = ev_lines.join("\n");
+    assert!(!ev_all.contains("订阅"), "第 4 项起不占设置屏行:{ev_all}");
+    assert!(!ev_all.contains("标签"), "第 5 项起不占设置屏行:{ev_all}");
+}
+
 // ---- #37 外部源详情:类别 / 仓库链接 / 扫出的条目(只读,以引擎输出为准) ----
 
 /// 两条外部源记录:第一条字段齐全(多级类别 + 两条条目),
