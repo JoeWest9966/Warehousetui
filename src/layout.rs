@@ -94,6 +94,13 @@ pub enum Target {
     /// 边界(输入态只管键入,见 `CatalogGet` 那条同口径注记),不是本段特有的
     /// 分叉。
     CatalogDelete,
+    /// 点反查跳转浮层里的第 `n` 条命中 = 在浮层里选中它并回车直跳(#120)。
+    /// 与键盘 `↑/↓` + `Enter` 完全同路——矩形由
+    /// [`catalog::tag_jump_row_rect`](crate::screens::catalog::tag_jump_row_rect)
+    /// 与渲染同源产出(渲染把第 n 条画在同一个矩形里),点哪打哪(ADR-0005)。
+    /// **只标签册、且反查跳转浮层在场时**由 `catalog_hits` 产出;浮层外的
+    /// 正文是「点任意处关闭」(`DismissPopup`),与 Esc 同路。
+    TagJump(usize),
 }
 
 /// 滚动方向(类型形状钉死在 spec #15)。
@@ -288,6 +295,24 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     // 「点外面没反应」,与规格原文相反。整块正文即浮层自己的命中区,底层
     // 不另产——「只有浮层自己的命中」这条弹层纪律不变。
     if app.vps_reverse_open() {
+        if inner.width > 0 && inner.height > 0 {
+            hits.push((inner, Target::DismissPopup));
+        }
+        return;
+    }
+    // 反查跳转浮层(#120):标签册那一层薄浮层,弹层优先级与反查上浮同级
+    // (本屏最高)。命中条目行给 `TagJump(i)`(点它 = 选中并直跳,与
+    // `↑/↓` + `Enter` 同路);浮层外的正文整块是「点任意处关闭」,与 Esc 同路
+    // ——规格钉的是「Esc 或点浮层外关闭」,只给浮层矩形会变成「点外面没
+    // 反应」,与反查上浮那一层的口径相反。
+    if app.tag_jump_open() {
+        if let Some(popup) = crate::screens::catalog::tag_jump_popup_rect(inner, app) {
+            for i in 0..app.tag_jump.hits().len() {
+                if let Some(r) = crate::screens::catalog::tag_jump_row_rect(popup, i) {
+                    hits.push((r, Target::TagJump(i)));
+                }
+            }
+        }
         if inner.width > 0 && inner.height > 0 {
             hits.push((inner, Target::DismissPopup));
         }
