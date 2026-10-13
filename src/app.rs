@@ -5883,7 +5883,12 @@ mod tests {
             app.log[0]
         );
         let s = crate::testutil::frame_display(&app, 110, 30);
-        assert!(s.contains("登记禁用"), "外部源域列表行可见禁用指路:{s}");
+        // #124 起列表尾行走共享行构造器的单行指路形态(⚠ 外部源登记 入口禁用:
+        // …),不再自己拼「登记禁用」——同一处措辞真相,且未决态不会被画成禁用。
+        assert!(
+            s.contains("⚠ 外部源登记 入口禁用"),
+            "外部源域列表行可见禁用指路:{s}"
+        );
         assert!(app.queue.is_empty(), "缺能力不下发命令");
     }
 

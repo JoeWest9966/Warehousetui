@@ -1296,20 +1296,27 @@ fn 外部源域为空_给指向登记的指路_不摆空框() {
     let mut app = sources_app(
         r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}"#,
     );
-    // 探测未回 / 缺能力:给能力指路,不冒充「可以登记」
+    // 探测未回 / 缺能力:给能力指路,不冒充「可以登记」。
+    // #124 起这一句走共享行构造器的单行指路形态(⚠ 外部源登记 入口禁用:…),
+    // 不再自己拼「登记禁用」——同一处措辞真相,且**未决态不会再被画成禁用**。
     let s = draw(&app, 110, 30);
     assert!(s.contains("外部源域为空"), "空态有事实一句:{s}");
-    assert!(s.contains("登记禁用"), "缺能力时不给键位:{s}");
+    // 夹具没喂过探针 = **未决**(探测失败),不是真禁用。老写法无论哪一态
+    // 都渲染「缺的是引擎能力…升级所配 nw」——那正是对未决的冒充;#124 收口
+    // 后未决走自己的话术,这条断言从此钉住「未决不演禁用」。
+    assert!(s.contains("外部源登记 未决"), "未决不冒充禁用:{s}");
+    assert!(!s.contains("缺的是引擎能力"), "未决不给缺能力指路:{s}");
+    assert!(!s.contains("升级所配 nw"), "未决不给误导性下一步:{s}");
     assert!(
-        s.contains("缺的是引擎能力,不是面板坏了"),
-        "指路说清缺的是引擎能力:{s}"
+        !s.contains("按 r 登记新外部源"),
+        "未决不冒充「可以登记」:{s}"
     );
     // 引擎确有 source register 能力:空态给登记键位
     app.capabilities
         .record(Capability::SourceRegister, Probe::Available, None);
     let s2 = draw(&app, 110, 30);
     assert!(s2.contains("按 r 登记新外部源"), "有能力时给键位指路:{s2}");
-    assert!(!s2.contains("登记禁用"), "两态互不冒充:{s2}");
+    assert!(!s2.contains("⚠ 外部源登记"), "两态互不冒充:{s2}");
 }
 
 /// 66×50(保证最小)紧凑态:条目名字与路径**都**完整可见——逐行画,不是折行;

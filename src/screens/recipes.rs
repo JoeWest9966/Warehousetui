@@ -123,15 +123,20 @@ fn domain_count(app: &App, d: Domain) -> usize {
 /// 登记入口提示(#30):可用给键位、缺能力给指路 —— 外部源域的**列表尾行**
 /// 与**详情空态指路**共用这一句,两种呈现里同一概念只有一个拼写。
 /// 根不可用时不进此路(整域已走上方 signpost)。
+///
+/// #124 起这一句走 [`App::reg_gate_hint`](共享行构造器的单行指路形态),
+/// 不再自己拼 `GATE_HINT`。**这不只是收口**:`reg_entry_enabled()` 对
+/// `Unavailable` 与 `Unknown` 一律返回 false,而老写法无论哪一态都渲染
+/// 「⚠ 登记禁用:缺的是引擎能力…升级所配 nw」——探测未决(引擎这一跑根本没
+/// 答上)被画成了真禁用,正是规格要消灭的冒充(spec #90 故事 2/22/23)。
+/// `reg_gate_hint()` 按三态分措辞:未决走「修引擎发现后重启重探」,且带
+/// 探针证据带。
 fn register_entry_hint(app: &App) -> Line<'static> {
     let p = &app.palette;
     if app.reg_entry_enabled() {
         Line::from(Span::styled("  按 r 登记新外部源…", p.info()))
     } else {
-        Line::from(Span::styled(
-            format!("  ⚠ 登记禁用:{}", crate::engine::capability::GATE_HINT),
-            p.warn(),
-        ))
+        Line::from(Span::styled(format!("  {}", app.reg_gate_hint()), p.warn()))
     }
 }
 
