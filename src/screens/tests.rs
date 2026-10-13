@@ -952,12 +952,14 @@ fn 设置屏能力清单_缺能力禁用并指路_紧凑态不截断() {
     // 老引擎(没有 tag 命令组)对 `nw tag` 的回放:stderr 人话「未知子命令」
     let runner = FakeRunner::with_stderr(&[("tag", 3, "", "nw: 未知子命令 \"tag\"")]);
     let mut app = App::with_runner(std::sync::Arc::new(runner));
-    app.capabilities.record(Capability::Tag, Probe::Unavailable);
-    app.capabilities.record(Capability::Vps, Probe::Unavailable);
     app.capabilities
-        .record(Capability::SourceRegister, Probe::Available);
+        .record(Capability::Tag, Probe::Unavailable, None);
     app.capabilities
-        .record(Capability::SourceRecheck, Probe::Available);
+        .record(Capability::Vps, Probe::Unavailable, None);
+    app.capabilities
+        .record(Capability::SourceRegister, Probe::Available, None);
+    app.capabilities
+        .record(Capability::SourceRecheck, Probe::Available, None);
     app.screen = Screen::Settings;
     // 常畅态:禁用组 + 指路句都在
     let s = draw(&app, 110, 30);
@@ -977,7 +979,7 @@ fn 设置屏能力清单_recipe_new_与烘焙同组不同项_紧凑态不截断(
     app.splash = false;
     app.screen = Screen::Settings;
     for cap in Capability::ALL {
-        app.capabilities.record(cap, Probe::Available);
+        app.capabilities.record(cap, Probe::Available, None);
     }
     // 常畅态:八项能力一排(顺序 = 入口清单),recipe new 与 bake 并列(同组不同项)
     let s = crate::testutil::frame_display(&app, 110, 30);
@@ -1010,7 +1012,7 @@ fn 设置屏能力_无响应回未决不冒充禁用() {
     let runner = FakeRunner::with_stderr(&[("tag", -1, "", "")]);
     let mut app = App::with_runner(std::sync::Arc::new(runner));
     for cap in Capability::ALL {
-        app.capabilities.record(cap, Probe::Unknown);
+        app.capabilities.record(cap, Probe::Unknown, None);
     }
     app.screen = Screen::Settings;
     let s = draw(&app, 110, 30);
@@ -1124,7 +1126,7 @@ fn 外部源域为空_给指向登记的指路_不摆空框() {
     );
     // 引擎确有 source register 能力:空态给登记键位
     app.capabilities
-        .record(Capability::SourceRegister, Probe::Available);
+        .record(Capability::SourceRegister, Probe::Available, None);
     let s2 = draw(&app, 110, 30);
     assert!(s2.contains("按 r 登记新外部源"), "有能力时给键位指路:{s2}");
     assert!(!s2.contains("登记禁用"), "两态互不冒充:{s2}");
@@ -1175,7 +1177,7 @@ fn bake_app() -> App {
         .unwrap(),
     );
     app.capabilities
-        .record(Capability::RecipeBake, Probe::Available);
+        .record(Capability::RecipeBake, Probe::Available, None);
     app
 }
 
@@ -1247,14 +1249,14 @@ fn 配方域建议命令_引擎无bake能力给指路_不冒充面板故障() {
     use crate::engine::{Capability, Probe};
     let mut app = bake_app();
     app.capabilities
-        .record(Capability::RecipeBake, Probe::Unavailable);
+        .record(Capability::RecipeBake, Probe::Unavailable, None);
     let s = draw(&app, 110, 30);
     assert!(s.contains("引擎缺 recipe bake 能力"), "缺能力指路:{s}");
     assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
     assert!(!s.contains("nw recipe bake"), "缺能力不给半条命令:{s}");
     // 未决(探测失败)同样不给命令,且说法与禁用可区分
     app.capabilities
-        .record(Capability::RecipeBake, Probe::Unknown);
+        .record(Capability::RecipeBake, Probe::Unknown, None);
     let s2 = draw(&app, 110, 30);
     assert!(!s2.contains("nw recipe bake"), "未决不给命令:{s2}");
     assert!(
@@ -1270,7 +1272,7 @@ fn 配方域建议命令_选中即给出recipe_new_骨架名与out_dir同源() {
     use crate::engine::{Capability, Probe};
     let mut app = bake_app();
     app.capabilities
-        .record(Capability::RecipeNew, Probe::Available);
+        .record(Capability::RecipeNew, Probe::Available, None);
     app.data_root = Some("/tmp".to_string());
     // 常畅态:新建骨架命令整段在场(详情内层窄,按宽折行是真设计;
     // 旗标一段都不少,拼回来的串与纯函数层逐字相同)
@@ -1328,14 +1330,14 @@ fn 配方域建议命令_recipe_new_三种缺前提各有可区分指路_不给�
     // 引擎没有 recipe new 能力:指路点名 recipe new,不拿 bake 的话冒充
     let mut app = bake_app();
     app.capabilities
-        .record(Capability::RecipeNew, Probe::Unavailable);
+        .record(Capability::RecipeNew, Probe::Unavailable, None);
     let s = draw(&app, 110, 30);
     assert!(s.contains("引擎缺 recipe new 能力"), "缺能力指路:{s}");
     assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
     assert!(!s.contains("nw recipe new"), "缺能力不给半条命令:{s}");
     // 未决(探测失败)同样不给命令,且与禁用同走缺能力指路
     app.capabilities
-        .record(Capability::RecipeNew, Probe::Unknown);
+        .record(Capability::RecipeNew, Probe::Unknown, None);
     let s3 = draw(&app, 110, 30);
     assert!(!s3.contains("nw recipe new"), "未决不给命令:{s3}");
     assert!(
@@ -1345,7 +1347,7 @@ fn 配方域建议命令_recipe_new_三种缺前提各有可区分指路_不给�
     // 未设数据仓根:--out-dir 指不到本地仓,同样不给半条命令
     let mut app = bake_app();
     app.capabilities
-        .record(Capability::RecipeNew, Probe::Available);
+        .record(Capability::RecipeNew, Probe::Available, None);
     app.data_root = None;
     let s2 = draw(&app, 110, 30);
     assert!(s2.contains("数据仓根未设"), "未设根指路:{s2}");
@@ -1527,7 +1529,7 @@ fn recheck_app() -> App {
     app.hl_mode = HealthMode::Recheck;
     app.ls = Some(serde_json::from_str(ls).unwrap());
     app.capabilities
-        .record(Capability::SourceRecheck, Probe::Available);
+        .record(Capability::SourceRecheck, Probe::Available, None);
     app
 }
 
@@ -1606,7 +1608,7 @@ fn 外部源漂移_三种缺前提各有可区分指路() {
     use crate::engine::{Capability, Probe};
     let mut app = recheck_app();
     app.capabilities
-        .record(Capability::SourceRecheck, Probe::Unavailable);
+        .record(Capability::SourceRecheck, Probe::Unavailable, None);
     let s = draw(&app, 110, 30);
     assert!(s.contains("引擎缺 source 能力"), "缺能力指路:{s}");
     assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
@@ -1659,6 +1661,7 @@ async fn 外部源漂移_不认识的schema走需升级_不按旧形状猜() {
     app.capabilities.record(
         crate::engine::Capability::SourceRecheck,
         crate::engine::Probe::Available,
+        None,
     );
     app.ls = Some(
         serde_json::from_str(
@@ -1918,7 +1921,7 @@ fn 过滤后选中行不错位_c取用建议命令作用于看得见的那一行
     let mut app = five_app();
     app.rc_domain = crate::app::Domain::Recipes;
     app.capabilities
-        .record(Capability::RecipeBake, Probe::Available);
+        .record(Capability::RecipeBake, Probe::Available, None);
     app.data_root = Some("/tmp".into());
     // 不过滤时第 0 条是 research-desk:先钉住过滤前的口径
     let plain = draw(&app, 110, 30);

@@ -1338,7 +1338,7 @@ mod tests {
         app.screen = Screen::Health;
         app.hl_mode = crate::app::HealthMode::Recheck;
         app.capabilities
-            .record(Capability::SourceRecheck, Probe::Available);
+            .record(Capability::SourceRecheck, Probe::Available, None);
         app.ls = Some(
             serde_json::from_str::<crate::engine::LsData>(
                 r#"{"domain":"all","recipes":[],"components":[],"sources":[{"name":"web-search","kind":"skill","entries":[]},{"name":"theme-pack","kind":"extension","entries":[]}],"profiles":[],"locks":[]}"#,

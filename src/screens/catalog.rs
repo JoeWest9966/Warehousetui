@@ -5197,6 +5197,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         app.vps_ls = Some(serde_json::from_str(ls).unwrap());
         for (w, h) in [(80u16, 30u16), (66, 50), (100, 40)] {
@@ -5396,6 +5397,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Tag,
             crate::engine::Probe::Available,
+            None,
         );
         app
     }
@@ -5821,6 +5823,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Subscription,
             crate::engine::Probe::Available,
+            None,
         );
         (app, runner)
     }
@@ -6222,6 +6225,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         app.vps_ls = Some(serde_json::from_str(CAT_VPS_LS).unwrap());
         tap(&mut app, KeyCode::Char('d'));
@@ -6467,6 +6471,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Subscription,
             crate::engine::Probe::Unavailable,
+            None,
         );
         assert!(!app.sub_entry_enabled());
         tap(&mut app, KeyCode::Char('r'));
@@ -6516,6 +6521,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Key,
             crate::engine::Probe::Available,
+            None,
         );
         (app, runner)
     }
@@ -6995,6 +7001,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Key,
             crate::engine::Probe::Unavailable,
+            None,
         );
         assert!(!app.key_entry_enabled());
         tap(&mut app, KeyCode::Char('r'));
@@ -7122,11 +7129,13 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         if tag_cap {
             app.capabilities.record(
                 crate::engine::Capability::Tag,
                 crate::engine::Probe::Available,
+                None,
             );
         }
         app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
@@ -7480,6 +7489,7 @@ mod tests {
             app.capabilities.record(
                 crate::engine::Capability::Tag,
                 crate::engine::Probe::Available,
+                None,
             );
             tap(&mut app, KeyCode::Char('l')); // 先把册体读出来(有行可选)
             feed(&mut app);
@@ -7979,6 +7989,7 @@ mod tests {
         empty.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         empty.vps_ls =
             Some(serde_json::from_str(r#"{"catalogPath":"/r/vps.json","machines":[]}"#).unwrap());
@@ -8105,6 +8116,7 @@ mod tests {
             app.capabilities.record(
                 crate::engine::Capability::Vps,
                 crate::engine::Probe::Available,
+                None,
             );
             app.vps_ls = Some(serde_json::from_str(ls).unwrap());
             app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
@@ -8728,6 +8740,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         app.vps_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
         app
@@ -8881,6 +8894,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Vps,
             crate::engine::Probe::Available,
+            None,
         );
         app.data_root = Some(std::env::temp_dir().to_string_lossy().to_string());
         // 真刷新一次:入队并回放,让 FakeRunner 记到一条 argv
@@ -8979,6 +8993,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Key,
             crate::engine::Probe::Available,
+            None,
         );
         // 机器册筛 gate
         过滤敲词(&mut app, "gate");
@@ -9305,6 +9320,7 @@ mod tests {
         app.capabilities.record(
             crate::engine::Capability::Subscription,
             crate::engine::Probe::Available,
+            None,
         );
         app.sub_ls = Some(serde_json::from_str(ls.as_str()).unwrap());
         app
