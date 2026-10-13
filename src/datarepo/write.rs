@@ -1,5 +1,5 @@
 //! 数据仓写侧(spec #95 工单 #109):与读侧同层、面板**自有文件写**的
-//! 唯一接缝。准许面 / 禁止面 / 方法清单由 ADR-0010 钉死,这里只实现。
+//! 唯一接缝。准许面 / 禁止面 / 方法清单由 ADR-0011 钉死,这里只实现。
 //!
 //! 三条铁律(全部有测试双证):
 //! 1. **类型层不可达 NW_HOME**:句柄只收数据仓根,写目标只收
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 /// 构造时挡掉:空值、绝对路径、任一 `..` 段、`/` 与 `\` 混用、NUL、
 /// `~` 开头段(家目录简写,NW_HOME 的默认形状不许以相对路径还魂)。
 /// 于是「写去 NW_HOME」「写去引擎仓」「写去根之外」在类型层就过不来——
-/// 调用方连一个越界的值都造不出来,更别说递进写侧方法(ADR-0010 §4)。
+/// 调用方连一个越界的值都造不出来,更别说递进写侧方法(ADR-0011 §4)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoRelPath(String);
 
@@ -95,7 +95,7 @@ pub struct WriteReceipt {
     pub written: Vec<String>,
 }
 
-/// 数据仓写侧句柄:只收数据仓根,只写根之下(ADR-0010 §4)。
+/// 数据仓写侧句柄:只收数据仓根,只写根之下(ADR-0011 §4)。
 /// 与读侧 [`InstallRoot`](super::InstallRoot) 并列同层,两类路径知识
 /// 互不窜:读侧句柄的世界是 NW_HOME,写侧句柄的世界是数据仓根。
 #[derive(Clone, Debug)]
@@ -138,7 +138,7 @@ impl DataRepo {
     /// 逐文件:同目录兄弟 tmp(`.name.nwt-tmp`,保证同文件系统 rename)→
     /// 写 tmp → rename 覆盖目标。任何一步失败:清 tmp、回报人话(带相对
     /// 路径),目标处要么旧内容原样、要么没有——**永不留半文件**。
-    /// 多文件 plan 是逐文件原子,非跨文件事务(ADR-0010 Consequences)。
+    /// 多文件 plan 是逐文件原子,非跨文件事务(ADR-0011 Consequences)。
     pub fn commit(&self, plan: &WritePlan) -> Result<WriteReceipt, WriteError> {
         let mut written = Vec::with_capacity(plan.writes.len());
         for w in &plan.writes {
@@ -235,7 +235,7 @@ impl WritePlanError {
 }
 
 /// 落盘失败:磁盘 / 权限问题,**不是用户输入问题**(引擎 rc 4 同款教训,
-/// ADR-0010 §5:别渲染成「输入无效」)。`path` 是数据仓根之下的相对路径。
+/// ADR-0011 §5:别渲染成「输入无效」)。`path` 是数据仓根之下的相对路径。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteError {
     pub path: String,
@@ -480,7 +480,7 @@ mod tests {
             .unwrap();
         let err = r.commit(&plan).unwrap_err();
         assert_eq!(err.path, "blocked.yaml");
-        // 前一个文件已实落(逐文件原子,非跨文件事务,ADR-0010 明示)
+        // 前一个文件已实落(逐文件原子,非跨文件事务,ADR-0011 明示)
         assert_eq!(
             fs::read_to_string(root.join("recipes/research.yaml")).unwrap(),
             "new: true\n"

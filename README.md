@@ -90,7 +90,7 @@ CI(GitHub Actions,公库免费额度):push 到 main / 开 PR 时三平台(ubuntu
 ## 文档
 
 - 领域词汇:[CONTEXT.md](./CONTEXT.md)
-- 架构决策:[docs/adr/](./docs/adr/)(0001 子进程契约 / 0002 技术栈 / 0003 动作边界 / 0004 响应式双态 / 0005 鼠标命中区 / 0006 外部源登记两段式 / 0007 面板跟随引擎 / 0008 跟随引擎三层 / 0009 编目册写动作边界与机密纪律 / 0010 数据仓安装根访问层与装配历史)
+- 架构决策:[docs/adr/](./docs/adr/)(0001 子进程契约 / 0002 技术栈 / 0003 动作边界 / 0004 响应式双态 / 0005 鼠标命中区 / 0006 外部源登记两段式 / 0007 面板跟随引擎 / 0008 跟随引擎三层 / 0009 编目册写动作边界与机密纪律 / 0010 数据仓安装根访问层与装配历史 / 0011 面板写数据仓的边界与写侧接缝)
 - 调研底稿:[docs/research/](./docs/research/)(nw CLI 契约面 / 用户旅程 / 环境验证)
 - 发布矩阵:[docs/release.md](./docs/release.md)(安装 / 校验 / 打 tag 发布)
 - 工单:[GitHub Issues](https://github.com/JoeWest9966/Warehousetui/issues)(wayfinder 蓝图 #1)
