@@ -1005,6 +1005,37 @@ fn 设置屏能力清单_recipe_new_与烘焙同组不同项_紧凑态不截断(
     }
 }
 
+/// #124-review:混合态(既有真禁用又有未决)时,那句「升级所配 nw」必须显式
+/// 归给「入口禁用」那一组——否则操作者会以为对未决那几项也管用,正是故事 23
+/// 要消灭的跨组误读。归组行两组并列、指路句点名归属、未决组不出那句。
+#[test]
+fn 设置屏能力清单_混合态_升级指路显式归给禁用组_未决组不沾() {
+    use crate::engine::{Capability, Probe};
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Settings;
+    // 标签 = 真禁用(引擎没有 tag 命令组);vps = 未决(引擎没答上)
+    app.capabilities
+        .record(Capability::Tag, Probe::Unavailable, None);
+    app.capabilities
+        .record(Capability::Vps, Probe::Unknown, None);
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    // 两组并列,互不冒充
+    assert!(s.contains("入口禁用:标签"), "禁用组在场:{s}");
+    // 没喂过探针的六项默认未决,与 vps 同组——两组并列,谁也不并进谁
+    assert!(s.contains("未决:"), "未决组在场:{s}");
+    assert!(
+        s.contains("未决:外部源登记"),
+        "未决组自己点名,不与禁用组混:{s}"
+    );
+    // 指路句点名归属,不让人跨组解读
+    assert!(
+        s.contains("入口禁用那几项:缺的是引擎能力,不是面板坏了"),
+        "升级指路显式归给禁用组:{s}"
+    );
+    assert!(!s.contains("未决那几项"), "未决组绝不挂上缺能力指路:{s}");
+}
+
 #[test]
 fn 设置屏能力_无响应回未决不冒充禁用() {
     use crate::engine::{Capability, FakeRunner, Probe};

@@ -115,8 +115,17 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
         )));
     }
     // 指路:只在真有「引擎没这能力」时给(未决不冒充禁用,指路屏另管)。
+    //
+    // #124-review:混合态(既有禁用又有未决)时,光秃秃一句「升级所配 nw」会被
+    // 读成对未决那几项也管用——故事 23 要的正是「两态互不冒充」,连读法都不许
+    // 混。所以这里**显式点名归属**:那句话只归「入口禁用」那一组,未决那一组
+    // 的下一步在逐项证据里(「修引擎发现后重启重探」),两组各看各的。
+    // 句子本身仍只有一个出处(`capability::GATE_HINT` 常量),这里只加范围限定。
     if !disabled.is_empty() {
-        lines.push(Line::from(Span::styled(format!("  {GATE_HINT}"), p.dim())));
+        lines.push(Line::from(Span::styled(
+            format!("  入口禁用那几项:{GATE_HINT}"),
+            p.dim(),
+        )));
     }
     // 逐项证据(#123):归组行只说「谁关着」,这一段说「凭什么」——每个非可用
     // 项一段紧凑片段:入口标记 + 入口名 + 探针 argv + 引擎那一跑的原话或
