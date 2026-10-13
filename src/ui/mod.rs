@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::app::{App, Domain, HealthMode, Screen};
 use crate::layout::{popup_rect, size_class, SizeClass, HELP_H, HELP_W, NAV_WIDTH};
@@ -45,17 +45,125 @@ pub fn render(frame: &mut Frame, app: &App) {
         // `area_pad(area,1)` 同源,浮层可见区与「点任意处关」命中区永不分歧。
         render_help(frame, rows[1], app);
     }
+    // 自升级浮层(#121):与帮助浮层同族——同一个 body 区、同一个 popup_rect。
+    // 在帮助之后画只是兜底(两者都是查询型浮层,正常态只开一个)。
+    if app.upgrade.is_open() {
+        render_upgrade(frame, rows[1], app);
+    }
     let _ = p;
+}
+
+/// 自升级浮层(#121):全屏叠加层,六态两两可区分(版本输入 / 干跑在途 /
+/// 计划摊开 / 真跑在途 / 完成 / 失败)。几何与命中区共用 `layout::upgrade_*`
+/// ——渲染与「点任意处关」永不分歧(ADR-0005)。
+fn render_upgrade(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = crate::layout::upgrade_popup_rect(area);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        app.upgrade.headline(),
+        match &app.upgrade {
+            crate::upgrade::UpgradePhase::Failed { .. } => p.fail().bold(),
+            crate::upgrade::UpgradePhase::Done { .. } => p.ok().bold(),
+            _ => p.accent().bold(),
+        },
+    )));
+    match &app.upgrade {
+        crate::upgrade::UpgradePhase::Version { buf } => {
+            lines.push(Line::from(Span::styled(
+                format!("  目标版本  {buf}█"),
+                p.text(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  latest = 装最新;也可钉一个 tag(如 0.4.0 或 v0.4.0)",
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Enter 取安装计划(零下载、零落盘)· Esc/q 放弃",
+                p.dim(),
+            )));
+        }
+        crate::upgrade::UpgradePhase::Plan { version } => {
+            lines.push(Line::from(Span::styled(
+                format!("  目标版本  {version}"),
+                p.text(),
+            )));
+            // 计划原文:install.sh 的 `--dry-run` 输出,面板不翻译。
+            for l in app.upgrade_log.iter().take(6) {
+                lines.push(Line::from(Span::styled(format!("  {l}"), p.dim())));
+            }
+            lines.push(Line::from(Span::styled(
+                "  Enter 开始下载并校验 · Esc/q 放弃",
+                p.dim(),
+            )));
+        }
+        crate::upgrade::UpgradePhase::Planning { .. }
+        | crate::upgrade::UpgradePhase::Running { .. } => {
+            lines.push(Line::from(Span::styled(
+                "  过程原文(install.sh 逐行来,面板不翻译):",
+                p.dim(),
+            )));
+            let inner = crate::layout::upgrade_inner(area);
+            let view = (inner.height as usize).saturating_sub(6);
+            let max_off = app.upgrade_log.len().saturating_sub(view);
+            let off = app.upgrade_offset.min(max_off);
+            for l in app.upgrade_log.iter().skip(off).take(view) {
+                lines.push(Line::from(Span::styled(format!("  {l}"), p.text())));
+            }
+            lines.push(Line::from(Span::styled(
+                "  升级期间其余动作已锁(与装配态同款互斥);↑/↓ 翻进度",
+                p.dim(),
+            )));
+        }
+        crate::upgrade::UpgradePhase::Done { version, sha256 } => {
+            lines.push(Line::from(Span::styled(
+                format!("  已装到  v{version}"),
+                p.text(),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  sha256  {sha256}"),
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  ** 重启面板后新版本才在场 **",
+                p.accent(),
+            )));
+            lines.push(Line::from(Span::styled("  Enter/Esc/q 关", p.dim())));
+        }
+        crate::upgrade::UpgradePhase::Failed { reason } => {
+            lines.push(Line::from(Span::styled(format!("  {reason}"), p.fail())));
+            lines.push(Line::from(Span::styled(
+                "  旧二进制原样不动,未安装任何文件。",
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled("  Enter/Esc/q 关", p.dim())));
+        }
+        crate::upgrade::UpgradePhase::Idle => {}
+    }
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 自升级 nwt ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
 }
 
 fn render_top_bar(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let lamp = if app.assembling {
-        "◉ 装配中"
+    // 升级在途也点 assembling 那盏灯(#121:与装配态同款互斥),但文案说
+    // 「升级中」——两件事不许共用一个词冒充。
+    let (lamp, lamp_style) = if app.upgrade.in_flight() {
+        ("◉ 升级中", p.accent())
+    } else if app.assembling {
+        ("◉ 装配中", p.accent())
     } else {
-        "○ 空闲"
+        ("○ 空闲", p.dim())
     };
-    let lamp_style = if app.assembling { p.accent() } else { p.dim() };
     // 紧凑态精简:去副品牌与版本细节,只留装配态灯与 NW_HOME
     // (ADR-0004「顶栏去副品牌/版本细节」,spec #15 ticket #17)。
     let line = if size_class(area) == SizeClass::Compact {
@@ -157,7 +265,11 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     }
     spans.push(Span::styled("?", p.accent()));
     spans.push(Span::raw(" 帮助 "));
-    if app.assembling {
+    if app.upgrade.in_flight() {
+        // 升级在途(#121):与装配态同款互斥,但话术说「升级中」不冒充装配。
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("升级中:动作已锁定 · ↑/↓ 翻进度", p.dim()));
+    } else if app.assembling {
         spans.push(Span::raw(" "));
         // 中止键只在真有 up 在途时给(#59):登记落账也点这盏灯,但它的
         // 返航语义归登记流自己,不在这里混成一个键。
@@ -220,14 +332,33 @@ pub(crate) struct HelpRow {
     pub(crate) book: Option<crate::screens::CatalogKind>,
     pub(crate) prep: Prep,
     pub(crate) code: KeyCode,
+    /// 派发这个键时要带的修饰键(#119:`Ctrl+P` 需要 CONTROL;其余一律 NONE)。
+    /// 帮助↔实现对照测试按它派发,所以带修饰键的键位也能被正向验证。
+    pub(crate) modifiers: KeyModifiers,
     /// 派发前先把 App 布成「有 up 在途」(#59 中止键的受理面前提)。
     pub(crate) running: bool,
+    /// 这一条的后果是**写**(登记 / 删除 / 打开发射仪式):装配态下命令面板
+    /// 不透出它(#119 规格故事 9)。帮助浮层照旧全列——它是文档,不是执行面。
+    pub(crate) write: bool,
 }
 
 /// 帮助浮层键位对照表(单一真相源):顺序即浮层里的自上而下。
 /// 别名不逐列——`↑/↓` 之 `n/p`、`h/l` 之 `←/→`、`j/k` 之 `Tab/BackTab`
 /// 与主键同义,帮助只呈现主键(与 README 键位表同粒度)。
 pub(crate) const HELP_ROWS: &[HelpRow] = &[
+    HelpRow {
+        key: "Ctrl+P",
+        desc: "命令面板:模糊搜全部键位,回车执行",
+        screen: None,
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('p'),
+        modifiers: KeyModifiers::CONTROL,
+        write: false,
+    },
     HelpRow {
         key: "j / k",
         desc: "切屏(下一屏 / 上一屏)",
@@ -238,6 +369,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('j'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "↑ / ↓",
@@ -249,6 +382,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "a / h / l / v",
@@ -260,6 +395,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('a'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "r",
@@ -271,6 +408,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Enter",
@@ -282,6 +421,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "x",
@@ -293,6 +434,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: true,
         prep: Prep::Shell,
         code: KeyCode::Char('x'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "m",
@@ -304,6 +447,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "r",
@@ -315,6 +460,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Enter",
@@ -326,6 +473,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "h / l",
@@ -337,6 +486,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('h'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "c",
@@ -348,6 +499,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "r",
@@ -359,6 +512,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "/",
@@ -370,6 +525,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('/'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "r",
@@ -381,6 +538,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "d",
@@ -392,6 +551,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('d'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "l",
@@ -403,6 +564,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('l'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "m",
@@ -414,6 +577,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "/",
@@ -425,6 +590,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('/'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "g",
@@ -436,6 +603,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('g'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "g",
@@ -447,6 +616,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('g'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Enter",
@@ -458,6 +629,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Enter",
@@ -469,6 +642,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "n",
@@ -480,6 +655,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('n'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "i",
@@ -491,6 +668,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('i'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "d",
@@ -502,6 +681,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('d'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "e",
@@ -513,6 +694,21 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('e'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "U",
+        desc: "设置:自升级 nwt(复用 install.sh 同一道 sha256 闸)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('u'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "m",
@@ -524,6 +720,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Esc",
@@ -535,6 +733,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::HelpOpen,
         code: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "t",
@@ -546,6 +746,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('t'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "?",
@@ -557,6 +759,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('?'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "q",
@@ -568,6 +772,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('q'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
 ];
 

@@ -154,6 +154,11 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         help_hits(body, &mut hits);
         return hits;
     }
+    // 自升级浮层(#121):与帮助浮层同级的吞点击纪律——底层一个命中区都不产。
+    if app.upgrade.is_open() {
+        upgrade_hits(body, &mut hits);
+        return hits;
+    }
     if app.as_confirm {
         ritual_hits(body, class, &mut hits);
         return hits;
@@ -868,6 +873,28 @@ fn help_hits(area: Rect, hits: &mut Vec<(Rect, Target)>) {
 /// 帮助浮层尺寸:渲染(`ui::render_help`)与命中(`help_hits`)共用。
 pub(crate) const HELP_W: u16 = 60;
 pub(crate) const HELP_H: u16 = 30;
+
+/// 自升级浮层(#121)尺寸:渲染(`ui::render_upgrade`)与命中(`upgrade_hits`)
+/// 共用,与 `HELP_W` / `HELP_H` 同族——一处几何真相。
+pub(crate) const UPGRADE_W: u16 = 66;
+pub(crate) const UPGRADE_H: u16 = 18;
+
+/// 自升级浮层矩形(与渲染同一个 `popup_rect` + 同一组常量)。
+pub(crate) fn upgrade_popup_rect(area: Rect) -> Rect {
+    popup_rect(area, UPGRADE_W, UPGRADE_H)
+}
+
+/// 自升级浮层内层(去掉边框,与 `Block::bordered().inner(r)` 同结果)。
+pub(crate) fn upgrade_inner(area: Rect) -> Rect {
+    shrink_border(upgrade_popup_rect(area))
+}
+
+/// 自升级浮层的命中区:整块浮层一个 `DismissPopup`——点哪儿都是「放弃 /
+/// 关」,与键盘 Esc 同路(在途态点不动,见 `on_key_upgrade`)。浮层外不产
+/// 命中区(吞点击不穿透,与帮助浮层同纪律)。
+pub(crate) fn upgrade_hits(area: Rect, hits: &mut Vec<(Rect, Target)>) {
+    hits.push((upgrade_popup_rect(area), Target::DismissPopup));
+}
 
 /// 与壳/浮层渲染同款的居中弹层矩形(`recipes` 登记浮层渲染直接调用,
 /// 与命中侧同一个函数——居中与收窄规则永不分歧)。

@@ -14,6 +14,7 @@ mod term;
 mod testutil;
 mod theme;
 mod ui;
+mod upgrade;
 
 use anyhow::Result;
 use app::{App, Message};
@@ -92,7 +93,19 @@ async fn main() -> Result<()> {
     let (etx, mut erx) = mpsc::unbounded_channel::<engine::EngineEvent>();
     app.bootstrap(&etx);
 
-    let result = run_loop(&mut terminal, &mut app, &mut rx, &mut erx, &etx).await;
+    // 自升级事件通道(#121):与引擎事件并列,主循环在 select 里一起收。
+    let (utx, mut urx) = mpsc::unbounded_channel::<upgrade::UpgradeEvent>();
+
+    let result = run_loop(
+        &mut terminal,
+        &mut app,
+        &mut rx,
+        &mut erx,
+        &etx,
+        &mut urx,
+        &utx,
+    )
+    .await;
 
     term::restore();
     result
@@ -104,6 +117,8 @@ async fn run_loop(
     rx: &mut mpsc::UnboundedReceiver<Event>,
     erx: &mut mpsc::UnboundedReceiver<engine::EngineEvent>,
     etx: &mpsc::UnboundedSender<engine::EngineEvent>,
+    urx: &mut mpsc::UnboundedReceiver<upgrade::UpgradeEvent>,
+    utx: &mpsc::UnboundedSender<upgrade::UpgradeEvent>,
 ) -> Result<()> {
     let mut tick = interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -126,6 +141,14 @@ async fn run_loop(
         if app.quit {
             break;
         }
+        // 自升级队列(#121):与引擎命令同一个 drain 模式,但走 upgrade 模块
+        // 自己那条 async fn(它把 install.sh 的逐行原文当进度推回来)。
+        for req in std::mem::take(&mut app.upgrade_queue) {
+            let utx = utx.clone();
+            tokio::spawn(async move {
+                upgrade::run(&req, &upgrade::UpgradeEnv::from_env(), &utx).await;
+            });
+        }
         // 键位处理器排队的引擎命令在这里统一执行(键位没有 tx)。
         for args in std::mem::take(&mut app.queue) {
             app.spawn_engine(args, etx);
@@ -147,6 +170,8 @@ async fn run_loop(
                 _ => {}
             },
             Some(ev) = erx.recv() => app.update(Message::Engine(ev)),
+            // 自升级推进(#121):install.sh 的逐行进度 + 终结结论。
+            Some(ev) = urx.recv() => app.update(Message::Upgrade(ev)),
             _ = tick.tick(), if app.assembling => app.update(Message::Tick),
         }
     }
