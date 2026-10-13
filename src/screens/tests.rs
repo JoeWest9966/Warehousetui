@@ -3200,6 +3200,68 @@ fn 作者侧三道门_三处入口措辞同调() {
     std::fs::remove_dir_all(&app2_root).ok();
 }
 
+/// 三份字段枚举(skill / extension / 打包)走同一只字段光标(共用形状
+/// `FormField`):顺序即 `ALL`,↑/↓ 到顶 / 到底不越界、不绕回 —— 字段枚举各不同,
+/// 操作者的肌肉记忆不分叉。
+#[test]
+fn 字段光标_三份枚举同一条轮转习惯() {
+    use crate::screens::recipes::PackField;
+    use crate::screens::scaffold::{ExtensionField, SkillField};
+    use crate::screens::FormField;
+    /// 从起点一路向下(多走一格):末两份相同 = 到底不绕回。
+    fn down_walk<F: FormField>(start: F) -> Vec<&'static str> {
+        let mut cur = start;
+        let mut out = vec![cur.label()];
+        for _ in 0..F::ALL.len() {
+            cur = cur.moved(true);
+            out.push(cur.label());
+        }
+        out
+    }
+    /// 从起点一路向上(多走一格):末两份相同 = 回顶不越界。
+    fn up_walk<F: FormField>(start: F) -> Vec<&'static str> {
+        let mut cur = start;
+        let mut out = vec![cur.label()];
+        for _ in 0..F::ALL.len() {
+            cur = cur.moved(false);
+            out.push(cur.label());
+        }
+        out
+    }
+    assert_eq!(
+        down_walk(SkillField::Name),
+        vec!["名称", "描述", "触发词", "模板", "模板"],
+        "skill 四字段:到底停在模板不绕回"
+    );
+    assert_eq!(
+        down_walk(ExtensionField::Name),
+        vec!["名称", "描述", "入口文件", "模板", "模板"],
+        "extension 四字段:同一只习惯"
+    );
+    assert_eq!(
+        down_walk(PackField::Source),
+        vec!["源目录", "组件名", "版  本", "版  本"],
+        "pack 三字段:同一只习惯"
+    );
+    assert_eq!(
+        up_walk(SkillField::Template),
+        vec!["模板", "触发词", "描述", "名称", "名称"],
+        "回顶不越界"
+    );
+    assert_eq!(
+        up_walk(PackField::Version),
+        vec!["版  本", "组件名", "源目录", "源目录"],
+        "回顶不越界"
+    );
+    // index 与 ALL 自洽(下标 = 标签序)
+    for (i, f) in SkillField::ALL.iter().enumerate() {
+        assert_eq!(f.index(), i, "{} 的下标与 ALL 序一致", f.label());
+    }
+    for (i, f) in PackField::ALL.iter().enumerate() {
+        assert_eq!(f.index(), i, "{} 的下标与 ALL 序一致", f.label());
+    }
+}
+
 /// 规格验收 5(ADR-0010 §5):落盘失败是磁盘 / 权限问题,要在**确认闸**里看得见
 /// ——与脚手架同款(fail() + 预览态渲染),不是只写一行日志让操作者对浮层干瞪眼。
 #[test]

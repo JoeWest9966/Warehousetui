@@ -53,7 +53,7 @@ use crate::datarepo::write::{PlannedWrite, WritePlan, WriteReceipt};
 use crate::input::{self, InputAction};
 use crate::layout::popup_rect;
 use crate::screens::recipes::clip;
-use crate::screens::FormAction;
+use crate::screens::{FormAction, FormField};
 
 // ---- 共用的表单流:阶段机 + 拟落账/收据槽 ----
 
@@ -165,16 +165,17 @@ pub enum SkillField {
     Template,
 }
 
-impl SkillField {
-    pub const ALL: [SkillField; 4] = [
+/// 字段顺序即 ↑/↓ 轮转顺序;标签与工单「名称/描述/触发词」同词。光标移动
+/// (到顶/到底不越界、不绕回)走共用形状 [`FormField`],不在这再写一遍。
+impl FormField for SkillField {
+    const ALL: &'static [SkillField] = &[
         SkillField::Name,
         SkillField::Description,
         SkillField::Triggers,
         SkillField::Template,
     ];
 
-    /// 字段标签(与工单「名称/描述/触发词」同词)。
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             SkillField::Name => "名称",
             SkillField::Description => "描述",
@@ -182,11 +183,9 @@ impl SkillField {
             SkillField::Template => "模板",
         }
     }
+}
 
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
-    }
-
+impl SkillField {
     /// 文本字段(有单行缓冲);模板开关没有。
     fn is_text(self) -> bool {
         !matches!(self, SkillField::Template)
@@ -214,17 +213,6 @@ impl SkillForm {
             SkillField::Triggers => Some(&mut self.triggers),
             SkillField::Template => None,
         }
-    }
-
-    /// ↑/↓ 移字段(四字段轮转,到顶/到底不越界、不绕回)。
-    fn move_field(&mut self, down: bool) {
-        let i = self.field.index();
-        let n = SkillField::ALL.len();
-        self.field = SkillField::ALL[if down {
-            (i + 1).min(n - 1)
-        } else {
-            i.saturating_sub(1)
-        }];
     }
 }
 
@@ -329,11 +317,11 @@ fn skill_md(name: &str, description: &str, triggers: &[String], template: bool) 
 pub fn on_key_skill_form(form: &mut SkillForm, k: KeyEvent) -> FormAction {
     match k.code {
         KeyCode::Up => {
-            form.move_field(false);
+            form.field = form.field.moved(false);
             return FormAction::Edited;
         }
         KeyCode::Down => {
-            form.move_field(true);
+            form.field = form.field.moved(true);
             return FormAction::Edited;
         }
         // 模板开关:焦点在模板字段时,空格切换(空格在文本字段里仍是普通字符)。
@@ -393,16 +381,17 @@ pub enum ExtensionField {
     Template,
 }
 
-impl ExtensionField {
-    pub const ALL: [ExtensionField; 4] = [
+/// 光标移动走共用形状 [`FormField`](crate::screens::FormField),与
+/// [`SkillField`] 同一只移字段习惯,不因规格不同改操作者的肌肉记忆。
+impl FormField for ExtensionField {
+    const ALL: &'static [ExtensionField] = &[
         ExtensionField::Name,
         ExtensionField::Description,
         ExtensionField::Entry,
         ExtensionField::Template,
     ];
 
-    /// 字段标签。
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             ExtensionField::Name => "名称",
             ExtensionField::Description => "描述",
@@ -410,11 +399,9 @@ impl ExtensionField {
             ExtensionField::Template => "模板",
         }
     }
+}
 
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
-    }
-
+impl ExtensionField {
     /// 文本字段(有单行缓冲);模板开关没有。
     fn is_text(self) -> bool {
         !matches!(self, ExtensionField::Template)
@@ -453,18 +440,6 @@ impl ExtensionForm {
             ExtensionField::Entry => Some(&mut self.entry),
             ExtensionField::Template => None,
         }
-    }
-
-    /// ↑/↓ 移字段(四字段轮转,到顶/到底不越界、不绕回)——与 [`SkillForm`]
-    /// 同一只移字段习惯,不因规格不同改操作者的肌肉记忆。
-    fn move_field(&mut self, down: bool) {
-        let i = self.field.index();
-        let n = ExtensionField::ALL.len();
-        self.field = ExtensionField::ALL[if down {
-            (i + 1).min(n - 1)
-        } else {
-            i.saturating_sub(1)
-        }];
     }
 }
 
@@ -646,11 +621,11 @@ fn ext_entry_ts(name: &str, description: &str, template: bool) -> String {
 pub fn on_key_ext_form(form: &mut ExtensionForm, k: KeyEvent) -> FormAction {
     match k.code {
         KeyCode::Up => {
-            form.move_field(false);
+            form.field = form.field.moved(false);
             return FormAction::Edited;
         }
         KeyCode::Down => {
-            form.move_field(true);
+            form.field = form.field.moved(true);
             return FormAction::Edited;
         }
         KeyCode::Char(' ') if form.field == ExtensionField::Template => {
@@ -704,7 +679,7 @@ fn render_skill_form(frame: &mut Frame, area: Rect, app: &App) {
         "  skill 身份 = SKILL.md frontmatter 的 name;落进 skills/<名>/",
         p.dim(),
     ))];
-    for field in SkillField::ALL {
+    for field in SkillField::ALL.iter().copied() {
         let on = field == f.field;
         if field == SkillField::Template {
             let mark = if f.template { "[x]" } else { "[ ]" };
@@ -762,7 +737,7 @@ fn render_ext_form(frame: &mut Frame, area: Rect, app: &App) {
         "  pi 只扫一层 extensions/*/index.ts:条目必须自带 package.json",
         p.dim(),
     ))];
-    for field in ExtensionField::ALL {
+    for field in ExtensionField::ALL.iter().copied() {
         let on = field == f.field;
         if field == ExtensionField::Template {
             let mark = if f.template { "[x]" } else { "[ ]" };

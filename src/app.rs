@@ -3787,6 +3787,9 @@ impl App {
             // 漂移复核走 run_recheck(三道门 + 按名/全查),不在这条派体检路上;
             // 引用完整性(#116)在函数开头就分流出去了(它跟派无关)。
             HealthMode::Recheck => self.run_recheck(None),
+            // 死臂:函数开头已按 Integrity 分流(引用完整性不挑派),到这儿不可达。
+            // 留着只为穷尽匹配——删了它 `match` 要补 `_`,反而丢掉「四个档都在
+            // 这里点过名」这份清点。
             HealthMode::Integrity => {}
         }
     }
