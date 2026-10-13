@@ -349,6 +349,11 @@ pub struct App {
     /// 目录,面板自己算 sha256、生成组件清单,拟落账摊开后图形确认才经
     /// datarepo 写侧原子落盘(ADR-0010)。`None` = 浮层不在场。
     pub pk_flow: Option<crate::screens::recipes::PackFlow>,
+    /// 配方编辑器(spec #95 工单 #113):选中配方结构化编辑(加/删组件槽、改
+    /// env 声明),编辑态往返保真,写回 recipe.yaml 前自动预跑 validate(引擎
+    /// 代跑、argv 与健康屏同源),拟落账 + 图形确认后才经 datarepo 写侧原子
+    /// 落盘(ADR-0010 §4 #113 行)。`None` = 浮层不在场。
+    pub rc_edit_flow: Option<crate::screens::recipes::RecipeEditFlow>,
     /// 外部源登记·预审段状态机(spec #25 / 工单 #30)。
     pub reg_state: RegState,
     /// repo 链接缓冲(通用单行输入态机,[`input::BUF_CAP`] 封顶)。
@@ -623,6 +628,8 @@ impl App {
             rc_landing: None,
             // 组件打包器浮层(#112):None = 不在场。
             pk_flow: None,
+            // 配方编辑器浮层(#113):None = 不在场。
+            rc_edit_flow: None,
             reg_state: RegState::Idle,
             reg_repo_buf: String::new(),
             reg_kind: RegKind::Skill,
@@ -869,6 +876,11 @@ impl App {
             // 带守卫的臂到达即确有此态;鼠标与键盘不可能给出两种后果。
             Target::Activate if self.pack_open() => self.pack_commit(),
             Target::DismissPopup if self.pack_open() => self.pk_flow = None,
+            // 配方编辑器浮层(#113):与键盘完全同路 —— 确认段点「Enter 写回」段
+            // = `recipe_edit_commit`(命中区只在预跑通过时产,故到达即确有此态),
+            // 点「Esc 返航」段 / 结果屏任意处 = 收起(清 scratch,不写回)。
+            Target::Activate if self.recipe_edit_open() => self.recipe_edit_commit(),
+            Target::DismissPopup if self.recipe_edit_open() => self.recipe_edit_abandon(),
             // 点导航(常畅)/屏 Tab(紧凑)切屏,与 j/k 同语义。
             Target::NavTo(s) => {
                 self.screen = s;
@@ -1108,6 +1120,10 @@ impl App {
             // 组件打包器返航(#112):只收状态,一个字节都不落(拟落账随浮层
             // 一起丢)。确认前不落盘的纪律在这里也成立——返航不等于落盘。
             self.pk_flow = None;
+        } else if self.recipe_edit_open() {
+            // 配方编辑器返航(#113):鼠标点任意处与键盘 Esc/q 同路——清 scratch
+            // (若预跑在途)、丢流程,recipe.yaml 一个字节都不落(除非已写回)。
+            self.recipe_edit_abandon();
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
@@ -1223,6 +1239,19 @@ impl App {
                 }
             }
             "doctor" | "validate" => {
+                // 配方编辑器写回前预跑(#113):按 argv 是否指向预跑暂存文件,把编辑器的
+                // validate 回音与健康屏的分开——暂存路径归编辑器(在途则摊开四态、清
+                // scratch;预跑在途被返航的迟到回音丢弃,不污染 hl_result);其余才归
+                // 健康屏。argv 与健康屏同源(同一 `commands::validate_recipe`),只是路径
+                // 指向 scratch(编辑态)——recipe.yaml 确认前不动。
+                if crate::datarepo::recipe::is_prerun_argv(&out.args) {
+                    if self.recipe_edit_prerun() {
+                        self.absorb_recipe_validate(out);
+                    } else {
+                        self.push_log("配方预跑回音已丢弃(编辑器已返航)".to_string());
+                    }
+                    return;
+                }
                 self.hl_loading = false;
                 self.push_log(format!("{cmd} 复核完成"));
                 self.hl_result = Some(out);
@@ -1371,6 +1400,14 @@ impl App {
         // 「Enter 落盘 / Esc 返航」,结果段只认返航。
         if self.pack_open() {
             self.on_key_pack(k);
+            return;
+        }
+        // 配方编辑器浮层(#113):与打包器同级的顶层浮层 —— 在场时吞键,五域键位
+        // (切域/选行/过滤/建议命令/落点/打包)一个都不受理,配方屏原选中行原样
+        // 不动。表单态键入归表单(含行内输入),预跑态只认放弃,确认态认写回/
+        // 再改改/放弃,结果态只认关闭。
+        if self.recipe_edit_open() {
+            self.on_key_recipe_edit(k);
             return;
         }
         // 浮层优先级:帮助浮层 > 发射确认 > 手填输入(NW_HOME / 数据仓根) > 指路屏/常屏(见 spec #9)
@@ -1926,6 +1963,11 @@ impl App {
             // 打包的对象是数据仓里的本地 skill/extension 目录。三道门在
             // start_pack 里把守(装配互斥 / 不重入 / 数据仓根就绪)。
             KeyCode::Char('p') if self.rc_domain == Domain::Components => self.start_pack(),
+            // 配方编辑器入口(#113):只配方域给(编辑的是 recipe.yaml)——`e` 取
+            // 配方屏未占用的键(Enter 已被 #115 落点溯源占用,故不用 Enter)。四道门
+            // 在 start_recipe_edit 里把守(装配互斥 / 不重入 / 数据仓根就绪 / 选中
+            // 行是配方且引擎给了路径)。
+            KeyCode::Char('e') if self.rc_domain == Domain::Recipes => self.start_recipe_edit(),
             // 反向溯源(#115):Enter 看选中组件/外部源铺进派后的落点 —— 纯只读
             // 呈现,不读派目录、不发引擎命令(落点规则是上游 external-sources.md
             // 的只读知识,面板不另造)。无落点语义的域静默不摆(open_landing 三道门)。
@@ -4035,6 +4077,424 @@ impl App {
                 self.push_log(e.why());
             }
         }
+    }
+
+    // ---- 配方编辑器(spec #95 工单 #113,ADR-0010 §4 表格 #113 行) ----
+
+    /// 配方编辑器浮层在不在场(渲染 / 键位守卫 / 命中弹层优先级共用这一判据)。
+    pub fn recipe_edit_open(&self) -> bool {
+        self.rc_edit_flow.is_some()
+    }
+
+    /// 配方编辑器是否在「预跑 validate 在途」——引擎 validate 回音据此分流:
+    /// 在途归编辑器(摊开四态、清 scratch),否则归健康屏(hl_result)。
+    fn recipe_edit_prerun(&self) -> bool {
+        self.rc_edit_flow
+            .as_ref()
+            .is_some_and(|f| f.phase == crate::screens::RecipeEditPhase::PreRun)
+    }
+
+    /// `e` 键发起配方编辑器(只配方域给):四道门与 `start_pack` 同族 ——
+    /// 装配互斥(写互斥,ADR-0010 §5)、不重入、数据仓根就绪;外加「选中行是
+    /// 配方且引擎给了路径」(要从数据仓读 recipe.yaml)。过后经 datarepo 读侧
+    /// 加载配方进结构化中间形状。任一门不过只留指路,不开浮层。
+    fn start_recipe_edit(&mut self) {
+        if self.rc_domain != Domain::Recipes {
+            return; // 只配方域给(编辑的是 recipe.yaml)
+        }
+        if self.assembling {
+            self.push_log("装配进行中:配方编辑与装配互斥,稍后再试".to_string());
+            return;
+        }
+        if self.recipe_edit_open() {
+            return; // 流程进行中不重入
+        }
+        if self.data_root_cause().is_some() {
+            self.push_log(format!("配方编辑入口:{}", self.data_root_gate_msg()));
+            return;
+        }
+        let picked = self
+            .selected_recipe()
+            .and_then(|r| r.path.clone().map(|p| (r.name.clone(), p)));
+        let Some((name, rel)) = picked else {
+            self.push_log(
+                "没有选中的配方(或引擎 ls 没给配方路径):配方编辑无从加载,先 ls 刷新".to_string(),
+            );
+            return;
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("配方编辑:{}", self.data_root_gate_msg()));
+            return;
+        };
+        let repo = crate::datarepo::write::DataRepo::new(&root);
+        match crate::datarepo::recipe::load(&repo, &rel) {
+            Ok(doc) => {
+                self.rc_edit_flow =
+                    Some(crate::screens::RecipeEditFlow::new(doc, rel, name.clone()));
+                self.push_log(format!(
+                    "配方编辑器[{name}]:加/删组件槽、改 env 声明;s 拟落账+预跑 validate,Esc 放弃"
+                ));
+            }
+            Err(e) => {
+                self.push_log(format!("配方加载失败:{},留配方屏", e.why()));
+            }
+        }
+    }
+
+    /// 配方编辑器键位(按阶段 + 行内输入态分发)。浮层在场时五域键位一个都不
+    /// 受理(壳级切屏/主题也不穿透,同登记/打包的弹层优先级)。
+    fn on_key_recipe_edit(&mut self, k: KeyEvent) {
+        use crate::screens::RecipeEditPhase;
+        // 行内输入态在场:键入归它(通用单行态机),Enter 确认、Esc/q 取消。
+        if self
+            .rc_edit_flow
+            .as_ref()
+            .is_some_and(|f| f.input.is_some())
+        {
+            self.on_key_recipe_edit_input(k);
+            return;
+        }
+        let Some(phase) = self.rc_edit_flow.as_ref().map(|f| f.phase) else {
+            return;
+        };
+        match phase {
+            RecipeEditPhase::Form => self.on_key_recipe_edit_form(k),
+            RecipeEditPhase::PreRun => match k.code {
+                // 预跑在途:只受理放弃(取消这一程;scratch 随返航清)。
+                KeyCode::Esc | KeyCode::Char('q') => self.recipe_edit_abandon(),
+                _ => {}
+            },
+            RecipeEditPhase::Review => match k.code {
+                // 写回闸:预跑通过才受理 Enter 写回。
+                KeyCode::Enter if self.rc_edit_flow.as_ref().is_some_and(|f| f.validate_pass) => {
+                    self.recipe_edit_commit();
+                }
+                // 回编辑态再改改(拟落账/预跑结论丢,doc 编辑保留)。
+                KeyCode::Char('e') => self.recipe_edit_back_to_form(),
+                KeyCode::Esc | KeyCode::Char('q') => self.recipe_edit_abandon(),
+                _ => {}
+            },
+            RecipeEditPhase::Done => {
+                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
+                    self.recipe_edit_abandon();
+                }
+            }
+        }
+    }
+
+    /// 表单态键位:Tab 切区、↑/↓ 移光标、a 加 / x 删、space required(env)、
+    /// Enter 改默认(env)、s 拟落账+预跑、Esc/q 放弃。
+    fn on_key_recipe_edit_form(&mut self, k: KeyEvent) {
+        use crate::screens::RecipeEditSection;
+        let Some(flow) = self.rc_edit_flow.as_mut() else {
+            return;
+        };
+        match k.code {
+            KeyCode::Tab => {
+                flow.section = match flow.section {
+                    RecipeEditSection::Components => RecipeEditSection::Env,
+                    RecipeEditSection::Env => RecipeEditSection::Components,
+                };
+            }
+            KeyCode::Up => match flow.section {
+                RecipeEditSection::Components => {
+                    flow.comp_sel = flow.comp_sel.saturating_sub(1);
+                }
+                RecipeEditSection::Env => {
+                    flow.env_sel = flow.env_sel.saturating_sub(1);
+                }
+            },
+            KeyCode::Down => match flow.section {
+                RecipeEditSection::Components => {
+                    let n = flow.comp_len();
+                    if n > 0 {
+                        flow.comp_sel = (flow.comp_sel + 1).min(n - 1);
+                    }
+                }
+                RecipeEditSection::Env => {
+                    let n = flow.env_len();
+                    if n > 0 {
+                        flow.env_sel = (flow.env_sel + 1).min(n - 1);
+                    }
+                }
+            },
+            KeyCode::Char('a') => {
+                flow.err = None;
+                flow.input = Some(match flow.section {
+                    RecipeEditSection::Components => {
+                        crate::screens::RecipeEditInput::AddComponent(String::new())
+                    }
+                    RecipeEditSection::Env => {
+                        crate::screens::RecipeEditInput::AddEnv(String::new())
+                    }
+                });
+            }
+            KeyCode::Char('x') => {
+                match flow.section {
+                    RecipeEditSection::Components => {
+                        flow.doc.remove_component(flow.comp_sel);
+                        let n = flow.comp_len();
+                        flow.comp_sel = flow.comp_sel.min(n.saturating_sub(1));
+                    }
+                    RecipeEditSection::Env => {
+                        flow.doc.remove_env(flow.env_sel);
+                        let n = flow.env_len();
+                        flow.env_sel = flow.env_sel.min(n.saturating_sub(1));
+                    }
+                }
+                flow.err = None;
+            }
+            KeyCode::Char(' ') if flow.section == RecipeEditSection::Env => {
+                let i = flow.env_sel;
+                let cur = flow
+                    .doc
+                    .env_views()
+                    .get(i)
+                    .map(|e| e.required)
+                    .unwrap_or(false);
+                flow.doc.set_env_required(i, !cur);
+                flow.err = None;
+            }
+            KeyCode::Enter if flow.section == RecipeEditSection::Env => {
+                let i = flow.env_sel;
+                let cur = flow
+                    .doc
+                    .env_views()
+                    .get(i)
+                    .and_then(|e| e.default.clone())
+                    .unwrap_or_default();
+                flow.input = Some(crate::screens::RecipeEditInput::EditDefault(cur));
+            }
+            KeyCode::Char('s') => {
+                self.recipe_edit_submit();
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.recipe_edit_abandon(),
+            _ => {}
+        }
+    }
+
+    /// 行内输入态键位:Enter 确认(加组件 / 加 env / 改默认),Esc/q 取消。
+    fn on_key_recipe_edit_input(&mut self, k: KeyEvent) {
+        use crate::screens::RecipeEditInput;
+        // 取出输入态与缓冲分别操作(避开借用冲突)。
+        let buf = match self.rc_edit_flow.as_mut() {
+            Some(f) => match f.input.as_mut() {
+                Some(RecipeEditInput::AddComponent(b))
+                | Some(RecipeEditInput::AddEnv(b))
+                | Some(RecipeEditInput::EditDefault(b)) => b,
+                None => return,
+            },
+            None => return,
+        };
+        match input::on_key(buf, k) {
+            InputAction::Submit => self.recipe_edit_input_confirm(),
+            InputAction::Cancel => {
+                if let Some(f) = self.rc_edit_flow.as_mut() {
+                    f.input = None;
+                }
+            }
+            InputAction::Edited | InputAction::Ignored => {}
+        }
+    }
+
+    /// 行内输入确认:按输入态落一次编辑。空名拒(留输入态可改)。
+    fn recipe_edit_input_confirm(&mut self) {
+        use crate::screens::RecipeEditInput;
+        let Some(flow) = self.rc_edit_flow.as_mut() else {
+            return;
+        };
+        let Some(input) = flow.input.take() else {
+            return;
+        };
+        match input {
+            RecipeEditInput::AddComponent(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    flow.err = Some("组件槽名不能空".to_string());
+                    return;
+                }
+                flow.doc.add_component(name, "0.0.0");
+                flow.comp_sel = flow.comp_len().saturating_sub(1);
+                flow.err = None;
+            }
+            RecipeEditInput::AddEnv(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    flow.err = Some("env 名不能空".to_string());
+                    return;
+                }
+                flow.doc.add_env(name);
+                flow.env_sel = flow.env_len().saturating_sub(1);
+                flow.err = None;
+            }
+            RecipeEditInput::EditDefault(val) => {
+                let i = flow.env_sel;
+                flow.doc.set_env_default(i, &val);
+                flow.err = None;
+            }
+        }
+    }
+
+    /// 表单 `s`:拟落账(写回 recipe.yaml 的 WritePlan,**一个字节都不落**)+ 把
+    /// 编辑态暂存进 scratch + 入队预跑 validate(argv 与健康屏同源)——进 PreRun
+    /// 等引擎回音。拟落账被拒 / 暂存失败:留编辑态可改,一个字节都不落。
+    fn recipe_edit_submit(&mut self) {
+        use crate::engine::commands;
+        let Some(flow) = self.rc_edit_flow.as_ref() else {
+            return;
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("配方编辑:{}", self.data_root_gate_msg()));
+            return;
+        };
+        let repo = crate::datarepo::write::DataRepo::new(&root);
+        let plan = match crate::datarepo::recipe::plan_writeback(&repo, &flow.doc, &flow.recipe_rel)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let why = e.why();
+                self.push_log(format!("拟落账被拒:{why},留编辑态可改"));
+                if let Some(f) = self.rc_edit_flow.as_mut() {
+                    f.err = Some(why);
+                }
+                return;
+            }
+        };
+        // 暂存编辑态到 scratch(写侧原子落),喂引擎 validate 读;这不是对
+        // recipe.yaml 的写回。
+        let scratch = crate::datarepo::recipe::scratch_rel(&flow.recipe_rel);
+        if let Err(reason) = crate::datarepo::recipe::stage_for_validate(&repo, &flow.doc, &scratch)
+        {
+            self.push_log(format!("预跑暂存失败:{reason},一个字节都没写回"));
+            if let Some(f) = self.rc_edit_flow.as_mut() {
+                f.err = Some(reason);
+            }
+            return;
+        }
+        // 预跑 argv:与健康屏 validate 同源(同一 `commands::validate_recipe`
+        // 构造函数),只是路径指向 scratch(编辑态)——recipe.yaml 仍未动。
+        let scratch_abs = format!("{}/{scratch}", root.trim_end_matches('/'));
+        self.queue.push(commands::validate_recipe(&scratch_abs));
+        if let Some(f) = self.rc_edit_flow.as_mut() {
+            f.plan = Some(plan);
+            f.scratch_rel = Some(scratch);
+            f.validate = None;
+            f.validate_pass = false;
+            f.phase = crate::screens::RecipeEditPhase::PreRun;
+        }
+        self.push_log("拟落账就绪:正在预跑 validate(引擎代跑,写回前必过)…".to_string());
+    }
+
+    /// 预跑 validate 回音落地:清 scratch、摊开四态、按「无 fail 且 rc 0」定写回闸。
+    /// 不可定型(含契约守卫「需升级」)一律不过闸——不按旧形状降级解析。
+    fn absorb_recipe_validate(&mut self, out: EngineOutput) {
+        let pass = out.ok
+            && out
+                .envelope
+                .as_ref()
+                .and_then(|e| e.data_as::<crate::engine::ValidateData>())
+                .is_some_and(|d| d.summary.fail == 0);
+        let headline = out.headline().to_string();
+        // 清 scratch(预跑读完即清,recipe.yaml 自始至终未动)。
+        if let Some(scratch) = self
+            .rc_edit_flow
+            .as_ref()
+            .and_then(|f| f.scratch_rel.clone())
+        {
+            if let Some(root) = self.usable_data_root() {
+                crate::datarepo::recipe::clear_staged(
+                    &crate::datarepo::write::DataRepo::new(&root),
+                    &scratch,
+                );
+            }
+        }
+        if let Some(f) = self.rc_edit_flow.as_mut() {
+            f.scratch_rel = None;
+            f.validate_pass = pass;
+            f.validate = Some(out);
+            f.phase = crate::screens::RecipeEditPhase::Review;
+        }
+        self.push_log(if pass {
+            format!("预跑 validate 通过({headline}):可确认写回")
+        } else {
+            format!("预跑 validate 未过({headline}):不可写回,可放弃或再改改")
+        });
+    }
+
+    /// 确认闸放行(预跑通过 + Enter):把拟落账递去写侧原子落盘,刷新五域。
+    /// 落盘失败是磁盘/权限问题,留在确认态说清,不冒充成功(ADR-0010 §5)。
+    fn recipe_edit_commit(&mut self) {
+        let Some(flow) = self.rc_edit_flow.as_ref() else {
+            return;
+        };
+        if flow.phase != crate::screens::RecipeEditPhase::Review || !flow.validate_pass {
+            return;
+        }
+        let Some(plan) = flow.plan.clone() else {
+            return;
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("配方写回:{}", self.data_root_gate_msg()));
+            return;
+        };
+        let repo = crate::datarepo::write::DataRepo::new(&root);
+        match crate::datarepo::recipe::commit_writeback(&repo, &plan) {
+            Ok(receipt) => {
+                let written = receipt.written.join(", ");
+                self.refresh_ls();
+                self.push_log(format!(
+                    "配方已写回:{written}(原子落盘,改动走 git PR + 家长审)"
+                ));
+                if let Some(f) = self.rc_edit_flow.as_mut() {
+                    f.receipt = Some(format!("已写入 {written}"));
+                    f.phase = crate::screens::RecipeEditPhase::Done;
+                }
+            }
+            Err(e) => {
+                let why = e.why();
+                self.push_log(why.clone());
+                if let Some(f) = self.rc_edit_flow.as_mut() {
+                    f.err = Some(why);
+                }
+            }
+        }
+    }
+
+    /// 确认态回编辑态(拟落账 / 预跑结论丢,doc 编辑保留;scratch 已清)。
+    fn recipe_edit_back_to_form(&mut self) {
+        if let Some(f) = self.rc_edit_flow.as_mut() {
+            if f.phase == crate::screens::RecipeEditPhase::Review {
+                f.phase = crate::screens::RecipeEditPhase::Form;
+                f.plan = None;
+                f.validate = None;
+                f.validate_pass = false;
+                f.err = None;
+                self.push_log("回到编辑态:再改改组件槽 / env,s 重新拟落账+预跑".to_string());
+            }
+        }
+    }
+
+    /// 返航:任一态同义。清 scratch(若在途),丢流程。已写回(结论态)说「完成」,
+    /// 否则说「recipe.yaml 一个字节都没落」——两态不互冒充。键盘与鼠标点任意处
+    /// 同路(经 `dismiss_popup`)。
+    fn recipe_edit_abandon(&mut self) {
+        let Some(flow) = self.rc_edit_flow.take() else {
+            return;
+        };
+        if let Some(scratch) = flow.scratch_rel {
+            if let Some(root) = self.usable_data_root() {
+                crate::datarepo::recipe::clear_staged(
+                    &crate::datarepo::write::DataRepo::new(&root),
+                    &scratch,
+                );
+            }
+        }
+        let done = flow.phase == crate::screens::RecipeEditPhase::Done;
+        self.push_log(if done {
+            "配方编辑完成:关闭(改动在数据仓,走 git PR 审)".to_string()
+        } else {
+            "配方编辑返航:recipe.yaml 一个字节都没落".to_string()
+        });
     }
 }
 

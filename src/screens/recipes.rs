@@ -34,6 +34,10 @@ pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
     // 浮层同层覆盖、同一条弹层优先级(键位见 `App::on_key` 的守卫,鼠标见
     // `layout::recipes_hits`);它在场时五域键位一个都不受理。
     render_pack_overlay(frame, area, app);
+    // 配方编辑器浮层(#113):结构化编辑组件槽/env → 拟落账 + 写回前预跑 validate
+    // (引擎代跑、argv 与健康屏同源)→ 确认 → 写回 recipe.yaml。与另几个浮层
+    // 同层覆盖、同一条弹层优先级;它在场时五域键位一个都不受理。
+    render_recipe_edit_overlay(frame, area, app);
 }
 
 /// 常畅态:五域轨(定宽 14)/ 列表 / 详情三栏,既有外观逐像素不变。
@@ -2057,4 +2061,493 @@ fn render_pack_overlay(frame: &mut Frame, area: Rect, app: &App) {
             .style(p.surface()),
         popup,
     );
+}
+
+// ---- 配方编辑器浮层(spec #95 工单 #113):编辑 → 拟落账+预跑 → 确认 → 写回 ----
+
+/// 配方编辑器流程的阶段。与打包器([`PackPhase`])同族、不同源:这条写回
+/// `recipe.yaml` 前多一道**写回前预跑 validate**(引擎代跑,ADR-0010 §4 #113 行)。
+/// - `Form`:结构化编辑(加/删组件槽、改 env required/默认)。
+/// - `PreRun`:拟落账已定型、编辑态暂存进 scratch,`validate` 已入队等回音。
+/// - `Review`:预跑四态摊开 + 拟落账,图形确认闸(通过才可写回)。
+/// - `Done`:recipe.yaml 已原子写回。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecipeEditPhase {
+    Form,
+    PreRun,
+    Review,
+    Done,
+}
+
+/// 编辑器里的两个可编区(组件槽 / env 声明);Tab 轮转。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecipeEditSection {
+    Components,
+    Env,
+}
+
+/// 表单里的行内输入态(加组件槽名 / 加 env 名 / 改 env 默认值)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecipeEditInput {
+    AddComponent(String),
+    AddEnv(String),
+    EditDefault(String),
+}
+
+/// 配方编辑器浮层的全部状态(屏幕层持结构化中间形状 + 拟落账,零路径拼接)。
+/// (`validate` 持引擎回音 [`EngineOutput`],不派生 `PartialEq`——它只进状态树与
+/// 渲染,不进帮助↔实现的 `KeySnap` 快照;后者靠 `start_recipe_edit` 的日志辨别
+/// `e` 键有无分支。)
+#[derive(Clone, Debug)]
+pub struct RecipeEditFlow {
+    pub phase: RecipeEditPhase,
+    /// 结构化中间形状(往返保真;编辑都经它)。
+    pub doc: crate::datarepo::recipe::RecipeDoc,
+    /// recipe.yaml 在数据仓根之下的相对路径(来自 ls 的配方行)。
+    pub recipe_rel: String,
+    /// 配方名(标题 / 日志用)。
+    pub recipe_name: String,
+    /// 当前焦点区。
+    pub section: RecipeEditSection,
+    /// 组件槽选中下标。
+    pub comp_sel: usize,
+    /// env 声明选中下标。
+    pub env_sel: usize,
+    /// 行内输入态(在场时键入归它)。
+    pub input: Option<RecipeEditInput>,
+    /// 拟落账(写回 recipe.yaml 的 WritePlan;确认闸摊开它)。
+    pub plan: Option<crate::datarepo::write::WritePlan>,
+    /// 写回前预跑 validate 的回音(四态摊开)。
+    pub validate: Option<crate::engine::EngineOutput>,
+    /// 预跑是否通过(无 fail 且 rc 0):写回闸。
+    pub validate_pass: bool,
+    /// 写回收据(Done 态呈现)。
+    pub receipt: Option<String>,
+    /// 面板侧就拒 / 加载失败的人话(留在编辑态可改)。
+    pub err: Option<String>,
+    /// 预跑暂存文件(scratch)的相对路径——返航 / 回音落地时清。
+    pub scratch_rel: Option<String>,
+}
+
+impl RecipeEditFlow {
+    pub fn new(
+        doc: crate::datarepo::recipe::RecipeDoc,
+        recipe_rel: String,
+        recipe_name: String,
+    ) -> Self {
+        Self {
+            phase: RecipeEditPhase::Form,
+            doc,
+            recipe_rel,
+            recipe_name,
+            section: RecipeEditSection::Components,
+            comp_sel: 0,
+            env_sel: 0,
+            input: None,
+            plan: None,
+            validate: None,
+            validate_pass: false,
+            receipt: None,
+            err: None,
+            scratch_rel: None,
+        }
+    }
+
+    pub fn comp_len(&self) -> usize {
+        self.doc.component_views().len()
+    }
+    pub fn env_len(&self) -> usize {
+        self.doc.env_views().len()
+    }
+}
+
+/// 配方编辑器浮层在不在场(渲染 / 键位守卫 / 命中弹层优先级共用这一句)。
+pub fn recipe_edit_open(app: &App) -> bool {
+    app.rc_edit_flow.is_some()
+}
+
+/// 表单浮层尺寸(渲染与命中同一组常量)。
+pub const RC_EDIT_FORM_W: u16 = 70;
+pub const RC_EDIT_FORM_H: u16 = 20;
+/// 预跑 / 确认闸浮层尺寸:**两档各一份**(ADR-0004)。
+pub const RC_EDIT_REVIEW_W: u16 = 76;
+pub const RC_EDIT_REVIEW_H_COMFY: u16 = 22;
+pub const RC_EDIT_REVIEW_H_COMPACT: u16 = 18;
+/// 结果浮层尺寸。
+pub const RC_EDIT_DONE_W: u16 = 66;
+pub const RC_EDIT_DONE_H: u16 = 10;
+
+/// 确认闸键位行左段(渲染与命中共用,与 `RITUAL_KEY_RETURN` 同法)。
+pub const RC_EDIT_KEY_COMMIT: &str = "  Enter 写回 ";
+/// 表单键位行(单一真相源;表单段鼠标惰性,无命中区)。完整编辑提示在表单体里
+/// 摊成一行 dim(见 `render_edit_form`),键位行只留主作「拟落账+预跑 / 放弃」
+/// —— 常畅/紧凑两档都放得下(66 宽内层不溢出)。
+pub const RC_EDIT_KEY_FORM: &str = "  s 拟落账+预跑 · Esc/q 放弃 ";
+/// 表单体的完整编辑提示行(↑/↓ 移、Tab 切区、加/删、env 的 required/默认)。
+pub const RC_EDIT_HINT: &str = "  Tab 切区 · a 加 · x 删 · space required · Enter 默认 ";
+
+/// 配方编辑器浮层矩形:按态取尺寸,`popup_rect` 再按终端收窄(渲染与命中共用)。
+/// 尺寸档由调用方给(渲染传 `size_class(frame.area())`、命中传 `class`)。
+pub(crate) fn recipe_edit_popup_rect(area: Rect, app: &App, class: SizeClass) -> Option<Rect> {
+    let f = app.rc_edit_flow.as_ref()?;
+    let (w, h) = match f.phase {
+        RecipeEditPhase::Form => (RC_EDIT_FORM_W, RC_EDIT_FORM_H),
+        RecipeEditPhase::PreRun | RecipeEditPhase::Review => (
+            RC_EDIT_REVIEW_W,
+            match class {
+                SizeClass::Comfy => RC_EDIT_REVIEW_H_COMFY,
+                SizeClass::Compact => RC_EDIT_REVIEW_H_COMPACT,
+            },
+        ),
+        RecipeEditPhase::Done => (RC_EDIT_DONE_W, RC_EDIT_DONE_H),
+    };
+    let popup = crate::layout::popup_rect(area, w, h);
+    (popup.width > 0 && popup.height > 0).then_some(popup)
+}
+
+/// 配方编辑器浮层总入口:按阶段画一个;不在场无浮层。
+fn render_recipe_edit_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(flow) = app.rc_edit_flow.as_ref() else {
+        return;
+    };
+    let Some(popup) = recipe_edit_popup_rect(area, app, size_class(frame.area())) else {
+        return;
+    };
+    let p = &app.palette;
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let content_h = popup.height.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let (title, key_line): (String, String) = match flow.phase {
+        RecipeEditPhase::Form => {
+            render_edit_form(&mut lines, app, inner_w);
+            (
+                format!(" 配方编辑器 · {} ", flow.recipe_name),
+                RC_EDIT_KEY_FORM.to_string(),
+            )
+        }
+        RecipeEditPhase::PreRun => {
+            render_edit_prerun(&mut lines, app, inner_w);
+            (
+                " 配方编辑器 · 预跑中 ".to_string(),
+                "  Esc 放弃(取消预跑,不写回) ".to_string(),
+            )
+        }
+        RecipeEditPhase::Review => {
+            render_edit_review(&mut lines, app, inner_w);
+            let key = if flow.validate_pass {
+                format!(
+                    "{}{}{}",
+                    RC_EDIT_KEY_COMMIT,
+                    crate::layout::RITUAL_KEY_GAP,
+                    crate::layout::RITUAL_KEY_RETURN
+                )
+            } else {
+                "  e 再改改 · Esc 返航(不写回) ".to_string()
+            };
+            (" 配方编辑器 · 确认闸 ".to_string(), key)
+        }
+        RecipeEditPhase::Done => {
+            render_edit_done(&mut lines, app, inner_w);
+            (
+                " 配方编辑器 · 写回结果 ".to_string(),
+                "  Esc/q/Enter 关闭 ".to_string(),
+            )
+        }
+    };
+    // 内容钉进内层:超量截断、欠量垫空,键位行恒在内层最后一行。
+    lines.truncate(content_h.saturating_sub(1));
+    while lines.len() < content_h.saturating_sub(1) {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(key_line, p.dim())));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(title, p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// 表单态:两个可编区(组件槽 / env 声明)+ 焦点光标 + 行内输入。
+fn render_edit_form(lines: &mut Vec<Line<'static>>, app: &App, inner_w: usize) {
+    let p = &app.palette;
+    let flow = app.rc_edit_flow.as_ref().expect("在场");
+    let focused = flow.section;
+    // 组件槽区
+    let comps = flow.doc.component_views();
+    lines.push(Line::from(Span::styled(
+        format!(
+            " 组件槽({}){}",
+            comps.len(),
+            if focused == RecipeEditSection::Components {
+                " · 焦点"
+            } else {
+                ""
+            }
+        ),
+        if focused == RecipeEditSection::Components {
+            p.accent().bold()
+        } else {
+            p.dim().bold()
+        },
+    )));
+    let show_comp = 4.min(comps.len());
+    for (i, c) in comps.iter().take(show_comp).enumerate() {
+        let cur = focused == RecipeEditSection::Components && i == flow.comp_sel;
+        let detail = if c.source.is_empty() {
+            format!(
+                "v{}",
+                if c.version.is_empty() {
+                    "—"
+                } else {
+                    &c.version
+                }
+            )
+        } else {
+            format!("source:{}", c.source)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(if cur { "  ▸ " } else { "    " }),
+            Span::styled(
+                format!(
+                    "component: {}",
+                    if c.name.is_empty() { "—" } else { &c.name }
+                ),
+                if cur { p.sel().bold() } else { p.text() },
+            ),
+            Span::raw("  "),
+            Span::styled(clip(&detail, inner_w.saturating_sub(24)), p.dim()),
+        ]));
+    }
+    if comps.len() > show_comp {
+        lines.push(Line::from(Span::styled(
+            format!("    …其余 {} 个组件槽(屏内未全显)", comps.len() - show_comp),
+            p.dim(),
+        )));
+    }
+    lines.push(Line::from(""));
+    // env 声明区
+    let envs = flow.doc.env_views();
+    lines.push(Line::from(Span::styled(
+        format!(
+            " env 声明({}){}",
+            envs.len(),
+            if focused == RecipeEditSection::Env {
+                " · 焦点"
+            } else {
+                ""
+            }
+        ),
+        if focused == RecipeEditSection::Env {
+            p.accent().bold()
+        } else {
+            p.dim().bold()
+        },
+    )));
+    let show_env = 4.min(envs.len());
+    for (i, e) in envs.iter().take(show_env).enumerate() {
+        let cur = focused == RecipeEditSection::Env && i == flow.env_sel;
+        lines.push(Line::from(vec![
+            Span::raw(if cur { "  ▸ " } else { "    " }),
+            Span::styled(
+                format!("{}  ", if e.name.is_empty() { "—" } else { &e.name }),
+                if cur { p.sel().bold() } else { p.text() },
+            ),
+            Span::styled(
+                format!("required:{}", if e.required { "是" } else { "否" }),
+                p.dim(),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("默认:{}", e.default.as_deref().unwrap_or("—")),
+                p.dim(),
+            ),
+        ]));
+    }
+    if envs.len() > show_env {
+        lines.push(Line::from(Span::styled(
+            format!("    …其余 {} 条 env(屏内未全显)", envs.len() - show_env),
+            p.dim(),
+        )));
+    }
+    // 行内输入 / 拒件人话
+    match flow.input.as_ref() {
+        Some(crate::screens::recipes::RecipeEditInput::AddComponent(buf)) => {
+            lines.push(Line::from(Span::styled(
+                format!("  新组件槽名:{buf}█"),
+                p.info(),
+            )));
+        }
+        Some(crate::screens::recipes::RecipeEditInput::AddEnv(buf)) => {
+            lines.push(Line::from(Span::styled(
+                format!("  新 env 名:{buf}█"),
+                p.info(),
+            )));
+        }
+        Some(crate::screens::recipes::RecipeEditInput::EditDefault(buf)) => {
+            lines.push(Line::from(Span::styled(
+                format!("  env 默认值(空=清除):{buf}█"),
+                p.info(),
+            )));
+        }
+        None => {
+            if let Some(err) = flow.err.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", clip(err, inner_w.saturating_sub(4))),
+                    p.fail(),
+                )));
+            }
+        }
+    }
+    // 完整编辑提示(一行 dim;键位行只留主作)。
+    lines.push(Line::from(Span::styled(RC_EDIT_HINT, p.dim())));
+}
+
+/// 预跑中:说清这段在干什么(编辑态暂存 + 引擎代跑 validate,recipe.yaml 不动)。
+fn render_edit_prerun(lines: &mut Vec<Line<'static>>, app: &App, inner_w: usize) {
+    let p = &app.palette;
+    let flow = app.rc_edit_flow.as_ref().expect("在场");
+    lines.push(Line::from(Span::styled(
+        "  正在预跑 validate(引擎代跑,argv 与健康屏同源)…",
+        p.text(),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  拟写回  {}",
+            clip(&flow.recipe_rel, inner_w.saturating_sub(13))
+        ),
+        p.dim(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  编辑态暂存进 scratch 供引擎读;recipe.yaml 仍未动。",
+        p.dim(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  预跑不过可不写回:数据仓状态不变。",
+        p.dim(),
+    )));
+}
+
+/// 确认闸:预跑四态摊开 + 拟落账 + 写回闸结论。
+fn render_edit_review(lines: &mut Vec<Line<'static>>, app: &App, inner_w: usize) {
+    let p = &app.palette;
+    let flow = app.rc_edit_flow.as_ref().expect("在场");
+    // 拟落账:将写文件 + 体量。
+    if let Some(plan) = flow.plan.as_ref() {
+        let target = plan.paths().join(", ");
+        lines.push(Line::from(vec![
+            Span::raw("  将写    "),
+            Span::styled(clip(&target, inner_w.saturating_sub(10)), p.text()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  体量    "),
+            Span::styled(format!("{} 字节", plan.total_bytes()), p.dim()),
+        ]));
+    }
+    lines.push(Line::from(""));
+    // 预跑 validate 四态。
+    lines.push(Line::from(Span::styled("  预跑 validate:", p.accent())));
+    let out = flow.validate.as_ref();
+    match out
+        .and_then(|o| o.envelope.as_ref())
+        .and_then(|e| e.data_as::<crate::engine::ValidateData>())
+    {
+        Some(d) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {} 项 · 过 {} · 警 {} · 败 {} · 略 {}",
+                    d.summary.total, d.summary.pass, d.summary.warn, d.summary.fail, d.summary.skip
+                ),
+                p.dim(),
+            )));
+            let cap = if inner_w >= 60 { 10 } else { 6 };
+            for r in d.results.iter().filter(|r| r.status != "pass").take(cap) {
+                let st = crate::engine::State::from(r.status.as_str());
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(p.lamp(st), p.state(st)),
+                    Span::raw(" "),
+                    Span::styled(r.id.clone(), p.dim()),
+                    Span::raw(" "),
+                    Span::styled(
+                        clip(&r.message, inner_w.saturating_sub(10 + r.id.len())),
+                        p.text(),
+                    ),
+                ]));
+            }
+            if d.summary.fail == 0 && d.summary.warn == 0 {
+                lines.push(Line::from(Span::styled(
+                    "    全绿(无 warn/fail)。",
+                    p.info(),
+                )));
+            }
+        }
+        None => {
+            // 不可定型(含契约守卫「需升级」):走证据呈现,不按旧形状降级。
+            let headline = out.map(|o| o.headline().to_string()).unwrap_or_default();
+            for ln in wrap(
+                &format!("    预跑结果不可定型:{headline}"),
+                inner_w.saturating_sub(4),
+            )
+            .into_iter()
+            .take(2)
+            {
+                lines.push(Line::from(Span::styled(ln, p.warn())));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+    // 写回闸结论。
+    if flow.validate_pass {
+        lines.push(Line::from(Span::styled(
+            "  预跑通过:可写回 recipe.yaml(确认才原子落盘)。",
+            p.info().bold(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  ⚠ 预跑未过:不可写回——按 e 再改改,或 Esc 放弃(一个字节都不落)。",
+            p.warn().bold(),
+        )));
+    }
+    if let Some(err) = flow.err.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ {}", clip(err, inner_w.saturating_sub(4))),
+            p.fail(),
+        )));
+    }
+}
+
+/// 结果态:写回位置 + git 变更提示。
+fn render_edit_done(lines: &mut Vec<Line<'static>>, app: &App, inner_w: usize) {
+    let p = &app.palette;
+    let flow = app.rc_edit_flow.as_ref().expect("在场");
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {}",
+            flow.receipt.clone().unwrap_or_else(|| "已写回".into())
+        ),
+        p.info().bold(),
+    )));
+    if let Some(plan) = flow.plan.as_ref() {
+        let target = plan.paths().join(", ");
+        lines.push(Line::from(Span::styled(
+            format!("  位置    {}", clip(&target, inner_w.saturating_sub(10))),
+            p.dim(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ⚠ recipe.yaml 是一次 git 变更:走 PR + 家长审,",
+        p.warn(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "    面板只负责把确认过的字节写对地方(ADR-0010 §6)。",
+        p.warn(),
+    )));
 }

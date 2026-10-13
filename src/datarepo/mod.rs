@@ -16,6 +16,7 @@
 //! 收在 [`write`](ADR-0010),面板永不写 NW_HOME。
 
 pub mod pack;
+pub mod recipe;
 pub mod write;
 
 use std::collections::{BTreeMap, BTreeSet};

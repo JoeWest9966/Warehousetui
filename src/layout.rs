@@ -631,6 +631,14 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
 /// (45% 栏),紧凑态在 Tab 行之下(52% 栏)。两支都用与渲染同一套
 /// ratatui `Layout` 常量,几何零分歧(#18 收起内层栏后命中自动跟随)。
 fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    // 配方编辑器浮层(#113):与打包器/落点浮层同一条弹层纪律 —— 在场时整块正文
+    // 只有浮层自己的命中区,底层列表行与键位行一段都不产。表单/预跑段鼠标惰性
+    // (打字归键盘);确认段(预跑通过时)键位行两段(Enter 写回 / Esc 返航),
+    // 预跑未过只产返航;结果段点任意处 = 返航。
+    if app.recipe_edit_open() {
+        recipe_edit_hits(area, app, class, hits);
+        return;
+    }
     // 组件打包器浮层(#112):与落点溯源浮层同一条弹层纪律 —— 在场时整块正文
     // 只有浮层自己的命中区,底层列表行与键位行一段都不产。表单段鼠标惰性
     // (打字归键盘,同手填浮层先例);确认段键位行两段(Enter 落盘 /
@@ -747,6 +755,52 @@ fn pack_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Targ
         }
         // 结果屏:点任意处 = 返航(同登记结果屏先例)。
         crate::screens::recipes::PackPhase::Done => {
+            if popup.width > 0 && popup.height > 0 {
+                hits.push((popup, Target::DismissPopup));
+            }
+        }
+    }
+}
+
+/// 配方编辑器浮层(#113)的命中区:几何与 `recipes::render_recipe_edit_overlay`
+/// 同一组常量、同一个 `recipe_edit_popup_rect`(渲染与命中共用一份,ADR-0005)。
+/// 表单 / 预跑段鼠标惰性(键入归键盘,同手填浮层先例);确认段预跑通过时键位行
+/// 两段(Enter 写回 / Esc 返航),预跑未过整块归返航(点哪都是放弃,不误写回);
+/// 结果段点任意处 = 返航。浮层外无任何命中区。
+fn recipe_edit_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    let Some(popup) = crate::screens::recipes::recipe_edit_popup_rect(area, app, class) else {
+        return;
+    };
+    let flow = match app.rc_edit_flow.as_ref() {
+        Some(f) => f,
+        None => return,
+    };
+    use crate::screens::recipes::RecipeEditPhase;
+    match flow.phase {
+        // 表单 / 预跑:打字归键盘,鼠标不分派(同 NW_HOME / 数据仓根手填浮层)。
+        RecipeEditPhase::Form | RecipeEditPhase::PreRun => {}
+        // 确认闸:预跑通过才产「Enter 写回」段;未过整块归返航(不可写回)。
+        RecipeEditPhase::Review => {
+            if !flow.validate_pass {
+                if popup.width > 0 && popup.height > 0 {
+                    hits.push((popup, Target::DismissPopup));
+                }
+                return;
+            }
+            if popup.height < 4 {
+                return; // 收窄后键位行不再可信,不产命中
+            }
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(
+                popup,
+                key_y,
+                crate::screens::recipes::RC_EDIT_KEY_COMMIT,
+                RITUAL_KEY_RETURN,
+                hits,
+            );
+        }
+        // 结果屏:点任意处 = 返航(同登记 / 打包结果屏先例)。
+        RecipeEditPhase::Done => {
             if popup.width > 0 && popup.height > 0 {
                 hits.push((popup, Target::DismissPopup));
             }
