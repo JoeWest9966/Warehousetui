@@ -35,6 +35,11 @@ pub const PROFILES_DIR: &str = "profiles";
 /// 安装根下的锁定集目录(引擎 `ls` 的 locks 域与装配命令交锁段的同一落点)。
 pub const LOCKS_DIR: &str = "locks";
 
+/// 安装根下的回收站目录(引擎把换下的旧组件**整目录移进来**,只移不删;
+/// `--allow-prune` 才真删)。上游布局见 `docs/research/nw-cli-surface.md` §4:
+/// `pruned/<时间戳>/` 住在**安装根根部**,不在某个派底下——面板不按派另造一层。
+pub const PRUNED_DIR: &str = "pruned";
+
 /// 安装根不可用的两种原因(与数据仓根的
 /// [`crate::app::DataRootCause`] 同口径:各有各的说法、互不冒充)。
 ///
@@ -201,6 +206,71 @@ pub fn read_manifest(nw_home: &str, profile: &str) -> ManifestStatus {
             reason: format!("清单 schema 认得、字段形状不对:{e}"),
         },
     }
+}
+
+/// 回收站里的一条:一次退场的一座旧组件(#102)。
+///
+/// 上游事实(`docs/research/nw-cli-surface.md` §4、`nw-journeys-and-docs.md`):
+/// `nw up` 收敛到新锁时,被换下的旧组件**整目录移入** `$NW_HOME/pruned/<时间戳>/`,
+/// 只移不删(`--allow-prune` 才真删)。所以一条 = 一个「退场时刻 × 组件名」的
+/// 二元组,外加面板唯一能负责任地给出的东西:**完整恢复路径**(选中即复制它,
+/// 面板不代恢复——规格故事 6/7)。
+///
+/// 不派生相等性:与 [`ManifestArchive`] 同一理由(测试按字段断言)。
+#[derive(Clone, Debug)]
+pub struct PrunedEntry {
+    /// 退场时刻目录名(引擎写的原样串,面板不改写、不解析成日期)。
+    pub stamp: String,
+    /// 组件名(该时刻目录下的目录名 / 文件名)。
+    pub component: String,
+    /// 完整恢复路径:操作者拿它去 shell 里手工找回的地址。
+    pub path: String,
+}
+
+/// 枚举回收站里被换下的旧组件(只读;#102)。
+///
+/// **不按派过滤**:上游 `pruned/<时间戳>/` 住在安装根根部,不在某个派底下
+/// (见 [`PRUNED_DIR`]);面板不按派另造一层布局。「从哪一派的视角翻进来」
+/// 是视图层的事(`App` 记下来历派),枚举这一层只答「回收站里有什么」。
+///
+/// 可用性另问 [`home_cause`]:安装根本身不在时走指路,不拿一个空列表冒充
+/// 「从没换下过组件」(规格故事 28)。而 `pruned/` 不在 / 读不通 / 是文件
+/// 都归**空**:那确实是「没有可恢复的东西」,不是错误(规格验收:空/缺失
+/// 目录呈空态不报错)。
+///
+/// 顺序确定(字典序,stamp 先、组件名后):与 [`list_profiles`] 同一口径,
+/// 渲染与测试都不靠 `read_dir` 的偶然顺序。
+pub fn list_pruned(nw_home: &str) -> Vec<PrunedEntry> {
+    let root = expand_tilde(nw_home).join(PRUNED_DIR);
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut stamps: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    stamps.sort();
+    let mut out: Vec<PrunedEntry> = Vec::new();
+    for stamp in stamps {
+        let dir = root.join(&stamp);
+        let Ok(inner) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut comps: Vec<String> = inner
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        comps.sort();
+        for component in comps {
+            out.push(PrunedEntry {
+                stamp: stamp.clone(),
+                path: dir.join(&component).display().to_string(),
+                component,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -421,6 +491,86 @@ mod tests {
             }
             other => panic!("不认识的 schema 该走契约守卫,实得 {other:?}"),
         }
+    }
+
+    // ---- 回收站枚举:被换下的旧组件 ----
+
+    /// 造一座 fixture 回收站(#102):两个退场时刻目录,组件名照上游事实取
+    /// (整目录移入,所以组件也是目录)。
+    fn fixture_pruned(tag: &str) -> std::path::PathBuf {
+        let home = fixture_home(tag);
+        let stamps: Vec<(&str, Vec<&str>)> = vec![
+            (
+                "20261009T030007Z",
+                vec!["retention", "satoshi-localeselector"],
+            ),
+            ("20261012T101500Z", vec!["hyva-ai-tools"]),
+        ];
+        for (stamp, comps) in stamps {
+            for c in comps {
+                std::fs::create_dir_all(home.join(PRUNED_DIR).join(stamp).join(c)).unwrap();
+            }
+        }
+        home
+    }
+
+    #[test]
+    fn 回收站枚举_时间戳目录与组件名齐_顺序确定() {
+        let home = fixture_pruned("pruned");
+        let got = list_pruned(home.to_str().unwrap());
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|e| (e.stamp.as_str(), e.component.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("20261009T030007Z", "retention"),
+                ("20261009T030007Z", "satoshi-localeselector"),
+                ("20261012T101500Z", "hyva-ai-tools"),
+            ],
+            "顺序确定(字典序):渲染与测试都不靠 read_dir 的偶然顺序"
+        );
+        assert!(
+            got[0].path.ends_with("pruned/20261009T030007Z/retention"),
+            "完整恢复路径由 datarepo 给出,屏幕层不拼:{}",
+            got[0].path
+        );
+    }
+
+    #[test]
+    fn 回收站_散落文件不算一条_只收时间戳目录下的组件() {
+        let home = fixture_pruned("pruned-stray");
+        // 落在 pruned/ 根部的散落文件不是一次退场,更不是组件
+        std::fs::write(home.join(PRUNED_DIR).join("stray.txt"), "x").unwrap();
+        let got = list_pruned(home.to_str().unwrap());
+        assert_eq!(got.len(), 3, "散落文件不该混进回收站:{got:?}");
+    }
+
+    #[test]
+    fn 回收站_pruned不在时是空_不报错() {
+        let home = fixture_home("no-pruned");
+        assert!(
+            list_pruned(home.to_str().unwrap()).is_empty(),
+            "从没换下过组件:空是事实,不是错误"
+        );
+    }
+
+    #[test]
+    fn 回收站_pruned是个文件时也是空_不炸() {
+        let home = fixture_home("pruned-file");
+        std::fs::write(home.join(PRUNED_DIR), "x").unwrap();
+        assert!(list_pruned(home.to_str().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn 回收站_空的退场目录不产条目() {
+        let home = fixture_home("pruned-empty-stamp");
+        std::fs::create_dir_all(home.join(PRUNED_DIR).join("20261013T000000Z")).unwrap();
+        assert!(
+            list_pruned(home.to_str().unwrap()).is_empty(),
+            "一次退场目录里没有组件:没有可恢复的地址可给"
+        );
     }
 
     #[test]
