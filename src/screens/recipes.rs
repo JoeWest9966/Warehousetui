@@ -22,6 +22,10 @@ pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
     // 登记两段式的浮层(#30):盖在屏体之上(几何与 layout::register_hits
     // 共用 popup_rect 与同一组常量,点哪打哪)。
     render_register_overlay(frame, area, app);
+    // 落点溯源浮层(#115):与登记浮层同层覆盖(它在场时键位/命中都被吞,
+    // 见 on_key 守卫与 layout::recipes_hits;两个浮层不会同时在场的语义由
+    // dismiss_popup 的受理次序保证)。
+    render_landing_overlay(frame, area, app);
 }
 
 /// 常畅态:五域轨(定宽 14)/ 列表 / 详情三栏,既有外观逐像素不变。
@@ -732,6 +736,199 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                 .title(Span::styled(" 详情 ", p.dim())),
         ),
         area,
+    );
+}
+
+// ---- #115 反向溯源:选中行的派落点(只读知识呈现) ----
+
+/// 选中行「铺进派后落哪」的快照:打开浮层时从当次 ls 五域数据算定,之后
+/// 不随刷新漂(呈现的是操作者选中那一刻的事实)。
+///
+/// 两类分列的来源(上游 docs/external-sources.md,只读知识、面板不另造规则):
+/// - 本地组件住 `nw/components/<组件名>/`(「机制不同,家就不同」,2026-10-03 裁定);
+/// - 外部源一条记录 = 一个仓库,条目按记录 kind 分派:skill 落
+///   `skills/<仓库名>/<条目名>/`(仓库名即命名空间),extension 落
+///   `nw/extensions/<仓库名>/<条目名>/`(与本地组件同一屋檐但不进 components/)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LandingTrace {
+    /// 选中一个本地组件(ls 的 components 域:上游 `ls.go` 的 readComponents
+    /// 只扫 `<root>/components/<名>/component.yaml`,这一域恒为本地组件)。
+    Local { name: String },
+    /// 选中一条外部源记录(ls 的 sources 域:一条记录 = 一个仓库 + 一次扫描的
+    /// 条目清单)。`kind` 取引擎原文(skill/extension;缺 None 时呈现侧明说)。
+    External {
+        repo: String,
+        kind: Option<String>,
+        entries: Vec<String>,
+    },
+}
+
+/// 本地组件的派落点(相对派目录):上游 external-sources.md「本地组件的 skill
+/// 仍住 `nw/components/<组件>/` 里」。
+pub fn local_component_landing(name: &str) -> String {
+    format!("nw/components/{name}/")
+}
+
+/// 外部源条目的派落点(相对派目录):kind = `extension` 落
+/// `nw/extensions/<仓库名>/<条目名>/`;其余(含 kind 缺省)按 skill 落
+/// `skills/<仓库名>/<条目名>/` —— 上游编目两条数组必居其一(skills[] /
+/// extensions[]),kind 缺省时呈现侧在标题明说,不静默冒充。
+pub fn external_entry_landing(repo: &str, entry: &str, kind: Option<&str>) -> String {
+    match kind {
+        Some("extension") => format!("nw/extensions/{repo}/{entry}/"),
+        _ => format!("skills/{repo}/{entry}/"),
+    }
+}
+
+/// 当前选中行的落点快照(纯计算):只读,不碰文件系统、不发引擎命令。
+/// 门与五域同源:数据仓根不就绪(`data_root_cause`)时不摆;无落点语义的域
+/// (recipes/profiles/locks)不给;选中行取过滤后「看得见的那一行」(#61 同源)。
+pub fn landing_trace(app: &App) -> Option<LandingTrace> {
+    if app.data_root_cause().is_some() {
+        return None;
+    }
+    let l = app.ls.as_ref()?;
+    let i = *app.rc_visible().get(app.rc_sel)?;
+    match app.rc_domain {
+        Domain::Components => l.components.get(i).map(|c| LandingTrace::Local {
+            name: c.name.clone(),
+        }),
+        Domain::Sources => l.sources.get(i).map(|s| LandingTrace::External {
+            repo: s.name.clone(),
+            kind: s.kind.clone(),
+            entries: s.entries.iter().map(|e| e.name.clone()).collect(),
+        }),
+        _ => None,
+    }
+}
+
+/// 浮层宽:要容得下 `nw/extensions/<仓库名>/<条目名>/` 的实指行(常畅/紧凑
+/// 两档都放得下;`popup_rect` 再按终端收窄)。
+const LANDING_W: u16 = 64;
+
+/// 外部源条目的实指行上限:一仓扫出几十条时浮层不无限长,超出明说条数
+///(与健康屏证据面板 20 条上限同一种「不收进无限列表」的纪律)。
+const LANDING_MAX_ENTRIES: usize = 6;
+
+/// 落点溯源浮层矩形:宽 [`LANDING_W`],高随内容(内容行 + 2 边框,与
+/// `vps_reverse_popup_rect` 同法,钳在终端内)。渲染与命中共用这一几何。
+pub(crate) fn landing_popup_rect(area: Rect, trace: &LandingTrace) -> Option<Rect> {
+    let content = match trace {
+        // 标签 + 实指 + 规则标签 + 两条规则 + 收口
+        LandingTrace::Local { .. } => 6,
+        // 标签 + 条目(含溢出说明)+ 规则标签 + 规则行 + 收口
+        LandingTrace::External { entries, .. } => {
+            4 + entries.len().min(LANDING_MAX_ENTRIES)
+                + usize::from(entries.len() > LANDING_MAX_ENTRIES)
+        }
+    };
+    let h = u16::try_from(content).unwrap_or(u16::MAX).saturating_add(2);
+    let popup = crate::layout::popup_rect(area, LANDING_W, h);
+    (popup.width > 0 && popup.height > 0).then_some(popup)
+}
+
+/// 落点溯源浮层(#115):纯只读呈现 —— 不读派目录、不发引擎命令、不落文件;
+/// 两类分列:选中行所属那类摊实指,另一类给上游规则作对照(规格故事 19:
+/// 两类组件的落点差异一目了然)。Esc 或点任意处关闭(键盘路由见
+/// `App::on_key` 的浮层守卫,鼠标见 `layout::recipes_hits` 的弹层分支)。
+fn render_landing_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(trace) = app.rc_landing.as_ref() else {
+        return;
+    };
+    let Some(popup) = landing_popup_rect(area, trace) else {
+        return;
+    };
+    let p = &app.palette;
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    match trace {
+        LandingTrace::Local { name } => {
+            lines.push(Line::from(Span::styled(
+                " 本地组件(选中) ",
+                p.text().bold(),
+            )));
+            lines.push(Line::from(vec![
+                Span::raw("   ▸ "),
+                Span::styled(local_component_landing(name), p.info()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                " 外部源组件 · 规则(上游落点) ",
+                p.dim().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "   · skill      →  skills/<仓库名>/<条目名>/",
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "   · extension →  nw/extensions/<仓库名>/<条目名>/",
+                p.dim(),
+            )));
+        }
+        LandingTrace::External {
+            repo,
+            kind,
+            entries,
+        } => {
+            lines.push(Line::from(Span::styled(
+                " 外部源组件(选中) ",
+                p.text().bold(),
+            )));
+            if entries.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "   该仓库还没有扫出条目(register 预审时才有)。",
+                    p.dim(),
+                )));
+            }
+            for e in entries.iter().take(LANDING_MAX_ENTRIES) {
+                lines.push(Line::from(vec![
+                    Span::raw("   ▸ "),
+                    Span::styled(clip(e, 18), p.info()),
+                    Span::raw("  →  "),
+                    Span::styled(
+                        clip(
+                            &external_entry_landing(repo, e, kind.as_deref()),
+                            inner_w.saturating_sub(26),
+                        ),
+                        p.info(),
+                    ),
+                ]));
+            }
+            let rest = entries.len().saturating_sub(LANDING_MAX_ENTRIES);
+            if rest > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("   …其余 {rest} 条按同一规则落 skills/<仓库名>/<条目名>/"),
+                    p.dim(),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                " 本地组件 · 规则(上游落点) ",
+                p.dim().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "   · 铺到 nw/components/<组件名>/",
+                p.dim(),
+            )));
+        }
+    }
+    lines.push(Line::from(Span::styled(" Esc 或点击任意处关闭", p.dim())));
+    let budget = popup.height.saturating_sub(2) as usize;
+    lines.truncate(budget);
+    // 标题带 kind 原文;缺 kind 明说按 skill 呈现,不静默冒充
+    let title = match trace {
+        LandingTrace::Local { name } => format!(" 落点溯源 · {name} "),
+        LandingTrace::External { repo, kind, .. } => match kind.as_deref() {
+            Some(k) => format!(" 落点溯源 · {repo} · kind: {k} "),
+            None => format!(" 落点溯源 · {repo} · kind 未给出(按 skill) "),
+        },
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_style(p.accent())
+                .title(Span::styled(title, p.accent().bold())),
+        ),
+        popup,
     );
 }
 

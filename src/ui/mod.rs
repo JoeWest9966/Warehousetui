@@ -361,6 +361,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('r'),
     },
     HelpRow {
+        key: "Enter",
+        desc: "配方:看选中组件的落点(只读)",
+        screen: Some(Screen::Recipes),
+        domain: Some(Domain::Sources),
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Enter,
+    },
+    HelpRow {
         key: "/",
         desc: "配方:过滤五域(本地筛选,键入即筛)",
         screen: Some(Screen::Recipes),
