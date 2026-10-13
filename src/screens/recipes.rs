@@ -151,13 +151,20 @@ fn register_entry_hint(app: &App) -> Line<'static> {
     }
 }
 
-/// 组件域新建入口提示(#110):与登记入口提示同级的**入口行**(不是数据行),
-/// 始终留在列表尾行。skill 是组件(CONTEXT),脚手架落进数据仓 `skills/`;
-/// 入口门(数据仓根就绪 / 不重入)在 `App::start_scaffold` 把守,根不可用时
-/// 整域已走上方的 `data_root_signpost`,不进此路。
-fn scaffold_entry_hint(app: &App) -> Line<'static> {
+/// 组件域新建入口提示(#110 skill / #111 extension):与登记入口提示同级的
+/// **入口行**(不是数据行),始终留在列表尾行。skill 与 extension 都是组件
+/// (CONTEXT),脚手架分别落进数据仓 `skills/` 与 `extensions/`;入口门
+/// (数据仓根就绪 / 不重入)在 `App::start_scaffold` / `start_ext_scaffold`
+/// 把守,根不可用时整域已走上方的 `data_root_signpost`,不进此路。
+fn scaffold_entry_hint(app: &App) -> Vec<Line<'static>> {
     let p = &app.palette;
-    Line::from(Span::styled("  按 n 新建 skill 脚手架…", p.info()))
+    vec![
+        Line::from(Span::styled("  按 n 新建 skill 脚手架…", p.info())),
+        Line::from(Span::styled(
+            "  按 e 新建 extension 脚手架(pi-extension 契约)…",
+            p.info(),
+        )),
+    ]
 }
 
 fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
@@ -274,10 +281,10 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
     if app.rc_domain == Domain::Sources && app.ls.is_some() {
         items.push(register_entry_hint(app));
     }
-    // 组件域新建入口(#110):与外部源域登记入口同级的尾行入口(根不可用时
+    // 组件域新建入口(#110/#111):与外部源域登记入口同级的尾行入口(根不可用时
     // 整域已走上方 signpost,不进此分支)。
     if app.rc_domain == Domain::Components && app.ls.is_some() {
-        items.push(scaffold_entry_hint(app));
+        items.extend(scaffold_entry_hint(app));
     }
     let mut st = ListState::default();
     let n = app.domain_len();

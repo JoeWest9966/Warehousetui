@@ -100,6 +100,10 @@ _Avoid_: 压缩包、打包命令（产物是一份组件清单，不是 tarball
 配方屏从只读升级为结构化编辑（spec #95 工单 #113）：加/删组件槽、改 env 声明（required 及默认）。编辑态经**结构化中间形状**往返（`datarepo::recipe::RecipeDoc`——块状 YAML 手写解析，不引 serde_yaml，只解析面板要编辑的 `components:` / `env:` 两条序列，其余顶层块原样保留），**面板不认识的自定义字段原样保留**（硬约束，fixture 断言往返不丢）。写回 `recipe.yaml` 走 datarepo 写侧：先把编辑态暂存成配方同目录的隐藏 scratch 喂引擎 `validate`（引擎代跑、argv 与健康屏同源）预跑，结果四态摊开，拟落账 + 图形确认后才经写侧原子落盘（tmp+rename）——确认前 `recipe.yaml` 一个字节都不落，预跑不过可不写回、数据仓状态不变。是「作者侧工具」八项之一（ADR-0010 §4 #113 行）。
 _Avoid_: 通用 yaml 编辑器（面板只写数据仓根之下的配方文件且全过确认闸；不是任意文件编辑器，也不是引擎命令）
 
+**extension 脚手架（extension scaffold）**：
+作者侧工具之一：图形表单生成 **pi-extension landing 契约**骨架——条目子树自带 `package.json` 且 `pi.extensions` 非空、入口文件（缺省 `index.ts`）就是那份清单指着的一个，两件一起落进数据仓 `extensions/<条目名>/`（条目身份 = 子树目录名，上游 #21：扩展没有 frontmatter 可当身份）。字段形状与自审判据对齐上游 `--kind extension` 的验收第六条（缺清单 = 装上了不加载）；派内落点 `<agent-dir>/nw/extensions/<仓库>/<条目>/` 与 `settings.packages` 登记是 `up` 的事，面板只写数据仓里的源、不写 `catalog.json`。与 skill 脚手架共用同一条表单流（阶段机 / 拟落账 / 确认闸 / 原子落盘），换的只有表单与规格。
+_Avoid_: 扩展生成器、扩展模板（面板不是通用代码生成器：只写数据仓根之下 manifest + 入口两件且全过确认闸；「模板」是面板静态资产，不是引擎概念）
+
 **跟随引擎（upstream-first）**：
 本面板不拥有任何领域决策：CLI 契约、领域词汇、「准许代跑哪些命令」的边界,一律以上游 Nous Warehouse 仓为唯一真相源;上游改,面板跟,不自创、不背离、不复刻引擎逻辑。
 _Avoid_: 兼容、适配（太被动;适配暗示以面板为主位）
