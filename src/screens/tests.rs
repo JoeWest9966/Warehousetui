@@ -397,6 +397,7 @@ fn 概览警示带_点名到期订阅_active不占带() {
     app.capabilities.record(
         crate::engine::Capability::Subscription,
         crate::engine::Probe::Available,
+        None,
     );
     let s = draw(&app, 110, 30);
     assert!(s.contains("订阅到期"), "警示带给出租期看板这一档:{s}");
@@ -434,6 +435,7 @@ fn 概览警示带_订阅看板三种降级都不占带() {
     app.capabilities.record(
         crate::engine::Capability::Subscription,
         crate::engine::Probe::Available,
+        None,
     );
     let s = calm(&app);
     assert!(s.contains("一切平静"), "全 active 时不占带:{s}");
@@ -445,6 +447,7 @@ fn 概览警示带_订阅看板三种降级都不占带() {
     app.capabilities.record(
         crate::engine::Capability::Subscription,
         crate::engine::Probe::Unavailable,
+        None,
     );
     let s = calm(&app);
     assert!(s.contains("一切平静"), "引擎没这一组时不占带:{s}");
@@ -462,6 +465,7 @@ fn 概览警示带_漂移派一档仍优先于订阅到期() {
     app.capabilities.record(
         crate::engine::Capability::Subscription,
         crate::engine::Probe::Available,
+        None,
     );
     let s = draw(&app, 110, 30);
     assert!(s.contains("警示带"), "漂移一档照旧亮相:{s}");
@@ -480,6 +484,7 @@ fn 概览警示带_订阅到期一档两档都在场且不超宽() {
     app.capabilities.record(
         crate::engine::Capability::Subscription,
         crate::engine::Probe::Available,
+        None,
     );
     app.splash = false;
     for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
@@ -1105,12 +1110,14 @@ fn 设置屏能力清单_缺能力禁用并指路_紧凑态不截断() {
     // 老引擎(没有 tag 命令组)对 `nw tag` 的回放:stderr 人话「未知子命令」
     let runner = FakeRunner::with_stderr(&[("tag", 3, "", "nw: 未知子命令 \"tag\"")]);
     let mut app = App::with_runner(std::sync::Arc::new(runner));
-    app.capabilities.record(Capability::Tag, Probe::Unavailable);
-    app.capabilities.record(Capability::Vps, Probe::Unavailable);
     app.capabilities
-        .record(Capability::SourceRegister, Probe::Available);
+        .record(Capability::Tag, Probe::Unavailable, None);
     app.capabilities
-        .record(Capability::SourceRecheck, Probe::Available);
+        .record(Capability::Vps, Probe::Unavailable, None);
+    app.capabilities
+        .record(Capability::SourceRegister, Probe::Available, None);
+    app.capabilities
+        .record(Capability::SourceRecheck, Probe::Available, None);
     app.screen = Screen::Settings;
     // 常畅态:禁用组 + 指路句都在
     let s = draw(&app, 110, 30);
@@ -1130,7 +1137,7 @@ fn 设置屏能力清单_recipe_new_与烘焙同组不同项_紧凑态不截断(
     app.splash = false;
     app.screen = Screen::Settings;
     for cap in Capability::ALL {
-        app.capabilities.record(cap, Probe::Available);
+        app.capabilities.record(cap, Probe::Available, None);
     }
     // 常畅态:八项能力一排(顺序 = 入口清单),recipe new 与 bake 并列(同组不同项)
     let s = crate::testutil::frame_display(&app, 110, 30);
@@ -1163,7 +1170,7 @@ fn 设置屏能力_无响应回未决不冒充禁用() {
     let runner = FakeRunner::with_stderr(&[("tag", -1, "", "")]);
     let mut app = App::with_runner(std::sync::Arc::new(runner));
     for cap in Capability::ALL {
-        app.capabilities.record(cap, Probe::Unknown);
+        app.capabilities.record(cap, Probe::Unknown, None);
     }
     app.screen = Screen::Settings;
     let s = draw(&app, 110, 30);
@@ -1174,6 +1181,186 @@ fn 设置屏能力_无响应回未决不冒充禁用() {
         "未决不给「缺能力」指路(那是禁用组的):{s}"
     );
 }
+
+// ---- #123 设置屏能力清单逐项证据(共享行构造器的紧凑片段密度) ----
+
+/// 探针回音的夹具:stderr 原文进 `stderr_tail`(与 `FakeRunner::with_stderr`
+/// 回放同口径),经 `feed` 走与生产同一条收账路(`on_engine_finished` 的能力
+/// 回音兜底分支)——证据由 #118 的收账处入账,设置屏只读取、不重新采集。
+fn probe_out<S: AsRef<str>>(args: &[S], rc: i32, stderr: &str) -> EngineOutput {
+    EngineOutput {
+        args: args.iter().map(|s| s.as_ref().to_string()).collect(),
+        exit_code: ExitCode::from_number(rc),
+        ok: rc == 0,
+        stderr_tail: stderr.lines().map(|l| l.to_string()).collect(),
+        envelope: None,
+        raw_stdout: String::new(),
+        parse_error: None,
+    }
+}
+
+/// 喂两条真实形态的探针回音:老引擎对 `nw tag` 回「未知子命令」(判禁用)、
+/// 引擎无回答(判未决)。版本在喂之前落真值,证据带的版本字段才不是「探测中」。
+fn evidence_app() -> App {
+    let mut app = fake_app();
+    app.splash = false; // 整帧壳渲染走 splash 优先,先交棒
+    app.screen = Screen::Settings;
+    app.engine_version = "0.1.0".into();
+    feed(&mut app, probe_out(&["tag"], 3, "nw: 未知子命令 \"tag\""));
+    feed(&mut app, probe_out(&["vps"], 0, ""));
+    app
+}
+
+#[test]
+fn 设置屏能力清单_逐项证据_常畅态与紧凑态两档证据字段在场() {
+    let app = evidence_app();
+    // 常畅态 110×30:归组行之下每个非可用项一段紧凑片段,四要素一个不少
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    assert!(
+        s.contains("✗标签 · 探针 nw tag · 引擎原话:nw: 未知子命令 \"tag\" (rc 3)"),
+        "禁用项带齐 入口/探针/原话/rc:{s}"
+    );
+    assert!(
+        s.contains("?vps · 探针 nw vps · 引擎原话:引擎未给出可解回答 (rc 0)"),
+        "未决项同构在场,且如实说没答上:{s}"
+    );
+    // 故事 11:引擎身份三项与逐项证据同屏可对照(「问错二进制」与「引擎旧」
+    // 一眼可分)——二进制/来源/版本就在上一节,逐项不必每项重复一遍。
+    assert!(s.contains("二进制   <fake>"), "问的是哪个引擎同屏在场:{s}");
+    assert!(s.contains("来源     测试注入"), "来源同屏在场:{s}");
+    assert!(s.contains("版本     nw 0.1.0"), "版本同屏在场:{s}");
+    // 可用项不占证据行(八项里只有这两个非可用)
+    assert_eq!(
+        s.lines().filter(|l| l.contains(" · 探针 ")).count(),
+        2,
+        "只有非可用项出证据:{s}"
+    );
+    // 紧凑态 66×50:同两条证据一段一行、不被 clip 咬掉 rc,也不折行
+    let c = crate::testutil::frame_display(&app, 66, 50);
+    for line in [
+        "✗标签 · 探针 nw tag · 引擎原话:nw: 未知子命令 \"tag\" (rc 3)",
+        "?vps · 探针 nw vps · 引擎原话:引擎未给出可解回答 (rc 0)",
+    ] {
+        assert!(c.contains(line), "紧凑态证据整段在场:{c}");
+    }
+    for l in c.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(l) <= 66,
+            "66×50 设置行不溢出:{l}"
+        );
+    }
+    // 紧凑态能力入口行照旧按显示宽度折行,八项一个不许被折掉
+    for cap in crate::engine::Capability::ALL {
+        assert!(c.contains(cap.label()), "紧凑态 {cap:?} 入口不许被折掉:{c}");
+    }
+    // 三档主题下证据可辨(故事 27):同一段证据在真彩 / 256 / 16 三档都整段在场
+    // ——只用既有 palette 档 `dim()`,不引新颜色。
+    for cap in [
+        crate::term::ColorCap::Truecolor,
+        crate::term::ColorCap::C256,
+        crate::term::ColorCap::C16,
+    ] {
+        let mut a = evidence_app();
+        a.cap = cap;
+        a.palette = crate::theme::Palette::resolve(a.theme, cap);
+        let t = crate::testutil::frame_display(&a, 110, 30);
+        assert!(
+            t.contains("✗标签 · 探针 nw tag · 引擎原话:nw: 未知子命令 \"tag\" (rc 3)"),
+            "{cap:?} 档逐项证据可辨:{t}"
+        );
+    }
+}
+
+#[test]
+fn 设置屏能力清单_全部可用_零噪音_不占归组行与证据行() {
+    use crate::engine::{Capability, Probe};
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Settings;
+    for cap in Capability::ALL {
+        app.capabilities.record(cap, Probe::Available, None);
+    }
+    // 全部可用:能力节只剩入口行(八项一排),归组行 / 指路行 / 逐项证据一块都不占
+    // ——健康时零噪音,与 #123 之前逐字节相同(证据只随非可用项出现)。
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    assert!(
+        s.contains("  能力 ✓外部源登记 ✓外部源复核 ✓配方烘焙 ✓配方新建 ✓vps ✓key ✓订阅 ✓标签"),
+        "八项一排:{s}"
+    );
+    assert!(!s.contains("入口禁用"), "全可用不占归组行:{s}");
+    assert!(!s.contains("未决"), "全可用不占归组行:{s}");
+    assert!(!s.contains("缺的是引擎能力"), "全可用不给指路:{s}");
+    assert!(!s.contains("探针 "), "全可用不出证据行:{s}");
+    assert!(!s.contains("引擎原话"), "全可用不出证据行:{s}");
+    let c = crate::testutil::frame_display(&app, 66, 50);
+    assert!(!c.contains("探针 "), "紧凑态同样零证据:{c}");
+}
+
+#[test]
+fn 设置屏能力清单_未决不冒充禁用_逐项证据也不给缺能力指路() {
+    use crate::engine::Capability;
+    let mut app = evidence_app();
+    // 全部探针都无回答:八项全未决,证据照出(每项都「引擎未给出可解回答」)
+    for cap in Capability::ALL {
+        feed(&mut app, probe_out(&cap.probe_args(), 0, ""));
+    }
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    assert!(s.contains("未决"), "无响应回未决:{s}");
+    assert!(!s.contains("入口禁用"), "未决不冒充禁用:{s}");
+    assert!(
+        !s.contains("缺的是引擎能力"),
+        "未决的逐项证据也不碰那句缺能力指路(唯一出处是 GATE_HINT 常量):{s}"
+    );
+    assert!(
+        s.contains("?外部源登记 · 探针 nw source register · 引擎原话:引擎未给出可解回答 (rc 0)"),
+        "未决项证据如实说没答上:{s}"
+    );
+    assert_eq!(
+        s.lines().filter(|l| l.contains(" · 探针 ")).count(),
+        3,
+        "逐项证据整块封顶 3 行(+3 红线):{s}"
+    );
+}
+
+#[test]
+fn 设置屏能力清单_逐项证据_竖向封顶三行_归组行仍点名全部非可用项() {
+    let mut app = evidence_app();
+    // 五项非可用(tag/key/subscription/recipe new 禁用 + vps 未决),全部带证据:
+    // 逐项证据整块封顶 3 行,第 4 项起不占设置屏行——归组行仍把五项全点名,
+    // 同一条结论句连同证据已进最近日志(#118 收账处)。
+    feed(&mut app, probe_out(&["key"], 3, "nw: 未知子命令 \"key\""));
+    feed(
+        &mut app,
+        probe_out(&["subscription"], 3, "nw: 未知子命令 \"subscription\""),
+    );
+    feed(
+        &mut app,
+        probe_out(&["recipe", "new"], 3, "nw: 未知子命令 \"new\""),
+    );
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    let ev_lines: Vec<&str> = s.lines().filter(|l| l.contains(" · 探针 ")).collect();
+    assert_eq!(ev_lines.len(), 3, "逐项证据封顶 3 行:{s}");
+    // 归组行不受封顶影响:五项非可用全在里面(互不冒充两组)
+    assert!(
+        s.contains("入口禁用:配方新建、key、订阅、标签"),
+        "禁用组点名四项:{s}"
+    );
+    assert!(s.contains("未决:"), "未决组在场:{s}");
+    // 顺序即入口清单顺序:前三位是配方新建 / vps / key,订阅与标签让位给 +3 红线
+    assert!(
+        ev_lines[0].contains("✗配方新建"),
+        "首项即清单中首个非可用项:{ev_lines:?}"
+    );
+    assert!(
+        ev_lines[1].contains("?vps"),
+        "次项是未决的 vps:{ev_lines:?}"
+    );
+    assert!(ev_lines[2].contains("✗key"), "第三项是 key:{ev_lines:?}");
+    let ev_all = ev_lines.join("\n");
+    assert!(!ev_all.contains("订阅"), "第 4 项起不占设置屏行:{ev_all}");
+    assert!(!ev_all.contains("标签"), "第 5 项起不占设置屏行:{ev_all}");
+}
+
 // ---- #37 外部源详情:类别 / 仓库链接 / 扫出的条目(只读,以引擎输出为准) ----
 
 /// 两条外部源记录:第一条字段齐全(多级类别 + 两条条目),
@@ -1277,7 +1464,7 @@ fn 外部源域为空_给指向登记的指路_不摆空框() {
     );
     // 引擎确有 source register 能力:空态给登记键位
     app.capabilities
-        .record(Capability::SourceRegister, Probe::Available);
+        .record(Capability::SourceRegister, Probe::Available, None);
     let s2 = draw(&app, 110, 30);
     assert!(s2.contains("按 r 登记新外部源"), "有能力时给键位指路:{s2}");
     assert!(!s2.contains("登记禁用"), "两态互不冒充:{s2}");
@@ -1328,7 +1515,7 @@ fn bake_app() -> App {
         .unwrap(),
     );
     app.capabilities
-        .record(Capability::RecipeBake, Probe::Available);
+        .record(Capability::RecipeBake, Probe::Available, None);
     app
 }
 
@@ -1400,20 +1587,27 @@ fn 配方域建议命令_引擎无bake能力给指路_不冒充面板故障() {
     use crate::engine::{Capability, Probe};
     let mut app = bake_app();
     app.capabilities
-        .record(Capability::RecipeBake, Probe::Unavailable);
+        .record(Capability::RecipeBake, Probe::Unavailable, None);
     let s = draw(&app, 110, 30);
-    assert!(s.contains("引擎缺 recipe bake 能力"), "缺能力指路:{s}");
-    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    // #124 起这一支整句走共享行构造器的单行形态。详情栏窄(~34 列),
+    // `recipes::wrap` 在前缀内找最后一个空格断行、找不到就硬切——CJK 长句
+    // 会被切成「不是面板 / 坏了;」这种形态,所以跨词的断言一律在**去掉空白
+    // 的扁平串**上做(测的是操作者读到的内容,不是某一行的列断点)。
+    let flat: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(s.contains("⚠ 配方烘焙"), "缺能力指路点名是哪一项:{s}");
+    assert!(s.contains("入口禁用"), "说清是入口禁用:{s}");
+    assert!(flat.contains("不是面板坏了"), "不冒充面板故障:{flat}");
+    assert!(flat.contains("升级所配nw"), "真禁用才给升级下一步:{flat}");
     assert!(!s.contains("nw recipe bake"), "缺能力不给半条命令:{s}");
-    // 未决(探测失败)同样不给命令,且说法与禁用可区分
+    // 未决(探测失败)同样不给命令,且说法与禁用可区分:不再出现那句
+    // 「缺的是引擎能力…升级所配 nw」,换成「修引擎发现后重启重探」
     app.capabilities
-        .record(Capability::RecipeBake, Probe::Unknown);
+        .record(Capability::RecipeBake, Probe::Unknown, None);
     let s2 = draw(&app, 110, 30);
     assert!(!s2.contains("nw recipe bake"), "未决不给命令:{s2}");
-    assert!(
-        s2.contains("引擎缺 recipe bake 能力"),
-        "未决与禁用同走缺能力指路:{s2}"
-    );
+    assert!(s2.contains("配方烘焙 未决"), "未决换一套说法:{s2}");
+    assert!(!s2.contains("不是面板坏了"), "未决不冒充缺能力:{s2}");
+    assert!(!s2.contains("升级所配 nw"), "未决不给误导性下一步:{s2}");
 }
 
 // ---- #58 配方域建议命令补 recipe new:与 bake 同源同层,执行权留给操作者 ----
@@ -1423,7 +1617,7 @@ fn 配方域建议命令_选中即给出recipe_new_骨架名与out_dir同源() {
     use crate::engine::{Capability, Probe};
     let mut app = bake_app();
     app.capabilities
-        .record(Capability::RecipeNew, Probe::Available);
+        .record(Capability::RecipeNew, Probe::Available, None);
     app.data_root = Some(crate::testutil::stable_root());
     // 常畅态:新建骨架命令整段在场(详情内层窄,按宽折行是真设计;
     // 旗标一段都不少,拼回来的串与纯函数层逐字相同)
@@ -1485,24 +1679,25 @@ fn 配方域建议命令_recipe_new_三种缺前提各有可区分指路_不给�
     // 引擎没有 recipe new 能力:指路点名 recipe new,不拿 bake 的话冒充
     let mut app = bake_app();
     app.capabilities
-        .record(Capability::RecipeNew, Probe::Unavailable);
+        .record(Capability::RecipeNew, Probe::Unavailable, None);
     let s = draw(&app, 110, 30);
-    assert!(s.contains("引擎缺 recipe new 能力"), "缺能力指路:{s}");
-    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    let flat: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(s.contains("⚠ 配方新建"), "缺能力指路点名是哪一项:{s}");
+    assert!(s.contains("入口禁用"), "说清是入口禁用:{s}");
+    assert!(flat.contains("不是面板坏了"), "不冒充面板故障:{flat}");
     assert!(!s.contains("nw recipe new"), "缺能力不给半条命令:{s}");
-    // 未决(探测失败)同样不给命令,且与禁用同走缺能力指路
+    // 未决(探测失败)同样不给命令,且换一套说法:不给「升级所配 nw」那一步
     app.capabilities
-        .record(Capability::RecipeNew, Probe::Unknown);
+        .record(Capability::RecipeNew, Probe::Unknown, None);
     let s3 = draw(&app, 110, 30);
     assert!(!s3.contains("nw recipe new"), "未决不给命令:{s3}");
-    assert!(
-        s3.contains("引擎缺 recipe new 能力"),
-        "未决与禁用同走缺能力指路:{s3}"
-    );
+    assert!(s3.contains("配方新建 未决"), "未决换一套说法:{s3}");
+    assert!(!s3.contains("不是面板坏了"), "未决不冒充缺能力:{s3}");
+    assert!(!s3.contains("升级所配 nw"), "未决不给误导性下一步:{s3}");
     // 未设数据仓根:--out-dir 指不到本地仓,同样不给半条命令
     let mut app = bake_app();
     app.capabilities
-        .record(Capability::RecipeNew, Probe::Available);
+        .record(Capability::RecipeNew, Probe::Available, None);
     app.data_root = None;
     let s2 = draw(&app, 110, 30);
     assert!(s2.contains("数据仓根未设"), "未设根指路:{s2}");
@@ -1684,7 +1879,7 @@ fn recheck_app() -> App {
     app.hl_mode = HealthMode::Recheck;
     app.ls = Some(serde_json::from_str(ls).unwrap());
     app.capabilities
-        .record(Capability::SourceRecheck, Probe::Available);
+        .record(Capability::SourceRecheck, Probe::Available, None);
     app
 }
 
@@ -1759,14 +1954,36 @@ fn 外部源漂移_三种缺前提各有可区分指路() {
     let s = draw(&app, 110, 30);
     assert!(s.contains("数据仓根未设"), "未设根指路:{s}");
     assert!(!s.contains("还没查"), "未设根不摆查询态:{s}");
-    // 引擎无 source 能力
+    // 引擎无 source 能力(#124:门二两行收成共享构造器的单行形态)
     use crate::engine::{Capability, Probe};
     let mut app = recheck_app();
     app.capabilities
-        .record(Capability::SourceRecheck, Probe::Unavailable);
+        .record(Capability::SourceRecheck, Probe::Unavailable, None);
     let s = draw(&app, 110, 30);
-    assert!(s.contains("引擎缺 source 能力"), "缺能力指路:{s}");
-    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    assert!(
+        s.contains("外部源复核 入口禁用"),
+        "缺能力指路点名是哪一项(单行形态):{s}"
+    );
+    assert!(
+        s.contains("缺的是引擎能力,不是面板坏了"),
+        "不冒充面板故障:{s}"
+    );
+    assert!(
+        s.contains("nw 后入口自动开启"),
+        "真禁用才给「升级所配 nw」这一步:{s}"
+    );
+    assert!(
+        !s.contains("引擎缺 source 能力"),
+        "标题行与 GATE_HINT 行已收成一行,不再两行铺:{s}"
+    );
+    // 未决:同一道门走未决话术,「升级所配 nw」一步都不给
+    app.capabilities
+        .record(Capability::SourceRecheck, Probe::Unknown, None);
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("外部源复核 未决"), "未决话术:{s}");
+    assert!(s.contains("修引擎发现后重启重探"), "未决的下一步:{s}");
+    assert!(!s.contains("缺的是引擎能力"), "未决不冒充缺能力:{s}");
+    assert!(!s.contains("升级所配 nw"), "未决不给误导性下一步:{s}");
     // 编目为空
     let mut app = recheck_app();
     app.ls = Some(
@@ -1816,6 +2033,7 @@ async fn 外部源漂移_不认识的schema走需升级_不按旧形状猜() {
     app.capabilities.record(
         crate::engine::Capability::SourceRecheck,
         crate::engine::Probe::Available,
+        None,
     );
     app.ls = Some(
         serde_json::from_str(
@@ -2075,7 +2293,7 @@ fn 过滤后选中行不错位_c取用建议命令作用于看得见的那一行
     let mut app = five_app();
     app.rc_domain = crate::app::Domain::Recipes;
     app.capabilities
-        .record(Capability::RecipeBake, Probe::Available);
+        .record(Capability::RecipeBake, Probe::Available, None);
     app.data_root = Some(crate::testutil::stable_root());
     // 不过滤时第 0 条是 research-desk:先钉住过滤前的口径
     let plain = draw(&app, 110, 30);
