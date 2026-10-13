@@ -868,6 +868,8 @@ fn render_register_overlay(frame: &mut Frame, area: Rect, app: &App) {
     match app.reg_state {
         RegState::Idle => {}
         RegState::RepoInput => render_reg_input(frame, area, app),
+        RegState::PreScan => render_reg_prescan(frame, area, app),
+        RegState::PreScanPick => render_reg_pick(frame, area, app),
         RegState::KindPick => render_reg_kind(frame, area, app),
         RegState::PreAudit => render_reg_preaudit(frame, area, app),
         RegState::Review => render_reg_review(frame, area, app),
@@ -906,7 +908,122 @@ fn render_reg_input(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// ② kind 二选一:两行选项(选中标记 + 高亮)钉在内层第 1/2 行,
+/// ②·预扫在途(#114):只读拉目标仓条目清单(`gh api`),说清这段在干什么;
+/// 鼠标惰性(命中侧同款,见 `layout::register_hits` 的 `PreScan` 臂)。
+fn render_reg_prescan(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup =
+        crate::layout::popup_rect(area, crate::layout::REG_INPUT_W, crate::layout::REG_INPUT_H);
+    frame.render_widget(Clear, popup);
+    let slug = app.reg_scan_slug.as_deref().unwrap_or("—");
+    let lines = vec![
+        Line::from(Span::styled(format!("  正在预扫 {slug} 的条目…"), p.text())),
+        Line::from(Span::styled(
+            "  只读 GitHub(gh api):不落文件、不调引擎。",
+            p.dim(),
+        )),
+        Line::from(Span::styled("  Esc 可返航(回音将丢弃)。", p.dim())),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记外部源 · 预扫 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ③·预扫选单(#114):勾选要登记的条目。按 kind 分组列条,每条一个
+/// 勾选框(默认全勾——菜单答「这仓有什么」,作者改「我要登记哪些」);
+/// 键位行钉内层末行(与 `layout::register_hits` 同几何同文案)。
+/// **本段只改面板侧勾选态**:不落文件、不下发任何命令;勾选结论随
+/// 确认态呈现,登记仍按仓整体走引擎两段式。
+fn render_reg_pick(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup =
+        crate::layout::popup_rect(area, crate::layout::REG_PICK_W, crate::layout::REG_PICK_H);
+    frame.render_widget(Clear, popup);
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let slug = app.reg_scan_slug.as_deref().unwrap_or("—");
+    let total = app.reg_scan_entries.len();
+    let checked = app.reg_scan_checks.iter().filter(|c| **c).count();
+    lines.push(Line::from(Span::styled(
+        format!("  预扫 {slug}:{total} 条,已勾选 {checked}"),
+        p.text(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  空格 勾选/取消 · ↑/↓ 移选中(面板侧选单,引擎扫描仍为准)",
+        p.dim(),
+    )));
+    lines.push(Line::from(""));
+    // 分组列条(skill 组在前,与 scan::parse_tree 的确定序一致)
+    for kind in [
+        crate::scan::ScanKind::Skill,
+        crate::scan::ScanKind::Extension,
+    ] {
+        let idxs: Vec<usize> = app
+            .reg_scan_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == kind)
+            .map(|(i, _)| i)
+            .collect();
+        if idxs.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {}({}):", kind.word(), idxs.len()),
+            p.accent(),
+        )));
+        for i in idxs {
+            let on = app.reg_scan_checks.get(i).copied().unwrap_or(false);
+            let cur = i == app.reg_scan_sel;
+            lines.push(Line::from(vec![
+                Span::raw(if cur { "  ▸ " } else { "    " }),
+                Span::styled(
+                    if on { "[x] " } else { "[ ] " },
+                    if on { p.info() } else { p.dim() },
+                ),
+                Span::styled(
+                    clip(&app.reg_scan_entries[i].path, inner_w.saturating_sub(8)),
+                    if cur { p.sel() } else { p.text() },
+                ),
+            ]));
+        }
+    }
+    // 内容钉进内层:超量截断、欠量垫空,键位行恒在内层最后一行
+    // (与 layout::register_hits 的 key_y = popup.y + height - 2 同约定)。
+    let budget = inner_h.saturating_sub(1);
+    if lines.len() > budget {
+        lines.truncate(budget.saturating_sub(1));
+        lines.push(Line::from(Span::styled("  …(屏内未全显)", p.dim())));
+    }
+    while lines.len() < budget {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(crate::layout::REG_KEY_PICK_CONTINUE, p.accent().bold()),
+        Span::raw(crate::layout::RITUAL_KEY_GAP),
+        Span::styled(crate::layout::RITUAL_KEY_RETURN, p.dim()),
+    ]));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 登记外部源 · 预扫选单 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// ③ kind 二选一:两行选项(选中标记 + 高亮)钉在内层第 1/2 行,
 /// 键位行钉在内层末行——与 `layout::register_hits` 的行序同约定。
 fn render_reg_kind(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
@@ -1041,6 +1158,30 @@ fn render_reg_review(frame: &mut Frame, area: Rect, app: &App) {
             if d.entries.len() > 4 {
                 lines.push(Line::from(Span::styled(
                     format!("   … 共 {} 条,屏内未全显", d.entries.len()),
+                    p.dim(),
+                )));
+            }
+            // #114 预扫勾选(面板侧选单结论)随确认态摊开:登记按仓整体
+            // 进行、引擎扫描为准,这里只是把作者在选单上勾的结论给人看。
+            if !app.reg_scan_entries.is_empty() {
+                let picked: Vec<&str> = app
+                    .reg_scan_entries
+                    .iter()
+                    .zip(&app.reg_scan_checks)
+                    .filter(|(_, on)| **on)
+                    .map(|(e, _)| e.path.as_str())
+                    .collect();
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  预扫勾选(面板侧) {}/{}:{}",
+                        picked.len(),
+                        app.reg_scan_entries.len(),
+                        if picked.is_empty() {
+                            " 未勾选".to_string()
+                        } else {
+                            format!(" {}", clip(&picked.join(" · "), inner_w.saturating_sub(24)))
+                        }
+                    ),
                     p.dim(),
                 )));
             }
