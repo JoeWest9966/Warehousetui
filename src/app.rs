@@ -351,6 +351,13 @@ pub struct App {
     /// 新旧对比页的快照(#104):翻到该页时经 [`crate::datarepo`] 读一次,
     /// `None` = 还没读过。**快照语义**——与 #101 历史视图同口径,不轮询。
     pub as_ritual_diff: Option<crate::screens::RitualDiff>,
+    /// 回收站次级视图(#102):装配屏里看 `pruned/<时间戳>/` 下被换下的旧组件。
+    pub as_bin: bool,
+    /// 回收站快照(#102):只在进视图 / 按 `r` 时读一次,不轮询。
+    pub as_bin_rows: Option<Vec<crate::datarepo::PrunedEntry>>,
+    pub as_bin_sel: usize,
+    /// 从哪一派的视角翻进来的(#102):复用装配历史的选择,**不另立一个派选择槽**。
+    pub as_bin_from: Option<String>,
 
     // ---- 健康 ----
     pub hl_mode: HealthMode,
@@ -604,6 +611,10 @@ impl App {
             as_history_raw: None,
             as_ritual_page: crate::screens::RitualPage::Brief,
             as_ritual_diff: None,
+            as_bin: false,
+            as_bin_rows: None,
+            as_bin_sel: 0,
+            as_bin_from: None,
             hl_mode: HealthMode::Doctor,
             hl_sel: 0,
             hl_result: None,
@@ -813,6 +824,8 @@ impl App {
                                          // 翻存档」这种半屏两义。
                 self.as_history = false;
                 self.as_history_raw = None;
+                // 回收站同理(#102):闲时的只读浏览视图,装配一启动就让位。
+                self.as_bin = false;
                 self.push_log(format!("装配启动:{}", args.join(" ")));
             }
             Some("ls") => {
@@ -933,6 +946,7 @@ impl App {
                 self.catalog_filter_on = false; // 编目册过滤同理(#69)
                 self.as_history_filter_on = false; // 装配历史过滤同理(#101)
                 self.as_history_raw = None; // 原文浮层不跨屏(#101)
+                self.as_bin = false; // 回收站视图不跨屏(#102)
             }
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
@@ -949,7 +963,13 @@ impl App {
                     // 选中槽,点行按当前在场的那一个走——不共用一个槽,
                     // 两个视图的选中互不串味。
                     Screen::Assemble => {
-                        if self.as_history {
+                        // 三副列表(#101 / #102):锁定集选择器、装配历史、回收站
+                        // 各一个选中槽,点行按当前在场的那一个走——不共用一个
+                        // 槽,三个视图的选中互不串味。
+                        if self.as_bin {
+                            let n = self.bin_total();
+                            self.as_bin_sel = i.min(n.saturating_sub(1));
+                        } else if self.as_history {
                             let n = self.history_visible().len();
                             self.as_history_sel = i.min(n.saturating_sub(1));
                         } else {
@@ -1038,7 +1058,10 @@ impl App {
             Screen::Assemble => {
                 // 装配历史次级视图在场时(#101),滚轮移的是历史视图的选中
                 // (可见行数按过滤后的算);否则照旧移锁定集选择器。
-                if self.as_history {
+                if self.as_bin {
+                    let n = self.bin_total();
+                    (&mut self.as_bin_sel, n)
+                } else if self.as_history {
                     let n = self.history_visible().len();
                     (&mut self.as_history_sel, n)
                 } else {
@@ -1692,6 +1715,12 @@ impl App {
         // (Enter 开发射仪式 / x 中止)在此期间一律不受理,两个语义不串味。
         // **装配在途时整屏归运行态**:历史旗子可能还挂着(渲染画的是七步与
         // 日志),但它的键位一个都不该有分支。
+        // 回收站(#102)是历史视图的下一层:装配在途时整屏归运行态,它的键位
+        // 一个都不该有分支(与 `as_history` 同一条纪律)。
+        if self.as_bin && !self.assembling {
+            self.key_bin(k);
+            return;
+        }
         if self.as_history && !self.assembling {
             self.key_history(k);
             return;
@@ -1761,6 +1790,24 @@ impl App {
                 self.push_log(format!("装配历史已重读:{n} 个派(只读快照)"));
             }
             KeyCode::Char('/') => self.as_history_filter_on = true,
+            // 回收站(#102):从当前选中的这一派的视角翻进去。**复用历史视图的
+            // 选中**,不另立一个派选择槽——「从多派视角切派查看」= 回历史、
+            // ↑/↓ 换一派、再按 p,选择槽只有一份。
+            KeyCode::Char('p') => {
+                self.as_bin_from = self.as_history_rows.as_ref().and_then(|rows| {
+                    self.history_visible()
+                        .get(self.as_history_sel)
+                        .copied()
+                        .and_then(|i| rows.get(i))
+                        .map(|r| r.profile.clone())
+                });
+                self.as_bin = true;
+                self.load_bin();
+                let n = self.bin_total();
+                self.push_log(format!(
+                    "回收站:读到 {n} 个被换下的旧组件(只读,回车复制恢复路径)"
+                ));
+            }
             // `h` 再按一次即退(进出一个键,不必记两个)。与 Esc 的分工:
             // Esc 第一级清过滤词、第二级退视图;`h` 直接退,过滤词留着
             // (与切屏「退输入态、留词」同口径)。
@@ -1778,6 +1825,46 @@ impl App {
                     self.as_history = false;
                     self.as_history_raw = None;
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// 回收站次级视图的键位(#102)。
+    ///
+    /// 全部只读:选中、复制路径、重读快照。**没有删除、没有恢复**——规格的
+    /// Out of Scope 明写「pruned 的恢复/清理动作(只读)」,面板永远不替
+    /// 操作者动引擎的归档(规格故事 7)。也没有任何引擎调用:`app.queue`
+    /// 一个字节都不进。
+    fn key_bin(&mut self, k: KeyEvent) {
+        let n = self.bin_total();
+        match k.code {
+            KeyCode::Down => {
+                if n > 0 {
+                    self.as_bin_sel = (self.as_bin_sel + 1) % n;
+                }
+            }
+            KeyCode::Up => {
+                if n > 0 {
+                    self.as_bin_sel = (self.as_bin_sel + n - 1) % n;
+                }
+            }
+            // 复制完整恢复路径(规格故事 6):进日志区,执行权留给操作者。
+            KeyCode::Enter => self.copy_bin_path(),
+            // 重读快照:显式刷新,不自动跑——引擎可能在面板之外又装了一版。
+            KeyCode::Char('r') => {
+                self.load_bin();
+                let n = self.bin_total();
+                self.push_log(format!("回收站已重读:{n} 个被换下的旧组件(只读快照)"));
+            }
+            // `p` 再按一次即退(与 `h` 同一进退口径);Esc 也退。
+            KeyCode::Char('p') => {
+                self.as_bin = false;
+                self.as_bin_from = None;
+            }
+            KeyCode::Esc => {
+                self.as_bin = false;
+                self.as_bin_from = None;
             }
             _ => {}
         }
@@ -3566,6 +3653,42 @@ impl App {
                 self.push_log(guard.message.clone())
             }
         }
+    }
+
+    // ---- #102 回收站(只读;文件面一律经 datarepo 接缝) ----
+
+    /// 读一遍回收站快照(#102)。
+    ///
+    /// 走 [`crate::datarepo`] 唯一接缝:屏幕层与 app 层都不碰文件系统
+    /// (规格故事 27)。**快照语义**与装配历史同口径:只在进视图 / 按 `r`
+    /// 时读一次,不轮询、不自动刷——引擎可能在面板之外又装了一版。
+    pub fn load_bin(&mut self) {
+        self.as_bin_rows = Some(crate::datarepo::list_pruned(&self.nw_home));
+        self.as_bin_sel = 0;
+    }
+
+    /// 回收站的总条数(过滤前的分母;回收站没有本地过滤,#102 不加)。
+    pub fn bin_total(&self) -> usize {
+        self.as_bin_rows.as_ref().map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// 选中条目复制完整恢复路径进日志区(#102,规格故事 6)。
+    ///
+    /// **只给地址,不代恢复**:路径进日志区(既有 `push_log` 先例),执行权
+    /// 留给操作者去 shell 里手工找回——`pruned` 的恢复 / 清理动作在规格的
+    /// Out of Scope 里(#94「pruned 的恢复/清理动作(只读)」)。也不给「建议
+    /// 命令」:这里没有任何引擎命令可建议,`cp` 是操作系统的事。
+    fn copy_bin_path(&mut self) {
+        let Some(rows) = self.as_bin_rows.as_ref() else {
+            return;
+        };
+        let Some(e) = rows.get(self.as_bin_sel) else {
+            return;
+        };
+        self.push_log(format!(
+            "恢复路径(复制它去 shell 找回,面板不代恢复):{}",
+            e.path
+        ));
     }
 
     /// 外部编辑器逃逸口(设置屏 e)。返回拉起命令;EDITOR/VISUAL 都缺则 None。
@@ -7156,6 +7279,7 @@ mod tests {
         as_history: bool,
         as_history_filter_on: bool,
         as_history_raw_on: bool,
+        as_bin: bool,
         pending_editor: bool,
         mouse_enabled: bool,
         settings_page: SettingsPage,
@@ -7189,6 +7313,7 @@ mod tests {
             as_ritual_page: a.as_ritual_page,
             as_history_filter_on: a.as_history_filter_on,
             as_history_raw_on: a.as_history_raw.is_some(),
+            as_bin: a.as_bin,
             pending_editor: a.pending_editor,
             mouse_enabled: a.mouse_enabled,
             settings_page: a.settings_page,
@@ -7266,6 +7391,17 @@ mod tests {
                 app.screen = Screen::Assemble;
                 app.as_history = true;
                 app.load_history();
+            }
+            if row.prep == Prep::BinView {
+                // 回收站次级视图(#102):`Enter` 复制路径与 `r` 重读只在这个
+                // 上下文里有分支。fixture 里非得有旧组件不可——空回收站里
+                // 复制动作无从下手,帮助会写成一条幽灵键。
+                app.screen = Screen::Assemble;
+                app.as_history = true;
+                app.nw_home = bin_home("help-bin").display().to_string();
+                app.load_history();
+                app.as_bin = true;
+                app.load_bin();
             }
             let before = key_snap(&app);
             app.update(Message::Key(KeyEvent::new(row.code, KeyModifiers::NONE)));
@@ -7611,6 +7747,166 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert!(!app.as_history, "再按 h 退视图");
+    }
+
+    /// fixture 回收站(#102):一座带派目录的安装根 + 两个退场时刻,组件名照
+    /// 上游事实取(整目录移入)。派目录也要有:回收站是从某一派的视角翻进来
+    /// 的,来历派得真实存在。
+    fn bin_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nwt-bin-app-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prof = dir
+            .join(crate::datarepo::PROFILES_DIR)
+            .join("research-desk");
+        std::fs::create_dir_all(&prof).unwrap();
+        std::fs::write(
+            prof.join(crate::datarepo::MANIFEST_FILE),
+            HISTORY_MANIFEST_OK,
+        )
+        .unwrap();
+        for (stamp, comps) in [
+            (
+                "20261009T030007Z",
+                vec!["retention", "satoshi-localeselector"],
+            ),
+            ("20261012T101500Z", vec!["hyva-ai-tools"]),
+        ] {
+            for c in comps {
+                std::fs::create_dir_all(dir.join(crate::datarepo::PRUNED_DIR).join(stamp).join(c))
+                    .unwrap();
+            }
+        }
+        dir
+    }
+
+    /// 从历史视图按 `p` 翻进回收站:与 `bin_app` 同一座 fixture,只是这一座
+    /// 走真实按键路径,不手工置旗。
+    fn bin_from_history(tag: &str) -> App {
+        let mut app = fake_app();
+        app.screen = Screen::Assemble;
+        app.nw_home = bin_home(tag).display().to_string();
+        app.as_history = true;
+        app.load_history();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        )));
+        app
+    }
+
+    fn bin_app(tag: &str) -> App {
+        let mut app = fake_app();
+        app.screen = Screen::Assemble;
+        app.nw_home = bin_home(tag).display().to_string();
+        app.as_history = true;
+        app.load_history();
+        app.as_bin_from = Some("research-desk".into());
+        app.as_bin = true;
+        app.load_bin();
+        app
+    }
+
+    /// 从历史视图翻进回收站(#102):读盘、零引擎调用,来历派不另立选择槽。
+    #[test]
+    fn 回收站_从历史视图翻进来_读快照_零引擎调用() {
+        let app = bin_from_history("bin-open");
+        assert!(app.as_bin, "p 翻回收站");
+        assert!(app.as_history, "回收站是历史视图的下一层,历史旗子留着");
+        assert_eq!(app.bin_total(), 3, "三个换下的旧组件都读到");
+        assert!(app.queue.is_empty(), "一个引擎命令都不入队");
+        assert!(
+            app.log.iter().any(|l| l.contains("回收站")),
+            "读到的条数进日志:{:?}",
+            app.log
+        );
+        assert_eq!(
+            app.as_bin_from.as_deref(),
+            Some("research-desk"),
+            "来历派取装配历史当前选中的那一派,不新开一个选择槽"
+        );
+    }
+
+    /// 选中条目即复制完整恢复路径进日志区(规格故事 6):面板给地址,
+    /// 执行权留给操作者——不代恢复、不代删(规格故事 7)。
+    #[test]
+    fn 回收站_回车复制完整恢复路径进日志区() {
+        let mut app = bin_app("copy");
+        let want = app.as_bin_rows.as_ref().unwrap()[0].path.clone();
+        assert!(want.contains("pruned/20261009T030007Z/retention"), "{want}");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            app.log[0].contains(&want),
+            "日志第一条就是可复制的完整路径:{:?}",
+            app.log
+        );
+        assert!(app.queue.is_empty(), "复制路径不下发任何引擎命令");
+    }
+
+    /// 鼠标与键盘同一条后果链(#102 与 #101 同口径):点回收站的行 = 按 ↑/↓,
+    /// 动的只有 `as_bin_sel`;锁定集选择器与历史视图的选中一个字节不动。
+    #[test]
+    fn 回收站_点行选中与键盘同一路() {
+        let mut app = bin_app("click");
+        app.size = Rect::new(0, 0, 110, 30);
+        app.splash = false;
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(_)));
+        click(&mut app, row);
+        assert_eq!(app.as_bin_sel, 0, "点第一行选中第一条");
+        assert_eq!(app.as_sel, 0, "锁定集选择器一个字节不动");
+        assert_eq!(app.as_history_sel, 0, "历史视图的选中一个字节不动");
+        assert!(app.queue.is_empty(), "选中不下发任何命令");
+    }
+
+    /// 装配在途不受理 `p`(#102:在途那屏归七步与中止键);`up` 一下发即清场。
+    #[test]
+    fn 回收站_装配在途不受理_up下发即清场() {
+        let mut app = bin_app("running");
+        app.as_running = true;
+        app.assembling = true;
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.as_bin, "在途不踢出视图(渲染画的是运行态),但也不新开");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.as_bin, "在途时 h 无分支");
+        // up 一下发即清场:装配一启动,闲时的只读浏览视图让位给七步与日志。
+        // 与 #101 同一条路:入队只是排队,清场发生在真正下发那一刻
+        // (`note_engine_dispatch`),与主循环排空 queue 的时序一致。
+        app.as_bin = true;
+        app.ls = Some(
+            serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"9f8e"}]}"#)
+                .unwrap(),
+        );
+        app.launch_selected_lock();
+        assert!(!app.queue.is_empty(), "up 已入队");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        for args in std::mem::take(&mut app.queue) {
+            app.spawn_engine(args, &tx);
+        }
+        assert!(!app.as_bin, "up 一下发,回收站清场");
+        assert!(app.as_running, "装配态接管");
+    }
+
+    /// 只读铁律(规格故事 7):在回收站里把键盘扫一遍,没有任何一键入队
+    /// 引擎命令——没有删除、没有恢复,连「建议命令」都不必给。
+    #[test]
+    fn 回收站_任何键都不下发引擎命令_只读() {
+        let mut app = bin_app("readonly");
+        for c in (b'a'..=b'z').map(|b| KeyCode::Char(b as char)) {
+            app.update(Message::Key(KeyEvent::new(c, KeyModifiers::NONE)));
+            assert!(app.queue.is_empty(), "键 {c:?} 不该入队任何命令");
+        }
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Enter, KeyCode::Esc] {
+            app.update(Message::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+            assert!(app.queue.is_empty(), "键 {code:?} 不该入队任何命令");
+        }
     }
 
     /// 一条坏记录只坏它自己(规格故事 4):分类各归各位,不连坐。
