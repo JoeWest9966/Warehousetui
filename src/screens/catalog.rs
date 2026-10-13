@@ -1366,13 +1366,23 @@ impl CatalogKind {
     /// 行,`catalog_key_parts` 不为本票加 `if kind ==` 分叉(#66 查表纪律);点下去
     /// 走 [`App::log_sub_get_suggest`] / [`App::log_key_get_suggest`],与按 `g`
     /// 逐字节同一条路。
+    ///
+    /// **`d 删除` 段也挂在本表里**(#78,兑 #75 裁决 A):四本册各一行,命中目标
+    /// `Some(Target::CatalogDelete)`——点它 = 按 `d`,汇到 [`App::start`] 的
+    /// `StartMode::Rm` 一个入口(与 `key_catalog` 受理 `d` 同一个函数、同一条
+    /// 后果链:选中行 → ADR-0009 图形确认闸 → 确认才 `rm`)。段面按册取文案:
+    /// 机器 / 订阅 / 钥匙三本 [`CATALOG_DELETE`],标签册
+    /// [`CATALOG_DELETE_TAG`](它的删除是摘引用 / 删整个标签两态,嵌套在表单流
+    /// 里,不是确认弹层)。无选中行时点下去复现键盘 `d` 的既有指路
+    /// (「删除未下发:没有选中的…」),不新造灰置态;#71 的 `x` 已经证明可点的
+    /// 重段不吓人,本段与它同口径。
     pub fn keys_body(self) -> &'static [crate::layout::KeyPart<'static>] {
         use crate::layout::Target;
         match self {
             CatalogKind::Vps => &[
                 ("  ↑/↓ 选", None, true),
                 ("r 登记", None, true),
-                ("d 删除", None, true),
+                (CATALOG_DELETE, Some(Target::CatalogDelete), true),
                 ("Esc", None, true),
             ],
             CatalogKind::Tag => &[
@@ -1380,7 +1390,7 @@ impl CatalogKind {
                 ("Enter 反查", None, true),
                 ("l 全部", None, true),
                 ("r 挂标签", None, true),
-                ("d 摘/删", None, true),
+                (CATALOG_DELETE_TAG, Some(Target::CatalogDelete), true),
             ],
             // #69 后续:订阅 / 钥匙册的 `g 取回命令` 收窄成 `g 取回`(#69 的
             // 鼠标过滤入口要在 66×50 下限内也放得下,两本册的键位行本来就最长;
@@ -1390,14 +1400,14 @@ impl CatalogKind {
                 ("  ↑/↓ 选订阅", None, true),
                 ("r 登记", None, true),
                 (CATALOG_GET, Some(Target::CatalogGet), true),
-                ("d 删除", None, true),
+                (CATALOG_DELETE, Some(Target::CatalogDelete), true),
                 ("l 重读", None, true),
             ],
             CatalogKind::Key => &[
                 ("  ↑/↓ 选钥匙", None, true),
                 ("r 登记", None, true),
                 (CATALOG_GET, Some(Target::CatalogGet), true),
-                ("d 删除", None, true),
+                (CATALOG_DELETE, Some(Target::CatalogDelete), true),
                 ("l 重读", None, true),
             ],
         }
@@ -2790,6 +2800,23 @@ pub(crate) const CATALOG_FILTER: &str = "/ 过滤";
 /// ——「这一段可不可点」与「`g` 这个键在这一本上有没有动作」是同一张表的
 /// 同一行(#66 查表纪律,#73 不为它加 `if kind ==` 分叉)。
 pub(crate) const CATALOG_GET: &str = "g 取回";
+
+/// 键位行「d 删除」可点文案(#78,兑 #75 裁决 A:点 `d` 段 ≡ 按 `d`):点它 =
+/// 按 `d`——选中行 → ADR-0009 图形确认闸 → 确认才 `rm`,与键盘完全同一路。
+/// 渲染画这个串、命中测这个串的宽,同一份字符串——点哪打哪(ADR-0005)。
+///
+/// 机器 / 订阅 / 钥匙三本共用这一个文案;标签册的删除是「摘引用 / 删整个标签」
+/// 两态,用 [`CATALOG_DELETE_TAG`]。产地与 [`CATALOG_GET`] 同:文案与命中目标
+/// 都写在 [`CatalogKind::keys_body`] 的四行里——「这一段可不可点」与「`d` 这个
+/// 键在这一本上有没有动作」是同一张表的同一行(#66 查表纪律,#78 不为它加
+/// `if kind ==` 分叉)。
+pub(crate) const CATALOG_DELETE: &str = "d 删除";
+
+/// 标签册键位行删除段的文案(#78):它的 `d` 是**两态**——引用留空 = 删整个标签,
+/// 填 `kind/条目` = 只摘那几条(嵌套在表单流里,不是rm 确认弹层),故段面写成
+/// 「d 摘/删」而不是「d 删除」。点它 = 按 `d`,与键盘进同一条表单流
+/// ([`App::start`](crate::app::App::start) 的 `StartMode::Rm` 一个入口)。
+pub(crate) const CATALOG_DELETE_TAG: &str = "d 摘/删";
 
 /// 编目册键位行的**段清单**(#67 通用接缝的第一个用户):提示段只画不点
 /// (`None`),末段「换册」可点(`Some(SwitchBook)`)。渲染与命中测试共用这
@@ -9283,16 +9310,6 @@ mod tests {
         app
     }
 
-    /// 把一本就绪的订阅 / 钥匙册换成「册体一条都没有」的**合法空态**(规格验收 3
-    /// 的空册变体:段清单该退成 `keys_empty`,`g 取回` 段不在场)。
-    fn 置空册(app: &mut crate::app::App, json: &str) {
-        match app.catalog_kind {
-            CatalogKind::Subscription => app.sub_ls = Some(serde_json::from_str(json).unwrap()),
-            CatalogKind::Key => app.key_ls = Some(serde_json::from_str(json).unwrap()),
-            _ => unreachable!("本族只测订阅 / 钥匙册"),
-        }
-    }
-
     /// 「g 取回」段的命中矩形(从布局模型取,点哪拿哪;`app.size` 须先钉好)。
     fn get_rect(app: &crate::app::App) -> Rect {
         crate::layout::hitmap(app.size, app, crate::layout::size_class(app.size))
@@ -9409,19 +9426,9 @@ mod tests {
             );
         }
         // 空册变体(合法空态):段清单退成 keys_empty
-        for (name, mut app, empty) in [
-            (
-                "订阅",
-                book("订阅"),
-                r#"{"catalogPath":"/r/subscriptions.json","subscriptions":[]}"#,
-            ),
-            (
-                "钥匙",
-                book("钥匙"),
-                r#"{"catalogPath":"/r/keys.json","keys":[]}"#,
-            ),
-        ] {
-            置空册(&mut app, empty);
+        for (name, mut app) in [("订阅", book("订阅")), ("钥匙", book("钥匙"))] {
+            let kind = app.catalog_kind;
+            置空册(&mut app, kind);
             let f = crate::testutil::frame_display(&app, 80, 30);
             assert!(f.contains("编目里还没有"), "{name}册空态在场:{f}");
             assert!(
@@ -9681,5 +9688,405 @@ mod tests {
         assert_eq!(runner.call_argvs(), before, "点击路径零引擎调用");
         let f = crate::testutil::frame_display(&app, 80, 30);
         assert!(!f.contains("ghp_"), "屏显永不出现钥匙本体:{f}");
+    }
+
+    // ---- #78 删除键 d 的正文动作段:点「d 删除」段 = 按 d ----
+    //
+    // 承接 #75 裁决 A(点段 ≡ 按键,完整复用键盘既有后果链,与 #71 的 `x` 中止段
+    // 同口径)。与 #73 的 g 族同款双路驱动:点击与按键各跑一遍,日志行一上一下
+    // 对;断言落在渲染帧、日志行、屏上状态、命中区清单、FakeRunner 收到的 argv
+    // 与调用计数上——不断言私有字段名、不断言内部方法名。差别在后果链的终点:
+    // g 的终点是日志里多一条建议命令,d 的终点是删除发起(机器 / 订阅 / 钥匙三本
+    // 进 rm 确认弹层,标签册进摘引用 / 删标签表单流),确认前一个字节都不下发。
+
+    /// 四本册的 (册名, kind, 就绪 app):非空册体、数据仓根可用、组能力记上
+    /// (夹具口径见 `book_apps`)。
+    fn four_books() -> Vec<(&'static str, CatalogKind, crate::app::App)> {
+        [
+            ("机器", CatalogKind::Vps),
+            ("标签", CatalogKind::Tag),
+            ("订阅", CatalogKind::Subscription),
+            ("钥匙", CatalogKind::Key),
+        ]
+        .into_iter()
+        .map(|(name, kind)| (name, kind, book(name)))
+        .collect()
+    }
+
+    /// 这一本册键位行上删除段的文案:机器 / 订阅 / 钥匙三本「d 删除」,标签册是
+    /// 两态的「d 摘/删」(引用留空 = 删整个标签,填 kind/条目 = 只摘那几条)。
+    fn delete_text(kind: CatalogKind) -> &'static str {
+        match kind {
+            CatalogKind::Tag => CATALOG_DELETE_TAG,
+            _ => CATALOG_DELETE,
+        }
+    }
+
+    /// 「d 删除」段的命中矩形(从布局模型取,点哪拿哪;`app.size` 须先钉好)。
+    fn delete_rect(app: &crate::app::App) -> Rect {
+        crate::layout::hitmap(app.size, app, crate::layout::size_class(app.size))
+            .into_iter()
+            .find(|(_, t)| *t == crate::layout::Target::CatalogDelete)
+            .map(|(r, _)| r)
+            .expect("该册此刻应有 d 删除命中段")
+    }
+
+    /// 点击 / 按键之后「删除已发起」的跨册可观测量:机器 / 订阅 / 钥匙三本进
+    /// rm 确认弹层(`CatalogKind::rm_confirm`,与 `catalog_key_parts` 的在途判定
+    /// 同一个查表成员),标签册进表单流(`flow` 非 Idle)。四本册一个口径,
+    /// 不断言私有字段名。
+    fn 删除已发起(kind: CatalogKind, app: &crate::app::App) -> bool {
+        match kind {
+            CatalogKind::Tag => app.catalog_kind.flow(app).phase != RegPhase::Idle,
+            _ => kind.rm_confirm(app),
+        }
+    }
+
+    /// 把一本就绪的册换成「册体一条都没有」的**合法空态**(段清单该退成
+    /// `keys_empty`,一个可点段都没有)。四本各换各的数据源——标签册的回音面是
+    /// `tag_ls_echo`(EngineOutput),其余三本是解析后的数据。#73 的 g 族原先只覆盖
+    /// 订阅 / 钥匙两本(各带一段 JSON),本族按册参数化后两处共用这一份。
+    fn 置空册(app: &mut crate::app::App, kind: CatalogKind) {
+        match kind {
+            CatalogKind::Vps => {
+                app.vps_ls = Some(
+                    serde_json::from_str(r#"{"catalogPath":"/r/vps.json","machines":[]}"#)
+                        .unwrap(),
+                )
+            }
+            CatalogKind::Tag => {
+                app.tag_ls_echo = Some(crate::engine::EngineOutput {
+                    args: vec!["tag".into(), "ls".into()],
+                    exit_code: crate::engine::ExitCode::Ok,
+                    ok: true,
+                    stderr_tail: vec![],
+                    envelope: Some(
+                        serde_json::from_str(
+                            r#"{"schema":"nw/tag-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/tags.json","tags":[]}}"#,
+                        )
+                        .unwrap(),
+                    ),
+                    raw_stdout: String::new(),
+                    parse_error: None,
+                })
+            }
+            CatalogKind::Subscription => {
+                app.sub_ls = Some(
+                    serde_json::from_str(
+                        r#"{"catalogPath":"/r/subscriptions.json","subscriptions":[]}"#,
+                    )
+                    .unwrap(),
+                )
+            }
+            CatalogKind::Key => {
+                app.key_ls = Some(
+                    serde_json::from_str(r#"{"catalogPath":"/r/keys.json","keys":[]}"#).unwrap(),
+                )
+            }
+        }
+    }
+
+    /// 规格验收 1:点「d 删除」段 = 按 `d`——四本册 × 两档,两条路各跑一遍,
+    /// 日志行一上一下对,删除以同一形态发起,确认闸前一个字节都不下发。屏上进
+    /// 同一条流:三本画 rm 确认弹层(「确认删除」在场),标签册画表单。
+    #[test]
+    fn 点d删除段_等于按d_四本册两档同一后果链() {
+        for (name, kind, _) in four_books() {
+            for (w, h) in [(80u16, 30u16), (66, 50)] {
+                let mut clicked = book(name);
+                let mut keyed = book(name);
+                clicked.size = Rect::new(0, 0, w, h);
+                keyed.size = Rect::new(0, 0, w, h);
+                assert!(!删除已发起(kind, &clicked), "{name} {w}×{h} 点前删除未发起");
+                点中(&mut clicked, w, h, |t| {
+                    *t == crate::layout::Target::CatalogDelete
+                });
+                tap(&mut keyed, KeyCode::Char('d'));
+                assert_eq!(
+                    clicked.log, keyed.log,
+                    "{name} {w}×{h} 点 d 段与按 d 日志逐条相同"
+                );
+                assert!(删除已发起(kind, &clicked), "{name} {w}×{h} 点击发起删除");
+                assert!(删除已发起(kind, &keyed), "{name} {w}×{h} 按键发起删除");
+                assert!(
+                    clicked.queue.is_empty() && clicked.fed_queue.is_empty(),
+                    "{name} {w}×{h} 确认闸前一个字节都不下发"
+                );
+                let f = crate::testutil::frame_display(&clicked, w, h);
+                let needle = match kind {
+                    CatalogKind::Tag => "一行一条",
+                    _ => "确认删除",
+                };
+                assert!(
+                    f.contains(needle),
+                    "{name} {w}×{h} 屏上进同一条流(浮层带着 {needle}):{f}"
+                );
+                let picked = kind.selected_name(&clicked).expect("删之前册里确有选中行");
+                assert!(
+                    clicked.log.iter().any(|l| l.contains(&picked)),
+                    "{name} {w}×{h} 后果链冲着选中那一条去:{:?}",
+                    clicked.log.first()
+                );
+            }
+        }
+    }
+
+    /// 规格验收 2:删除确认弹层在场时,键位行整行换成浮层提示——删除段不在命中
+    /// 区,点它原来的位置什么都不发生(日志不新增、弹层不被打扫);Esc 收回后再点
+    /// 一次 = 再按一次 `d`:日志逐条相同,删除再次发起,不是静默无后果。(三本同一
+    /// 口径,取订阅册为代表;标签册的表单流见标签册专属那条。)
+    #[test]
+    fn 弹层在场时无删除段_收回后再点等于再按() {
+        let (mut clicked, _r) = sub_book();
+        let (mut keyed, _r) = sub_book();
+        clicked.size = Rect::new(0, 0, 80, 30);
+        let rect = delete_rect(&clicked);
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogDelete
+        });
+        tap(&mut keyed, KeyCode::Char('d'));
+        assert!(
+            clicked.sub_rm_confirm && keyed.sub_rm_confirm,
+            "第一次都发起"
+        );
+        // 弹层态:命中区里没有删除段(整行换成浮层提示)
+        assert!(
+            crate::layout::hitmap(
+                clicked.size,
+                &clicked,
+                crate::layout::size_class(clicked.size)
+            )
+            .iter()
+            .all(|(_, t)| *t != crate::layout::Target::CatalogDelete),
+            "删除确认弹层在场时没有删除命中目标"
+        );
+        // 点原来的位置:确认弹层够矮(7 行、居中),盖不到键位行,那一格此刻谁也不
+        // 是——点击无后果(日志不新增、弹层不被打扫)
+        let log_after_first = clicked.log.len();
+        clicked.update(crate::app::Message::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + rect.width / 2,
+            row: rect.y + rect.height / 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(clicked.log.len(), log_after_first, "点原位置不新增日志");
+        assert!(clicked.sub_rm_confirm, "点原位置不打扫弹层");
+        // Esc 收回,再点一次 = 再按一次
+        tap(&mut clicked, KeyCode::Esc);
+        tap(&mut keyed, KeyCode::Esc);
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogDelete
+        });
+        tap(&mut keyed, KeyCode::Char('d'));
+        assert_eq!(clicked.log, keyed.log, "收回后再点与再按逐条相同");
+        assert!(clicked.sub_rm_confirm, "删除再次发起");
+    }
+
+    /// 规格验收 3:段的在场条件 = 键位行变体条件,由 `CatalogKind` 查表一处决定
+    /// ——四本册的**非空、非在途**变体各恰好一个删除段(文案按册、无禁用态);
+    /// 空册变体(合法空态)一个都没有;在途变体(登记浮层 / 删除确认浮层)整行换成
+    /// 浮层提示,也一个都没有。
+    #[test]
+    fn d删除段_四本册非空非在途都在_空册与浮层态都不在() {
+        for (name, kind, mut app) in four_books() {
+            app.size = Rect::new(0, 0, 80, 30);
+            let segs: Vec<_> = catalog_key_parts(&app)
+                .into_iter()
+                .filter(|(_, t, _)| *t == Some(crate::layout::Target::CatalogDelete))
+                .collect();
+            assert_eq!(segs.len(), 1, "{name}册应恰好一个删除段:{segs:?}");
+            assert_eq!(segs[0].0, delete_text(kind), "{name}册段文案与屏上同源");
+            assert!(
+                segs[0].2,
+                "{name}册删除段没有禁用态(点下去复现键盘指路,不画灰)"
+            );
+        }
+        // 空册变体:段清单退成 keys_empty(一个可点段都没有)
+        for (name, kind, mut app) in four_books() {
+            置空册(&mut app, kind);
+            let f = crate::testutil::frame_display(&app, 80, 30);
+            assert!(f.contains("编目里还没有"), "{name}册空态在场:{f}");
+            assert!(
+                catalog_key_parts(&app)
+                    .iter()
+                    .all(|(_, t, _)| *t != Some(crate::layout::Target::CatalogDelete)),
+                "{name}册空册变体没有删除命中目标"
+            );
+        }
+        // 在途变体:登记浮层 / 删除确认浮层
+        for (name, _kind, mut app) in four_books() {
+            app.size = Rect::new(0, 0, 80, 30);
+            tap(&mut app, KeyCode::Char('r'));
+            assert!(
+                catalog_key_parts(&app)
+                    .iter()
+                    .all(|(_, t, _)| *t != Some(crate::layout::Target::CatalogDelete)),
+                "{name}册登记浮层态没有删除命中目标"
+            );
+            tap(&mut app, KeyCode::Esc);
+            tap(&mut app, KeyCode::Char('d'));
+            assert!(
+                catalog_key_parts(&app)
+                    .iter()
+                    .all(|(_, t, _)| *t != Some(crate::layout::Target::CatalogDelete)),
+                "{name}册删除确认 / 删除表单态没有删除命中目标"
+            );
+            let f = crate::testutil::frame_display(&app, 80, 30);
+            assert!(f.contains("Enter 确认"), "{name}册在途键位行:{f}");
+        }
+    }
+
+    /// 规格验收 4:点段与段之间的空白不触发任何动作——日志不新增、删除不发起。
+    /// 四本册各一遍(段面文案不同,几何同构)。
+    #[test]
+    fn 点d段之间的空白_无任何后果() {
+        for (name, kind, mut app) in four_books() {
+            app.size = Rect::new(0, 0, 80, 30);
+            let d = delete_rect(&app);
+            let before_log = app.log.len();
+            assert!(!删除已发起(kind, &app), "{name}册点前删除未发起");
+            // d 段左侧那一列正是段间分隔(`CATALOG_KEY_GAP` = " ·")所在的空白:
+            // 段间不重叠、不留歧义区(#67),命中矩形只覆盖段文案本身
+            app.update(crate::app::Message::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: d.x - 1,
+                row: d.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert_eq!(app.log.len(), before_log, "{name}册点段间空白不新增日志");
+            assert!(!删除已发起(kind, &app), "{name}册点段间空白不发起删除");
+        }
+    }
+
+    /// 规格验收 5 / #69 口径:册内过滤筛到空时,可见列表里没有选中的那一行——
+    /// 删除段仍在场(键位行按册体全长走,不随过滤收),点它与按 `d` 同后果:同一条
+    /// 既有指路(「删除未下发:没有选中的…」),不弹确认、不下发、不新造行为。
+    #[test]
+    fn 册内过滤筛到空_点d段与按d同走既有指路() {
+        let (mut clicked, _r) = sub_book();
+        let (mut keyed, _r) = sub_book();
+        过滤敲词(&mut clicked, "zzz-不存在");
+        过滤敲词(&mut keyed, "zzz-不存在");
+        clicked.size = Rect::new(0, 0, 80, 30);
+        let d = delete_rect(&clicked);
+        let f = crate::testutil::frame_display(&clicked, 80, 30);
+        assert!(f.contains("册无命中"), "册体确实被筛空:{f}");
+        assert!(f.contains(CATALOG_DELETE), "筛到空,删除段仍在场:{f}");
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogDelete
+        });
+        tap(&mut keyed, KeyCode::Char('d'));
+        assert_eq!(clicked.log, keyed.log, "筛到空:点击与按键逐条相同");
+        assert!(
+            clicked
+                .log
+                .iter()
+                .any(|l| l.contains("删除未下发:没有选中的")),
+            "给不出选中行时走既有指路:{:?}",
+            clicked.log.first()
+        );
+        assert!(!clicked.sub_rm_confirm, "没有选中行就不弹确认");
+        assert!(clicked.queue.is_empty(), "指路路径零下发");
+        assert_eq!(d.height, 1, "删除段是 1 行可点段");
+    }
+
+    /// 规格验收 6:两档(80×30 / 66×50)四本册都点得中;段在屏上的起始列 = 命中
+    /// 矩形 x(渲染与命中共用同一份段表量宽),整段在场才可点;删除段与换册段同一
+    /// 行——键位行钉在册体内层末行(#73 的几何,删除段继承,不另推一份)。
+    #[test]
+    fn d段_四本册两档都点得中_屏上那一列就是命中矩形() {
+        for (name, kind, _) in four_books() {
+            for (w, h) in [(80u16, 30u16), (66, 50)] {
+                // 每档一本新册:点中之后册子进删除发起态(键位行整行换成浮层提示),
+                // 复用同一本会把下一档的 delete_rect 找空
+                let mut app = book(name);
+                app.size = Rect::new(0, 0, w, h);
+                let d = delete_rect(&app);
+                let sw = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size))
+                    .into_iter()
+                    .find(|(_, t)| *t == crate::layout::Target::SwitchBook)
+                    .map(|(r, _)| r)
+                    .expect("换册段应有命中区");
+                assert_eq!(
+                    d.y, sw.y,
+                    "{name} {w}×{h} 删除段与换册段同一行(键位行钉末行)"
+                );
+                let f = crate::testutil::frame_display(&app, w, h);
+                let row = f.lines().nth(d.y as usize).expect("命中行在渲染中在场");
+                assert_eq!(
+                    帧行截取(
+                        row,
+                        d.x,
+                        unicode_width::UnicodeWidthStr::width(delete_text(kind))
+                    ),
+                    delete_text(kind),
+                    "{name} {w}×{h} 段整段在场(不是半个命中):{row}"
+                );
+                点中(&mut app, w, h, |t| {
+                    *t == crate::layout::Target::CatalogDelete
+                });
+                assert!(删除已发起(kind, &app), "{name} {w}×{h} 点得中");
+            }
+        }
+    }
+
+    /// 规格验收 7 / ADR-0009 §4:装配态下点删除段与按 `d` 同后果——`d` 是写动作,
+    /// 与装配互斥(键盘侧本就复现这句,鼠标同口径):日志逐条相同、不弹确认、
+    /// 不入队、零引擎调用。
+    #[test]
+    fn 装配态下点d段_与按d同后果() {
+        let (mut clicked, r1) = sub_book();
+        let (mut keyed, _r) = sub_book();
+        clicked.assembling = true;
+        keyed.assembling = true;
+        clicked.size = Rect::new(0, 0, 80, 30);
+        let before = r1.call_argvs();
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogDelete
+        });
+        tap(&mut keyed, KeyCode::Char('d'));
+        assert_eq!(clicked.log, keyed.log, "装配态下两条路逐条相同");
+        assert!(
+            clicked
+                .log
+                .iter()
+                .any(|l| l.contains("装配进行中:删除与装配互斥")),
+            "写互斥那句复现:{:?}",
+            clicked.log.first()
+        );
+        assert!(!clicked.sub_rm_confirm, "装配态不弹确认");
+        assert!(clicked.queue.is_empty(), "装配态零下发");
+        assert_eq!(r1.call_argvs(), before, "装配态点击零引擎调用");
+    }
+
+    /// #75 裁决 A 的标签册形状:点「d 摘/删」段进的不是确认弹层,是同一条表单
+    /// 流——名字预填选中的那条、光标落引用字段(留空 = 删整个标签,填 kind/条目
+    /// = 只摘那几条),确认前零下发。与按 `d` 逐条相同。
+    #[test]
+    fn 标签册点d段_进同一表单流_预填选中标签名() {
+        let mut clicked = book("标签");
+        let mut keyed = book("标签");
+        clicked.size = Rect::new(0, 0, 80, 30);
+        keyed.size = Rect::new(0, 0, 80, 30);
+        点中(&mut clicked, 80, 30, |t| {
+            *t == crate::layout::Target::CatalogDelete
+        });
+        tap(&mut keyed, KeyCode::Char('d'));
+        assert_eq!(clicked.log, keyed.log, "点 d 摘/删段与按 d 日志逐条相同");
+        assert_eq!(
+            clicked.tag_flow.phase,
+            RegPhase::Form,
+            "进表单流,不是确认弹层"
+        );
+        assert_eq!(
+            clicked.tag_form.name, "bare",
+            "预填选中的标签名(排序后首行)"
+        );
+        assert_eq!(clicked.tag_form.field, TagField::Refs, "光标落引用字段");
+        assert!(
+            !clicked.tag_rm_confirm,
+            "表单阶段的确认旗未亮(Enter 提交后才亮)"
+        );
+        assert!(clicked.queue.is_empty(), "表单没确认前不下发任何写命令");
     }
 }

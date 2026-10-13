@@ -844,6 +844,14 @@ impl App {
             // `key_catalog` 同一个),所以鼠标与键盘不可能给出两种后果。(过滤输入态
             // 里键入归输入态、鼠标照旧点得动,那是键位行所有可点段的共同边界。)
             Target::CatalogGet => self.catalog_get(),
+            // 点正文键位行的「d 删除」段(#78,兑 #75 裁决 A):与键盘 `d` 同一个
+            // 函数、同一条后果链——选中行 → ADR-0009 图形确认闸 → 确认才 `rm`
+            // (标签册的删除嵌套在表单流里,点它进同一条流)。路由查
+            // `CatalogKind::action` 同一张表(与 `key_catalog` 受理 `d` 同一个
+            // 入口),落到 `App::start` 的 `StartMode::Rm`(与 #76 收敛后的键盘
+            // 路径逐字同一处),所以鼠标与键盘不可能给出两种后果;无选中行 /
+            // 入口门不过 / 装配在途时,复现键盘 `d` 的既有日志,不新造行为。
+            Target::CatalogDelete => self.catalog_delete(),
         }
     }
 
@@ -2492,6 +2500,31 @@ impl App {
             .action(self, crossterm::event::KeyCode::Char('g'))
         {
             f(self);
+        }
+    }
+
+    /// 点键位行「d 删除」段 = 按 `d`(#78,兑 #75 裁决 A:点段 ≡ 按键)。
+    ///
+    /// 走 [`catalog::CatalogKind::action`] **同一张表**(与 `key_catalog` 受理
+    /// `d` 的那一次查表同一个入口):四本册同一个动作值
+    /// `Start(StartMode::Rm)`,由 [`App::start`] **一个函数**落实——机器 /
+    /// 订阅 / 钥匙三本进 rm 确认弹层(ADR-0009 §2:上游 `rm` 都没有 `--yes`,
+    /// 面板加一道,删掉要重新登记、代价不对称),标签册的删除嵌套在表单流里
+    /// (摘引用 / 删整个标签两态)。按册差异全在查表成员里,鼠标与键盘因此不可能
+    /// 给出两种后果,也不会有第二份「点下去发生什么」。
+    ///
+    /// 段在四本册的非空、非在途键位行变体在场(命中区的产地
+    /// [`catalog::catalog_key_parts`]),所以这一处到达即确有册可删;无选中行
+    /// (如册内过滤筛到空)时 `selected_name` 落空,复现键盘 `d` 的既有指路
+    /// (「删除未下发:没有选中的…」),不新造灰置态;装配在途 / 入口门不过时
+    /// 复现各自的既有日志。过滤输入态里键入归输入态、鼠标照旧点得动,那是
+    /// 键位行所有可点段的共同边界(见 [`catalog_get`] 的同口径注记)。
+    fn catalog_delete(&mut self) {
+        if let Some(catalog::CatalogAction::Start(mode)) = self
+            .catalog_kind
+            .action(self, crossterm::event::KeyCode::Char('d'))
+        {
+            self.start(self.catalog_kind, mode);
         }
     }
 
@@ -6583,14 +6616,16 @@ mod tests {
     /// 与 README 鼠标小节两边都点名。旧版只查了「README 有的短语在不在章节
     /// 里」这一个方向,于是 #69 给机器册加了 `/ 过滤` 段、#70 加了
     /// `Enter 反查` 段,README 还停在「换册 / Enter 反查」两段,两边悄悄不
-    /// 一致也没人红。段名词从**画段的那三份常量**取
+    /// 一致也没人红。段名词从**画段的那几份常量**取
     /// ([`crate::screens::catalog::CATALOG_SWITCH`] / `CATALOG_FILTER` /
-    /// `CATALOG_REVERSE`——`catalog_key_parts` 里全部 `Some(Target)` 的段都
-    /// 是它们),不另抄一份清单:将来加第四个可点段而文档没跟上,这条就红。
+    /// `CATALOG_REVERSE` / `CATALOG_GET` / `CATALOG_DELETE` /
+    /// `CATALOG_DELETE_TAG`——`catalog_key_parts` 里全部 `Some(Target)` 的段都
+    /// 是它们),不另抄一份清单:将来加新的可点段而文档没跟上,这条就红。
     #[test]
     fn 帮助鼠标章节_覆盖_readme_全部条目() {
         use crate::screens::catalog::{
-            CATALOG_FILTER, CATALOG_GET, CATALOG_REVERSE, CATALOG_SWITCH,
+            CATALOG_DELETE, CATALOG_DELETE_TAG, CATALOG_FILTER, CATALOG_GET, CATALOG_REVERSE,
+            CATALOG_SWITCH,
         };
         use crate::ui::MOUSE_LINES;
         let readme = include_str!("../README.md");
@@ -6619,7 +6654,14 @@ mod tests {
             assert!(joined.contains(phrase), "鼠标章节缺 README 条目 `{phrase}`");
         }
         // 反方向:画在屏上的每一个可点段,章节与 README 两边都点名
-        for seg in [CATALOG_SWITCH, CATALOG_FILTER, CATALOG_REVERSE, CATALOG_GET] {
+        for seg in [
+            CATALOG_SWITCH,
+            CATALOG_FILTER,
+            CATALOG_REVERSE,
+            CATALOG_GET,
+            CATALOG_DELETE,
+            CATALOG_DELETE_TAG,
+        ] {
             // 段文案是 `m 换册` / `/ 过滤` / `Enter 反查`:名词取最后一段
             let noun = seg.split_whitespace().last().unwrap_or(seg);
             assert!(
