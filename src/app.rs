@@ -380,6 +380,13 @@ pub struct App {
     /// skill 脚手架表单(名称 / 描述 / 触发词 + 模板起步开关)。#111 追加
     /// extension 表单时,在此旁添一份并让表单流按 kind 分派。
     pub scaffold_form: crate::screens::SkillForm,
+    /// 脚手架的目标规格(#111):skill 与 extension 共用[`scaffold_flow`](Self::scaffold_flow)
+    /// 那一条表单流,表单各一份,按它取哪份在场。
+    pub scaffold_kind: crate::screens::ScaffoldKind,
+    /// extension 脚手架表单(#111:名称 / 描述 / 入口文件 + 模板起步);与
+    /// [`scaffold_form`](Self::scaffold_form) 并列,按 [`scaffold_kind`](Self::scaffold_kind)
+    /// 取哪份。
+    pub ext_form: crate::screens::ExtensionForm,
     /// 编目册屏(#53):vps 两段式登记流(与命令组无关的骨架件)。
     pub vps_flow: crate::screens::RegisterFlow,
     /// vps 登记表单(名字 / 若干条地址 / 端口 / 若干条登录 / 备注)。
@@ -628,6 +635,8 @@ impl App {
             scan_pending: Vec::new(),
             scaffold_flow: crate::screens::ScaffoldFlow::default(),
             scaffold_form: crate::screens::SkillForm::default(),
+            scaffold_kind: crate::screens::ScaffoldKind::Skill,
+            ext_form: crate::screens::ExtensionForm::default(),
             vps_flow: crate::screens::RegisterFlow::new(),
             vps_form: crate::screens::new_form(),
             vps_ls: None,
@@ -1908,6 +1917,11 @@ impl App {
             // (入口门在 start_scaffold 里把守:装配互斥 / 流程不重入 / 数据仓根
             // 就绪,不可用只留指路)。skill 是组件(CONTEXT),落进数据仓 skills/。
             KeyCode::Char('n') if self.rc_domain == Domain::Components => self.start_scaffold(),
+            // 作者侧 extension 脚手架(#111):与 `n` 同域同构——同一条表单流
+            // (阶段机/拟落账/确认闸/原子落盘全复用 #110),换的是规格:
+            // pi-extension landing 契约(manifest + 入口文件),落进数据仓
+            // extensions/。入口门同样在 start_ext_scaffold 里把守。
+            KeyCode::Char('e') if self.rc_domain == Domain::Components => self.start_ext_scaffold(),
             // 组件打包器入口(#112):只组件域给(与 `r` 只外部源域同构) ——
             // 打包的对象是数据仓里的本地 skill/extension 目录。三道门在
             // start_pack 里把守(装配互斥 / 不重入 / 数据仓根就绪)。
@@ -2514,10 +2528,23 @@ impl App {
 
     // ---- 作者侧脚手架表单流(spec #95 工单 #110,ADR-0010) ----
 
-    /// 组件域 `n` 发起 skill 脚手架:三道门(装配互斥 / 流程不重入 / 数据仓根
-    /// 就绪)过后进表单态。数据仓根不可用**统一指路、不开流程**——写侧连
-    /// 构造都不该发生(ADR-0010 §5)。
+    /// 组件域 `n` 发起 skill 脚手架:与 [`start_ext_scaffold`] 共用
+    /// [`begin_scaffold`] 那三道门(装配互斥 / 流程不重入 / 数据仓根就绪),
+    /// 过后进 skill 表单态。
     pub fn start_scaffold(&mut self) {
+        self.begin_scaffold(crate::screens::ScaffoldKind::Skill);
+    }
+
+    /// 组件域 `e` 发起 extension 脚手架(#111):与 [`start_scaffold`] 同一条
+    /// 表单流、同一组入口门,只换规格(表单 + [`ScaffoldSpec`] 实现)。
+    pub fn start_ext_scaffold(&mut self) {
+        self.begin_scaffold(crate::screens::ScaffoldKind::Extension);
+    }
+
+    /// 脚手架入口的共用门(两份规格同一处,不写两遍):装配互斥 / 流程不重入 /
+    /// 数据仓根就绪。过后按 kind 复位那一份表单并进表单态——另一份表单
+    /// 一并清掉,旧字段不冒充本次。
+    fn begin_scaffold(&mut self, kind: crate::screens::ScaffoldKind) {
         if self.assembling {
             // 写互斥(ADR-0010 §5):脚手架与装配不同时进行。
             self.push_log("装配进行中:脚手架与装配互斥,稍后再试");
@@ -2530,9 +2557,19 @@ impl App {
             self.push_log(format!("脚手架入口:{}", self.data_root_gate_msg()));
             return;
         }
+        self.scaffold_kind = kind;
         self.scaffold_form = crate::screens::SkillForm::default();
+        self.ext_form = crate::screens::ExtensionForm::default();
         self.scaffold_flow.begin();
-        self.push_log("新建 skill 脚手架:填名称/描述/触发词,Enter 拟落账预览,Esc/q 放弃");
+        // 字段提示按规格各说各的(操作者要知道填什么),流程措辞同一套。
+        let fields = match kind {
+            crate::screens::ScaffoldKind::Skill => "填名称/描述/触发词",
+            crate::screens::ScaffoldKind::Extension => "填名称/描述/入口文件",
+        };
+        self.push_log(format!(
+            "新建 {} 脚手架:{fields},Enter 拟落账预览,Esc/q 放弃",
+            kind.word()
+        ));
     }
 
     /// 脚手架浮层键位:表单态转口规格自己的键入分发;预览态 Enter 落盘 /
@@ -2541,7 +2578,17 @@ impl App {
         use crate::screens::{FormAction, ScaffoldPhase};
         match self.scaffold_flow.phase {
             ScaffoldPhase::Form => {
-                match crate::screens::on_key_skill_form(&mut self.scaffold_form, k) {
+                // 表单段按 kind 转口:键位处理器归规格自己(#110 skill /
+                // #111 extension 各一份),流程后果(Submit/Cancel)同一套。
+                let action = match self.scaffold_kind {
+                    crate::screens::ScaffoldKind::Skill => {
+                        crate::screens::on_key_skill_form(&mut self.scaffold_form, k)
+                    }
+                    crate::screens::ScaffoldKind::Extension => {
+                        crate::screens::on_key_ext_form(&mut self.ext_form, k)
+                    }
+                };
+                match action {
                     FormAction::Submit => self.scaffold_submit(),
                     FormAction::Cancel => self.cancel_scaffold(),
                     FormAction::Edited => {}
@@ -2561,13 +2608,20 @@ impl App {
         }
     }
 
-    /// 表单 Enter:面板侧字段校验(对齐上游 validate 对 SKILL.md 的检查)
-    /// → 写侧 `plan` 拟落账(**一个字节都不落**)→ 进预览态摊开。字段不合法
-    /// 拦在表单里留可改;写侧校验(空 / 重复目标 / 路径)不过也留表单。
+    /// 表单 Enter:面板侧字段校验(对齐上游 validate 对 SKILL.md / extension
+    /// manifest 的检查)→ 写侧 `plan` 拟落账(**一个字节都不落**)→ 进预览态
+    /// 摊开。字段不合法拦在表单里留可改;写侧校验(空 / 重复目标 / 路径)
+    /// 不过也留表单。
     fn scaffold_submit(&mut self) {
         use crate::datarepo::write::DataRepo;
         use crate::screens::ScaffoldSpec;
-        let writes = match self.scaffold_form.planned_writes() {
+        // 两份规格同一只 trait:字段校验 + 拟落账条目生成。消费方(本函数)
+        // 不分叉——这就是「表单流复用而非复制」的接缝点。
+        let writes = match self.scaffold_kind {
+            crate::screens::ScaffoldKind::Skill => self.scaffold_form.planned_writes(),
+            crate::screens::ScaffoldKind::Extension => self.ext_form.planned_writes(),
+        };
+        let writes = match writes {
             Ok(w) => w,
             Err(reasons) => {
                 self.push_log(format!("脚手架被拒:{},留表单可改", reasons.join(";")));
@@ -2612,7 +2666,8 @@ impl App {
                 let n = receipt.written.len();
                 self.scaffold_flow.enter_done(receipt);
                 self.push_log(format!(
-                    "skill 骨架已写入数据仓:{n} 个文件(原子落盘,改动走 git PR + 家长审)"
+                    "{} 骨架已写入数据仓:{n} 个文件(原子落盘,改动走 git PR + 家长审)",
+                    self.scaffold_kind.word()
                 ));
             }
             Err(e) => {
@@ -2629,6 +2684,8 @@ impl App {
         let done = self.scaffold_flow.phase == crate::screens::ScaffoldPhase::Done;
         self.scaffold_flow.abandon();
         self.scaffold_form = crate::screens::SkillForm::default();
+        self.ext_form = crate::screens::ExtensionForm::default();
+        self.scaffold_kind = crate::screens::ScaffoldKind::Skill;
         self.push_log(if done {
             "脚手架完成:关闭预览(改动在数据仓,走 git PR 审)".to_string()
         } else {

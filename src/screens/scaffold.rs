@@ -1,7 +1,9 @@
-//! 作者侧脚手架表单流(spec #95 工单 #110,含首套模板)。
+//! 作者侧脚手架表单流(spec #95 工单 #110 skill 含首套模板 / #111
+//! extension pi-extension 契约)。
 //!
 //! 面板第一次**自己写文件**的消费方之一(ADR-0010):图形表单生成 `SKILL.md`
-//! 骨架,落进数据仓 `skills/`。落盘全程走 datarepo 写侧(#109)——**拟落账
+//! 骨架或 extension 的 manifest + 入口文件,落进数据仓 `skills/` 或
+//! `extensions/`。落盘全程走 datarepo 写侧(#109)——**拟落账
 //! 摊开(路径 + 内容)→ 图形确认 → 原子落盘(tmp + rename)**,确认前一个字节
 //! 不落。
 //!
@@ -14,15 +16,28 @@
 //!   阶段机(表单 → 拟落账预览 → 结论)、拟落账形状、确认闸、原子落盘调用。
 //!   #111 的 extension 脚手架换一份表单与一份 [`ScaffoldSpec`] 实现即可,
 //!   流程/预览/落盘一字不重写。
-//! - **各自不同的规格**(本文件的 [`SkillForm`] / `impl ScaffoldSpec for
-//!   SkillForm` / `render_skill_form` / `on_key_skill_form`):字段形态、
-//!   形状校验、骨架内容、落点目录。
+//! - **各自不同的规格**(本文件的 [`SkillForm`] / [`ExtensionForm`] 各一份
+//!   `impl ScaffoldSpec` + `render_*_form` / `on_key_*_form`):字段形态、
+//!   形状校验、骨架内容、落点目录。两份规格由 [`ScaffoldKind`] 指名,
+//!   `App` 按它取哪份表单在场(入口门 / 确认闸 / 落盘仍只有一处)。
 //!
-//! 字段形状校验**对齐上游 validate 对 skill 的检查**:`SKILL.md` frontmatter
-//! 必填 `name` + `description`(见上游 `docs/external-sources.md` 注册验收第
-//! 2 条);skill 身份 = frontmatter 的 `name`,故名字按引擎 `validName` 同款
-//! 口径校验(它同时是落点目录名 `skills/<名>/`)。产出内容是**面板自有资产**
+//! 字段形状校验**分别对齐上游对相应文件的检查**:skill 侧
+//! `SKILL.md` frontmatter 必填 `name` + `description`(见上游
+//! `docs/external-sources.md` 注册验收第 2 条);skill 身份 = frontmatter 的
+//! `name`,故名字按引擎 `validName` 同款口径校验(它同时是落点目录名
+//! `skills/<名>/`)。extension 侧对齐 #21 的第六条验收:条目子树自带
+//! `package.json` 且 `pi.extensions` 非空、清单里每条路径真实存在
+//! (上游 `internal/source/scan.go` 的 `ExtensionManifestIssue`;validate 的
+//! 形态面 = `catalog.extension_entries`),面板侧镜像见
+//! [`ext_manifest_audit`]。产出内容是**面板自有资产**
 //! (内置模板),不是引擎逻辑复刻(ADR-0010 §3)。
+//!
+//! 两份规格的落点同源:数据仓的组件家是 `skills/` 与 `extensions/`
+//! (`datarepo` 读侧 `SKILLS_DIR` / `EXTENSIONS_DIR` 是路径知识的单源,
+//! #114 预扫与 #116 引用完整性都按它认条目)。上游那半的**派内**落点是
+//! `<agent-dir>/nw/extensions/<仓库>/<条目>/` 且必须登记
+//! `settings.packages`(external-sources.md「扩展这半」)——那是 `up` 铺下
+//! 去的事,面板脚手架只写数据仓里的源,不写派、也不写 `catalog.json`。
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
@@ -221,7 +236,7 @@ impl ScaffoldSpec for SkillForm {
         let name = self.name.trim();
         if name.is_empty() {
             errs.push("名称必填:skill 身份 = SKILL.md frontmatter 的 name".into());
-        } else if let Some(reason) = invalid_skill_name(name) {
+        } else if let Some(reason) = invalid_entry_name(name) {
             errs.push(reason);
         }
         // 描述:SKILL.md frontmatter 的 description,validate 盯着这项(注册验收第 2 条)。
@@ -244,7 +259,11 @@ impl ScaffoldSpec for SkillForm {
 /// 名称形状校验(对齐上游 `internal/bake/scaffold.go` 的 `validName`:名字直接
 /// 拼进文件路径,挡路径穿越与破坏路径的字符;字母数字按 Unicode 判,`-` `_` `.`
 /// 放行——非 ASCII 名合法,同引擎口径)。
-fn invalid_skill_name(name: &str) -> Option<String> {
+///
+/// **两份规格共用这一条**:skill 名是 `skills/<名>/` 的目录名,extension
+/// 条目名是 `extensions/<名>/` 的目录名(上游 #21:扩展没有 frontmatter,
+/// 身份就是子树目录名)——两者都直接拼进落点路径,判据同源,不写两份。
+fn invalid_entry_name(name: &str) -> Option<String> {
     if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
         return Some("名称不能是路径:不含 `/` `\\` 分隔符,也不是 `.` / `..`".into());
     }
@@ -335,13 +354,384 @@ pub fn on_key_skill_form(form: &mut SkillForm, k: KeyEvent) -> FormAction {
     }
 }
 
+// ---- extension 规格(#111):pi-extension landing 契约 ----
+
+/// 脚手架的目标规格:#110 skill 与 #111 extension 各一份表单、各一份
+/// [`ScaffoldSpec`],**表单流本身不分叉**(阶段机 / 拟落账 / 确认闸 / 原子
+/// 落盘全共用)。`App` 按它取哪份表单在场,入口门与落盘仍只有一处。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ScaffoldKind {
+    #[default]
+    Skill,
+    Extension,
+}
+
+impl ScaffoldKind {
+    /// 屏上 / 日志里的词(与上游 `nw source register --kind` 的槽位同词,
+    /// 不另造;`internal/model` 的 `CatalogKindSkill` / `CatalogKindExtension`)。
+    pub fn word(self) -> &'static str {
+        match self {
+            ScaffoldKind::Skill => "skill",
+            ScaffoldKind::Extension => "extension",
+        }
+    }
+}
+
+/// 扩展表单字段(↑/↓ 移焦点;文本字段走通用单行输入态机)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ExtensionField {
+    #[default]
+    Name,
+    Description,
+    /// 入口文件名:manifest 的 `pi.extensions` 指着它。
+    Entry,
+    /// 模板起步开关(空格切换;不是文本字段)。
+    Template,
+}
+
+impl ExtensionField {
+    pub const ALL: [ExtensionField; 4] = [
+        ExtensionField::Name,
+        ExtensionField::Description,
+        ExtensionField::Entry,
+        ExtensionField::Template,
+    ];
+
+    /// 字段标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            ExtensionField::Name => "名称",
+            ExtensionField::Description => "描述",
+            ExtensionField::Entry => "入口文件",
+            ExtensionField::Template => "模板",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
+    }
+
+    /// 文本字段(有单行缓冲);模板开关没有。
+    fn is_text(self) -> bool {
+        !matches!(self, ExtensionField::Template)
+    }
+}
+
+/// 入口文件名的缺省值:pi 的扩展发现规则是
+/// `<agent-dir>/extensions/*.ts` + `<agent-dir>/extensions/*/index.ts`
+///(**只一层**),条目根上的入口就叫 `index.ts`(上游 `docs/extensions.md`
+/// 的发现位置表,转述于 `docs/external-sources.md`「扩展这半」)。
+pub const DEFAULT_ENTRY: &str = "index.ts";
+
+/// 条目 `package.json` 的起始版本:上游只读它、不校验它(本地组件的
+/// `version` 才被 validate 查),给一个诚实的起步值,作者自己 bump。
+const EXT_VERSION: &str = "0.1.0";
+
+/// 条目清单的文件名:上游样本 `docs/samples/components/scout/package.json`。
+const EXT_MANIFEST_FILE: &str = "package.json";
+
+/// extension 脚手架表单:名称 / 描述 / 入口文件 + 模板起步开关。
+/// `name` = 条目身份(= 条目子树目录名,上游 #21:扩展没有 frontmatter 可当
+/// 身份),也是数据仓落点 `extensions/<名>/` 的目录名。
+#[derive(Clone)]
+pub struct ExtensionForm {
+    pub name: String,
+    pub description: String,
+    /// 入口文件名(manifest 的 `pi.extensions` 指着它;缺省 [`DEFAULT_ENTRY`])。
+    pub entry: String,
+    /// 从内置 extension 模板起步(true)还是空白入口(false)。
+    pub template: bool,
+    pub field: ExtensionField,
+}
+
+impl ExtensionForm {
+    fn focused_buf(&mut self) -> Option<&mut String> {
+        match self.field {
+            ExtensionField::Name => Some(&mut self.name),
+            ExtensionField::Description => Some(&mut self.description),
+            ExtensionField::Entry => Some(&mut self.entry),
+            ExtensionField::Template => None,
+        }
+    }
+
+    /// ↑/↓ 移字段(四字段轮转,到顶/到底不越界、不绕回)——与 [`SkillForm`]
+    /// 同一只移字段习惯,不因规格不同改操作者的肌肉记忆。
+    fn move_field(&mut self, down: bool) {
+        let i = self.field.index();
+        let n = ExtensionField::ALL.len();
+        self.field = ExtensionField::ALL[if down {
+            (i + 1).min(n - 1)
+        } else {
+            i.saturating_sub(1)
+        }];
+    }
+}
+
+/// `Default` 手工实现(derive 给不出非空初值):入口文件名预填
+/// [`DEFAULT_ENTRY`] —— pi 的发现规则与上游样本都以 `index.ts` 为条目根
+/// 入口,预填它 = 少一个要想的字段,清空了也有形状校验兜。
+impl Default for ExtensionForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            entry: DEFAULT_ENTRY.to_string(),
+            template: false,
+            field: ExtensionField::Name,
+        }
+    }
+}
+
+impl ScaffoldSpec for ExtensionForm {
+    fn title() -> &'static str {
+        "extension"
+    }
+
+    fn planned_writes(&self) -> Result<Vec<PlannedWrite>, Vec<String>> {
+        let mut errs = Vec::new();
+        // 名称:条目身份 + 落点目录名(上游 #21:身份 = 子树目录名)。
+        let name = self.name.trim();
+        if name.is_empty() {
+            errs.push("名称必填:扩展条目身份 = 条目子树目录名(上游 #21)".into());
+        } else if let Some(reason) = invalid_entry_name(name) {
+            errs.push(reason);
+        }
+        // 描述:进 manifest 的 description 与入口文件头(面板侧便利字段)。
+        let description = self.description.trim();
+        if description.is_empty() {
+            errs.push("描述必填:进 package.json 的 description 与入口文件头".into());
+        }
+        // 入口文件:manifest 的 pi.extensions 指着它,形状不合 = 清单与入口对不上。
+        let entry = self.entry.trim();
+        if let Some(reason) = invalid_entry_file(entry) {
+            errs.push(reason);
+        }
+        if !errs.is_empty() {
+            return Err(errs);
+        }
+        // 落点:数据仓 extensions/<名>/(作者侧脚手架的扩展家,与 skills/ 对称;
+        // 见 datarepo::SKILLS_DIR / EXTENSIONS_DIR 的路径知识单源)。
+        let dir = format!("extensions/{name}");
+        let writes = vec![
+            PlannedWrite::text(
+                RepoRelPath::new(&format!("{dir}/{EXT_MANIFEST_FILE}"))
+                    .expect("name 已校验:拼得出的相对路径合法"),
+                &ext_package_json(name, description, entry),
+            ),
+            PlannedWrite::text(
+                RepoRelPath::new(&format!("{dir}/{entry}"))
+                    .expect("name/entry 已校验:拼得出的相对路径合法"),
+                &ext_entry_ts(name, description, self.template),
+            ),
+        ];
+        // 自审:上游 register 验收第六条(仅 --kind extension)的面板侧镜像。
+        // 面板自己生成 manifest 与入口两边,这里保证两边对得上 —— 对不上就是
+        // 「装上了不加载」的形状,上游 register 会拒。
+        if let Some(reason) = ext_manifest_audit(&dir, &writes) {
+            return Err(vec![reason]);
+        }
+        Ok(writes)
+    }
+}
+
+/// 入口文件名形状:条目子树里的一个文件,manifest 的 `pi.extensions` 指着它。
+/// 单段(不带 `/` `\`:落点路径由面板拼,入口文件不是子目录)、`.ts` / `.js`
+/// 后缀(pi 的扩展只认这两种)、不是隐藏文件。
+fn invalid_entry_file(entry: &str) -> Option<String> {
+    if entry.is_empty() {
+        return Some(format!(
+            "入口文件名必填:manifest 的 pi.extensions 指着它(缺省 {DEFAULT_ENTRY})"
+        ));
+    }
+    if entry.contains('/') || entry.contains('\\') {
+        return Some("入口文件名是单段:不带 `/` `\\`(落点路径由面板拼)".into());
+    }
+    if entry.starts_with('.') {
+        return Some("入口文件名不是隐藏文件(不以 `.` 开头)".into());
+    }
+    if !(entry.ends_with(".ts") || entry.ends_with(".js")) {
+        return Some("入口文件名以 .ts 或 .js 结尾:pi 的扩展只认这两种".into());
+    }
+    None
+}
+
+/// JSON 字符串字面量(面板自写 manifest:字节要确定、键序按样本钉死,不引
+/// serde 的序列化器)。控制字符按 `\u00XX` 逃,双引号与反斜杠转义。
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 单行化(描述进 `//` 注释与 JSON 串:换行会折断注释行,表单本就单行输入,
+/// 这里是防线加深,不是新语义)。
+fn one_line(s: &str) -> String {
+    s.replace(['\n', '\r'], " ")
+}
+
+/// 条目 `package.json` 字节(确定):上游样本
+/// `docs/samples/components/scout/package.json` 的 pi manifest 形状 ——
+/// `pi.extensions` **非空**是硬要求(上游 register 验收第六条;validate 的
+/// `catalog.extension_entries` 审的就是编目里每条 entry 的 name/path 形态)。
+///
+/// 键序按样本钉死,`pi` 清单收成一行:拟落账预览屏(24 行)要能**把两份
+/// 文件全摊开**给操作者看,多行 `pi` 会把入口文件挤出屏外。
+///
+/// 零依赖起步:**没有 `dependencies`** → bake 的 vendored 那套用不上
+/// (#21「零依赖扩展零 npm」)。要引 pi 运行时包就写 `peerDependencies`
+/// (宿主提供,别写 `dependencies`)—— 这句话写在入口文件头,不塞进清单。
+fn ext_package_json(name: &str, description: &str, entry: &str) -> String {
+    let mut s = String::new();
+    s.push_str("{\n");
+    s.push_str(&format!("  \"name\": {},\n", json_str(name)));
+    s.push_str(&format!("  \"version\": {},\n", json_str(EXT_VERSION)));
+    s.push_str("  \"private\": true,\n");
+    s.push_str("  \"type\": \"module\",\n");
+    s.push_str(&format!("  \"description\": {},\n", json_str(description)));
+    s.push_str(&format!(
+        "  \"pi\": {{ \"extensions\": [\"./{entry}\"] }}\n"
+    ));
+    s.push_str("}\n");
+    s
+}
+
+/// 入口文件字节(确定):`export default` 工厂收 `ExtensionAPI`(上游样本
+/// `components/scout/extensions/session-marker.ts` 同形)。空白路只给契约
+/// 注释 + 空工厂;模板路多一条 `registerCommand` 起步。
+fn ext_entry_ts(name: &str, description: &str, template: bool) -> String {
+    let desc = one_line(description);
+    let mut s = String::new();
+    s.push_str(&format!(
+        "// {name} —— pi 扩展入口(由 nwt extension 脚手架生成,spec #95 工单 #111)。\n"
+    ));
+    s.push_str("// 契约(上游 docs/external-sources.md「扩展这半」):pi 只扫一层\n");
+    s.push_str("// extensions/*.ts 与 extensions/*/index.ts,条目必须自带\n");
+    s.push_str("// package.json 且 pi.extensions 非空 —— 缺清单 = 装上了不加载。\n");
+    s.push_str("// 本文件就是它指着的一个。零依赖起步(没有 dependencies → 不需要\n");
+    s.push_str("// npm);要引 pi 运行时包就写 peerDependencies,别写 dependencies。\n");
+    s.push_str("import type { ExtensionAPI } from \"@earendil-works/pi-coding-agent\";\n");
+    s.push('\n');
+    s.push_str("export default function (pi: ExtensionAPI) {\n");
+    s.push_str(&format!("  // {desc}\n"));
+    if template {
+        s.push_str(&format!("  pi.registerCommand({}, {{\n", json_str(name)));
+        s.push_str(&format!("    description: {},\n", json_str(&desc)));
+        s.push_str("    handler: async (_arg, ctx) => {\n");
+        s.push_str(&format!(
+            "      ctx.ui.notify({}, \"info\");\n",
+            json_str(&format!("{name}: 把活填在这里"))
+        ));
+        s.push_str("    },\n");
+        s.push_str("  });\n");
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// 上游 register 验收第六条(仅 `--kind extension`,#21)的面板侧镜像:
+/// 条目子树自带 `package.json`、`pi.extensions` 非空、清单里每条路径在条目
+/// 子树里真实存在。判据逐条对齐上游 `internal/source/scan.go` 的
+/// `ExtensionManifestIssue`(路径不许绝对、不许越级,匹配得到文件)。
+///
+/// 面板自己生成 manifest 与入口两边,这个自审把「两边对不上」挡在拟落账
+/// 之前 —— 那种形状上游 register 会拒(装上了不加载),不该流到确认闸。
+fn ext_manifest_audit(dir: &str, writes: &[PlannedWrite]) -> Option<String> {
+    let manifest_rel = format!("{dir}/{EXT_MANIFEST_FILE}");
+    let at = |rel: &str| writes.iter().find(|w| w.path.as_str() == rel);
+    let Some(manifest) = at(&manifest_rel) else {
+        return Some(format!(
+            "条目子树没有 {EXT_MANIFEST_FILE}:pi 的包登记不兜底这种形状"
+        ));
+    };
+    let text = String::from_utf8_lossy(&manifest.content);
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return Some(format!("{EXT_MANIFEST_FILE} 解析失败:{e}")),
+    };
+    let Some(patterns) = v.pointer("/pi/extensions").and_then(|p| p.as_array()) else {
+        return Some(format!(
+            "{EXT_MANIFEST_FILE} 缺 pi.extensions:这不是一个 pi 扩展条目"
+        ));
+    };
+    if patterns.is_empty() {
+        return Some(format!(
+            "{EXT_MANIFEST_FILE} 的 pi.extensions 为空:这不是一个 pi 扩展条目"
+        ));
+    }
+    for p in patterns.iter().filter_map(|p| p.as_str()) {
+        if p.starts_with('/') || p.contains("..") {
+            return Some(format!("pi.extensions 里的 {p:?} 不许绝对路径或越级"));
+        }
+        let rel = p.trim_start_matches("./");
+        if at(&format!("{dir}/{rel}")).is_none() {
+            return Some(format!(
+                "pi.extensions 里的 {p:?} 在条目子树里一个文件都没匹配上"
+            ));
+        }
+    }
+    None
+}
+
+/// 表单键位(规格自己的键入分发):与 [`on_key_skill_form`] 同一只形状 ——
+/// ↑/↓ 移字段、模板字段空格切换、文本字段走通用单行输入态机。
+pub fn on_key_ext_form(form: &mut ExtensionForm, k: KeyEvent) -> FormAction {
+    match k.code {
+        KeyCode::Up => {
+            form.move_field(false);
+            return FormAction::Edited;
+        }
+        KeyCode::Down => {
+            form.move_field(true);
+            return FormAction::Edited;
+        }
+        KeyCode::Char(' ') if form.field == ExtensionField::Template => {
+            form.template = !form.template;
+            return FormAction::Edited;
+        }
+        _ => {}
+    }
+    if !form.field.is_text() {
+        return match k.code {
+            KeyCode::Enter => FormAction::Submit,
+            KeyCode::Esc | KeyCode::Char('q') => FormAction::Cancel,
+            _ => FormAction::Edited,
+        };
+    }
+    match input::on_key(form.focused_buf().expect("文本字段有缓冲"), k) {
+        InputAction::Submit => FormAction::Submit,
+        InputAction::Cancel => FormAction::Cancel,
+        InputAction::Edited | InputAction::Ignored => FormAction::Edited,
+    }
+}
+
 // ---- 渲染(共用预览/结论 + skill 表单)----
 
 /// 脚手架浮层总入口:按阶段画一个;Idle 无浮层(几何与命中区同一 `popup_rect`)。
+///
+/// 表单段按 [`ScaffoldKind`] 分派到规格自己的表单件;#111 的 extension 表单
+/// 与 #110 的 skill 表单**共用**预览 / 结论两屏与全部几何常量(一个字节的
+/// 渲染逻辑都不复制)。
 pub fn render_scaffold_overlay(frame: &mut Frame, area: Rect, app: &App) {
     match app.scaffold_flow.phase {
         ScaffoldPhase::Idle => {}
-        ScaffoldPhase::Form => render_skill_form(frame, area, app),
+        ScaffoldPhase::Form => match app.scaffold_kind {
+            ScaffoldKind::Skill => render_skill_form(frame, area, app),
+            ScaffoldKind::Extension => render_ext_form(frame, area, app),
+        },
         ScaffoldPhase::Review => render_scaffold_review(frame, area, app),
         ScaffoldPhase::Done => render_scaffold_done(frame, area, app),
     }
@@ -401,6 +791,64 @@ fn render_skill_form(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(""));
     }
     render_scaffold_block(frame, popup, lines, p, " 新建 skill · 表单 ");
+}
+
+/// ① extension 表单(#111):名称 / 描述 / 入口文件 / 模板起步。与 skill 表单
+/// 同一只几何(`SCAFFOLD_FORM_W` / `SCAFFOLD_FORM_H`)、同一只字段光标与
+/// ↑/↓ 习惯,只换字段与首行契约说明。
+fn render_ext_form(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::layout::{SCAFFOLD_FORM_H, SCAFFOLD_FORM_W};
+    let p = &app.palette;
+    let popup = popup_rect(area, SCAFFOLD_FORM_W, SCAFFOLD_FORM_H);
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let f = &app.ext_form;
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        "  pi 只扫一层 extensions/*/index.ts:条目必须自带 package.json",
+        p.dim(),
+    ))];
+    for field in ExtensionField::ALL {
+        let on = field == f.field;
+        if field == ExtensionField::Template {
+            let mark = if f.template { "[x]" } else { "[ ]" };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {} ", field.label())),
+                Span::styled(
+                    format!("{mark} 从内置 extension 模板起步"),
+                    if on { p.sel().bold() } else { p.text() },
+                ),
+            ]));
+            continue;
+        }
+        let value = match field {
+            ExtensionField::Name => &f.name,
+            ExtensionField::Description => &f.description,
+            ExtensionField::Entry => &f.entry,
+            ExtensionField::Template => unreachable!("模板字段已在上支接走"),
+        };
+        let shown = if on {
+            format!("{value}█")
+        } else {
+            value.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!("  {} ", field.label())),
+            Span::styled(
+                clip(&shown, inner_w.saturating_sub(6)),
+                if on { p.sel().bold() } else { p.text() },
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ 移字段 · 空格切模板 · Enter 拟落账预览 · Esc/q 放弃",
+        p.dim(),
+    )));
+    let budget = popup.height.saturating_sub(3) as usize;
+    lines.truncate(budget);
+    while lines.len() < budget {
+        lines.push(Line::from(""));
+    }
+    render_scaffold_block(frame, popup, lines, p, " 新建 extension · 表单 ");
 }
 
 /// ② 拟落账预览(**本段一个字节都不落**):摊开将写文件清单 + 逐条路径与内容
@@ -791,6 +1239,390 @@ mod tests {
             assert!(
                 f.contains("description: 从网页检索资料"),
                 "{w}×{h} 内容预览 description:{f}"
+            );
+            assert!(f.contains("Enter 落盘"), "{w}×{h} 确认键位:{f}");
+            for ln in frame_display(&app, w, h).lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 预览有行超宽:{ln}"
+                );
+            }
+        }
+    }
+
+    // ---- extension 规格(#111):pi-extension landing 契约 ----
+
+    /// 一份填好的 extension 表单(名称 / 描述 / 入口 / 模板全默认)。
+    fn ext_form(name: &str, description: &str) -> ExtensionForm {
+        ExtensionForm {
+            name: name.into(),
+            description: description.into(),
+            ..ExtensionForm::default()
+        }
+    }
+
+    #[test]
+    fn extension表单_字段导航与入口默认值与模板切换() {
+        let mut f = ExtensionForm::default();
+        // 入口文件名预填 pi 的发现缺省(index.ts):少一个要想的字段
+        assert_eq!(f.entry, DEFAULT_ENTRY);
+        assert_eq!(f.field, ExtensionField::Name);
+        on_key_ext_form(&mut f, down());
+        assert_eq!(f.field, ExtensionField::Description);
+        on_key_ext_form(&mut f, down());
+        assert_eq!(f.field, ExtensionField::Entry);
+        on_key_ext_form(&mut f, down());
+        assert_eq!(f.field, ExtensionField::Template);
+        // 到底不绕回
+        on_key_ext_form(&mut f, down());
+        assert_eq!(f.field, ExtensionField::Template);
+        // 模板字段:空格切换起步方式
+        assert!(!f.template);
+        on_key_ext_form(&mut f, press(' '));
+        assert!(f.template);
+        // 键入进当前文本字段
+        f.field = ExtensionField::Entry;
+        on_key_ext_form(&mut f, press('m'));
+        on_key_ext_form(&mut f, press('.'));
+        assert_eq!(f.entry, "index.tsm.");
+    }
+
+    #[test]
+    fn extension_合法产出_manifest与入口两件_字节确定() {
+        let f = ext_form("ribbon", "把会话结论钉成一行");
+        let writes = f.planned_writes().unwrap();
+        assert_eq!(writes.len(), 2, "manifest + 入口文件");
+        assert_eq!(writes[0].path.as_str(), "extensions/ribbon/package.json");
+        assert_eq!(writes[1].path.as_str(), "extensions/ribbon/index.ts");
+        // manifest 字节:pi.extensions 指着入口文件(上游样本同形)
+        assert_eq!(
+            String::from_utf8(writes[0].content.clone()).unwrap(),
+            "{\n  \"name\": \"ribbon\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"description\": \"把会话结论钉成一行\",\n  \"pi\": { \"extensions\": [\"./index.ts\"] }\n}\n"
+        );
+        // 入口字节:默认工厂收 ExtensionAPI,与上游样本同形
+        let ts = String::from_utf8(writes[1].content.clone()).unwrap();
+        assert!(
+            ts.contains("import type { ExtensionAPI } from \"@earendil-works/pi-coding-agent\";")
+        );
+        assert!(ts.contains("export default function (pi: ExtensionAPI) {"));
+        assert!(ts.contains("  // 把会话结论钉成一行\n"));
+        // 空白路没有 registerCommand 起步
+        assert!(!ts.contains("registerCommand"), "空白路只给空工厂:{ts}");
+    }
+
+    #[test]
+    fn extension_入口文件名与描述进manifest_换名即换落点与清单() {
+        let mut f = ext_form("ribbon", "d");
+        f.entry = "main.js".into();
+        let writes = f.planned_writes().unwrap();
+        assert_eq!(writes[1].path.as_str(), "extensions/ribbon/main.js");
+        let manifest = String::from_utf8(writes[0].content.clone()).unwrap();
+        assert!(
+            manifest.contains("\"extensions\": [\"./main.js\"]"),
+            "manifest 的 pi.extensions 跟着入口文件走:{manifest}"
+        );
+        // 自定义入口名也过自审(manifest 与入口两边对得上)
+        assert_eq!(ext_manifest_audit("extensions/ribbon", &writes), None);
+    }
+
+    #[test]
+    fn extension_空白与模板两路_产出不同入口() {
+        let base = ext_form("ribbon", "把会话结论钉成一行");
+        let blank = String::from_utf8(base.planned_writes().unwrap()[1].content.clone()).unwrap();
+        let mut tmpl = base.clone();
+        tmpl.template = true;
+        let tmpl_ts = String::from_utf8(tmpl.planned_writes().unwrap()[1].content.clone()).unwrap();
+        assert_ne!(blank, tmpl_ts, "两路入口不同");
+        assert!(!blank.contains("registerCommand"), "空白路:{blank}");
+        assert!(
+            tmpl_ts.contains("pi.registerCommand(\"ribbon\", {"),
+            "模板路给 registerCommand 起步:{tmpl_ts}"
+        );
+        assert!(
+            tmpl_ts.contains("ctx.ui.notify(\"ribbon: 把活填在这里\", \"info\");"),
+            "模板路的命令体:{tmpl_ts}"
+        );
+        // 两路的 manifest 逐字节相同(差别只在入口文件)
+        assert_eq!(
+            base.planned_writes().unwrap()[0],
+            tmpl.planned_writes().unwrap()[0]
+        );
+    }
+
+    #[test]
+    fn extension_描述含引号与反斜杠_json与注释都不破() {
+        let f = ext_form("ribbon", "他说\"你好\" \\ 走人");
+        let writes = f.planned_writes().unwrap();
+        let manifest = String::from_utf8(writes[0].content.clone()).unwrap();
+        // 仍是合法 JSON(自审要能解析),且转义落在字节里
+        assert!(manifest.contains("\\\"你好\\\""), "双引号转义:{manifest}");
+        assert_eq!(ext_manifest_audit("extensions/ribbon", &writes), None);
+        let ts = String::from_utf8(writes[1].content.clone()).unwrap();
+        assert!(ts.contains("// 他说\"你好\" \\ 走人"), "注释单行化:{ts}");
+    }
+
+    #[test]
+    fn extension_自审_对齐上游验收第六条_对不上就拦() {
+        // 合法形状:manifest + 入口都在,pi.extensions 指着入口
+        let ok = ext_form("ribbon", "d").planned_writes().unwrap();
+        assert_eq!(ext_manifest_audit("extensions/ribbon", &ok), None);
+        // ① 缺 manifest
+        let no_manifest = vec![PlannedWrite::text(
+            RepoRelPath::new("extensions/ribbon/index.ts").unwrap(),
+            "x",
+        )];
+        assert!(ext_manifest_audit("extensions/ribbon", &no_manifest)
+            .unwrap()
+            .contains("package.json"));
+        // ② pi.extensions 为空
+        let empty_pi = vec![PlannedWrite::text(
+            RepoRelPath::new("extensions/ribbon/package.json").unwrap(),
+            "{\n  \"pi\": {\n    \"extensions\": []\n  }\n}\n",
+        )];
+        assert!(ext_manifest_audit("extensions/ribbon", &empty_pi)
+            .unwrap()
+            .contains("pi.extensions"));
+        // ③ 清单指着一个不存在的文件(= 装上了不加载)
+        let dangling = vec![
+            PlannedWrite::text(
+                RepoRelPath::new("extensions/ribbon/package.json").unwrap(),
+                "{\n  \"pi\": {\n    \"extensions\": [\"./gone.ts\"]\n  }\n}\n",
+            ),
+            PlannedWrite::text(RepoRelPath::new("extensions/ribbon/index.ts").unwrap(), "x"),
+        ];
+        assert!(ext_manifest_audit("extensions/ribbon", &dangling)
+            .unwrap()
+            .contains("一个文件都没匹配上"));
+        // ④ 绝对路径 / 越级
+        for bad in ["/etc/passwd", "../outside.ts"] {
+            let evil = vec![PlannedWrite::text(
+                RepoRelPath::new("extensions/ribbon/package.json").unwrap(),
+                &format!("{{\n  \"pi\": {{\n    \"extensions\": [\"{bad}\"]\n  }}\n}}\n"),
+            )];
+            assert!(ext_manifest_audit("extensions/ribbon", &evil)
+                .unwrap()
+                .contains("不许绝对路径或越级"));
+        }
+    }
+
+    #[test]
+    fn extension_字段不合法被拦_不进预览更不落盘() {
+        // 名称:与 skill 同一条目录名判据(共享 invalid_entry_name)
+        for bad in ["a/b", "..", "a b", "ribbon@1"] {
+            let f = ext_form(bad, "d");
+            let errs = f.planned_writes().unwrap_err();
+            assert!(errs.iter().any(|e| e.contains("名称")), "{bad}:{errs:?}");
+        }
+        // 空名称 / 空描述各有一条拦
+        let errs = ExtensionForm::default().planned_writes().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("名称")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("描述")), "{errs:?}");
+        // 入口文件名:必填、单段、.ts/.js、不隐藏
+        for bad in ["", "sub/index.ts", "index.txt", ".hidden.ts", "index"] {
+            let mut f = ext_form("ribbon", "d");
+            f.entry = bad.into();
+            let errs = f.planned_writes().unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.contains("入口文件")),
+                "{bad}:{errs:?}"
+            );
+        }
+        // 合法入口名照常收
+        for ok in ["index.ts", "main.js", "ribbon.ts"] {
+            let mut f = ext_form("ribbon", "d");
+            f.entry = ok.into();
+            assert!(f.planned_writes().is_ok(), "{ok} 应放行");
+        }
+    }
+
+    // ---- 表单流(#110 的共用件被 extension 消费,不复制)----
+
+    #[test]
+    fn extension表单流_确认前零字节_确认后确定字节落进extensions() {
+        let root = repo("ext-twostage");
+        let mut app = form_app();
+        app.data_root = Some(root.to_str().unwrap().to_string());
+        // 数据仓根不可用:入口指路、不开流程
+        let bad = std::env::temp_dir().join(format!("nwt-scaffold-extnope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bad);
+        app.data_root = Some(bad.to_str().unwrap().to_string());
+        app.start_ext_scaffold();
+        assert!(!app.scaffold_flow.in_flight(), "根不可用不开流程");
+
+        // 根可用:开流程填表
+        app.data_root = Some(root.to_str().unwrap().to_string());
+        app.start_ext_scaffold();
+        assert_eq!(app.scaffold_flow.phase, ScaffoldPhase::Form);
+        assert_eq!(app.scaffold_kind, ScaffoldKind::Extension);
+        assert_eq!(app.ext_form.entry, DEFAULT_ENTRY, "入口文件名有缺省");
+        app.ext_form.name = "ribbon".into();
+        app.ext_form.description = "把会话结论钉成一行".into();
+        // Enter 提交 → 拟落账预览(**仍不落盘**,两段式先例)
+        app.update(Message::Key(enter()));
+        assert_eq!(app.scaffold_flow.phase, ScaffoldPhase::Review);
+        assert!(
+            std::fs::read_dir(&root).unwrap().next().is_none(),
+            "确认前一个字节都不落"
+        );
+        // Enter 确认 → 原子落盘
+        app.update(Message::Key(enter()));
+        assert_eq!(app.scaffold_flow.phase, ScaffoldPhase::Done);
+        // 落盘后按上游 register 验收第六条(仅 --kind extension)读回判:
+        // 条目子树自带 package.json、pi.extensions 非空、每条路径真实存在。
+        let dir = root.join("extensions/ribbon");
+        let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
+        assert!(
+            manifest.contains("\"extensions\": [\"./index.ts\"]"),
+            "{manifest}"
+        );
+        assert!(
+            dir.join("index.ts").is_file(),
+            "pi.extensions 指着的那条路径在条目子树里真实存在"
+        );
+        // 确定字节:与拟落账逐字节相同
+        let plan = app.scaffold_flow.receipt.as_ref().unwrap();
+        assert_eq!(
+            plan.written,
+            vec![
+                "extensions/ribbon/package.json".to_string(),
+                "extensions/ribbon/index.ts".to_string()
+            ]
+        );
+        assert!(std::fs::read_to_string(dir.join("index.ts"))
+            .unwrap()
+            .contains("export default function (pi: ExtensionAPI) {"));
+        // 返航:两份表单与 kind 一并复位(旧字段不冒充下一轮)
+        app.update(Message::Key(press('q')));
+        assert!(!app.scaffold_flow.in_flight(), "Done 后 Esc/q 返航");
+        assert_eq!(app.ext_form.name, "", "返航清表单");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn extension_填错入口文件名_拦在表单里一个字节都不落() {
+        let root = repo("ext-reject");
+        let mut app = form_app();
+        app.data_root = Some(root.to_str().unwrap().to_string());
+        app.start_ext_scaffold();
+        app.ext_form.name = "ribbon".into();
+        app.ext_form.description = "d".into();
+        app.ext_form.entry = "index.txt".into();
+        app.update(Message::Key(enter()));
+        assert_eq!(
+            app.scaffold_flow.phase,
+            ScaffoldPhase::Form,
+            "入口文件名不合法拦在表单里,留可改"
+        );
+        assert!(
+            std::fs::read_dir(&root).unwrap().next().is_none(),
+            "被拒即不落盘"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn 组件域e键_发起extension脚手架_n键仍是skill_两流程不互窜() {
+        let root = repo("ext-entry");
+        let mut app = form_app();
+        app.data_root = Some(root.to_str().unwrap().to_string());
+        app.screen = crate::app::Screen::Recipes;
+        app.rc_domain = crate::app::Domain::Recipes;
+        app.update(Message::Key(press('e')));
+        assert!(!app.scaffold_flow.in_flight(), "非组件域 e 不触发");
+        // 组件域 e → extension 表单
+        app.rc_domain = crate::app::Domain::Components;
+        app.update(Message::Key(press('e')));
+        assert_eq!(app.scaffold_flow.phase, ScaffoldPhase::Form);
+        assert_eq!(app.scaffold_kind, ScaffoldKind::Extension);
+        app.update(Message::Key(press('q')));
+        assert!(!app.scaffold_flow.in_flight());
+        // 组件域 n → skill 表单(kind 跟着复位,不留在 extension)
+        app.update(Message::Key(press('n')));
+        assert_eq!(app.scaffold_kind, ScaffoldKind::Skill);
+        assert_eq!(app.scaffold_flow.phase, ScaffoldPhase::Form);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- 快照:常畅 / 紧凑两档 ----
+
+    #[test]
+    fn extension_拟落账预览_点落盘段_与键盘同路落确定字节() {
+        // 图形确认闸对鼠标同样成立(ADR-0005:渲染与命中共用同一份几何,
+        // #110 的 scaffold_hits 按阶段产段,与规格无关)。
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let root = repo("ext-mouse");
+        let mut app = form_app();
+        app.data_root = Some(root.to_str().unwrap().to_string());
+        app.screen = crate::app::Screen::Recipes;
+        app.size = ratatui::layout::Rect::new(0, 0, 110, 30);
+        app.start_ext_scaffold();
+        app.ext_form.name = "ribbon".into();
+        app.ext_form.description = "把会话结论钉成一行".into();
+        app.update(Message::Key(enter()));
+        assert_eq!(app.scaffold_flow.phase, ScaffoldPhase::Review);
+        // 键位行上「Enter 落盘」段的命中区(几何由 layout 与渲染同源算出)
+        let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+        let seg = hits
+            .iter()
+            .find(|(_, t)| *t == crate::layout::Target::Activate)
+            .expect("预览态应产「Enter 落盘」命中段");
+        let at = (seg.0.x + 1, seg.0.y);
+        app.update(Message::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.0,
+            row: at.1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(
+            app.scaffold_flow.phase,
+            ScaffoldPhase::Done,
+            "点确认段即落盘"
+        );
+        assert!(root.join("extensions/ribbon/package.json").is_file());
+        assert!(root.join("extensions/ribbon/index.ts").is_file());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn extension浮层_表单拟落账_常畅紧凑两档不溢出() {
+        for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+            let mut app = form_app();
+            app.screen = crate::app::Screen::Recipes;
+            app.start_ext_scaffold();
+            app.ext_form.name = "ribbon".into();
+            app.ext_form.description = "把会话结论钉成一行".into();
+            let f = snap(&app, w, h);
+            assert!(f.contains("新建 extension"), "{w}×{h} 表单标题:{f}");
+            assert!(f.contains("ribbon"), "{w}×{h} 名称回显:{f}");
+            assert!(f.contains("index.ts"), "{w}×{h} 入口文件名缺省:{f}");
+            for ln in frame_display(&app, w, h).lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 表单有行超宽:{ln}"
+                );
+            }
+            // 拟落账预览态:摊开 manifest 与入口两件的路径 + 内容
+            app.update(Message::Key(enter()));
+            assert_eq!(app.scaffold_flow.phase, ScaffoldPhase::Review);
+            let f = snap(&app, w, h);
+            assert!(f.contains("将写 2 个文件"), "{w}×{h} 将写清单:{f}");
+            assert!(
+                f.contains("extensions/ribbon/package.json"),
+                "{w}×{h} manifest 落点:{f}"
+            );
+            assert!(
+                f.contains("extensions/ribbon/index.ts"),
+                "{w}×{h} 入口落点:{f}"
+            );
+            // 预览摊开的是**内容**:pi.extensions 指着入口文件(上游硬要求)
+            assert!(f.contains("\"pi\""), "{w}×{h} manifest 内容:{f}");
+            assert!(
+                f.contains("\"./index.ts\""),
+                "{w}×{h} pi.extensions 指着入口:{f}"
+            );
+            assert!(
+                f.contains("export default function"),
+                "{w}×{h} 入口内容:{f}"
             );
             assert!(f.contains("Enter 落盘"), "{w}×{h} 确认键位:{f}");
             for ln in frame_display(&app, w, h).lines() {
