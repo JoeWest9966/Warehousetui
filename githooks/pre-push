@@ -1,0 +1,63 @@
+#!/bin/sh
+# nwt 本地闸门(pre-push)—— 工单 #84
+#
+# 本仓不跑 GitHub Actions:账号级计费挡住全部 job(业主裁定不付钱、不走 Action,
+# 见 docs/release.md「发布矩阵」节),原 CI 三平台的活由这台开发机在 push 前干。
+#
+# 启用(一次性,在仓库根目录):
+#   git config core.hooksPath githooks
+# 恢复默认(.git/hooks):
+#   git config --unset core.hooksPath
+#
+# 逃逸(已知的环境性红,不是缺陷 —— 见 README「开发」节):
+#   NWT_SKIP_GATE=1 git push ...
+# 典型场景:discover 测试在装着真 nw 的开发机上会红(环境测试)。
+#
+# 跑齐的就是 README「开发」节那四项;发布时 scripts/release.sh 的 gate 步
+# 跑同一套,两边不许分成两套口径。
+
+set -u
+
+if [ "${NWT_SKIP_GATE:-0}" = "1" ]; then
+  printf 'nwt-gate: NWT_SKIP_GATE=1 —— 本轮 push 跳过本地闸门(请确认不是随手设的)\n'
+  exit 0
+fi
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  printf 'nwt-gate: 不在 git 仓库里,闸门无从跑起\n' >&2
+  exit 1
+}
+cd "$ROOT" || exit 1
+
+command -v cargo >/dev/null 2>&1 || {
+  printf 'nwt-gate: 找不到 cargo —— 先装 Rust 工具链(rustup)\n' >&2
+  exit 1
+}
+
+FAIL=0
+
+printf 'nwt-gate: push 前闸门(fmt / clippy / test / build)……\n'
+
+step() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
+
+step "cargo fmt --check"
+cargo fmt --check || FAIL=1
+
+step "cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings || FAIL=1
+
+step "cargo test --all-targets"
+cargo test --all-targets || FAIL=1
+
+step "cargo build --release"
+cargo build --release || FAIL=1
+
+if [ "$FAIL" != "0" ]; then
+  printf '\nnwt-gate: 闸门没过,push 被挡下。\n' >&2
+  printf 'nwt-gate: 已知环境性红(非缺陷):discover 测试在装有真 nw 的机器上会红\n' >&2
+  printf 'nwt-gate: (README「开发」节)。确认是它、且不是本轮改动引起的:\n' >&2
+  printf 'nwt-gate:   NWT_SKIP_GATE=1 git push ...\n' >&2
+  exit 1
+fi
+
+printf '\nnwt-gate: 四项全绿,放行。\n'
