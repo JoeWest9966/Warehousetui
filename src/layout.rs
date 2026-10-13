@@ -688,6 +688,18 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         );
         return;
     }
+    // 引用自查(#116):只给有问题的那几行命中。几何与 render_reference 同源
+    // (同一个 55/45 分栏 + shrink_border),点行即选中,与 ↑/↓ 同一后果链。
+    if matches!(app.hl_mode, crate::app::HealthMode::Reference) {
+        // 门一不过:整栏是指路,没有可选中行(与渲染同一个判据)
+        if app.data_root_cause().is_some() {
+            return;
+        }
+        let (cols, _) = h_split2(area, 55, 45);
+        let lst = shrink_border(cols);
+        row_hits(lst, 0, app.reference_len(), hits, Target::SelectRow);
+        return;
+    }
     if !matches!(app.hl_mode, crate::app::HealthMode::Validate) {
         return;
     }

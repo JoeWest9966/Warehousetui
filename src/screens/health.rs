@@ -27,6 +27,12 @@ pub fn render_health(frame: &mut Frame, area: Rect, app: &App) {
         render_recheck(frame, inner, app);
         return;
     }
+    // 引用完整性自查(#116):面板自有的只读检查,与引擎的七面 / 27 项
+    // 分开一屏内模式,不并进同一张清单(来源必须在块标题上可区分)。
+    if app.hl_mode == crate::app::HealthMode::Reference {
+        render_reference(frame, inner, app);
+        return;
+    }
 
     let Some(out) = app.hl_result.as_ref() else {
         let hint = if app.hl_loading {
@@ -47,6 +53,8 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App, out: &crate::engine:
     match app.hl_mode {
         // 漂移复核走 render_recheck(左栏清单 + 右栏证据),不在这条 match 里。
         crate::app::HealthMode::Recheck => {}
+        // 引用自查走 render_reference(面板自有两栏),同样不在这条 match 里。
+        crate::app::HealthMode::Reference => {}
         HealthMode::Doctor => {
             let results = out
                 .envelope
@@ -156,6 +164,217 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App, out: &crate::engine:
         }
     }
     let _ = SURFACES;
+}
+
+// ---- 引用完整性自查(spec #94 工单 #116):面板自有,只读,只报不修 ----
+
+/// 数据仓引用图的四态呈现。
+///
+/// **为什么单独一屏内模式,不并进 validate 那张 27 项清单**:那张清单的
+/// 每一行都是引擎回答的(`id` + `surface` 是引擎词汇),块标题写「27 项」。
+/// 把面板自己扫出来的行插进同一张表,「这条是谁说的」就得靠猜了——而工单
+///  #116 的验收头一条就是来源可区分。所以照 [`crate::app::HealthMode`]
+/// 的既有样子加一员(与 recheck 平级),块标题自带来源标注。
+///
+/// 两栏几何与命中区同源:渲染用 `Layout::horizontal([Percentage(55),
+/// Percentage(45)])`(与 `render_health` 同一个分栏),命中侧
+/// `layout::health_hits` 用等价的 `h_split2(area, 55, 45)`——两边同一组
+/// ratatui 常量(ADR-0005)。
+fn render_reference(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let cols = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Percentage(55),
+        ratatui::layout::Constraint::Percentage(45),
+    ])
+    .split(area);
+
+    // 门一:数据仓根未设 / 不可用——走既有指路语义,不画空列表
+    // (「扫了个空」与「没问题」在屏上是两件事,规格故事 28)。
+    if app.data_root_cause().is_some() {
+        frame.render_widget(
+            Paragraph::new(crate::screens::data_root_signpost(app))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(
+                    Block::bordered()
+                        .border_style(p.dim())
+                        .title(Span::styled(" 引用完整性 ", p.accent())),
+                ),
+            cols[0],
+        );
+        frame.render_widget(
+            Paragraph::new("指路说清了缺的是什么;补上数据仓根再回来扫。").style(p.dim()),
+            cols[1],
+        );
+        return;
+    }
+
+    let Some(scan) = app.hl_ref.as_ref() else {
+        // 还没扫:一句人话,不是空列表(空列表会被读成「查过了,没问题」)
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("  还没扫:按 r 扫一遍数据仓。", p.dim())),
+                Line::from(Span::styled("  只读:不写任何文件,也不调引擎。", p.dim())),
+            ])
+            .block(
+                Block::bordered()
+                    .border_style(p.dim())
+                    .title(Span::styled(" 引用完整性 ", p.accent())),
+            ),
+            cols[0],
+        );
+        reference_notes(frame, cols[1], app);
+        return;
+    };
+
+    match scan {
+        crate::datarepo::RefScan::Clean => {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled("  ✓ 两头都对得上", p.ok())),
+                    Line::from(Span::styled(
+                        "  配方点名的组件都有目录,组件也都进了配方。",
+                        p.dim(),
+                    )),
+                ])
+                .block(
+                    Block::bordered()
+                        .border_style(p.dim())
+                        .title(Span::styled(" 引用完整性 ", p.accent())),
+                ),
+                cols[0],
+            );
+        }
+        crate::datarepo::RefScan::Empty => {
+            // 四态之「略」:没东西可查 ≠ 查过了没问题
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled("  ○ 没什么可对照的", p.dim())),
+                    Line::from(Span::styled(
+                        "  数据仓里一本配方、一个组件都还没有。",
+                        p.dim(),
+                    )),
+                ])
+                .block(
+                    Block::bordered()
+                        .border_style(p.dim())
+                        .title(Span::styled(" 引用完整性 ", p.accent())),
+                ),
+                cols[0],
+            );
+        }
+        crate::datarepo::RefScan::Unreadable { reason } => {
+            // 读不通不当「没问题」:原因原样上屏
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled("  ✗ 读不通,没扫完", p.fail())),
+                    Line::from(Span::styled(format!("  {reason}"), p.dim())),
+                    Line::from(Span::styled(
+                        "  半张图会造出假孤儿,所以读不通就不给结论。",
+                        p.dim(),
+                    )),
+                ])
+                .block(
+                    Block::bordered()
+                        .border_style(p.dim())
+                        .title(Span::styled(" 引用完整性 ", p.accent())),
+                ),
+                cols[0],
+            );
+        }
+        crate::datarepo::RefScan::Findings(rows) => {
+            let mut st = ListState::default();
+            st.select(Some(app.hl_sel.min(rows.len() - 1)));
+            let items: Vec<Line> = rows
+                .iter()
+                .map(|r| {
+                    // 断链是败(图断了,配方点名一个不存在的组件);
+                    // 孤儿是警(白养着,不影响装配)。
+                    // 行文按紧凑态的列宽写死地短:左栏在 66×50 只有 ~34 列,
+                    // 长句会被终端裁掉半截——判据的全文在右栏,不挤进行里。
+                    let (state, tail) = match r.kind {
+                        crate::datarepo::RefKind::BrokenLink => {
+                            (crate::engine::State::Fail, format!("← {}", r.fact))
+                        }
+                        crate::datarepo::RefKind::Orphan => {
+                            (crate::engine::State::Warn, "未入配方".to_string())
+                        }
+                    };
+                    Line::from(vec![
+                        Span::styled(format!("{} ", p.lamp(state)), p.state(state)),
+                        Span::raw(r.name.clone()),
+                        Span::raw(" "),
+                        Span::styled(tail, p.dim()),
+                    ])
+                })
+                .collect();
+            // 块标题自带来源标注:这一栏是面板自己扫的,不是引擎回答的。
+            // 标题与右上计数**不并排**——左栏在 66×50 只有 ~34 列,两者
+            // 挤同一行会互相裁掉半截( ratatui 的 title 与 title_top 同行)。
+            // 计数搬到右栏,那里有地方说全。
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(
+                        Block::bordered()
+                            .border_style(p.dim())
+                            .title(Span::styled(" 引用完整性·面板自查 ", p.accent())),
+                    )
+                    .highlight_style(p.sel()),
+                cols[0],
+                &mut st,
+            );
+        }
+    }
+    reference_notes(frame, cols[1], app);
+}
+
+/// 右栏:本检查是什么、读了什么、纪律是什么(来源标注在这里说全)。
+fn reference_notes(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let root = app.data_root.as_deref().unwrap_or("——");
+    let mut lines = vec![
+        Line::from(Span::styled("来源:面板自查", p.accent())),
+        Line::from(Span::styled("  自己读数据仓,不调 nw", p.dim())),
+        Line::from(Span::styled(format!("  根 {root}"), p.dim())),
+        Line::from(Span::styled("  只读:不写文件,只报不修", p.dim())),
+        Line::from(Span::styled("  r 重扫 · ↑/↓ 翻 · m 切回", p.dim())),
+    ];
+    if let Some(rows) = app.hl_ref.as_ref().and_then(|s| match s {
+        crate::datarepo::RefScan::Findings(r) => Some(r),
+        _ => None,
+    }) {
+        let broken = rows
+            .iter()
+            .filter(|r| r.kind == crate::datarepo::RefKind::BrokenLink)
+            .count();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  本次 {} 处:断链 {} · 孤儿 {}",
+                rows.len(),
+                broken,
+                rows.len() - broken
+            ),
+            p.dim(),
+        )));
+    }
+    if app.hl_ref.is_some() {
+        // 灯的判据写全:行里放不下,这里说清(与行里同一套词,不另造)
+        lines.push(Line::from(Span::styled(
+            "  ✗ 断链:配方点了没目录",
+            p.state(crate::engine::State::Fail),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  ◐ 孤儿:有目录没进配方",
+            p.state(crate::engine::State::Warn),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_style(p.dim())
+                .title(Span::styled(" 面板自有检查 ", p.accent())),
+        ),
+        area,
+    );
 }
 
 fn render_evidence(frame: &mut Frame, area: Rect, app: &App, out: &crate::engine::EngineOutput) {

@@ -333,7 +333,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
     },
     HelpRow {
         key: "m",
-        desc: "健康:切 体检 / 校验 / 复核",
+        desc: "健康:切 体检 / 校验 / 复核 / 引用自查",
         screen: Some(Screen::Health),
         domain: None,
         mode: None,
@@ -344,7 +344,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
     },
     HelpRow {
         key: "r",
-        desc: "健康:复核(重跑 / 全查外部源)",
+        desc: "健康:复核(重跑/全查外部源/扫引用图)",
         screen: Some(Screen::Health),
         domain: None,
         mode: None,

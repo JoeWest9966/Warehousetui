@@ -102,14 +102,19 @@ impl Domain {
     }
 }
 
-/// 健康屏三种复核模式:doctor 七面 / validate 27 项 / 外部源漂移(recheck,
-/// spec #34 工单 #40)。三者并列,语义互不冒充。
+/// 健康屏的复核模式:doctor 七面 / validate 27 项 / 外部源漂移(recheck,
+/// spec #34 工单 #40)/ 引用完整性自查(spec #94 工单 #116)。
+/// 四者并列,语义互不冒充——每加一种就是往这个枚举加一员,不新开顶级屏。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HealthMode {
     Doctor,
     Validate,
     /// 外部源漂移复核:只读,结论按结果四态呈现,与 doctor 三档并列不合并。
     Recheck,
+    /// 数据仓引用完整性自查(spec #94 工单 #116):**面板自有**的检查——
+    /// 自己读数据仓的配方 × 组件目录,不调引擎、不问 `nw`。与引擎的
+    /// 七面 / 27 项分开记账(块标题写明来源),只报不修。
+    Reference,
 }
 
 /// 设置屏的屏内页(spec #94 工单 #108,照 [`HealthMode`] 的屏内多模样板)。
@@ -354,6 +359,16 @@ pub struct App {
     /// 外部源漂移复核的**本次**结论(#40):只由刚下发的那一次 recheck 的回音
     /// 写入,面板不缓存、不轮询、不冒充「上次结果」。换数据仓根即清空。
     pub hl_recheck: Option<EngineOutput>,
+    /// 引用完整性自查的**本次**快照(#116):按 `r` 显式扫一次数据仓,
+    /// 不自动跑(与 #107 多派总览同一条显式刷新纪律)。`None` = 还没扫;
+    /// 读不通也入账([`crate::datarepo::RefScan::Unreadable`]),屏上明说
+    /// 读不通,不拿「没问题」冒充。换数据仓根即清空——旧根的图不冒充
+    /// 新根的图。
+    ///
+    /// 存的是**分类**([`crate::datarepo::RefScan`])不是问题向量:屏幕上
+    /// 「查过了没问题」与「还没东西可查」是结果四态里的两态,压成一个空
+    /// 向量就分不出了(规格故事 28 同款纪律)。
+    pub hl_ref: Option<crate::datarepo::RefScan>,
 
     // ---- 配方 ----
     pub rc_domain: Domain,
@@ -601,6 +616,7 @@ impl App {
             hl_result: None,
             hl_loading: false,
             hl_recheck: None,
+            hl_ref: None,
             rc_domain: Domain::Recipes,
             rc_sel: 0,
             reg_state: RegState::Idle,
@@ -1687,7 +1703,8 @@ impl App {
             self.hl_mode = match self.hl_mode {
                 HealthMode::Doctor => HealthMode::Validate,
                 HealthMode::Validate => HealthMode::Recheck,
-                HealthMode::Recheck => HealthMode::Doctor,
+                HealthMode::Recheck => HealthMode::Reference,
+                HealthMode::Reference => HealthMode::Doctor,
             };
             return;
         }
@@ -1710,6 +1727,16 @@ impl App {
                     _ => {}
                 }
             }
+            HealthMode::Reference => {
+                // r = 扫一遍数据仓(只读,零引擎调用);↑/↓ 在问题行间移。
+                let n = self.reference_len();
+                match k.code {
+                    KeyCode::Char('r') => self.load_references(),
+                    KeyCode::Down if n > 0 => self.hl_sel = (self.hl_sel + 1) % n,
+                    KeyCode::Up if n > 0 => self.hl_sel = (self.hl_sel + n - 1) % n,
+                    _ => {}
+                }
+            }
             _ => {
                 let n = self
                     .hl_result
@@ -1724,6 +1751,53 @@ impl App {
                 }
             }
         }
+    }
+
+    /// 引用完整性自查的可选行数(#116):本次快照里的问题行数。
+    /// 还没扫 / 读不通 / 一处问题都没有,都是 0 行——屏上分别由三句
+    /// 不同的话说,不共用一个空列表。
+    pub fn reference_len(&self) -> usize {
+        match self.hl_ref.as_ref() {
+            Some(crate::datarepo::RefScan::Findings(rows)) => rows.len(),
+            _ => 0,
+        }
+    }
+
+    /// 扫一遍数据仓的引用图(#116):**面板自有的只读检查**。
+    ///
+    /// 三道门:数据仓根未设 / 不可用都不扫——指路由
+    /// [`App::data_root_cause`] 的说法接管,面板不拿「扫了个空」冒充
+    /// 「没问题」(规格故事 28)。根就绪才读盘,读盘一律经
+    /// [`crate::datarepo`] 接缝(屏幕层不自己拼路径)。
+    ///
+    /// **零引擎调用**:本检查不问 `nw`,所以 `queue` 一个字节都不进;
+    /// 与 #107 多派总览同一条显式刷新纪律——不自动跑,要扫按 `r`。
+    pub fn load_references(&mut self) {
+        let Some(root) = self.usable_data_root() else {
+            // 话术与五域入口同源:标题点名缺的是什么,不拿 advice 的长句
+            self.push_log(format!(
+                "引用完整性未扫:{}",
+                self.data_root_cause().unwrap().title()
+            ));
+            return;
+        };
+        let scan = crate::datarepo::scan_references(&root);
+        let msg = match &scan {
+            crate::datarepo::RefScan::Clean => "引用完整性:配方与组件两头都对得上".to_string(),
+            crate::datarepo::RefScan::Findings(rows) => {
+                format!("引用完整性:{} 处问题(只报不修)", rows.len())
+            }
+            crate::datarepo::RefScan::Empty => {
+                "引用完整性:数据仓里还没有配方与组件,没什么可对照".to_string()
+            }
+            crate::datarepo::RefScan::Unreadable { reason } => {
+                // 读不通不当「没问题」:屏上明说读不通,快照不留旧结论
+                format!("引用完整性读不通:{reason}")
+            }
+        };
+        self.hl_ref = Some(scan);
+        self.hl_sel = 0;
+        self.push_log(msg);
     }
 
     /// 外部源漂移复核的可选行数(#40):已登记的外部源记录数。
@@ -2109,6 +2183,10 @@ impl App {
         // 换根即作废上一轮的漂移结论(#40 无缓存语义):旧根的结论不冒充新根的。
         if self.hl_recheck.take().is_some() {
             self.push_log("漂移结论已作废:数据仓根已换(旧根结论不入账)");
+        }
+        // 同一条纪律管引用自查快照(#116):旧根的图不冒充新根的图。
+        if self.hl_ref.take().is_some() {
+            self.push_log("引用自查快照已作废:数据仓根已换(旧根图不入账)");
         }
     }
 
@@ -3475,6 +3553,9 @@ impl App {
             HealthMode::Validate => self.queue_validate(&profile),
             // 漂移复核走 run_recheck(三道门 + 按名/全查),不在这条派体检路上。
             HealthMode::Recheck => self.run_recheck(None),
+            // 引用自查不认派:它扫的是数据仓(配方 × 组件),与某一部派
+            // 无关,所以也不走这条派体检路。
+            HealthMode::Reference => self.load_references(),
         }
     }
 
@@ -5206,6 +5287,135 @@ mod tests {
         assert_eq!(app.screen, Screen::Recipes, "右键不分派");
     }
 
+    // ---- #116 引用完整性自查:面板自有,只读,零引擎调用 ----
+
+    /// 一座 fixture 数据仓:一本配方点名两个组件,`retention` 目录不在
+    /// (断链),另有一个谁都没引用的 `ghost-tools`(孤儿)。
+    fn reference_repo(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nwt-ref-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("recipes/research-desk")).unwrap();
+        std::fs::write(
+            dir.join("recipes/research-desk/recipe.yaml"),
+            "components:\n  - component: scout\n    version: 1.0.0\n  - component: retention\n    version: 0.4.1\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("components/scout")).unwrap();
+        std::fs::create_dir_all(dir.join("components/ghost-tools")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn 引用自查_按r扫数据仓_零引擎调用_快照入账() {
+        let mut app = fake_app();
+        let root = reference_repo("scan");
+        app.data_root = Some(root.display().to_string());
+        app.hl_mode = HealthMode::Reference;
+        app.queue.clear(); // bootstrap 的 ls 已入过账,之后一个字节都不该再有
+        app.load_references();
+        assert!(
+            app.queue.is_empty(),
+            "面板自有的读盘检查不下发任何命令:{:?}",
+            app.queue
+        );
+        let rows = match app.hl_ref.as_ref() {
+            Some(crate::datarepo::RefScan::Findings(r)) => r.clone(),
+            other => panic!("该有两处问题,实得 {other:?}"),
+        };
+        assert_eq!(rows.len(), 2, "一处断链 + 一处孤儿");
+        assert_eq!(app.reference_len(), 2, "可选行数照快照");
+        assert!(
+            app.log.iter().any(|l| l.contains("2 处问题")),
+            "流水记账:{:?}",
+            app.log
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 引用自查_数据仓根未设_不扫也不给空结论() {
+        let mut app = fake_app();
+        app.data_root = None;
+        app.hl_mode = HealthMode::Reference;
+        app.queue.clear();
+        app.load_references();
+        assert!(app.hl_ref.is_none(), "根未设:没有快照,不拿「没问题」冒充");
+        assert!(
+            app.log.iter().any(|l| l.contains("数据仓根未设")),
+            "日志走既有指路语义:{:?}",
+            app.log
+        );
+        assert!(app.queue.is_empty(), "未设根更不下发命令:{:?}", app.queue);
+    }
+
+    #[test]
+    fn 引用自查_换数据仓根即作废旧快照() {
+        let mut app = fake_app();
+        let root = reference_repo("swap");
+        app.data_root = Some(root.display().to_string());
+        app.hl_mode = HealthMode::Reference;
+        app.load_references();
+        assert!(app.hl_ref.is_some(), "先有一份快照");
+        // 换到一座空仓:旧根的图不入账
+        let other = std::env::temp_dir().join(format!("nwt-ref-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&other).unwrap();
+        app.apply_data_root(other.display().to_string());
+        assert!(app.hl_ref.is_none(), "旧根的图不冒充新根的图");
+        assert!(
+            app.log.iter().any(|l| l.contains("引用自查快照已作废")),
+            "作废有记账:{:?}",
+            app.log
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn 引用自查_m在四模间轮转_不跳面板() {
+        let mut app = fake_app();
+        app.screen = Screen::Health;
+        let seen = [
+            HealthMode::Doctor,
+            HealthMode::Validate,
+            HealthMode::Recheck,
+            HealthMode::Reference,
+            HealthMode::Doctor,
+        ];
+        for want in seen {
+            assert_eq!(app.hl_mode, want, "m 一轮转到 {want:?}");
+            app.update(Message::Key(key('m')));
+        }
+    }
+
+    /// 点路 == 键路:点帧上第一处问题 = 选中它(与 ↑/↓ 同一后果链)。
+    /// 坐标取自整帧真显示(点哪打哪),不硬编码矩形。
+    #[test]
+    fn 引用自查_点问题行与键盘同一路() {
+        let mut app = fake_app();
+        let root = reference_repo("click");
+        app.data_root = Some(root.display().to_string());
+        app.screen = Screen::Health;
+        app.splash = false;
+        app.hl_mode = HealthMode::Reference;
+        app.load_references();
+        app.size = Rect::new(0, 0, 80, 30);
+        let (col, row) = locate_col_row(&app, 80, 30, "retention");
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            row,
+        )));
+        assert_eq!(app.hl_sel, 0, "点第一处问题 = 选中它");
+        // 键盘同路:↓ 移到第二行(孤儿)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.hl_sel, 1, "↓ 移到下一处问题");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ---- #68 概览指令栏第五条「浏览编目」:一键到第六屏,点它也等于按键 ----
 
     /// 在整帧真显示里定位某子串的终端 (列, 行)(列按显示宽累计,与命中区
@@ -6774,9 +6984,11 @@ mod tests {
     }
 
     #[test]
-    fn m_在三模式间轮转_漂移与doctor不互冒充() {
+    fn m_在四模式间轮转_各模不互冒充() {
         let mut app = recheck_app();
         assert_eq!(app.hl_mode, HealthMode::Recheck);
+        app.update(Message::Key(key('m')));
+        assert_eq!(app.hl_mode, HealthMode::Reference, "引用自查是第四模(#116)");
         app.update(Message::Key(key('m')));
         assert_eq!(app.hl_mode, HealthMode::Doctor);
         app.update(Message::Key(key('m')));
