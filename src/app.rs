@@ -193,6 +193,12 @@ pub enum RegState {
     Idle,
     /// 填 repo 链接(通用单行输入态机)。
     RepoInput,
+    /// 预扫已下发(工单 #114:`gh api` 拉目标仓条目清单,只读、不落
+    /// 文件、不调引擎),等回音;Esc 仍可返航(回音将丢弃)。
+    PreScan,
+    /// 预扫选单在场(工单 #114):勾选要登记的条目。面板侧选单,
+    /// 登记仍走引擎两段式;勾选结果随确认态呈现,不旁路引擎闸。
+    PreScanPick,
     /// 选 kind(skill / extension)。
     KindPick,
     /// 预审已下发(不带 `--yes`,文件不落),等回音。
@@ -254,6 +260,9 @@ pub enum Message {
     Mouse(MouseEvent),
     Engine(EngineEvent),
     Tick,
+    /// 外部源登记向导的预扫回音(工单 #114):只读 GitHub 查询的结果,
+    /// 与引擎回音分成两条通道——预扫不调引擎,也不冒充引擎回音。
+    Scan(crate::scan::ScanEvent),
 }
 
 pub struct App {
@@ -334,6 +343,19 @@ pub struct App {
     pub reg_kind_sel: usize,
     /// 预审回音(确认态呈现;为 None 时 Review 不成立)。
     pub reg_result: Option<EngineOutput>,
+    /// 外部源登记向导·预扫选单(工单 #114):面板侧发现的条目,与
+    /// [`reg_scan_checks`] 逐位对应;只在 `PreScanPick` 与确认态呈现里读。
+    pub reg_scan_entries: Vec<crate::scan::ScannedEntry>,
+    /// 预扫选单的勾选态(与 [`reg_scan_entries`] 等长;默认全勾——
+    /// 菜单答「这仓有什么」,作者改的是「我要登记哪些」)。
+    pub reg_scan_checks: Vec<bool>,
+    /// 预扫选单选中行(↑/↓ / 滚轮 / 鼠标点行同源)。
+    pub reg_scan_sel: usize,
+    /// 在途预扫的 slug(对账用:迟到回音只认当前这一次,不幽灵重开)。
+    pub reg_scan_slug: Option<String>,
+    /// 待扫 slug 队列(工单 #114):键位处理器没有 tx,只排队;主循环
+    /// 取出后跑只读 `gh api`,回音经扫描通道回流。
+    pub scan_pending: Vec<String>,
     /// 编目册屏(#53):vps 两段式登记流(与命令组无关的骨架件)。
     pub vps_flow: crate::screens::RegisterFlow,
     /// vps 登记表单(名字 / 若干条地址 / 端口 / 若干条登录 / 备注)。
@@ -569,6 +591,11 @@ impl App {
             reg_kind: RegKind::Skill,
             reg_kind_sel: 0,
             reg_result: None,
+            reg_scan_entries: Vec::new(),
+            reg_scan_checks: Vec::new(),
+            reg_scan_sel: 0,
+            reg_scan_slug: None,
+            scan_pending: Vec::new(),
             vps_flow: crate::screens::RegisterFlow::new(),
             vps_form: crate::screens::new_form(),
             vps_ls: None,
@@ -756,6 +783,7 @@ impl App {
             Message::Mouse(ev) => self.on_mouse(ev),
             Message::Engine(ev) => self.on_engine(ev),
             Message::Tick => self.blink = !self.blink,
+            Message::Scan(ev) => self.on_scan(ev),
         }
     }
 
@@ -809,6 +837,12 @@ impl App {
                     self.reg_kind = RegKind::from_index(self.reg_kind_sel);
                     return;
                 }
+                // 预扫选单(#114):点行 = 勾选/取消该条(与空格同路,
+                // 顺带移选中)——选单的主操作就是勾选。
+                if self.reg_state == RegState::PreScanPick {
+                    self.toggle_scan_row(i);
+                    return;
+                }
                 match self.screen {
                     Screen::Overview => self.ov_sel = i,
                     // 装配历史视图在场(#101):点行选中的是历史列表,
@@ -835,6 +869,7 @@ impl App {
             Target::Activate => match self.reg_state {
                 RegState::KindPick => self.dispatch_register(),
                 RegState::Review if self.reg_can_commit() => self.dispatch_register_commit(),
+                RegState::PreScanPick => self.reg_pick_confirm(),
                 _ => self.launch_selected_lock(),
             },
             // 帮助「任意处关」与仪式「Esc 返航」:与键盘 Esc 同一路
@@ -919,6 +954,18 @@ impl App {
                         ScrollDir::Up => cur.saturating_sub(1),
                     };
                     self.reg_kind = RegKind::from_index(self.reg_kind_sel);
+                    return;
+                }
+                // 预扫选单的滚轮移选中(#114,与 ↑/↓ 同路;勾选归空格/点行)
+                if self.reg_state == RegState::PreScanPick {
+                    let n = self.reg_scan_entries.len();
+                    if n > 0 {
+                        let cur = self.reg_scan_sel.min(n - 1);
+                        self.reg_scan_sel = match dir {
+                            ScrollDir::Down => (cur + 1).min(n - 1),
+                            ScrollDir::Up => cur.saturating_sub(1),
+                        };
+                    }
                     return;
                 }
                 let n = self.domain_len();
@@ -1313,11 +1360,19 @@ impl App {
             self.on_key_flow(crate::screens::CatalogKind::Key, k);
             return;
         }
-        // 登记两段式(#30 #31):输入 → 预审 → 确认 → 落账 → 结果,
-        // 浮层优先级接在手填之后
+        // 登记两段式(#30 #31)+ 外部源登记向导(#114):输入 → 预扫 → 选单
+        // → 选 kind → 预审 → 确认 → 落账 → 结果,浮层优先级接在手填之后
         match self.reg_state {
             RegState::RepoInput => {
                 self.on_key_reg_repo(k);
+                return;
+            }
+            RegState::PreScan => {
+                self.on_key_reg_prescan(k);
+                return;
+            }
+            RegState::PreScanPick => {
+                self.on_key_reg_pick(k);
                 return;
             }
             RegState::KindPick => {
@@ -2025,22 +2080,26 @@ impl App {
     }
 
     /// repo 链接提交:格式非法**当场拒绝并留驻可改**(不等引擎跑一趟);
-    /// 合法则进 kind 选择。
+    /// 合法则排队一次只读预扫(工单 #114:面板先看清这仓有什么,再让
+    /// 作者勾选),预扫不落文件、不调引擎;回音失败/空选单回落单条流。
     fn apply_reg_repo(&mut self) {
         let Some(trimmed) = input::normalize(&self.reg_repo_buf) else {
             self.push_log("登记被拒:repo 链接为空,留输入态可改");
             return;
         };
-        if !valid_repo_link(&trimmed) {
+        let Some(slug) = crate::scan::repo_slug(&trimmed) else {
             self.push_log(format!(
                 "登记被拒:\"{trimmed}\" 不是合法 repo 链接(owner/repo、https://github.com/owner/repo 或 git@github.com:owner/repo.git),留输入态可改"
             ));
             return;
-        }
+        };
         self.reg_repo_buf = trimmed;
-        self.reg_state = RegState::KindPick;
         self.reg_kind = RegKind::Skill;
         self.reg_kind_sel = 0;
+        self.reg_scan_slug = Some(slug.clone());
+        self.scan_pending.push(slug);
+        self.reg_state = RegState::PreScan;
+        self.push_log("登记预扫已排队:gh api 拉条目清单(只读,不落文件)");
         self.push_log("选 kind:↑/↓ 或 s/e 选择,Enter 预审,Esc/q 返航");
     }
 
@@ -2104,6 +2163,97 @@ impl App {
         }
     }
 
+    /// 预扫在途键位(#114):等只读回音;Esc 仍可返航(回音将丢弃,
+    /// 不幽灵重开),其余键不动作——与预审在途同纪律。
+    fn on_key_reg_prescan(&mut self, k: KeyEvent) {
+        if matches!(k.code, KeyCode::Esc) {
+            self.cancel_register();
+        }
+    }
+
+    /// 预扫选单键位(#114):↑/↓ 移选中;空格勾选/取消当前条;
+    /// Enter = 带着勾选进 kind 选择(下一段仍是引擎 register 两段式,
+    /// 面板不旁路闸);Esc/q 返航。
+    fn on_key_reg_pick(&mut self, k: KeyEvent) {
+        let n = self.reg_scan_entries.len();
+        match k.code {
+            KeyCode::Up => self.reg_scan_sel = self.reg_scan_sel.saturating_sub(1),
+            KeyCode::Down => {
+                if n > 0 {
+                    self.reg_scan_sel = (self.reg_scan_sel + 1).min(n - 1);
+                }
+            }
+            KeyCode::Char(' ') => {
+                let i = self.reg_scan_sel;
+                self.toggle_scan_row(i);
+            }
+            KeyCode::Enter => self.reg_pick_confirm(),
+            KeyCode::Esc | KeyCode::Char('q') => self.cancel_register(),
+            _ => {}
+        }
+    }
+
+    /// 勾选/取消第 i 条(键盘空格与鼠标点行同一路;顺带移选中)。
+    pub fn toggle_scan_row(&mut self, i: usize) {
+        if let Some(slot) = self.reg_scan_checks.get_mut(i) {
+            *slot = !*slot;
+            self.reg_scan_sel = i;
+        }
+    }
+
+    /// 选单确认:带着勾选结论进 kind 选择——登记落账仍 100% 走引擎
+    /// 两段式(预审 + 图形确认),勾选只是面板侧选单(#114)。
+    pub fn reg_pick_confirm(&mut self) {
+        if self.reg_state != RegState::PreScanPick {
+            return;
+        }
+        let checked = self.reg_scan_checks.iter().filter(|c| **c).count();
+        self.push_log(format!(
+            "预扫选单确认:勾选 {}/{} 条(登记按仓整体进行,引擎扫描为准)",
+            checked,
+            self.reg_scan_entries.len()
+        ));
+        self.reg_state = RegState::KindPick;
+    }
+
+    /// 预扫回音(#114):只读 GitHub 查询的结果,与引擎回音分通道。只在
+    /// 预扫在途且 slug 对得上时受理(迟到回音丢弃,不幽灵重开);失败或
+    /// 空选单一律回落既有单条登记流,不报死、不拦路。
+    fn on_scan(&mut self, ev: crate::scan::ScanEvent) {
+        let crate::scan::ScanEvent::Finished { slug, outcome } = ev;
+        if self.reg_state != RegState::PreScan {
+            return;
+        }
+        if self.reg_scan_slug.as_deref() != Some(slug.as_str()) {
+            return; // 不是当前这一次预扫的回音
+        }
+        match outcome {
+            crate::scan::ScanOutcome::Entries(entries) if !entries.is_empty() => {
+                self.reg_scan_checks = vec![true; entries.len()];
+                self.reg_scan_entries = entries;
+                self.reg_scan_sel = 0;
+                self.reg_state = RegState::PreScanPick;
+                self.push_log(format!(
+                    "预扫完成({slug}):{} 条待勾选(只读,未落任何文件)",
+                    self.reg_scan_entries.len()
+                ));
+            }
+            crate::scan::ScanOutcome::Entries(_) => {
+                // 空选单:没什么可勾,回落单条登记流(引擎自己会扫)
+                self.reg_scan_entries.clear();
+                self.reg_scan_checks.clear();
+                self.reg_scan_slug = None;
+                self.reg_state = RegState::KindPick;
+                self.push_log(format!("预扫未发现条目({slug}):回落单条登记流"));
+            }
+            crate::scan::ScanOutcome::Failed(reason) => {
+                self.reg_scan_slug = None;
+                self.reg_state = RegState::KindPick;
+                self.push_log(reason);
+            }
+        }
+    }
+
     /// 下发预审:不带 `--yes`、不带 `--category`(类别输入不给),
     /// `--root` 指数据仓根;下发前重过两道门(入口状态可能已变)。
     pub fn dispatch_register(&mut self) {
@@ -2160,10 +2310,18 @@ impl App {
 
     /// 返航:任一态 Esc 同义,状态清空不留半条记录(结果丢弃);
     /// 键盘 Esc 与鼠标点「Esc 返航」段同路同语(经 [`App::dismiss_popup`])。
+    /// #114 起连预扫选单与在途对账一并清:已排队未跑的只读扫描撤掉,
+    /// 在途那一次的回音按状态丢弃——向导中途退出零副作用。
     pub fn cancel_register(&mut self) {
         self.reg_state = RegState::Idle;
         self.reg_repo_buf.clear();
         self.reg_result = None;
+        if let Some(slug) = self.reg_scan_slug.take() {
+            self.scan_pending.retain(|s| s != &slug);
+        }
+        self.reg_scan_entries.clear();
+        self.reg_scan_checks.clear();
+        self.reg_scan_sel = 0;
         self.push_log("登记返航");
     }
 
@@ -3438,35 +3596,9 @@ fn domain_row_fields(d: Domain, l: &LsData, i: usize) -> Vec<String> {
 /// repo 链接形状检查(spec #25:owner/repo · https://github.com/… ·
 /// git@github.com:…,非 GitHub 拒)。面板侧快一拍拒绝,免得操作者
 /// 等引擎跑一趟才发现写错(#30 故事 14);真正的守门人仍是引擎。
+/// 形状规则的唯一出处在 [`crate::scan::repo_slug`](#114 起登记与预扫共用)。
 pub fn valid_repo_link(s: &str) -> bool {
-    let t = s.trim();
-    if t.is_empty() || t.contains(char::is_whitespace) {
-        return false;
-    }
-    if let Some(rest) = t.strip_prefix("https://github.com/") {
-        return is_owner_repo(rest.trim_end_matches(".git"));
-    }
-    if let Some(rest) = t.strip_prefix("git@github.com:") {
-        return is_owner_repo(rest.trim_end_matches(".git"));
-    }
-    // 其余带协议/其它主机的写法一律不在面板放行(非 GitHub 拒)
-    if t.starts_with("http") || t.starts_with("git@") || t.contains("://") {
-        return false;
-    }
-    is_owner_repo(t)
-}
-
-fn is_owner_repo(t: &str) -> bool {
-    let mut parts = t.split('/');
-    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    let seg = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    seg(owner) && seg(repo)
+    crate::scan::repo_slug(s).is_some()
 }
 
 fn prev_domain(d: Domain) -> Domain {
@@ -5593,6 +5725,8 @@ mod tests {
     }
 
     /// r 发起 → 填链 → Enter:走到 kind 选择态(合法链接才走得到)。
+    /// #114 起提交链接先排队一次只读预扫;本助手灌一次「预扫失败」回音
+    /// 走回落路(既有单条登记流)——两段式登记本身的测试不依赖选单。
     fn reg_to_kindpick(app: &mut App, link: &str) {
         app.update(Message::Key(key('r')));
         assert_eq!(app.reg_state, RegState::RepoInput, "入口键进输入态");
@@ -5601,7 +5735,13 @@ mod tests {
             KeyCode::Enter,
             KeyModifiers::NONE,
         )));
-        assert_eq!(app.reg_state, RegState::KindPick, "合法链接进 kind 选择");
+        assert_eq!(app.reg_state, RegState::PreScan, "合法链接进预扫(只读排队)");
+        let slug = crate::scan::repo_slug(link).expect("夹具链接合法");
+        app.update(Message::Scan(crate::scan::ScanEvent::Finished {
+            slug,
+            outcome: crate::scan::ScanOutcome::Failed("测试夹具:预扫不走网".into()),
+        }));
+        assert_eq!(app.reg_state, RegState::KindPick, "预扫失败回落单条登记流");
     }
 
     /// 按当前队尾 argv 回放回音并灌进 update(与 #28 的既有先例同款)。
@@ -5775,7 +5915,10 @@ mod tests {
             KeyCode::Enter,
             KeyModifiers::NONE,
         )));
-        assert_eq!(app.reg_state, RegState::KindPick, "改对了就放行");
+        // #114:合法链接的下一站是预扫(只读排队),不是直接 kind 选择
+        assert_eq!(app.reg_state, RegState::PreScan, "改对了进预扫(只读排队)");
+        assert_eq!(app.scan_pending, vec!["owner/tiny-skills".to_string()]);
+        assert!(app.queue.is_empty(), "预扫不走引擎队列");
     }
 
     #[test]
@@ -6148,6 +6291,283 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert_eq!(app.reg_state, RegState::Idle, "Esc 返航不漂移");
+    }
+
+    /// 同 [`reg_app`],但把 runner 交回调用方(断言零引擎调用用)。
+    fn reg_app_with(runner: Arc<FakeRunner>) -> App {
+        let mut app = App::with_runner(runner);
+        app.capabilities
+            .record(Capability::SourceRegister, Probe::Available);
+        app.splash = false;
+        app.screen = Screen::Recipes;
+        app.rc_domain = Domain::Sources;
+        app
+    }
+
+    // ---- 外部源登记向导·预扫选单(工单 #114)----
+
+    /// 预扫选单夹具:两条 skill + 一条 extension。
+    fn scan_entries() -> Vec<crate::scan::ScannedEntry> {
+        vec![
+            crate::scan::ScannedEntry {
+                path: "skills/greeter".into(),
+                kind: crate::scan::ScanKind::Skill,
+            },
+            crate::scan::ScannedEntry {
+                path: "skills/scanner".into(),
+                kind: crate::scan::ScanKind::Skill,
+            },
+            crate::scan::ScannedEntry {
+                path: "extensions/foo".into(),
+                kind: crate::scan::ScanKind::Extension,
+            },
+        ]
+    }
+
+    /// 灌一次预扫回音(与生产同一条路:`Message::Scan`)。
+    fn scan_feed(app: &mut App, outcome: crate::scan::ScanOutcome) {
+        let slug = app.reg_scan_slug.clone().expect("在途预扫有 slug");
+        app.update(Message::Scan(crate::scan::ScanEvent::Finished {
+            slug,
+            outcome,
+        }));
+    }
+
+    /// r → 填链 → Enter:进预扫在途(只读排队,引擎零调用)。
+    fn reg_to_prescan(app: &mut App, link: &str) {
+        app.update(Message::Key(key('r')));
+        type_str(app, link);
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::PreScan, "合法链接进预扫在途");
+    }
+
+    #[tokio::test]
+    async fn 登记向导_贴链接进预扫_只读排队且零引擎调用() {
+        let runner = Arc::new(FakeRunner::new(&[]));
+        let mut app = reg_app_with(runner.clone());
+        reg_to_prescan(&mut app, "https://github.com/owner/tiny-skills");
+        assert_eq!(
+            app.scan_pending,
+            vec!["owner/tiny-skills".to_string()],
+            "只读预扫排队(gh api),不进引擎队列"
+        );
+        assert!(app.queue.is_empty(), "预扫不下发任何引擎命令");
+        assert!(
+            runner.call_argvs().is_empty(),
+            "零引擎调用:预扫不调 nw:{:?}",
+            runner.call_argvs()
+        );
+        // 在途态 Esc 返航:连排队的只读扫描一并撤掉——退出零副作用
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Idle, "在途可返航");
+        assert!(app.scan_pending.is_empty(), "撤掉未跑的只读扫描");
+        assert!(
+            runner.call_argvs().is_empty(),
+            "全程零引擎调用:{:?}",
+            runner.call_argvs()
+        );
+    }
+
+    #[test]
+    fn 登记向导_预扫回选单_默认全勾_空格与方向键改勾选() {
+        let mut app = reg_app(&[]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        assert_eq!(app.reg_state, RegState::PreScanPick, "回音进选单态");
+        assert_eq!(app.reg_scan_entries.len(), 3, "三条待勾选");
+        assert!(
+            app.reg_scan_checks.iter().all(|c| *c),
+            "默认全勾:菜单答「这仓有什么」"
+        );
+        // 空格取消当前条(第 0 条)
+        app.update(Message::Key(key(' ')));
+        assert_eq!(
+            app.reg_scan_checks,
+            vec![false, true, true],
+            "空格切换当前条勾选"
+        );
+        // ↓ 移选中再勾回来
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_scan_sel, 1);
+        app.update(Message::Key(key(' ')));
+        assert_eq!(app.reg_scan_checks, vec![false, false, true]);
+        // Enter 带着勾选进 kind 选择(登记仍走引擎两段式)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::KindPick, "选单确认进 kind 选择");
+        assert!(
+            app.log[0].contains("预扫选单确认"),
+            "勾选结论留证据:{}",
+            app.log[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn 登记向导_预扫失败与空选单_都回落单条登记流() {
+        // 失败路(私有仓/网络/gh 缺失):回落,不报死
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        reg_to_prescan(&mut app, "owner/private-repo");
+        scan_feed(
+            &mut app,
+            crate::scan::ScanOutcome::Failed("预扫失败:gh 退出码 1".into()),
+        );
+        assert_eq!(app.reg_state, RegState::KindPick, "失败回落单条登记流");
+        assert!(app.log[0].contains("预扫失败"), "回落理由留证据");
+        // 回落路就是既有两段式:Enter 下发预审,argv 不带 --yes
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let argv = app.queue.last().expect("回落路仍走引擎预审").clone();
+        assert_eq!(argv[..2], ["source", "register"]);
+        assert!(!argv.iter().any(|s| s == "--yes"), "回落路同样不旁路闸");
+        // 空选单路:没什么可勾,同样回落
+        let mut app2 = reg_app(&[]);
+        reg_to_prescan(&mut app2, "owner/empty-repo");
+        scan_feed(&mut app2, crate::scan::ScanOutcome::Entries(vec![]));
+        assert_eq!(app2.reg_state, RegState::KindPick, "空选单回落");
+        assert!(app2.reg_scan_entries.is_empty(), "空选单不留在状态里");
+    }
+
+    #[tokio::test]
+    async fn 登记向导_全路径_勾选后两段式argv仍由引擎闸把守() {
+        let mut app = reg_app(&[("source register", 0, REG_OK)]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        // 选单 → kind → 预审(勾选只影响呈现,不改 argv)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::PreAudit);
+        let pre = app.queue.last().expect("预审入队").clone();
+        assert_eq!(pre[..2], ["source", "register"]);
+        assert!(!pre.iter().any(|s| s == "--yes"), "预审铁律:不带 --yes");
+        assert!(
+            pre.windows(2).any(|w| w[0] == "--root"),
+            "--root 指数据仓根"
+        );
+        assert!(pre.iter().any(|s| s == "--kind"), "kind 槽位在");
+        // 预审回音 → 确认态:勾选结论随拟落账摊开
+        reg_feed(&mut app, REG_OK, 0).await;
+        assert_eq!(app.reg_state, RegState::Review);
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("预扫勾选"), "确认态摊开面板侧勾选:{s}");
+        assert!(s.contains("skills/greeter"), "勾选的条目路径可见:{s}");
+        // 图形确认后才可能带 --yes(落账闸把守不变)
+        assert!(app.reg_can_commit());
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let commit = app.queue.last().expect("落账入队").clone();
+        assert!(commit.iter().any(|s| s == "--yes"), "落账段才带 --yes");
+    }
+
+    #[test]
+    fn 登记向导_选单与在途_两档快照不炸() {
+        let mut app = reg_app(&[]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        for (w, h) in [(110u16, 30u16), (66, 50)] {
+            let f = crate::testutil::frame_display(&app, w, h);
+            assert!(f.contains("正在预扫"), "{w}×{h} 在途态说明在场:{f}");
+            assert!(f.contains("不落文件"), "{w}×{h} 只读纪律可见:{f}");
+        }
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        for (w, h) in [(110u16, 30u16), (66, 50)] {
+            let f = crate::testutil::frame_display(&app, w, h);
+            assert!(f.contains("预扫选单"), "{w}×{h} 选单标题在场:{f}");
+            assert!(f.contains("skills/greeter"), "{w}×{h} 条目在列:{f}");
+            assert!(f.contains("extensions/foo"), "{w}×{h} 扩展组在列:{f}");
+            assert!(f.contains("[x]"), "{w}×{h} 勾选框在列:{f}");
+            assert!(f.contains("Enter 继续"), "{w}×{h} 键位行在列:{f}");
+            assert!(f.contains("空格 勾选"), "{w}×{h} HUD 给勾选键位:{f}");
+        }
+    }
+
+    #[test]
+    fn 登记向导_选单esc返航_数据仓与编目零变化() {
+        let runner = Arc::new(FakeRunner::new(&[]));
+        let mut app = reg_app_with(runner.clone());
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.reg_state, RegState::Idle, "选单态 Esc 返航");
+        assert!(app.reg_scan_entries.is_empty(), "选单清空");
+        assert!(app.reg_scan_checks.is_empty(), "勾选态清空");
+        assert!(app.reg_scan_slug.is_none(), "在途对账清空");
+        assert!(app.scan_pending.is_empty(), "无残留排队");
+        assert!(
+            runner.call_argvs().is_empty(),
+            "全程零引擎调用(登记落账从未发生):{:?}",
+            runner.call_argvs()
+        );
+    }
+
+    #[test]
+    fn 登记向导_迟到预扫回音_丢弃不幽灵重开() {
+        let mut app = reg_app(&[]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        // 先返航(Idle),回音才迟到
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        let slug = "owner/tiny-skills".to_string();
+        app.update(Message::Scan(crate::scan::ScanEvent::Finished {
+            slug,
+            outcome: crate::scan::ScanOutcome::Entries(scan_entries()),
+        }));
+        assert_eq!(app.reg_state, RegState::Idle, "迟到回音不重开流程");
+        assert!(app.reg_scan_entries.is_empty(), "迟到选单不入状态树");
+    }
+
+    #[test]
+    fn 登记向导_鼠标点行勾选_与空格同路() {
+        let mut app = reg_app(&[]);
+        app.size = Rect::new(0, 0, 110, 30);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        // 命中区与渲染同源:点第 1 行 = 勾选/取消第 1 条
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(1)));
+        click(&mut app, row);
+        assert_eq!(
+            app.reg_scan_checks,
+            vec![true, false, true],
+            "点行与空格同一后果"
+        );
+        assert_eq!(app.reg_scan_sel, 1, "点行顺带移选中");
+    }
+
+    #[test]
+    fn 登记向导_选单滚轮只移选中_不改勾选() {
+        let mut app = reg_app(&[]);
+        reg_to_prescan(&mut app, "owner/tiny-skills");
+        scan_feed(&mut app, crate::scan::ScanOutcome::Entries(scan_entries()));
+        app.wheel_sel(ScrollDir::Down);
+        assert_eq!(app.reg_scan_sel, 1, "滚轮移选中(与 ↑/↓ 同路)");
+        assert!(
+            app.reg_scan_checks.iter().all(|c| *c),
+            "滚轮不改勾选(勾选归空格/点行)"
+        );
     }
 
     #[test]

@@ -663,6 +663,10 @@ pub const REG_KEY_KIND_LAUNCH: &str = "  Enter 预审 ";
 /// 只在落账闸放行时铺——不可落账时整屏仍归返航(命中侧同条件分叉)。
 pub const REG_KEY_REVIEW_COMMIT: &str = "  Enter 落账 ";
 
+/// 预扫选单键位行的左段(#114「Enter 继续」):渲染
+/// (`recipes::render_reg_pick`)与命中(`register_hits`)同一份文案。
+pub const REG_KEY_PICK_CONTINUE: &str = "  Enter 继续 ";
+
 /// 编目册删除确认的键位行左段(#53,ADR-0009 §2 的图形确认):
 /// 渲染(`catalog::render_rm_confirm`)与命中(`catalog_hits`)同一份文案。
 pub const REG_KEY_RM_CONFIRM: &str = "  Enter 确认删除 ";
@@ -671,6 +675,9 @@ pub const REG_KEY_RM_CONFIRM: &str = "  Enter 确认删除 ";
 /// 几何零分歧;`popup_rect` 的收窄规则两边同用。
 pub const REG_INPUT_W: u16 = 64;
 pub const REG_INPUT_H: u16 = 7;
+/// 预扫选单浮层(#114):说明两行 + 分组勾选清单 + 键位行。
+pub const REG_PICK_W: u16 = 64;
+pub const REG_PICK_H: u16 = 20;
 pub const REG_KIND_W: u16 = 56;
 pub const REG_KIND_H: u16 = 9;
 pub const REG_REVIEW_W: u16 = 76;
@@ -806,10 +813,12 @@ pub fn key_line_segments(
     out
 }
 
-/// 登记浮层(#30 #31):几何与 `recipes::render_register_overlay` 同一组
+/// 登记浮层(#30 #31 #114):几何与 `recipes::render_register_overlay` 同一组
 /// 常量、同一 `popup_rect` 居中基准。输入/等回音态鼠标惰性(同手填
 /// 浮层先例);kind 选项两行产 [`Target::SelectRow`] 选中 + 键位行两段
-/// (Activate 预审 / Dismiss 返航);确认态按落账闸分叉——放行时
+/// (Activate 预审 / Dismiss 返航);预扫选单(#114)条目行产 SelectRow
+/// (app 侧按 reg_state 分派成勾选/取消)+ 键位行两段(Activate 继续 /
+/// Dismiss 返航);确认态按落账闸分叉——放行时
 /// 键位行两段(Activate 落账 / Dismiss 返航),不放行时整屏点任意处
 /// = 返航(不可落账不可达);结果屏整屏点任意处 = 返航。浮层外不产出
 /// 任何命中区(弹层优先级)。
@@ -824,6 +833,42 @@ fn register_hits(
     };
     match app.reg_state {
         crate::app::RegState::Idle | crate::app::RegState::RepoInput => {}
+        crate::app::RegState::PreScan => {} // 等回音:无处可点,同惰性
+        crate::app::RegState::PreScanPick => {
+            // 预扫选单(#114):条目行 = 勾选/取消(与空格同路,经
+            // Target::SelectRow 在 app 侧按 reg_state 分派);键位行两段
+            // (Enter 继续 / Esc 返航)。只给「键位行以上真的画出来了」
+            // 的行产命中——与渲染同序:内层 0/1 行说明、2 行空,其后按
+            // kind 分组(组头一行 + 条目行),超量截断。
+            let popup = popup_rect(content, REG_PICK_W, REG_PICK_H);
+            if popup.height < REG_PICK_H || popup.width == 0 {
+                return; // 收窄后行序不再可信,不产命中
+            }
+            let inner = shrink_border(popup);
+            let key_y = popup.y + popup.height - 2;
+            let mut y = inner.y + 3;
+            'outer: for kind in [
+                crate::scan::ScanKind::Skill,
+                crate::scan::ScanKind::Extension,
+            ] {
+                let mut any = false;
+                for (i, e) in app.reg_scan_entries.iter().enumerate() {
+                    if e.kind != kind {
+                        continue;
+                    }
+                    if !any {
+                        y += 1; // 组头占一行
+                        any = true;
+                    }
+                    if y >= key_y {
+                        break 'outer; // 截断线以下没画,不给命中
+                    }
+                    hits.push((Rect::new(inner.x, y, inner.width, 1), Target::SelectRow(i)));
+                    y += 1;
+                }
+            }
+            two_key_segments(popup, key_y, REG_KEY_PICK_CONTINUE, RITUAL_KEY_RETURN, hits);
+        }
         crate::app::RegState::PreAudit => {} // 等回音:无处可点,同惰性
         crate::app::RegState::KindPick => {
             let popup = popup_rect(content, REG_KIND_W, REG_KIND_H);

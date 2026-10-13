@@ -173,6 +173,12 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.reg_state == crate::app::RegState::RepoInput {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记填链:Enter 继续 · Esc/q 放弃", p.accent()));
+    } else if app.reg_state == crate::app::RegState::PreScanPick {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            "预扫选单:空格勾选 · Enter 继续 · Esc 返航",
+            p.accent(),
+        ));
     } else if app.reg_state != crate::app::RegState::Idle {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记中:Esc 返航", p.accent()));
