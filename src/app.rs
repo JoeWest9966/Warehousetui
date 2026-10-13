@@ -206,6 +206,19 @@ pub enum RegState {
     Done,
 }
 
+/// 反查跳转的待落地选中位(#120):目标册 / 目标域的投影还没读到时,跳转
+/// 先把这一条记下,等回音落地后按名字落选中。
+///
+/// 为什么不「先切过去、选中位随便落一个」:没数据就没有选中位,落 0 等于
+/// 指着另一条条目冒充命中(与面板其余部分同纪律——不猜、不拿默认值兜底)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JumpPending {
+    /// 落到机器册:等 `vps ls` 回音后按机器名选中。
+    Machine(String),
+    /// 落到配方屏外部源域:等 `ls` 回音后按条目名选中所在的那条源。
+    SourceEntry(String),
+}
+
 /// 登记类别二选一(引擎 `--kind` 槽位;`--category` 是 0.1.0 就有的
 /// `source register` 可重复旗标,不是能力缺口——要不要给类别输入是产品
 /// 范围问题(ADR-0006),不是引擎有没有的问题;类别输入一律不给,spec #25)。
@@ -361,6 +374,17 @@ pub struct App {
     /// **独立小状态,不并入 `assembling` 写互斥**(反查只读);三态两两可
     /// 区分,见 [`crate::screens::catalog::VpsReverse`]。
     pub vps_reverse: crate::screens::catalog::VpsReverse,
+    /// 反查跳转浮层(#120):标签册问「这一条引用了什么」之后,命中条目在场
+    /// 的薄浮层(↑/↓ 选、Enter 直跳对应册)。与 [`Self::vps_reverse`] 是两
+    /// 件事——那边问「什么标签引用了这一条」,这边问「这一条引用了什么」;
+    /// 同样**不并入 `assembling` 写互斥**(跳转零引擎调用、零写路径)。
+    pub tag_jump: crate::screens::catalog::TagJump,
+    /// 反查跳转的**待落地选中位**(#120):目标册 / 目标域的投影还没读到时,
+    /// 先把「要落到哪一条」记在这里,回音到达时按名字落选中——不许假装
+    /// 已经选中(没数据就没有选中位)。只在目标屏仍在场时落地;操作者已经
+    /// 切走 = 这次跳转的选中位作废(不落在别的屏上,也不在回音里偷偷改
+    /// 一个看不见的选中位)。
+    pub jump_pending: Option<JumpPending>,
     /// 标签册选中行(↑/↓ 与鼠标点行同源)。
     pub tag_sel: usize,
     /// 摘引用 / 删标签确认浮层(ADR-0009 §2:上游 rm 没有 `--yes`,面板加
@@ -572,6 +596,8 @@ impl App {
             tag_ls_loading: false,
             tag_lookup: None,
             vps_reverse: crate::screens::catalog::VpsReverse::Idle,
+            tag_jump: crate::screens::catalog::TagJump::Idle,
+            jump_pending: None,
             tag_sel: 0,
             tag_rm_confirm: false,
             tag_rm_result: None,
@@ -863,9 +889,14 @@ impl App {
             // 路径逐字同一处),所以鼠标与键盘不可能给出两种后果;无选中行 /
             // 入口门不过 / 装配在途时,复现键盘 `d` 的既有日志,不新造行为。
             Target::CatalogDelete => self.catalog_delete(),
-            // 点命令面板结果行(#119)= 选中那一行(与 ↑/↓ 同义)。执行留给
-            // Enter——鼠标只是叠加,不新增「点一下就开火」这条语义。
             Target::CmdRow(i) => self.cmd_select(i),
+            // 点反查跳转浮层里的命中条目(#120)= 在浮层里选中它并回车直跳,
+            // 与 `↑/↓` + `Enter` 完全同路(同一个 `tag_jump_to`,同一条后果链)。
+            Target::TagJump(i) => {
+                self.tag_jump.move_sel_to(i);
+                let sel = self.tag_jump.sel();
+                self.tag_jump_to(sel);
+            }
         }
     }
 
@@ -970,6 +1001,11 @@ impl App {
             // 落地只按当前册钳位),所以「回到原选中行」不需要一次恢复动作,只
             // 需要不在返航时顺手改它。Esc 与点任意处走这一条同路(语义不漂移)。
             self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
+        } else if self.tag_jump_open() {
+            // 反查跳转浮层返航(#120):与上面那一层同族——只收状态,册体一行
+            // 不改、反查结论与选中行原样在场。键盘 Esc/q 与鼠标点任意处走这
+            // 一条同路(语义不许漂移);没有这一支,点浮层外就会静默无反应。
+            self.tag_jump = crate::screens::catalog::TagJump::Idle;
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
@@ -1053,6 +1089,9 @@ impl App {
                         // 过滤词在刷新后仍然生效(#61):新回音照样过一遍筛,
                         // 选中钳回新的可见行数内,不越界、不指向另一条。
                         self.clamp_rc_sel();
+                        // 反查跳转的待落地选中位(#120):五域读到了,按名字
+                        // 把选中位落下去(见 `Self::land_jump_pending`)。
+                        self.land_jump_pending();
                         self.push_log("ls 五域已刷新".to_string());
                     }
                     None => {
@@ -1222,6 +1261,22 @@ impl App {
         if self.vps_reverse_open() {
             if matches!(k.code, KeyCode::Esc) {
                 self.dismiss_popup();
+            }
+            return;
+        }
+        // 反查跳转浮层(#120):与反查上浮同级的**顶层浮层**——标签册问「这一条
+        // 引用了什么」之后,命中条目在场时吞键:↑/↓ 选、Enter 直跳、Esc/q 收。
+        // 册体键位(↑/↓ / r / d / l / Enter / m / /)一个都不受理——尤其 Enter,\        // 否则会被册体再收一次、变成又发起一次反查。
+        if self.tag_jump_open() {
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.close_tag_jump(),
+                KeyCode::Up => self.tag_jump.move_sel(false),
+                KeyCode::Down => self.tag_jump.move_sel(true),
+                KeyCode::Enter => {
+                    let sel = self.tag_jump.sel();
+                    self.tag_jump_to(sel);
+                }
+                _ => {}
             }
             return;
         }
@@ -2630,6 +2685,9 @@ impl App {
         // 取消任何在途 / 在场的反查——不把机器册的结论顺带到别的册上,也不
         // 在换册这种「别的动作」后顺手收敛一次回音。
         self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
+        // 反查跳转浮层同理(#120):它是标签册独有的,换册即收——不把标签册
+        // 的命中清单顺带到别的册上,也不让它在别的册上被 Enter 误触。
+        self.tag_jump = crate::screens::catalog::TagJump::Idle;
         let k = self.catalog_kind;
         self.push_log(format!(
             "换册:{}册({});{}",
@@ -2780,6 +2838,7 @@ impl App {
         };
         self.tag_ls_loading = true;
         self.tag_ls_echo = None; // 在途:不拿上一轮结论冒充本次
+        self.tag_jump = crate::screens::catalog::TagJump::Idle; // 新一轮反查:上一轮的命中浮层不收(#120)
         self.tag_lookup = name.map(str::to_string);
         let argv = match name {
             Some(n) => commands::tag_ls_one(n, &root),
@@ -2850,6 +2909,192 @@ impl App {
     /// 键位吞键共用这一判据)。
     pub fn vps_reverse_open(&self) -> bool {
         self.vps_reverse.is_open()
+    }
+
+    // ---- 反查跳转(spec #96 工单 #120) ----
+
+    /// 反查跳转浮层在不在场(渲染 / 键位吞键 / 命中区共用这一判据)。
+    pub fn tag_jump_open(&self) -> bool {
+        self.tag_jump.is_open()
+    }
+
+    /// 收反查跳转浮层(与 [`Self::dismiss_popup`] 同族的「只收状态」:
+    /// 册体一行不改、反查结论与选中行原样在场)。
+    pub fn close_tag_jump(&mut self) {
+        self.tag_jump = crate::screens::catalog::TagJump::Idle;
+    }
+
+    /// 反查跳转浮层的命中条目**直跳对应去处**(#120 主入口)。
+    ///
+    /// 同帧做完三件事:收浮层、清反查残留、落目标屏的选中位。顺序有意义——
+    /// 先把浮层与反查态清掉,再切屏,跳转结束时屏上不留「反查 <根>」这种
+    /// 把数据仓根当标签名的册头口径(`tag_lookup` / `tag_ls_echo` 一清,
+    /// [`catalog::CatalogKind::scope_label`] 自然回到「全部标签」)。
+    ///
+    /// **零引擎调用**:目标册的投影已经读过 = 直接落选中;没读过 = 走既有
+    /// 的入队刷新 + [`Self::jump_pending`],回音落地才落选中——不假装选中。
+    pub fn tag_jump_to(&mut self, sel: usize) {
+        let Some(hit) = self.tag_jump.hit(sel) else {
+            return;
+        };
+        let label = hit.label();
+        let kind = hit.kind.clone();
+        let id = hit.id.clone();
+        // 同帧收浮层 + 清反查残留(见方法注释)
+        self.tag_jump = crate::screens::catalog::TagJump::Idle;
+        self.tag_lookup = None;
+        self.tag_ls_echo = None;
+        self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
+        match crate::screens::catalog::jump_dest(&kind) {
+            // 这个 kind 在现有屏结构里没有去处:明说,不是死键——条目仍在
+            // 标签册上,选中位一个字节都没动,也没入队任何命令。
+            None => self.push_log(format!(
+                "反查跳转未跳:{label} 这个 kind 在现有屏结构里没有去处(不是面板坏了:条目还在册上)"
+            )),
+            Some(dest) => match dest {
+                crate::screens::catalog::JumpDest::Machine => self.jump_to_machine(&id, &label),
+                crate::screens::catalog::JumpDest::SourceEntry => {
+                    self.jump_to_source_entry(&id, &label)
+                }
+            },
+        }
+    }
+
+    /// vps 命中 → 机器册(#120):册已读过就按机器名落选中;册里没有这一台
+    /// (标签引用可能已悬空)就明说;册还没读过就入队刷新 + 记待落地选中位。
+    fn jump_to_machine(&mut self, name: &str, label: &str) {
+        self.screen = Screen::Vps;
+        self.catalog_kind = crate::screens::CatalogKind::Vps;
+        let found = self
+            .vps_ls
+            .as_ref()
+            .and_then(|d| d.machines.iter().position(|m| m.name == name));
+        match found {
+            Some(orig) => match self.catalog_visible().iter().position(|&i| i == orig) {
+                Some(pos) => {
+                    let (sel, n) = self.catalog_sel_mut();
+                    *sel = pos.min(n.saturating_sub(1));
+                    self.push_log(format!("反查跳转:{label} → 机器册(已选中 {name})"));
+                }
+                // 过滤词把这一台挡在可见行外:不偷偷清操作者的词,明说。
+                None => self.push_log(format!(
+                    "反查跳转:{label} → 机器册;册内过滤词把 {name} 挡在可见行外,先清过滤(/  Esc)"
+                )),
+            },
+            None if self.vps_ls.is_some() => self.push_log(format!(
+                "反查跳转:{label} → 机器册,但册里没有 {name}(标签引用可能已悬空)"
+            )),
+            None => {
+                let before = self.queue.len();
+                self.run_vps_ls();
+                if self.queue.len() > before {
+                    self.jump_pending = Some(JumpPending::Machine(name.to_string()));
+                    self.push_log(format!(
+                        "反查跳转:{label} → 机器册;册还没读,已入队 vps ls,回音落地后选中 {name}"
+                    ));
+                } else {
+                    self.push_log(format!(
+                        "反查跳转:{label} → 机器册;册没读到,刷新也没入队(原因见上一条指路)"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// skill / extension 命中 → 配方屏外部源域(#120):技能与扩展住在源仓里,
+    /// `nw ls` 的 sources 域是面板唯一看得到它们的地方(编目册屏四本册都不
+    /// 是它们的家,硬安一个去处等于造第六本册)。落法是「选中所在的那条源」
+    /// ——源的详情栏就摊着它的条目清单,一步看得见命中那一条。
+    fn jump_to_source_entry(&mut self, id: &str, label: &str) {
+        self.screen = Screen::Recipes;
+        self.rc_domain = Domain::Sources;
+        self.rc_bake_sel = false; // 切域即复位只读选中态(#39 既有口径)
+        let found = self
+            .ls
+            .as_ref()
+            .and_then(|l| crate::screens::catalog::source_hit_index(l, id));
+        match found {
+            Some(orig) => match self.rc_visible().iter().position(|&i| i == orig) {
+                Some(pos) => {
+                    self.rc_sel = pos;
+                    let src = self
+                        .ls
+                        .as_ref()
+                        .and_then(|l| l.sources.get(orig))
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    self.push_log(format!("反查跳转:{label} → 外部源域(已选中源 {src})"));
+                }
+                None => self.push_log(format!(
+                    "反查跳转:{label} → 外部源域;过滤词把这一条挡在可见行外,先清过滤(/  Esc)"
+                )),
+            },
+            None if self.ls.is_some() => self.push_log(format!(
+                "反查跳转:{label} → 外部源域,但五域回音里没有 {id} 这一条(引用可能已悬空)"
+            )),
+            None => {
+                let before = self.queue.len();
+                self.refresh_ls();
+                if self.queue.len() > before {
+                    self.jump_pending = Some(JumpPending::SourceEntry(id.to_string()));
+                    self.push_log(format!(
+                        "反查跳转:{label} → 外部源域;五域还没读,已入队 ls,回音落地后选中 {id} 所在的源"
+                    ));
+                } else {
+                    self.push_log(format!(
+                        "反查跳转:{label} → 外部源域;五域没读到,刷新也没入队(原因见上一条指路)"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// 反查跳转的待落地选中位落地(#120):投影读到了,才把选中位按名字落下去。
+    ///
+    /// 只在**目标屏仍在场**时落——操作者跳过去又切走了,这一次跳转的选中位
+    /// 就作废:不落在别的屏上,也不在一条看不见的回音里偷偷改一个选中位。
+    /// `ls` 回音与 `vps ls` 回音两条落地路都调它(一处口径)。
+    pub(crate) fn land_jump_pending(&mut self) {
+        let Some(pending) = self.jump_pending.take() else {
+            return;
+        };
+        match pending {
+            JumpPending::Machine(name) => {
+                if self.screen != Screen::Vps
+                    || self.catalog_kind != crate::screens::CatalogKind::Vps
+                {
+                    return; // 已切走:这次跳转的选中位作废
+                }
+                let Some(orig) = self
+                    .vps_ls
+                    .as_ref()
+                    .and_then(|d| d.machines.iter().position(|m| m.name == name))
+                else {
+                    return; // 回音里仍然没有这一台:不落一个冒充的选中位
+                };
+                if let Some(pos) = self.catalog_visible().iter().position(|&i| i == orig) {
+                    let (sel, n) = self.catalog_sel_mut();
+                    *sel = pos.min(n.saturating_sub(1));
+                    self.push_log(format!("反查跳转落地:机器册已选中 {name}"));
+                }
+            }
+            JumpPending::SourceEntry(id) => {
+                if self.screen != Screen::Recipes || self.rc_domain != Domain::Sources {
+                    return; // 已切走:这一次的选中位作废
+                }
+                let orig = self
+                    .ls
+                    .as_ref()
+                    .and_then(|l| crate::screens::catalog::source_hit_index(l, &id));
+                let Some(orig) = orig else {
+                    return;
+                };
+                if let Some(pos) = self.rc_visible().iter().position(|&i| i == orig) {
+                    self.rc_sel = pos;
+                    self.push_log(format!("反查跳转落地:外部源域已选中 {id} 所在的源"));
+                }
+            }
+        }
     }
 
     // ---- 编目册屏·订阅册(spec #50 工单 #56,ADR-0009) ----
