@@ -27,7 +27,10 @@ pub use catalog::{
 pub use health::render_health;
 pub use overview::render_overview;
 pub use recipes::render_recipes;
-pub use scaffold::{on_key_skill_form, ScaffoldFlow, ScaffoldPhase, ScaffoldSpec, SkillForm};
+pub use scaffold::{
+    on_key_ext_form, on_key_skill_form, ExtensionForm, ScaffoldFlow, ScaffoldKind, ScaffoldPhase,
+    ScaffoldSpec, SkillForm,
+};
 pub use settings::render_settings;
 
 #[cfg(test)]
