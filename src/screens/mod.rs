@@ -26,7 +26,7 @@ pub use catalog::{
 pub use health::render_health;
 pub use overview::{alert_parts, render_overview};
 pub use recipes::render_recipes;
-pub use settings::render_settings;
+pub use settings::{render_settings, ProfileRow};
 
 #[cfg(test)]
 mod tests;

@@ -1,8 +1,8 @@
 //! 设置屏:引擎发现状态、NW_HOME、主题、配置入口、指路屏。
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListState, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -10,6 +10,40 @@ use crate::app::App;
 use crate::engine::config;
 use crate::engine::{Capability, Probe, GATE_HINT};
 use crate::screens::body;
+
+/// 多派总览的一行(#107):一个派 + 它那一格 doctor 档位快照。
+///
+/// `tier = None` 表示**本会话还没查过**这一派(打开页面不跑 doctor,规格
+/// 用户故事 22),与「查过了,结论是某一档」是两件事——前者屏上说「未查」,
+/// 后者才谈得上 ok / 降级 / 漂移 / 破损。
+pub struct ProfileRow {
+    pub profile: String,
+    /// doctor 回音的退出码档位(0 / 10 / 11 / 12,其余码原样呈)。
+    pub tier: Option<crate::engine::ExitCode>,
+}
+
+/// 档位那一格的措辞与颜色(#107)。
+///
+/// 档位 → 状态的映射只有一处(`ExitCode::doctor_state`,健康屏横幅共用),
+/// 本函数只负责「一行一派」的短措辞:健康档的词走 `State::label()`
+/// (ok / 降级 / 漂移 / 破损,既有词汇,不另造),没有健康结论的码给 rc 原话
+/// ——把「输入无效」画成破损,是把呈现错误说成引擎的健康判决。
+fn tier_cell(
+    p: &crate::theme::Palette,
+    tier: Option<crate::engine::ExitCode>,
+) -> (String, ratatui::style::Style) {
+    match tier {
+        None => ("未查".to_string(), p.dim()),
+        Some(rc) => {
+            let st = rc.doctor_state();
+            if st == crate::engine::State::Skip {
+                (format!("rc {}", rc.number()), p.dim())
+            } else {
+                (st.label().to_string(), p.state(st))
+            }
+        }
+    }
+}
 
 pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let block = body(app, "NW_HOME · 数据仓根 · 引擎发现");
@@ -23,6 +57,7 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         match app.settings_page {
             crate::app::SettingsPage::Panel => render_panel(frame, inner, app),
             crate::app::SettingsPage::Version => render_version(frame, inner, app),
+            crate::app::SettingsPage::Profiles => render_profiles(frame, inner, app),
         }
     }
     // 浮层优先级最低的常屏之上:手填输入浮层盖在指路屏上也成立
@@ -263,6 +298,94 @@ fn render_version(frame: &mut Frame, inner: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().border_style(p.dim())),
         inner,
+    );
+}
+
+/// 多派总览页(#107,spec #94 用户故事 21/22/23/28)。
+///
+/// 一个 NW_HOME 下并存多个派时,「谁降级谁漂移」要一眼看清;档位是
+/// **只读快照**:打开本页只读盘(`datarepo::list_profiles`),一个引擎命令都
+/// 不发——要档位按 `r` 显式刷新(规格用户故事 22:打开设置屏不偷偷跑一堆
+/// 引擎命令)。
+///
+/// 三态门与装配历史(#101)同口径:安装根本身不在/读不了 → 走共用指路件
+/// `home_signpost`(ADR-0010 §5:不各写一份),连列表都不画;安装根在但一个
+/// 派都没有 → 明说「还没有任何派」,不拿空列表冒充读到了数据。
+fn render_profiles(frame: &mut Frame, inner: Rect, app: &App) {
+    let p = &app.palette;
+    // 头部三行:页名 + 读的是哪座安装根 + 本页的只读口径。写在列表外面,
+    // 选中行因此永远不会落在一行说明上(说明不该被「选中」)。
+    let mut head: Vec<Line> = vec![
+        Line::from(Span::styled("多派总览", p.accent())),
+        Line::from(Span::styled(format!("  NW_HOME  {}", app.nw_home), p.dim())),
+    ];
+    // 安装根三态门:不可用时整块换成指路,不画列表(与装配历史同口径)
+    let signpost = crate::screens::home_signpost(app);
+    if !signpost.is_empty() {
+        head.extend(signpost);
+        frame.render_widget(Paragraph::new(head), inner);
+        return;
+    }
+    head.push(Line::from(Span::styled(
+        "  只读快照:打开本页不跑 doctor;档位按 r 显式刷新",
+        p.dim(),
+    )));
+    head.push(Line::from(Span::styled(
+        "  ↑/↓ 选派 · Enter 跳这一派的装配历史",
+        p.dim(),
+    )));
+    let Some(rows) = app.mp_rows.as_ref() else {
+        // 本会话还没翻开过:理论上进页面即读盘,这里是兜底,不画空列表
+        head.push(Line::from(Span::styled("  读不到派目录", p.dim())));
+        frame.render_widget(Paragraph::new(head), inner);
+        return;
+    };
+    if rows.is_empty() {
+        // 安装根在、profiles/ 里没有派:这是「还没装过」,不是「读不到」
+        head.push(Line::from(Span::styled(
+            "  还没有任何派:装第一个派之后这里才有东西可看",
+            p.dim(),
+        )));
+        frame.render_widget(Paragraph::new(head), inner);
+        return;
+    }
+    let n = rows.len();
+    let sel = app.mp_sel.min(n - 1);
+    let items: Vec<Line> = rows
+        .iter()
+        .map(|row| {
+            // 在途的那一派明说「对照中」:不拿旧结论冒充本次,也不说「未查」
+            let (word, style) = if app.mp_pending.iter().any(|q| q == &row.profile) {
+                ("对照中…".to_string(), p.dim())
+            } else {
+                tier_cell(p, row.tier)
+            };
+            // 灯与词同源:都从 `ExitCode::doctor_state()` 那一处映射来;
+            // 还没查过的那一派没有档位可灯,给空灯(○)不猜颜色。
+            let (lamp, lamp_style) = match row.tier {
+                Some(rc) => (p.lamp(rc.doctor_state()), p.state(rc.doctor_state())),
+                None => ("○", p.dim()),
+            };
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{lamp} "), lamp_style),
+                Span::raw(format!("{:<18}", row.profile)),
+                Span::raw(" "),
+                Span::styled(word, style),
+            ])
+        })
+        .collect();
+    // 头部定高、列表吃剩下的:两档都成立(紧凑态 66×50 内层 40+ 行,
+    // 放得下一座几十部的安装根;放不下时 List 自己滚,不折行、不截断)。
+    let [head_area, list_area] =
+        Layout::vertical([Constraint::Length(head.len() as u16), Constraint::Min(3)]).areas(inner);
+    frame.render_widget(Paragraph::new(head), head_area);
+    let mut st = ListState::default();
+    st.select(Some(sel));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(p.sel()),
+        list_area,
+        &mut st,
     );
 }
 
