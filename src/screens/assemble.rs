@@ -86,6 +86,52 @@ pub fn render_assemble(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(raw) = app.as_history_raw.as_ref() {
         render_history_raw(frame, area, app, raw);
     }
+    // 存档日志浮层(#103):同一层优先级。两个浮层互斥(键位链上一次只开
+    // 一个),同帧在场时后画的在上——测试按「一次只开一个」钉,不靠叠放次序。
+    if let Some(body) = app.as_history_log.as_ref() {
+        render_history_log(frame, area, app, body);
+    }
+}
+
+/// 存档日志浮层(#103,规格故事 18):居中薄浮层, stderr 副本照贴。
+/// 与清单原文浮层同族同几何(同一块 `popup` 算式),只换标题与收尾提示——
+/// 两个浮层的「点任意处 / Enter / Esc / q 关闭」也走同一条 `dismiss_popup`。
+fn render_history_log(frame: &mut Frame, area: Rect, app: &App, body: &str) {
+    let p = &app.palette;
+    let w = 72u16.min(area.width.saturating_sub(4));
+    let h = 20u16.min(area.height.saturating_sub(2));
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(Clear, popup);
+    let mut lines: Vec<Line> = body
+        .lines()
+        .map(|l| Line::from(Span::raw(l.to_string())))
+        .collect();
+    // 空存档不画一句假内容:明说「这一份里没有行」,与「没有这一份」分开
+    // (后者根本不进浮层,走日志区指路)。
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("(这一份里没有行)", p.dim())));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Enter / Esc 返回(stderr 旁路副本,只读)",
+        p.dim(),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 存档日志 ", p.accent().bold())),
+            )
+            .style(p.surface())
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        popup,
+    );
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
@@ -771,11 +817,12 @@ fn history_detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             )));
         }
     }
-    // 后续票的挂点(#102 回收站 / #103 存档日志):明写「随后续票」,不画一个
-    // 点了没反应的假动作段——点不到一个不存在的动作,比点得到更糟(#67)。
+    // 挂点(#102 回收站 / #103 存档日志):本票把存档日志这一条接上了,
+    // 回收站仍是随后续票。只写**在场**的入口——点不到一个不存在的动作,
+    // 比点得到更糟(#67)。
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  回收站与存档日志随后续票(#102 / #103)落地;本视图只读。",
+        "  l 回看这一派的存档日志(stderr 副本,只读);回收站随后续票 #102 落地。",
         p.dim(),
     )));
     lines

@@ -332,6 +332,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('r'),
     },
     HelpRow {
+        key: "l",
+        desc: "装配历史:回看选中派的存档日志(只读)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::HistoryView,
+        code: KeyCode::Char('l'),
+    },
+    HelpRow {
         key: "m",
         desc: "健康:切 体检 / 校验 / 复核",
         screen: Some(Screen::Health),

@@ -818,6 +818,7 @@ impl App {
                                          // 翻存档」这种半屏两义。
                 self.as_history = false;
                 self.as_history_raw = None;
+                self.as_history_log = None;
                 // 落盘旁路(#103):这一程的 stderr 副本现在开出来。安装根不在
                 // / 读不了时不开,并把原因说给人听——不凭空造一棵 logs/ 树
                 // (规格故事 28),也不静默丢日志(那等于骗人说「有存档`)。
@@ -954,6 +955,7 @@ impl App {
                 self.catalog_filter_on = false; // 编目册过滤同理(#69)
                 self.as_history_filter_on = false; // 装配历史过滤同理(#101)
                 self.as_history_raw = None; // 原文浮层不跨屏(#101)
+                self.as_history_log = None; // 存档日志浮层不跨屏(#103)
             }
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
@@ -1160,6 +1162,9 @@ impl App {
             // 清单原文浮层(#101):只收状态,历史视图与选中行原样不动——
             // 看原文不写任何选中态(规格故事 3 是「看」,不是「挑」)。
             self.as_history_raw = None;
+        } else if self.as_history_log.is_some() {
+            // 存档日志浮层(#103):同理,只收状态——回看日志不写任何选中态。
+            self.as_history_log = None;
         } else if self.vps_reverse_open() {
             // 反查上浮结果浮层返航(#70):只收状态,册体一行不改、机器册原选中行
             // 原样在场——反查从头到尾不写 `vps_sel`(它在途时册体键位被吞、回音
@@ -1434,6 +1439,14 @@ impl App {
             }
             return;
         }
+        // 存档日志浮层(#103):与清单原文浮层同级的顶层浮层——同一条吞键 /
+        // 同一条关闭链(Enter / Esc / q,鼠标点任意处走 `dismiss_popup`)。
+        if self.as_history_log.is_some() {
+            if matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                self.dismiss_popup();
+            }
+            return;
+        }
         // 反查上浮结果浮层(#70):与帮助浮层同级的**顶层浮层**——它在场时吞键,
         // 只有 Esc 返航;册体键位(↑/↓ / r / d / l / Enter / m)一个都不受理,
         // 机器册原选中行因此原样不动(规格故事 37:返航后回到原选中行)。
@@ -1676,6 +1689,10 @@ impl App {
                 }
             }
             KeyCode::Enter => self.show_history_raw(),
+            // 回看存档日志(#103,规格故事 18):选中派的清单里记着 lockId,
+            // 据此读 logs/<lockId>/<lockId>.log。与 Enter(看清单原文)分工:
+            // 原文答「以哪个锁装成的」,日志答「那次装配停在哪一步」。
+            KeyCode::Char('l') => self.show_history_log(),
             // 重读快照(#101):显式刷新,不自动跑——文件可能在面板之外变过
             // (引擎自己装了一版),要新的就按一下。
             KeyCode::Char('r') => {
@@ -1690,6 +1707,7 @@ impl App {
             KeyCode::Char('h') => {
                 self.as_history = false;
                 self.as_history_raw = None;
+                self.as_history_log = None;
                 self.as_history_filter_on = false;
             }
             // Esc 两级(#61 / #69 同口径):有过滤词先清词,再按才退视图。
@@ -1700,9 +1718,56 @@ impl App {
                 } else {
                     self.as_history = false;
                     self.as_history_raw = None;
+                    self.as_history_log = None;
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 回看选中派的存档日志(#103):清单给的 lockId 是唯一的线索,所以
+    /// **没有认得的清单就无从知道该读哪一份**——三条路各自说各自的话,
+    /// 不共用一个空态(与清单原文浮层同口径)。
+    fn show_history_log(&mut self) {
+        let Some(rows) = self.as_history_rows.as_ref() else {
+            return;
+        };
+        let Some(&i) = self.history_visible().get(self.as_history_sel) else {
+            // 一个派都没读到(或全被过滤词筛掉):说一句,别让按键像死了
+            self.push_log("装配历史里没有选中的派:没有存档日志可回看");
+            return;
+        };
+        let lock_id = match &rows[i].status {
+            crate::datarepo::ManifestStatus::Ok(a) => a.brief.lock_id.clone(),
+            crate::datarepo::ManifestStatus::Missing => {
+                self.push_log("这一派还没有清单:没有 lockId,也就没有存档日志可看");
+                return;
+            }
+            crate::datarepo::ManifestStatus::Broken { reason } => {
+                self.push_log(format!("清单读不通,取不到 lockId:{reason}"));
+                return;
+            }
+            crate::datarepo::ManifestStatus::UnknownSchema { guard } => {
+                self.push_log(guard.message.clone());
+                return;
+            }
+        };
+        let Some(lock_id) = lock_id.filter(|l| !l.trim().is_empty()) else {
+            self.push_log("这一派的清单没给 lockId:不知道存档日志该读哪一份");
+            return;
+        };
+        match crate::datarepo::read_log(&self.nw_home, &lock_id) {
+            crate::datarepo::LogArchive::Ok { body, .. } => {
+                self.as_history_log = Some(body);
+            }
+            crate::datarepo::LogArchive::Missing => {
+                self.push_log(format!(
+                    "这一派没有存档日志({lock_id} 从没在面板里跑过装配,或日志被清过)"
+                ));
+            }
+            crate::datarepo::LogArchive::Broken { reason } => {
+                self.push_log(format!("存档日志读不出:{reason}"));
+            }
         }
     }
 
@@ -3610,6 +3675,7 @@ impl App {
         self.catalog_filter_on = false; // 编目册过滤同理(#69):退输入态、留词
         self.as_history_filter_on = false; // 装配历史过滤同理(#101)
         self.as_history_raw = None; // 原文浮层不跨屏(#101)
+        self.as_history_log = None; // 存档日志浮层不跨屏(#103)
     }
 
     pub fn prev_screen(&mut self) {
@@ -3619,6 +3685,7 @@ impl App {
         self.catalog_filter_on = false;
         self.as_history_filter_on = false;
         self.as_history_raw = None;
+        self.as_history_log = None;
     }
 
     pub fn cycle_theme(&mut self) {
@@ -7330,6 +7397,7 @@ mod tests {
         as_history: bool,
         as_history_filter_on: bool,
         as_history_raw_on: bool,
+        as_history_log_on: bool,
         pending_editor: bool,
         mouse_enabled: bool,
         settings_page: SettingsPage,
@@ -7362,6 +7430,7 @@ mod tests {
             as_history: a.as_history,
             as_history_filter_on: a.as_history_filter_on,
             as_history_raw_on: a.as_history_raw.is_some(),
+            as_history_log_on: a.as_history_log.is_some(),
             pending_editor: a.pending_editor,
             mouse_enabled: a.mouse_enabled,
             settings_page: a.settings_page,
