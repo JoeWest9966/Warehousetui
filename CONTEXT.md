@@ -96,6 +96,10 @@ _Avoid_: 编辑器、生成器（面板不是通用文件编辑器：只写数�
 选中数据仓内一个本地 skill / extension 目录，图形化打成组件：面板自己算**目录校验和**（逐文件「相对路径 + 内容 sha256」一行，按行字典序拼起来再 sha256，排除 `.git/` 与 `node_modules/`——与上游 `manifest.DirHash` 同算法，于是面板算的值就是 bake / `up` 后来在同一棵树上算的值）、生成**组件清单**（`component.yaml`，schema 以数据仓现有组件为样本钉死：`apiVersion/kind/name/version/pi.package/packages/vendored/depends/params/config/env/requires`）。校验和与拟生成清单在确认闸摊开，确认才经 datarepo 写侧原子落盘（ADR-0010）。
 _Avoid_: 压缩包、打包命令（产物是一份组件清单，不是 tarball；面板不代跑 bake，也不复制 payload 文件——只写确认过的那一个文件）
 
+**配方编辑器（recipe editor）**：
+配方屏从只读升级为结构化编辑（spec #95 工单 #113）：加/删组件槽、改 env 声明（required 及默认）。编辑态经**结构化中间形状**往返（`datarepo::recipe::RecipeDoc`——块状 YAML 手写解析，不引 serde_yaml，只解析面板要编辑的 `components:` / `env:` 两条序列，其余顶层块原样保留），**面板不认识的自定义字段原样保留**（硬约束，fixture 断言往返不丢）。写回 `recipe.yaml` 走 datarepo 写侧：先把编辑态暂存成配方同目录的隐藏 scratch 喂引擎 `validate`（引擎代跑、argv 与健康屏同源）预跑，结果四态摊开，拟落账 + 图形确认后才经写侧原子落盘（tmp+rename）——确认前 `recipe.yaml` 一个字节都不落，预跑不过可不写回、数据仓状态不变。是「作者侧工具」八项之一（ADR-0010 §4 #113 行）。
+_Avoid_: 通用 yaml 编辑器（面板只写数据仓根之下的配方文件且全过确认闸；不是任意文件编辑器，也不是引擎命令）
+
 **跟随引擎（upstream-first）**：
 本面板不拥有任何领域决策：CLI 契约、领域词汇、「准许代跑哪些命令」的边界,一律以上游 Nous Warehouse 仓为唯一真相源;上游改,面板跟,不自创、不背离、不复刻引擎逻辑。
 _Avoid_: 兼容、适配（太被动;适配暗示以面板为主位）
