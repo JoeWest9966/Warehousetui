@@ -64,7 +64,10 @@ pub fn render_assemble(frame: &mut Frame, area: Rect, app: &App) {
     }
     // 右上注脚随次级视图换(#101):历史视图是只读档案,不是七步装配——
     // 不换的话屏上一直挂着「七步幂等装配」,讲一件此刻没发生的事。
-    let note = if app.as_history {
+    // 回收站(#102)同属只读档案,注脚照切。
+    let note = if app.as_bin {
+        "只读 · 回收站"
+    } else if app.as_history {
         "只读 · 清单存档"
     } else {
         "七步幂等装配"
@@ -75,6 +78,10 @@ pub fn render_assemble(frame: &mut Frame, area: Rect, app: &App) {
 
     if app.assembling {
         render_running(frame, inner, app);
+    } else if app.as_bin {
+        // 回收站是历史视图的下一层(#102):装配在途不受理,`as_bin` 已被
+        // `note_engine_dispatch` 清掉,这里照不到。
+        render_bin(frame, inner, app);
     } else if app.as_history {
         render_history(frame, inner, app);
     } else if let Some(out) = app.as_result.as_ref() {
@@ -545,6 +552,175 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// 常畅态:左栏派清单(55%)+ 右栏选中派明细(45%),与选择器的分栏同款。
+/// 回收站次级视图(#102):被换下的旧组件,只读。
+///
+/// 三道门与装配历史同口径:安装根不在先走指路(不拿空列表冒充「没有旧
+/// 组件」);其次空态(从没换下过 / pruned/ 被清过是同一件事);最后才分两档
+/// 画。几何与 [`render_history`] **同一组 Layout 常量**——命中区在
+/// `layout::assemble_hits` 里照这组常量重算,渲染与命中共用一份(ADR-0005)。
+fn render_bin(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    if let Some(_cause) = app.home_cause() {
+        frame.render_widget(
+            Paragraph::new(crate::screens::home_signpost(app))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .style(p.dim()),
+            area,
+        );
+        return;
+    }
+    if app.bin_total() == 0 {
+        frame.render_widget(Paragraph::new(bin_empty_lines(app, p)).style(p.dim()), area);
+        return;
+    }
+    match size_class(frame.area()) {
+        SizeClass::Comfy => render_bin_comfy(frame, area, app),
+        SizeClass::Compact => render_bin_compact(frame, area, app),
+    }
+}
+
+fn render_bin_comfy(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let cols =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
+    frame.render_stateful_widget(
+        bin_list(app, p, cols[0].width),
+        cols[0],
+        &mut bin_state(app),
+    );
+    frame.render_widget(
+        Paragraph::new(bin_detail_lines(app, cols[1].width))
+            .block(
+                Block::bordered()
+                    .border_style(p.dim())
+                    .title(Span::styled(" 选中条目的恢复地址 ", p.accent())),
+            )
+            .style(p.surface()),
+        cols[1],
+    );
+}
+
+fn render_bin_compact(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(12)]).split(area);
+    frame.render_stateful_widget(
+        bin_list(app, p, rows[0].width),
+        rows[0],
+        &mut bin_state(app),
+    );
+    frame.render_widget(
+        Paragraph::new(bin_detail_lines(app, rows[1].width)).style(p.surface()),
+        rows[1],
+    );
+}
+
+/// 选中态:`as_bin_sel` 是快照里的下标(回收站没有本地过滤,#102 不加),
+/// 钳在条数内。
+fn bin_state(app: &App) -> ListState {
+    let n = app.bin_total();
+    let mut st = ListState::default();
+    if n > 0 {
+        st.select(Some(app.as_bin_sel.min(n - 1)));
+    }
+    st
+}
+
+/// 回收站的行(一条一座被换下的旧组件):退场时刻 + 组件名。
+fn bin_list(app: &App, p: &crate::theme::Palette, width: u16) -> List<'static> {
+    use crate::screens::recipes::clip;
+    let w = history_text_width(Rect::new(0, 0, width, 0));
+    let items: Vec<Line<'static>> = app
+        .as_bin_rows
+        .as_ref()
+        .map(|rows| {
+            rows.iter()
+                .map(|e| {
+                    // 预算按构造算:时刻(17)+ 间隔(2)+ 组件名吃剩下那一截,
+                    // 整行恒不超宽(与册体行同一个 `clip` 纪律:截断,不折行)。
+                    let budget = w.saturating_sub(19);
+                    Line::from(vec![
+                        Span::styled(clip(&e.stamp, 17), p.info()),
+                        Span::raw("  "),
+                        Span::styled(clip(&e.component, budget), p.text()),
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    List::new(items)
+        .block(
+            Block::bordered()
+                .border_style(p.dim())
+                .title(Span::styled(" 回收站 ", p.accent())),
+        )
+        .highlight_style(p.sel())
+        .highlight_symbol("")
+}
+
+/// 回收站的空态(#102):「从没换下过」与「pruned/ 被清过」在文件面上是
+/// 同一件事——没有可恢复的地址。不报错,也不摆一个「读了个空目录」的假列表。
+fn bin_empty_lines(app: &App, p: &crate::theme::Palette) -> Vec<Line<'static>> {
+    let from = app
+        .as_bin_from
+        .as_deref()
+        .map(|f| format!("(从派 {f} 翻进来)"))
+        .unwrap_or_default();
+    vec![
+        Line::from(Span::styled(" 回收站是空的", p.dim())),
+        Line::from(Span::styled(
+            format!("  {from}没有被换下的旧组件:这一版装配没动过谁,或 pruned/ 已被清过。"),
+            p.dim(),
+        )),
+        Line::from(Span::styled(
+            "  只读:面板不删、不恢复,要找回请去 shell。",
+            p.dim(),
+        )),
+    ]
+}
+
+/// 选中条目的明细(#102):完整恢复路径是主角——操作者要的就是「去哪找回」
+/// 的准确地址(规格故事 6)。恢复动作本身在规格的 Out of Scope 里,面板只给
+/// 地址,执行权留给操作者。
+fn bin_detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    use crate::screens::recipes::clip;
+    let p = &app.palette;
+    let w = history_text_width(Rect::new(0, 0, width, 0));
+    let mut lines: Vec<Line> = Vec::new();
+    let Some(rows) = app.as_bin_rows.as_ref() else {
+        return vec![Line::from(Span::styled(
+            "  还没有读过(按 p 进视图即读)",
+            p.dim(),
+        ))];
+    };
+    let Some(e) = rows.get(app.as_bin_sel.min(rows.len().saturating_sub(1))) else {
+        return vec![Line::from(Span::styled("  没有选中的条目", p.dim()))];
+    };
+    if let Some(from) = app.as_bin_from.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("  视角   ", p.dim()),
+            Span::raw(clip(from, w.saturating_sub(8))),
+        ]));
+    }
+    for (label, value) in [("时刻", e.stamp.clone()), ("组件", e.component.clone())] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {label} "), p.dim()),
+            Span::styled(clip(&value, w.saturating_sub(8)), p.text()),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("  完整路径", p.dim())));
+    lines.push(Line::from(Span::styled(
+        clip(&e.path, w.saturating_sub(4)),
+        p.info(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  回车复制这条路径(面板不代恢复)",
+        p.dim(),
+    )));
+    lines
+}
+
 fn render_history_comfy(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     let cols =
@@ -771,11 +947,16 @@ fn history_detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             )));
         }
     }
-    // 后续票的挂点(#102 回收站 / #103 存档日志):明写「随后续票」,不画一个
+    // 回收站(#102 已落地)与存档日志(#103 未落地)的入口。已落地的那一个
+    // 给真动作段(`p` 翻回收站);没落地的那一个明写「随后续票」,不画一个
     // 点了没反应的假动作段——点不到一个不存在的动作,比点得到更糟(#67)。
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  回收站与存档日志随后续票(#102 / #103)落地;本视图只读。",
+        "  按 p 翻这一派的回收站(被换下的旧组件,只读)",
+        p.dim(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  存档日志随后续票(#103)落地;本视图只读。",
         p.dim(),
     )));
     lines
