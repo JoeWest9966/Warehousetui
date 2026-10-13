@@ -1599,20 +1599,32 @@ impl App {
             // 「一个组件都没有」,屏上明说无从对比,不拿空集冒充。
             _ => None,
         };
+        // 增列:在途有、旧态没有。旧态无从得知时(上一轮锁定集文件不在 /
+        // 读不通)**这一列照给**——在途这一份要铺什么是文件说了算的,与旧态
+        // 能不能读到无关;屏上另起一行说明删列无从得知。
         let added = match &old_names {
             Some(old) => new_names
                 .iter()
                 .filter(|n| !old.contains(n))
                 .cloned()
                 .collect(),
-            // 首次装配:没有旧态,在途这一份全部是将铺入
-            None if first_assembly => new_names.clone(),
-            None => Vec::new(),
+            None => new_names.clone(),
         };
+        // 删列:旧态有、在途没有。旧态无从得知时只能空着——空着不等于
+        // 「什么都没删」,屏上必须明说(见 render_ritual_diff)。
         let removed = match &old_names {
             Some(old) => old
                 .iter()
                 .filter(|n| !new_names.contains(n))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        // 未动:两侧都在。旧态无从得知时也给不出这一列。
+        let unchanged = match &old_names {
+            Some(old) => new_names
+                .iter()
+                .filter(|n| old.contains(n))
                 .cloned()
                 .collect(),
             None => Vec::new(),
@@ -1629,6 +1641,7 @@ impl App {
             old_hash,
             added,
             removed,
+            unchanged,
             first_assembly,
             hash_changes,
         });
@@ -7125,6 +7138,7 @@ mod tests {
         ov_sel: usize,
         as_sel: usize,
         as_confirm: bool,
+        as_ritual_page: crate::screens::RitualPage,
         hl_mode: HealthMode,
         hl_sel: usize,
         rc_domain: Domain,
@@ -7172,6 +7186,7 @@ mod tests {
             catalog_filter_on: a.catalog_filter_on,
             catalog_filter: a.catalog_filter.clone(),
             as_history: a.as_history,
+            as_ritual_page: a.as_ritual_page,
             as_history_filter_on: a.as_history_filter_on,
             as_history_raw_on: a.as_history_raw.is_some(),
             pending_editor: a.pending_editor,
@@ -7239,6 +7254,11 @@ mod tests {
             }
             if row.prep == Prep::HelpOpen {
                 app.help = true;
+            }
+            if row.prep == Prep::RitualOpen {
+                // 发射仪式(#104):`d` 翻页只在这个上下文里有分支
+                app.screen = Screen::Assemble;
+                app.as_confirm = true;
             }
             if row.prep == Prep::HistoryView {
                 // 装配历史次级视图(#101):`/` 过滤与 `r` 重读只在这个上下文
@@ -7938,6 +7958,27 @@ mod tests {
         );
         assert!(d.hash_changes, "换了锁定集:指纹会变(判据写在屏上)");
         assert_eq!(d.old_lock_id.as_deref(), Some("old-lock"));
+    }
+
+    #[test]
+    fn 对比页_同一锁定集重跑_两侧组件一个不动_指纹不变() {
+        // 上游幂等铁律:同 lock 连跑两次 up,manifest 逐字节一致 —— 面板据此
+        // 说「指纹不变」,不自己重算任何哈希。
+        let mut app = ritual_app("same");
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"old-lock","recipe":"research-desk"}]}"#,
+            )
+            .unwrap(),
+        );
+        app.as_ritual_page = crate::screens::RitualPage::Diff;
+        app.load_ritual_diff();
+        let d = app.as_ritual_diff.as_ref().expect("对比快照在场");
+        assert!(d.added.is_empty(), "同一锁定集:没有新增");
+        assert!(d.removed.is_empty(), "同一锁定集:没有删除");
+        assert_eq!(d.unchanged, vec!["scout", "retention"], "两侧都在(按在途文件顺序)");
+        assert!(!d.hash_changes, "同一 lock:指纹不变");
+        assert!(!d.first_assembly, "有旧态,不是首次装配");
     }
 
     #[test]

@@ -105,6 +105,8 @@ pub struct RitualDiff {
     pub added: Vec<String>,
     /// 组件删:上一轮有、在途没有(按上一轮文件的顺序)。
     pub removed: Vec<String>,
+    /// 两侧都在、这一份不动(按在途文件的顺序)。旧态无从得知时为空。
+    pub unchanged: Vec<String>,
     /// 清单缺失:首次装配、无旧态可比(规格故事 9)。
     pub first_assembly: bool,
     /// 指纹会不会变。判据只有 lockId 是否相同;没有旧指纹可比时为
@@ -237,7 +239,21 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// 发射前确认:展示将要发生什么。Enter 发射,Esc 返航。
+///
+/// #104 起仪式有两页(见 [`RitualPage`]):简报页与新旧对比页。两页
+/// **共用同一个弹层几何**——弹层大小与键位行位置一个字节不改,所以
+/// `layout::ritual_hits` 的命中区在兩页都成立(Enter 发射 / Esc 返航
+/// 两段照旧可点),不需要按页分叉几何。
 fn render_launch_ritual(frame: &mut Frame, area: Rect, app: &App) {
+    if matches!(app.as_ritual_page, RitualPage::Diff) {
+        render_ritual_diff(frame, area, app);
+        return;
+    }
+    render_ritual_brief(frame, area, app);
+}
+
+/// 简报页(#104 之前的既有内容,一行不改)。
+fn render_ritual_brief(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     let lock = app.ls.as_ref().and_then(|l| l.locks.get(app.as_sel));
     let w = 60u16.min(area.width.saturating_sub(4));
@@ -293,6 +309,12 @@ fn render_launch_ritual(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(crate::layout::RITUAL_KEY_GAP),
             Span::styled(crate::layout::RITUAL_KEY_RETURN, p.dim()),
         ]),
+        // 新键提示排在键位行**之下**:键位行是命中区的锚(layout::ritual_hits
+        // 的 y = popup.y + 10),往上加一行会把两段可点区域整体顶下去。
+        Line::from(Span::styled(
+            "  d 新旧对比:组件增删 + 指纹会不会变",
+            p.dim(),
+        )),
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -304,6 +326,177 @@ fn render_launch_ritual(frame: &mut Frame, area: Rect, app: &App) {
             .style(p.surface()),
         popup,
     );
+}
+
+/// 新旧对比页(#104,规格故事 8/9)。
+///
+/// 弹层几何与简报页**逐字节相同**(同一个 `popup_rect` 60×14),所以
+/// `layout::ritual_hits` 的「Enter 发射 / Esc 返航」两段命中区在这页
+/// 照样成立——键位行仍是同一行、同两段。`d 返回` 只是 dim 提示:
+/// 键盘翻页,不为它新开命中区(与 #101 历史视图的 `h`/`/`/`r` 同口径:
+/// 次级视图键位先不铺鼠标入口)。
+fn render_ritual_diff(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 14u16.min(area.height.saturating_sub(2));
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(Clear, popup);
+    let mut lines = ritual_diff_lines(app, p);
+    // 键位行与简报页同一行位(见 layout::ritual_hits 的 y = popup.y + 10):
+    // 仍是「Enter 发射 / Esc 返航」两段,命中区一个字节不改。
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(crate::layout::RITUAL_KEY_LAUNCH, p.accent().bold()),
+        Span::raw(crate::layout::RITUAL_KEY_GAP),
+        Span::styled(crate::layout::RITUAL_KEY_RETURN, p.dim()),
+    ]));
+    lines.push(Line::from(Span::styled("  d 返回简报页", p.dim())));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 发射仪式 · 新旧对比 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+/// 对比页正文(纯函数:快照 → 行)。四种读取结论各有各的说法,
+/// **互不冒充**:
+/// - 清单缺失 = 首次装配、无旧态可比(规格故事 9);
+/// - 清单读不通 / schema 不认得 = 只给证据,增删两列一并收起
+///   (不拿半份对比糊脸,也不按旧形状降级解析);
+/// - 上一轮锁定集文件不在 = 删列明说无从得知,不拿空集冒充「什么都没删」。
+fn ritual_diff_lines(app: &App, p: &crate::theme::Palette) -> Vec<Line<'static>> {
+    let Some(d) = app.as_ritual_diff.as_ref() else {
+        return vec![Line::from(Span::styled(
+            "  对比读不到,按 d 返回。",
+            p.dim(),
+        ))];
+    };
+    let mut out: Vec<Line<'static>> = Vec::new();
+    match &d.manifest {
+        Some(crate::datarepo::ManifestStatus::Ok(a)) => {
+            out.push(Line::from(vec![
+                Span::raw("  上一轮   "),
+                Span::styled(
+                    a.brief.lock_id.clone().unwrap_or_else(|| "—".into()),
+                    p.dim(),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    a.brief.installed_at.clone().unwrap_or_else(|| "—".into()),
+                    p.dim(),
+                ),
+            ]));
+            // 指纹侧:清单现值原样呈现 + 会不会变的判据(判据写在屏上)
+            out.push(Line::from(vec![
+                Span::raw("  指纹     "),
+                Span::styled(
+                    a.brief.converge_hash.clone().unwrap_or_else(|| "—".into()),
+                    p.dim(),
+                ),
+                Span::raw(if d.hash_changes {
+                    "  → 会变"
+                } else {
+                    "  → 不变"
+                }),
+            ]));
+            out.push(Line::from(Span::styled(
+                if d.hash_changes {
+                    "  换了锁定集:收敛指纹会变(同 lock 重跑才逐字节不变)"
+                } else {
+                    "  同一锁定集:收敛指纹不变(上游幂等铁律)"
+                },
+                p.dim(),
+            )));
+        }
+        Some(crate::datarepo::ManifestStatus::Missing) => {
+            out.push(Line::from(Span::styled(
+                "  首次装配、无旧态可比:下面是这一份将铺入的全部组件。",
+                p.warn(),
+            )));
+        }
+        Some(crate::datarepo::ManifestStatus::Broken { reason }) => {
+            out.push(Line::from(Span::styled(
+                format!("  清单读不通:{reason}"),
+                p.warn(),
+            )));
+            out.push(Line::from(Span::styled(
+                "  读不通就不比:不按旧形状猜一份旧态出来。",
+                p.dim(),
+            )));
+            return out;
+        }
+        Some(crate::datarepo::ManifestStatus::UnknownSchema { guard }) => {
+            out.push(Line::from(Span::styled(
+                format!("  需升级 nw:清单 schema 不认得({})", guard.message),
+                p.warn(),
+            )));
+            out.push(Line::from(Span::styled(
+                "  不按旧形状降级解析,增删两列收起。",
+                p.dim(),
+            )));
+            return out;
+        }
+        None => {
+            out.push(Line::from(Span::styled(
+                "  还没读,按 d 翻到本页即读。",
+                p.dim(),
+            )));
+            return out;
+        }
+    }
+    // 增 / 删两列
+    out.push(Line::from(Span::styled("  组件", p.accent())));
+    if d.first_assembly {
+        out.push(Line::from(vec![
+            Span::styled("    将铺入  ", p.ok()),
+            Span::raw(names_line(&d.added, 40)),
+        ]));
+    } else {
+        out.push(Line::from(vec![
+            Span::styled("    增      ", p.ok()),
+            Span::raw(names_line(&d.added, 40)),
+        ]));
+        out.push(Line::from(vec![
+            Span::styled("    删      ", p.fail()),
+            Span::raw(names_line(&d.removed, 40)),
+        ]));
+        out.push(Line::from(vec![
+            Span::styled("    未动    ", p.dim()),
+            Span::raw(names_line(&d.unchanged, 40)),
+        ]));
+        // 旧态组件面无从得知时明说(与「什么都没删」是两件事)
+        if !matches!(d.old_lock, Some(crate::datarepo::LockStatus::Ok(_))) {
+            out.push(Line::from(Span::styled(
+                "    上一轮的锁定集读不到:删列无从得知,不是「什么都没删」。",
+                p.dim(),
+            )));
+        } else if d.added.is_empty() && d.removed.is_empty() {
+            out.push(Line::from(Span::styled(
+                "    两侧组件相同,一个不动。",
+                p.dim(),
+            )));
+        }
+    }
+    out
+}
+
+/// 组件名一行摊平(窄档靠 `clip` 截断,不折行——折行会多占一行,
+/// 弹层里没有位置给它)。
+fn names_line(names: &[String], width: usize) -> String {
+    if names.is_empty() {
+        return "——".to_string();
+    }
+    crate::screens::recipes::clip(&names.join("、"), width)
 }
 
 fn render_running(frame: &mut Frame, area: Rect, app: &App) {
