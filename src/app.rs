@@ -363,6 +363,12 @@ pub struct App {
     /// 清单原文浮层(#101,规格故事 3):回车看选中派那份 `.nw-manifest`
     /// 的原文。`None` = 不在场。
     pub as_history_raw: Option<String>,
+    /// 发射仪式翻到哪一页(#104):简报页(默认)/ 新旧对比页。仪式只有两页,
+    /// `Enter` 发射 / `Esc` 返航 在两页同一语义(规格故事 10)。
+    pub as_ritual_page: crate::screens::RitualPage,
+    /// 新旧对比页的快照(#104):翻到该页时经 [`crate::datarepo`] 读一次,
+    /// `None` = 还没读过。**快照语义**——与 #101 历史视图同口径,不轮询。
+    pub as_ritual_diff: Option<crate::screens::RitualDiff>,
     /// 回收站次级视图(#102):装配屏里看 `pruned/<时间戳>/` 下被换下的旧组件。
     pub as_bin: bool,
     /// 回收站快照(#102):只在进视图 / 按 `r` 时读一次,不轮询。
@@ -644,6 +650,8 @@ impl App {
             as_history_filter: String::new(),
             as_history_filter_on: false,
             as_history_raw: None,
+            as_ritual_page: crate::screens::RitualPage::Brief,
+            as_ritual_diff: None,
             as_bin: false,
             as_bin_rows: None,
             as_bin_sel: 0,
@@ -1212,6 +1220,7 @@ impl App {
             self.help_offset = 0; // 关浮层即归零:重开总是从首行看起
         } else if self.as_confirm {
             self.as_confirm = false;
+            self.as_ritual_diff = None;
             self.push_log("发射取消");
         } else if self.as_history_raw.is_some() {
             // 清单原文浮层(#101):只收状态,历史视图与选中行原样不动——
@@ -1638,10 +1647,134 @@ impl App {
     /// 发射仪式确认浮层:Enter 发射,Esc 返航。
     fn on_key_confirm(&mut self, k: KeyEvent) {
         match k.code {
+            // 红线(#104 规格故事 10):两页同一语义,一个字节不改。
             KeyCode::Enter => self.launch_selected_lock(),
             KeyCode::Esc | KeyCode::Char('q') => self.dismiss_popup(),
+            // 翻到新旧对比页 / 翻回来(#104):进出一个键,与 #101 历史视图的
+            // `h` 同口径。Esc 仍一路返航——不因为站在对比页就变成「回上一页」。
+            KeyCode::Char('d') => {
+                self.as_ritual_page = match self.as_ritual_page {
+                    crate::screens::RitualPage::Brief => crate::screens::RitualPage::Diff,
+                    crate::screens::RitualPage::Diff => crate::screens::RitualPage::Brief,
+                };
+                if matches!(self.as_ritual_page, crate::screens::RitualPage::Diff) {
+                    self.load_ritual_diff();
+                }
+            }
             _ => {}
         }
+    }
+
+    /// 读一遍新旧对比(#104,规格故事 8/9)。
+    ///
+    /// 走 [`crate::datarepo`] 唯一接缝:选中锁定集的载体文件 + 当前清单 +
+    /// 清单指名的上一轮锁定集,屏幕层与 app 层都不碰文件系统(规格故事
+    /// 27)。**快照语义**:只在翻到该页时读一次,不轮询、不自动刷——与
+    /// #101 历史视图同口径。
+    ///
+    /// 判词全部来自文件,面板不重算引擎的任何结论:增 / 删是两侧组件名
+    /// 的集合差(按名比);指纹「会变 / 不变」的判据只有「清单记的 lockId
+    /// 与在途这一份是否相同」(上游铁律:同 lock 连跑两次 `up`,manifest
+    /// 逐字节一致)。没有旧指纹可比时两个都不说。
+    pub fn load_ritual_diff(&mut self) {
+        let nw_home = self.nw_home.clone();
+        let new_lock_id = self
+            .ls
+            .as_ref()
+            .and_then(|l| l.locks.get(self.as_sel))
+            .and_then(|l| l.lock_id.clone());
+        // ls 锁行的 `name`(目标派)是老口径,但真样本的锁行不一定带它;
+        // 权威答案在锁定集文件自己的 `profile` 字段里(见下一段)。
+        let ls_profile = self
+            .ls
+            .as_ref()
+            .and_then(|l| l.locks.get(self.as_sel))
+            .and_then(|l| l.name.clone())
+            .unwrap_or_default();
+        let lock = new_lock_id
+            .as_deref()
+            .map(|id| crate::datarepo::read_lock(&nw_home, id));
+        // 目标派以锁定集文件里的 `profile` 为准(ls 的锁行不一定带它),
+        // 读不到才退到 ls 锁行的 `name`。
+        let profile = match &lock {
+            Some(crate::datarepo::LockStatus::Ok(l)) => {
+                l.profile.clone().unwrap_or_else(|| ls_profile.clone())
+            }
+            _ => ls_profile.clone(),
+        };
+        let manifest = crate::datarepo::read_manifest(&nw_home, &profile);
+        // 旧态组件面:清单自己记的那个 lock 的锁定集文件。清单缺失 = 首次
+        // 装配,没有旧态可比(规格故事 9)——不摆一个吓人的空对比。
+        let (old_lock_id, old_hash, first_assembly) = match &manifest {
+            crate::datarepo::ManifestStatus::Ok(a) => (
+                a.brief.lock_id.clone(),
+                a.brief.converge_hash.clone(),
+                false,
+            ),
+            crate::datarepo::ManifestStatus::Missing => (None, None, true),
+            // 读不通 / 不认识的 schema:不当成「没有旧态」,也不当成就着它算差
+            // —— 屏上走契约守卫同款话术,增删两列一并收起(见 render_diff)。
+            _ => (None, None, false),
+        };
+        let old_lock = old_lock_id
+            .as_deref()
+            .map(|id| crate::datarepo::read_lock(&nw_home, id));
+        let new_names = match &lock {
+            Some(crate::datarepo::LockStatus::Ok(l)) => l.components.clone(),
+            _ => Vec::new(),
+        };
+        let old_names = match &old_lock {
+            Some(crate::datarepo::LockStatus::Ok(l)) => Some(l.components.clone()),
+            // 上一轮锁定集文件不在 / 读不通:旧态组件面无从得知。这不是
+            // 「一个组件都没有」,屏上明说无从对比,不拿空集冒充。
+            _ => None,
+        };
+        // 增列:在途有、旧态没有。旧态无从得知时(上一轮锁定集文件不在 /
+        // 读不通)**这一列照给**——在途这一份要铺什么是文件说了算的,与旧态
+        // 能不能读到无关;屏上另起一行说明删列无从得知。
+        let added = match &old_names {
+            Some(old) => new_names
+                .iter()
+                .filter(|n| !old.contains(n))
+                .cloned()
+                .collect(),
+            None => new_names.clone(),
+        };
+        // 删列:旧态有、在途没有。旧态无从得知时只能空着——空着不等于
+        // 「什么都没删」,屏上必须明说(见 render_ritual_diff)。
+        let removed = match &old_names {
+            Some(old) => old
+                .iter()
+                .filter(|n| !new_names.contains(n))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        // 未动:两侧都在。旧态无从得知时也给不出这一列。
+        let unchanged = match &old_names {
+            Some(old) => new_names
+                .iter()
+                .filter(|n| old.contains(n))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        let hash_changes = match (&old_lock_id, &new_lock_id) {
+            (Some(old), Some(new)) => old != new,
+            _ => false,
+        };
+        self.as_ritual_diff = Some(crate::screens::RitualDiff {
+            manifest: Some(manifest),
+            lock,
+            old_lock,
+            old_lock_id,
+            old_hash,
+            added,
+            removed,
+            unchanged,
+            first_assembly,
+            hash_changes,
+        });
     }
 
     fn screen_key(&mut self, k: KeyEvent) {
@@ -1712,7 +1845,9 @@ impl App {
                 }
             }
             KeyCode::Enter if !self.assembling && self.reg_state == RegState::Idle && n > 0 => {
-                self.as_confirm = true
+                self.as_confirm = true;
+                // #104:每次开仪式都从简报页起——上一轮停在对比页不带给下一轮
+                self.as_ritual_page = crate::screens::RitualPage::Brief;
             }
             // 装配中止(#59):在途才受理,键位取本屏未占用的 `x`。Esc 是
             // 发射前「返航」的既有语义(还没下发,什么都没发生),两个取消
@@ -4036,6 +4171,8 @@ impl App {
             self.queue
                 .push(commands::up(&self.lock_carrier(&lock), None));
             self.as_confirm = false;
+            // #104:发射即收仪式,对比快照不跨程(下一程的旧态是新的清单)
+            self.as_ritual_diff = None;
         } else {
             self.push_log("没有选中的锁定集");
         }
@@ -8205,6 +8342,7 @@ mod tests {
         ov_sel: usize,
         as_sel: usize,
         as_confirm: bool,
+        as_ritual_page: crate::screens::RitualPage,
         hl_mode: HealthMode,
         hl_sel: usize,
         rc_domain: Domain,
@@ -8254,6 +8392,7 @@ mod tests {
             catalog_filter_on: a.catalog_filter_on,
             catalog_filter: a.catalog_filter.clone(),
             as_history: a.as_history,
+            as_ritual_page: a.as_ritual_page,
             as_history_filter_on: a.as_history_filter_on,
             as_history_raw_on: a.as_history_raw.is_some(),
             as_bin: a.as_bin,
@@ -8323,6 +8462,11 @@ mod tests {
             }
             if row.prep == Prep::HelpOpen {
                 app.help = true;
+            }
+            if row.prep == Prep::RitualOpen {
+                // 发射仪式(#104):`d` 翻页只在这个上下文里有分支
+                app.screen = Screen::Assemble;
+                app.as_confirm = true;
             }
             if row.prep == Prep::HistoryView {
                 // 装配历史次级视图(#101):`/` 过滤与 `r` 重读只在这个上下文
@@ -9044,5 +9188,247 @@ mod tests {
         }
         assert!(!app.as_history, "up 一下发,历史视图清场");
         assert!(app.as_running, "装配态接管");
+    }
+
+    // ---- #104 发射前 diff 预览:仪式多一页,Enter/Esc 语义不动 ----
+
+    /// 一座 fixture 安装根 + 一份选中锁定集(#104):清单记着上一轮
+    /// `old-lock`,在途这一份是 `new-lock`,两边组件集合有增有删。
+    fn ritual_diff_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nwt-ritual-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pd = dir.join("profiles").join("desk");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join(".nw-manifest"),
+            r#"{"schema":"nw/manifest.v1","lockId":"old-lock","profile":"desk","recipe":"research-desk","version":"1.0.0","runtimeKey":"rk","installedAt":"2026-10-01T00:00:00Z","convergeHash":"3cf6a584a523b35ec42630766a9eb6a84d3dcf11d2347d5aa3f3ae879b420502","engine":"0.1.0"}"#,
+        )
+        .unwrap();
+        let ld = dir.join("locks");
+        std::fs::create_dir_all(&ld).unwrap();
+        // 上一轮锁定集:scout + retention(与清单 lockId 对得上)
+        std::fs::write(
+            ld.join("old-lock.nwlock"),
+            r#"{"schema":"nw/lock.v1","lockId":"old-lock","profile":"desk","components":[{"name":"scout"},{"name":"retention"}]}"#,
+        )
+        .unwrap();
+        // 在途这一份:retention 留着,scout 走了,新来 mcp-server
+        std::fs::write(
+            ld.join("new-lock.nwlock"),
+            r#"{"schema":"nw/lock.v1","lockId":"new-lock","profile":"desk","components":[{"name":"mcp-server"},{"name":"retention"}]}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// 一台「选中锁定集 = new-lock、安装根是 fixture」的台子(#104)。
+    fn ritual_app(tag: &str) -> App {
+        let mut app = App::with_runner(Arc::new(FakeRunner::new(&[])));
+        app.screen = Screen::Assemble;
+        app.nw_home = ritual_diff_home(tag).display().to_string();
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"new-lock","recipe":"research-desk"}]}"#,
+            )
+            .unwrap(),
+        );
+        app.as_sel = 0;
+        app.as_confirm = true;
+        app
+    }
+
+    #[test]
+    fn 发射仪式_d键翻新旧对比页_再按回简报页() {
+        let mut app = ritual_app("toggle");
+        assert!(
+            matches!(app.as_ritual_page, crate::screens::RitualPage::Brief),
+            "开场是既有的简报页"
+        );
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            matches!(app.as_ritual_page, crate::screens::RitualPage::Diff),
+            "d 翻到新旧对比页"
+        );
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            matches!(app.as_ritual_page, crate::screens::RitualPage::Brief),
+            "再按 d 回简报页:进出一个键,不必记两个"
+        );
+    }
+
+    #[test]
+    fn 对比页_esc仍返航_enter仍发射_肌肉记忆不作废() {
+        // 规格故事 10:预览只是仪式中间一页,两个既有键的语义一个字节不改。
+        let (runner, mut app) = up_inflight_app();
+        app.nw_home = ritual_diff_home("keys").display().to_string();
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"new-lock","recipe":"research-desk"}]}"#,
+            )
+            .unwrap(),
+        );
+        app.as_sel = 0;
+        app.as_confirm = true;
+        app.as_ritual_page = crate::screens::RitualPage::Diff;
+        app.load_ritual_diff();
+        // Esc:仍是返航(关仪式 + 留自己的话),不因为站在对比页就变成「回上一页」
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.as_confirm, "对比页上 Esc 照样返航");
+        assert!(
+            app.log.iter().any(|l| l.contains("发射取消")),
+            "返航留自己的话:{:?}",
+            app.log
+        );
+        assert_eq!(runner.abort_count(), 0, "返航不碰运行器(还没下发)");
+        // Enter:仍是发射(入队 up),不因为站在对比页就要多按一次
+        app.as_confirm = true;
+        app.as_ritual_page = crate::screens::RitualPage::Diff;
+        app.load_ritual_diff();
+        let qlen = app.queue.len();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.queue.len(), qlen + 1, "对比页上 Enter 照样发射");
+        assert!(
+            app.queue.last().unwrap().iter().any(|a| a == "up"),
+            "入队的还是 up:{:?}",
+            app.queue.last()
+        );
+    }
+
+    #[test]
+    fn 重开仪式回到简报页_不把上一轮的对比页带给下一次() {
+        let mut app = ritual_app("reopen");
+        app.as_ritual_page = crate::screens::RitualPage::Diff;
+        app.load_ritual_diff();
+        // 返航( Esc )再重开:页码归位,不然操作者按 Enter 后莫名站在对比页
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.as_confirm, "重开仪式");
+        assert!(
+            matches!(app.as_ritual_page, crate::screens::RitualPage::Brief),
+            "重开必回简报页"
+        );
+    }
+
+    #[test]
+    fn 对比页_组件增删按名做集合差_不猜旧态() {
+        let mut app = ritual_app("diff");
+        app.as_ritual_page = crate::screens::RitualPage::Diff;
+        app.load_ritual_diff();
+        let d = app.as_ritual_diff.as_ref().expect("对比快照在场");
+        // 增:在途有、上一轮没有
+        assert_eq!(d.added, vec!["mcp-server"], "只有 mcp-server 是新增");
+        // 删:上一轮有、在途没有
+        assert_eq!(d.removed, vec!["scout"], "只有 scout 被换下");
+        // retention 两侧都在:既不进增也不进删
+        assert!(!d.added.contains(&"retention".to_string()));
+        assert!(!d.removed.contains(&"retention".to_string()));
+        // 指纹侧:清单现值 + 判定,面板不重算任何哈希
+        assert_eq!(
+            d.old_hash.as_deref(),
+            Some("3cf6a584a523b35ec42630766a9eb6a84d3dcf11d2347d5aa3f3ae879b420502")
+        );
+        assert!(d.hash_changes, "换了锁定集:指纹会变(判据写在屏上)");
+        assert_eq!(d.old_lock_id.as_deref(), Some("old-lock"));
+    }
+
+    #[test]
+    fn 对比页_两段可点区不因新页移动_点发射照旧入队() {
+        // #104 只加一页,不动弹层几何:命中区(Enter 发射 / Esc 返航两段)
+        // 在对比页必须一个像素都不移,点下去与键盘同路。
+        let (runner, mut app) = up_inflight_app();
+        app.size = Rect::new(0, 0, 80, 30);
+        app.nw_home = ritual_diff_home("mouse").display().to_string();
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"new-lock","recipe":"research-desk"}]}"#,
+            )
+            .unwrap(),
+        );
+        app.as_sel = 0;
+        app.as_confirm = true;
+        app.as_ritual_page = crate::screens::RitualPage::Diff;
+        app.load_ritual_diff();
+        let brief_y = {
+            app.as_ritual_page = crate::screens::RitualPage::Brief;
+            let y = hit_target(&app, |t| *t == Target::Activate).y;
+            app.as_ritual_page = crate::screens::RitualPage::Diff;
+            y
+        };
+        assert_eq!(
+            hit_target(&app, |t| *t == Target::Activate).y,
+            brief_y,
+            "对比页上发射段还在同一行"
+        );
+        let qlen = app.queue.len();
+        let act = hit_target(&app, |t| *t == Target::Activate);
+        click(&mut app, act);
+        assert_eq!(app.queue.len(), qlen + 1, "对比页上点发射 = 按 Enter");
+        assert!(!app.as_confirm, "发射后仪式关闭");
+        let _ = runner;
+    }
+
+    #[test]
+    fn 对比页_同一锁定集重跑_两侧组件一个不动_指纹不变() {
+        // 上游幂等铁律:同 lock 连跑两次 up,manifest 逐字节一致 —— 面板据此
+        // 说「指纹不变」,不自己重算任何哈希。
+        let mut app = ritual_app("same");
+        app.ls = Some(
+            serde_json::from_str(
+                r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"old-lock","recipe":"research-desk"}]}"#,
+            )
+            .unwrap(),
+        );
+        app.as_ritual_page = crate::screens::RitualPage::Diff;
+        app.load_ritual_diff();
+        let d = app.as_ritual_diff.as_ref().expect("对比快照在场");
+        assert!(d.added.is_empty(), "同一锁定集:没有新增");
+        assert!(d.removed.is_empty(), "同一锁定集:没有删除");
+        assert_eq!(
+            d.unchanged,
+            vec!["scout", "retention"],
+            "两侧都在(按在途文件顺序)"
+        );
+        assert!(!d.hash_changes, "同一 lock:指纹不变");
+        assert!(!d.first_assembly, "有旧态,不是首次装配");
+    }
+
+    #[test]
+    fn 对比页_清单缺失时明示首次装配_不摆空对比() {
+        let mut app = ritual_app("first");
+        // 把清单挪走:新派第一次装配,没有旧态可比
+        let home = std::path::PathBuf::from(app.nw_home.clone());
+        std::fs::remove_file(home.join("profiles").join("desk").join(".nw-manifest")).unwrap();
+        app.as_ritual_page = crate::screens::RitualPage::Diff;
+        app.load_ritual_diff();
+        let d = app.as_ritual_diff.as_ref().expect("对比快照在场");
+        assert_eq!(
+            d.added,
+            vec!["mcp-server", "retention"],
+            "首次装配:全是将铺入"
+        );
+        assert!(d.removed.is_empty(), "没有旧态,删除列无可比内容");
+        assert!(d.first_assembly, "明示首次装配、无旧态可比");
+        assert!(
+            !d.hash_changes,
+            "没有旧指纹可对比:不说「会变」也不说「不变」"
+        );
     }
 }

@@ -36,6 +36,10 @@ pub const MANIFEST_FILE: &str = ".nw-manifest";
 /// 「需升级 nw」话术,不按旧形状降级解析)。
 pub const MANIFEST_SCHEMA: &str = "nw/manifest.v1";
 
+/// 内嵌锁定集 schema(上游 `nw/lock.v1`:bake 的 `data.lock` 与
+/// `$NW_HOME/locks/*.nwlock` 同一个形状)。
+pub const LOCK_SCHEMA: &str = "nw/lock.v1";
+
 /// 安装根下的派目录(每个派一部,清单住在其根部)。
 pub const PROFILES_DIR: &str = "profiles";
 
@@ -225,6 +229,115 @@ pub fn read_manifest(nw_home: &str, profile: &str) -> ManifestStatus {
     }
 }
 
+/// 一份锁定集存档(#104):面板从 `nw/lock.v1` 里只取**组件名**。
+///
+/// 为什么只取组件名:发射前 diff 要答的是「这次会改变什么」,而组件名集合
+/// 是唯一两侧都有的可比面(见 [`read_lock`]。sha256 / landing / packages
+/// 一概不取——面板不拿它们做任何判断,取了就是第二真相源。
+///
+/// 同 [`ManifestArchive`]:不派生相等性(内嵌 `Vec<String>` 虽可比,但
+/// 与另一侧的读取结论并排时没有比较的意义,测试按字段断言)。
+#[derive(Clone, Debug)]
+pub struct LockArchive {
+    /// 这份锁定集的目标派(`nw/lock.v1` 的 `profile`)。发射前 diff 靠它
+    /// 指到「该看哪个派的清单」——`ls` 的锁行不一定带这个字段(真样本
+    /// 只有 lockId / recipe / bakedAt / assets),所以以文件为准。
+    pub profile: Option<String>,
+    /// 组件名,**照文件里的顺序**(引擎写盘确定性:同输入重烤同锁,
+    /// 上游 `nw/lock.v1` 文档明写「同 lock 连跑两次 manifest 逐字节
+    /// 一致」)。集合差按名比,呈现顺序各侧保持原样——不重排,
+    /// 免得把引擎给的顺序悄悄换成面板的口味。
+    pub components: Vec<String>,
+    /// 文件落点(只读呈现;面板不写)。
+    pub path: String,
+}
+
+/// 锁定集存档的读取结论:**四种分类,没有第五种**(与
+/// [`ManifestStatus`] 同一套判词,屏幕层一处映射两种结论)。
+#[derive(Clone, Debug)]
+pub enum LockStatus {
+    /// 认得也读通了。
+    Ok(LockArchive),
+    /// 文件不在:锁定集被清过,或压根没 bake 过。
+    Missing,
+    /// 文件在但读不通:不是合法 JSON(载体也可能是装配命令 sh 脚本),
+    /// 或缺 `schema` 字段。
+    Broken { reason: String },
+    /// JSON 合法、`schema` 不认得:契约守卫同款「需升级 nw」五字段证据。
+    UnknownSchema { guard: crate::engine::Evidence },
+}
+
+/// 读一份锁定集存档(`$NW_HOME/locks/<lockId>.nwlock`,只读)。
+///
+/// 落点复用 [`lock_carrier`](self::lock_carrier) 那一份(面板按
+/// 引擎 `ls` 的 locks 域同一落点把 lockId 还原成文件);本方法不拼
+/// 第二个路径形状。
+///
+/// #104 的两侧对比面
+///
+/// 上游契约:`nw/manifest.v1`(`.nw-manifest`)**不记组件**——它只有
+/// `lockId` / `recipe` / `convergeHash` 等摘要字段(真样本见
+/// `docs/real-first-run/envelopes/doctor-profile.json` 的 `data.manifest`);
+/// 组件集合只住在 `nw/lock.v1` 里。所以「旧态装了哪些组件」这一问,
+/// 文件面上唯一的答案是**清单自己记的那个 lockId 对应的锁定集文件**
+/// (`locks/<manifest.lockId>.nwlock`)——本方法就是为读它而立的第二侧。
+/// 那不是引擎的收敛逻辑,只是把两份文件各读一遍再按名做集合差。
+pub fn read_lock(nw_home: &str, lock_id: &str) -> LockStatus {
+    let path = std::path::PathBuf::from(lock_carrier(nw_home, lock_id));
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LockStatus::Missing,
+        Err(e) => {
+            return LockStatus::Broken {
+                reason: format!("锁定集读不出:{e}"),
+            }
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return LockStatus::Broken {
+                reason: format!("锁定集不是合法 JSON:{e}"),
+            }
+        }
+    };
+    let Some(schema) = value.get("schema").and_then(|s| s.as_str()) else {
+        return LockStatus::Broken {
+            reason: "锁定集缺 schema 字段:不知道这是哪一版".into(),
+        };
+    };
+    if schema.trim().is_empty() {
+        return LockStatus::Broken {
+            reason: "锁定集 schema 是空的:不知道这是哪一版".into(),
+        };
+    }
+    if schema != LOCK_SCHEMA {
+        let nw = value.get("engine").and_then(|n| n.as_str()).unwrap_or("——");
+        return LockStatus::UnknownSchema {
+            guard: crate::engine::manifest_schema_guard(schema, nw),
+        };
+    }
+    // 只取组件名:缺 components 键按空数组(上游 omitempty 的老锁定集
+    // 也可能没有它),形状坏了才报读不通——空与坏是两件事。
+    let components = value
+        .get("components")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    LockStatus::Ok(LockArchive {
+        profile: value
+            .get("profile")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
+        components,
+        path: path.display().to_string(),
+    })
+}
 /// 回收站里的一条:一次退场的一座旧组件(#102)。
 ///
 /// 上游事实(`docs/research/nw-cli-surface.md` §4、`nw-journeys-and-docs.md`):
@@ -658,6 +771,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 往 `locks/` 里写一份 `.nwlock`(字段照引擎 bake 的 `data.lock`
+    /// 真样本:见 `docs/real-first-run/envelopes/bake.json`)。
+    fn write_lock(home: &std::path::Path, lock_id: &str, text: &str) {
+        let dir = home.join(LOCKS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{lock_id}.nwlock")), text).unwrap();
     }
 
     #[test]
@@ -1217,6 +1338,76 @@ mod tests {
         match read_manifest(home.to_str().unwrap(), "weird") {
             ManifestStatus::Broken { reason } => assert!(reason.contains("字段形状"), "{reason}"),
             other => panic!("形状坏该报读不通,实得 {other:?}"),
+        }
+    }
+
+    // ---- #104 发射前 diff 的锁定集一侧 ----
+
+    /// `nw/lock.v1` 夹具(字段与取值照 bake.json 的 `data.lock` 真样本;
+    /// 两个组件 + env 三键,env 只用于证明「读组件名不碰 env 值」)。
+    const LOCK_OK: &str = r#"{"schema":"nw/lock.v1","lockId":"research-desk-1.0.0-360ae68","bakedAt":"2026-10-09T02:52:51Z","recipe":{"name":"research-desk","version":"1.0.0"},"profile":"research-desk","runtime":{"node":"22.19.0","pi":"1.0.2","chezmoi":"2.73.0"},"components":[{"name":"scout","version":"1.0.0","landing":{"path":"<agent-dir>/nw/components/scout","kind":"pi-local-package"},"packages":[],"sha256":"d34c"},{"name":"retention","version":"0.4.1","landing":{"path":"<agent-dir>/nw/components/retention","kind":"pi-local-package"},"packages":[],"sha256":"b01b"}],"env":[{"name":"STEPFUN_API_KEY","required":false,"usedBy":["models.providers.stepfun-sb"],"purpose":""},{"name":"TAVILY_API_KEY","required":true,"usedBy":["components/scout"],"purpose":""}],"assets":[]}"#;
+
+    #[test]
+    fn 读锁定集_认得schema时给组件名与落点() {
+        let home = fixture_home("lock-ok");
+        write_lock(&home, "research-desk-1.0.0-360ae68", LOCK_OK);
+        match read_lock(home.to_str().unwrap(), "research-desk-1.0.0-360ae68") {
+            LockStatus::Ok(l) => {
+                // 组件名照文件顺序(引擎写盘确定性:同输入重烤同锁),不重排
+                assert_eq!(l.components, vec!["scout", "retention"]);
+                assert_eq!(l.profile.as_deref(), Some("research-desk"));
+                assert!(l.path.ends_with("locks/research-desk-1.0.0-360ae68.nwlock"));
+            }
+            other => panic!("认得该读到,实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 读锁定集_文件不在报缺失() {
+        let home = fixture_home("lock-gone");
+        assert!(
+            matches!(
+                read_lock(home.to_str().unwrap(), "9f8e"),
+                LockStatus::Missing
+            ),
+            "旧锁定集文件被清过:与「一个组件都没有」不是一件事"
+        );
+    }
+
+    #[test]
+    fn 读锁定集_不是合法json报读不通() {
+        let home = fixture_home("lock-bad");
+        // 载体也可能是装配命令(sh 脚本):那不是 nw/lock.v1,报读不通不猜
+        write_lock(&home, "cmd", "#!/bin/sh\nnw up --profile desk\n");
+        match read_lock(home.to_str().unwrap(), "cmd") {
+            LockStatus::Broken { reason } => assert!(reason.contains("JSON"), "{reason}"),
+            other => panic!("装配命令不是锁定集 JSON,该报读不通,实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 读锁定集_不认识的schema走契约守卫同款话术() {
+        let home = fixture_home("lock-v2");
+        write_lock(
+            &home,
+            "future",
+            r#"{"schema":"nw/lock.v2","lockId":"x","engine":"9.9.9","components":[]}"#,
+        );
+        match read_lock(home.to_str().unwrap(), "future") {
+            LockStatus::UnknownSchema { guard } => {
+                assert!(guard.message.contains("需升级"), "{}", guard.message)
+            }
+            other => panic!("不认识的 schema 该走契约守卫,实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 读锁定集_缺schema字段报读不通() {
+        let home = fixture_home("lock-noschema");
+        write_lock(&home, "noschema", r#"{"lockId":"x","components":[]}"#);
+        match read_lock(home.to_str().unwrap(), "noschema") {
+            LockStatus::Broken { reason } => assert!(reason.contains("schema"), "{reason}"),
+            other => panic!("缺 schema 不知道是哪一版,实得 {other:?}"),
         }
     }
 }

@@ -2766,3 +2766,139 @@ fn 版本对照页_常驻面板逐字节不动() {
     assert!(panel.contains("数据仓根"), "环境节在场");
     assert!(panel.contains("config 状态"), "配置节末行在场");
 }
+
+// ---- #104 发射前 diff 预览:仪式多一页,Enter/Esc 语义不动 ----
+
+/// 一座 fixture 安装根 + 在途锁定集(#104):清单记着上一轮 `old-lock`
+/// (scout + retention),在途这一份是 `new-lock`(mcp-server + retention)。
+fn diff_home(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nwt-diff-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let pd = dir.join("profiles").join("desk");
+    std::fs::create_dir_all(&pd).unwrap();
+    std::fs::write(
+        pd.join(".nw-manifest"),
+        r#"{"schema":"nw/manifest.v1","lockId":"old-lock","profile":"desk","recipe":"research-desk","version":"1.0.0","runtimeKey":"rk","installedAt":"2026-10-01T00:00:00Z","convergeHash":"3cf6a584a523b35ec42630766a9eb6a84d3dcf11d2347d5aa3f3ae879b420502","engine":"0.1.0"}"#,
+    )
+    .unwrap();
+    let ld = dir.join("locks");
+    std::fs::create_dir_all(&ld).unwrap();
+    std::fs::write(
+        ld.join("old-lock.nwlock"),
+        r#"{"schema":"nw/lock.v1","lockId":"old-lock","profile":"desk","components":[{"name":"scout"},{"name":"retention"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ld.join("new-lock.nwlock"),
+        r#"{"schema":"nw/lock.v1","lockId":"new-lock","profile":"desk","components":[{"name":"mcp-server"},{"name":"retention"}]}"#,
+    )
+    .unwrap();
+    dir
+}
+
+/// 一台「仪式开着、停在对比页」的台子(#104)。
+fn diff_app(tag: &str) -> App {
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Assemble;
+    app.nw_home = diff_home(tag).display().to_string();
+    app.ls = Some(
+        serde_json::from_str(
+            r#"{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"new-lock","recipe":"research-desk"}]}"#,
+        )
+        .unwrap(),
+    );
+    app.as_sel = 0;
+    app.as_confirm = true;
+    app.as_ritual_page = crate::screens::RitualPage::Diff;
+    app.load_ritual_diff();
+    app
+}
+
+/// 增 / 删两列 + 指纹对比,两档都在场且不溢宽(规格故事 8)。
+#[test]
+fn 对比页_增删两列与指纹对比_两档都在场不溢宽() {
+    let app = diff_app("snap");
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let s = crate::testutil::frame_display(&app, w, h);
+        assert!(s.contains("新旧对比"), "{w}×{h} 页标题在场:{s}");
+        assert!(s.contains("mcp-server"), "{w}×{h} 增列点名:{s}");
+        assert!(s.contains("scout"), "{w}×{h} 删列点名:{s}");
+        // retention 两侧都在:它该出现在「未动」那一列,而不是增 / 删
+        let row = s
+            .lines()
+            .find(|l| l.contains("未动"))
+            .unwrap_or_else(|| panic!("{w}×{h} 该有未动一列:{s}"));
+        assert!(row.contains("retention"), "{w}×{h} 未动列点名:{row}");
+        assert!(s.contains("3cf6a584"), "{w}×{h} 指纹现值在场:{s}");
+        for l in s.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= usize::from(w),
+                "{w}×{h} 有行超宽:{l}"
+            );
+        }
+    }
+}
+
+/// 简报页原样(#104:预览只是多一页,不是换掉简报页)——键位行仍是
+/// 「Enter 发射 / Esc 返航」两段,只多一行 dim 的 `d` 提示。
+#[test]
+fn 简报页_仍是既有内容_只多一行d提示() {
+    let mut app = diff_app("brief");
+    app.as_ritual_page = crate::screens::RitualPage::Brief;
+    app.as_ritual_diff = None;
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("发射仪式"), "简报页标题没变:{s}");
+    assert!(s.contains("Enter 发射"), "键位行左段没变:{s}");
+    assert!(s.contains("Esc 返航"), "键位行右段没变:{s}");
+    assert!(s.contains("d 新旧对比"), "新键在简报页有提示:{s}");
+}
+
+/// 清单缺失:明示「首次装配、无旧态可比」,不摆一个吓人的空对比
+/// (规格故事 9)。
+#[test]
+fn 对比页_清单缺失时明示首次装配() {
+    let mut app = diff_app("first");
+    let home = std::path::PathBuf::from(app.nw_home.clone());
+    std::fs::remove_file(home.join("profiles").join("desk").join(".nw-manifest")).unwrap();
+    app.load_ritual_diff();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("首次装配"), "明示首次装配:{s}");
+    assert!(s.contains("无旧态可比"), "说清没有旧态:{s}");
+    // 在途这一份的组件全列出来(将铺入),不当成「没有组件」
+    assert!(s.contains("mcp-server"), "将铺入的组件在场:{s}");
+    assert!(s.contains("retention"), "将铺入的组件在场:{s}");
+}
+
+/// 清单读不通 / schema 不认得:走契约守卫同款话术,增删两列一并收起
+/// ——不拿半份对比糊脸(规格:不猜、不按旧形状降级解析)。
+#[test]
+fn 对比页_清单读不通时收起两列只给证据() {
+    let mut app = diff_app("broken");
+    let home = std::path::PathBuf::from(app.nw_home.clone());
+    std::fs::write(
+        home.join("profiles").join("desk").join(".nw-manifest"),
+        r#"{"schema":"nw/manifest.v1","lockId""#,
+    )
+    .unwrap();
+    app.load_ritual_diff();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("清单读不通"), "读不通说读不通:{s}");
+    assert!(!s.contains("需升级 nw"), "不是升级问题不说升级:{s}");
+    // 两列收起:不拿半份增删糊脸
+    assert!(!s.contains("增 "), "读不通时不给增列:{s}");
+    assert!(!s.contains("删 "), "读不通时不给删列:{s}");
+}
+
+/// 上一轮锁定集文件不在:删列明说无从得知,不拿空集冒充「什么都没删」
+/// (与「一个组件都没有」是两件事)。
+#[test]
+fn 对比页_旧锁定集文件不在时删列说无从得知() {
+    let mut app = diff_app("oldlock-gone");
+    let home = std::path::PathBuf::from(app.nw_home.clone());
+    std::fs::remove_file(home.join("locks").join("old-lock.nwlock")).unwrap();
+    app.load_ritual_diff();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("mcp-server"), "增列照给:{s}");
+    assert!(s.contains("无从得知"), "删列说无从得知:{s}");
+}

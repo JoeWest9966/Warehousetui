@@ -204,6 +204,9 @@ pub(crate) enum Prep {
     /// 上下文里有分支,帮助对照表因此要能把它布出来(与 `running` 旗同级
     /// 的布场口,不是新浮层)。
     HistoryView,
+    /// 先打开发射仪式(#104):`d` 翻新旧对比页只在仪式里有分支,与
+    /// `HistoryView` 同级——是布场口,不是新浮层(仪式本身就是既有浮层)。
+    RitualOpen,
     /// 先布成回收站次级视图在场(#102):`Enter` 复制恢复路径与 `r` 重读只在
     /// 这个上下文里有分支(且要求回收站非空,否则复制动作无从下手),帮助
     /// 对照表因此要能把它布出来(与 `HistoryView` 同级的布场口)。
@@ -316,6 +319,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('h'),
+    },
+    HelpRow {
+        key: "d",
+        desc: "发射仪式:翻新旧对比(组件增删+指纹)",
+        screen: Some(Screen::Assemble),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::RitualOpen,
+        code: KeyCode::Char('d'),
     },
     HelpRow {
         key: "/",
