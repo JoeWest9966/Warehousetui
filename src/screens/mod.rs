@@ -24,7 +24,7 @@ pub use catalog::{
     WriteRoute,
 };
 pub use health::render_health;
-pub use overview::render_overview;
+pub use overview::{alert_parts, render_overview};
 pub use recipes::render_recipes;
 pub use settings::render_settings;
 

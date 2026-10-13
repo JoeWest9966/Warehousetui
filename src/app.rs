@@ -12,6 +12,7 @@ use crate::engine::{
 };
 use crate::input::{self, InputAction};
 use crate::layout::{hitmap, size_class, ScrollDir, Target};
+use crate::release::{upgrade_hint, verdict, ReleaseLookup, ReleaseProbe};
 use crate::screens::{catalog, RegisterSpec};
 use crate::term::{self, ColorCap};
 use crate::theme::{cached_degrade, Palette, ThemeKind};
@@ -109,6 +110,21 @@ pub enum HealthMode {
     Validate,
     /// 外部源漂移复核:只读,结论按结果四态呈现,与 doctor 三档并列不合并。
     Recheck,
+}
+
+/// 设置屏的屏内页(spec #94 工单 #108,照 [`HealthMode`] 的屏内多模样板)。
+///
+/// 为什么不把版本对照并进常驻面板的那棵扁平行向量:设置屏的竖向预算已被
+/// 110×30 内层 26 行钉死(`screens/settings.rs` 能力节注释记着「既有 21 行
+/// 之外只许 +3」),而常驻面板在无 config 告警时正好用满 26 行——再加一行
+/// 就会把末行的「config 状态」静默挤出手屏。新内容另起一页,常驻面板
+/// **逐字节不动**。后续工单(多派总览)往这个枚举加页即可。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SettingsPage {
+    /// 常驻面板(引擎 / 能力 / 环境 / 外观 / 配置)。
+    Panel,
+    /// 引擎版本对照页:本地 `nw` 版本 ↔ 引擎 release 仓最新 tag。
+    Version,
 }
 
 /// 数据仓根门控的三种不可用原因(spec #24:「没设 / 目录不可用 / 引擎缺能力」
@@ -248,11 +264,17 @@ impl RegKind {
 }
 
 /// 全局消息。引擎事件与动画心跳都在这里。
+///
+/// [`Message::Release`] 是引擎版本对照(#108)的回音:它**不借道**
+/// [`Message::Engine`]——那不是 `nw` 的进程输出,塞进引擎通道会让「面板
+/// 只跟 nw 说话」这条唯一缝说谎。同形(异步、不阻塞渲染)而不同路。
 #[derive(Clone, Debug)]
 pub enum Message {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Engine(EngineEvent),
+    /// 引擎 release 仓最新 tag 的对照结论(#108)。
+    Release(ReleaseProbe),
     Tick,
 }
 
@@ -275,6 +297,17 @@ pub struct App {
     pub engine_version: String,
     /// 能力探测门(#29):问引擎自己所得的三态结论,入口可用性唯一事实源。
     pub capabilities: Gate,
+    /// 设置屏当前翻开哪一页(#108)。
+    pub settings_page: SettingsPage,
+    /// 引擎版本对照的**远端侧**结论(#108):`None` = 还没对照过,或正在对照中
+    /// (见 `release_probing`)。判词不落状态——渲染时按本地版本 + 远端结论现算,
+    /// 免得本地版本后到的时候屏幕上留着一句已经不算数的话。
+    pub release_remote: Option<ReleaseProbe>,
+    /// 有一次远端对照在途(#108):在途不重复发起(spec #94 实施决策:远端对照
+    /// **不轮询**,定时轮询明确划在范围外)。
+    pub release_probing: bool,
+    /// 远端对照的注入缝(测试换 `release::FakeReleaseLookup`,零网络)。
+    pub release_lookup: Arc<dyn ReleaseLookup>,
     pub runner: Arc<dyn CommandRunner>,
 
     // ---- 概览 ----
@@ -542,6 +575,10 @@ impl App {
             engine,
             engine_version: "探测中".into(),
             capabilities: Gate::default(),
+            settings_page: SettingsPage::Panel,
+            release_remote: None,
+            release_probing: false,
+            release_lookup: Arc::new(crate::release::GhReleaseLookup),
             runner,
             ls: None,
             ls_loading: false,
@@ -654,6 +691,85 @@ impl App {
         self.runner.spawn(args, tx.clone());
     }
 
+    /// **打开设置屏才对照一次**(spec #94 实施决策:远端对照不轮询,定时轮询
+    /// 明确划在范围外)。结论一到就锁 latch,不再发起;操作者要重查按设置屏
+    /// `r`(清结论,下一帧自然再发起)。
+    ///
+    /// 发起走 `tokio::spawn` + 独立 channel,回音经 [`Message::Release`] 落账:
+    /// 与引擎调用同形(异步、不阻塞渲染),但不借道 [`App::spawn_engine`]——
+    /// 那不是 `nw` 命令,塞进引擎队列会让「面板只跟 nw 说话」这条缝说谎。
+    /// 主循环每帧调它,闸内自行判断要不要发起(幂等)。
+    pub fn ensure_release_probe(&mut self, tx: &mpsc::UnboundedSender<ReleaseProbe>) {
+        if self.screen != Screen::Settings
+            || self.release_probing
+            || self.release_remote.is_some()
+            || !self.engine.found
+        {
+            return;
+        }
+        self.start_release_probe(tx);
+    }
+
+    /// 设置屏 `r`:显式重查(与健康屏 `r` 复核同一语气)。
+    ///
+    /// 只清结论、不自己发起:键位处理器没有 channel(同 `queue` 的纪律),
+    /// 下一帧的 [`App::ensure_release_probe`] 看到「暂无结论」自然会再问一次。
+    pub fn reprobe_release(&mut self) {
+        if self.release_probing {
+            return; // 在途那次问完自然落账,不叠一次
+        }
+        self.release_remote = None;
+        self.push_log("重查引擎 release 仓…");
+    }
+
+    fn start_release_probe(&mut self, tx: &mpsc::UnboundedSender<ReleaseProbe>) {
+        self.release_probing = true;
+        let lookup = Arc::clone(&self.release_lookup);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let probe = lookup.latest_tag().await;
+            // 收端没了(面板正在退)就当没问过:不回写、不告警。
+            let _ = tx.send(probe);
+        });
+    }
+
+    /// 远端对照结论落账(#108):只写状态与日志,**绝不**据此下发任何命令
+    /// (ADR-0003:建议命令只给文案,执行权留给操作者)。
+    fn on_release_probe(&mut self, probe: ReleaseProbe) {
+        self.release_probing = false;
+        self.release_remote = Some(probe.clone());
+        match &probe {
+            ReleaseProbe::Latest(tag) => {
+                self.push_log(format!("引擎 release 仓最新 tag:{tag}"));
+            }
+            // 两种「取不到」理由分开说:操作者要知道是该去装 gh / 联网,
+            // 还是上游这次的发布形态不对劲。都不报错、都不猜(spec 用户故事 25)。
+            ReleaseProbe::Garbage => {
+                self.push_log("引擎 release 仓回话不是可用 tag:只显示本地版本,不猜".to_string())
+            }
+            ReleaseProbe::Unreachable => self.push_log(
+                "取不到引擎 release 仓(gh 不在 PATH 或没网):只显示本地版本,不报错".to_string(),
+            ),
+        }
+        self.note_release_verdict();
+    }
+
+    /// 落后时把升级指路写进日志区(#108,ADR-0003):建议命令只给文案,面板不代跑。
+    ///
+    /// 两个落账点都调它——本地版本与远端 tag 谁后到,这句指路都不该漏
+    /// (版本常比 tag 先到,也可能反过来)。
+    fn note_release_verdict(&mut self) {
+        let Some(ReleaseProbe::Latest(tag)) = self.release_remote.clone() else {
+            return; // 没拿到远端就无从判落后
+        };
+        if verdict(&self.engine_version, Some(&tag)) == crate::release::Verdict::Behind {
+            self.push_log(format!(
+                "引擎落后:升级指路 `{}`(不代跑,升不升你定)",
+                upgrade_hint()
+            ));
+        }
+    }
+
     /// **喂入版**引擎调用入口(#56): argv 同一个入口、同一套进行态登记,差别
     /// 只在多一份一次性 stdin 本体(订阅链接 / 将来的密钥本体)。喂入内容是
     /// 一次性值:原样写进子进程 stdin 后立即 drop,**绝不进 `EngineOutput` /
@@ -762,6 +878,7 @@ impl App {
             Message::Key(k) => self.on_key(k),
             Message::Mouse(ev) => self.on_mouse(ev),
             Message::Engine(ev) => self.on_engine(ev),
+            Message::Release(p) => self.on_release_probe(p),
             Message::Tick => self.blink = !self.blink,
         }
     }
@@ -890,6 +1007,12 @@ impl App {
             // 路径逐字同一处),所以鼠标与键盘不可能给出两种后果;无选中行 /
             // 入口门不过 / 装配在途时,复现键盘 `d` 的既有日志,不新造行为。
             Target::CatalogDelete => self.catalog_delete(),
+            // 点概览警示带上的订阅到期条目(#94 工单 #105,用户故事 12):跳到
+            // 订阅册并选中那一条。与键盘 `v` 到编目屏同族的三步(定册内维度 →
+            // 切屏 → 落册级选中槽),选中落在**可见行**上(#69 册内过滤);载荷是
+            // 投影下标,与 `SelectRow` 的可见行下标是两回事,故单立变体。
+            // 零引擎调用:回音是既有的 `sub_ls`,面板只换视图。
+            Target::AlertSubEntry(idx) => self.open_subscription_book(idx),
         }
     }
 
@@ -1062,6 +1185,8 @@ impl App {
                     })
                     .unwrap_or_else(|| "未知".into());
                 self.push_log(format!("引擎就绪:nw {}", self.engine_version));
+                // 版本后到也要补判一次:远端 tag 可能已经等在桌上了(#108)
+                self.note_release_verdict();
             }
             "ls" => {
                 self.ls_loading = false;
@@ -1781,6 +1906,29 @@ impl App {
             }
             KeyCode::Char('e') => self.pending_editor = true,
             KeyCode::Char('m') => self.toggle_mouse_capture(),
+            // 引擎版本对照页(#108):v 翻开,再按 v 或 Esc 回常驻面板。
+            // 引擎没找到时不给翻——没有本地版本可比,指路屏的话已经说清了。
+            KeyCode::Char('v') if self.engine.found => {
+                self.settings_page = match self.settings_page {
+                    SettingsPage::Panel => SettingsPage::Version,
+                    SettingsPage::Version => SettingsPage::Panel,
+                };
+                self.push_log(match self.settings_page {
+                    SettingsPage::Panel => "版本对照收起:回常驻面板".to_string(),
+                    SettingsPage::Version => {
+                        "版本对照:本地 nw 版本 ↔ 引擎 release 仓最新 tag".to_string()
+                    }
+                });
+            }
+            // 版本对照页内 Esc 返航(壳级 Esc 的既有语义:「返回」)。常驻面板上
+            // Esc 仍是无分支——那里没有可返回的上一层。
+            KeyCode::Esc if self.settings_page == SettingsPage::Version => {
+                self.settings_page = SettingsPage::Panel;
+            }
+            // 版本对照页内 r 重查(显式刷新,与健康屏 r 复核同语气)
+            KeyCode::Char('r') if self.settings_page == SettingsPage::Version => {
+                self.reprobe_release();
+            }
             _ => {}
         }
     }
@@ -2713,6 +2861,41 @@ impl App {
             k.file(),
             k.next_hint()
         ));
+    }
+
+    /// 点概览警示带的订阅到期条目 = 跳到订阅册并选中那一条(#94 工单 #105,
+    /// 用户故事 12:「从发现到处理一步到位」)。三步与键盘 `v` 到编目屏同族:
+    /// 先定屏内维度(订阅册)、再切屏、最后把册级选中槽落到那一条上。
+    ///
+    /// 选中槽是**可见行**下标(#69 册内过滤),故载荷给的投影下标要经
+    /// `catalog_visible()` 换算;换算不出来(这一条被过滤词挡在可见行外)只留
+    /// 一行指路日志,不新造禁用态——与册体「无选中行时点下去复现既有指路」
+    /// 同一口径。
+    ///
+    /// **零引擎调用**:回音是既有的 `app.sub_ls`,这里只换视图。
+    pub(crate) fn open_subscription_book(&mut self, idx: usize) {
+        self.catalog_kind = crate::screens::CatalogKind::Subscription;
+        // 换册即离开机器册语境(#70):反查上浮是机器册独有的只读动作,跳册同样
+        // 收回任何在场 / 在途的反查——与 `cycle_catalog_kind` 同一条纪律。
+        self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
+        self.screen = Screen::Vps;
+        self.catalog_filter_on = false; // 进册不顺手进过滤输入态(同 NavTo)
+        let name = self
+            .catalog_sheet()
+            .and_then(|s| s.entries.get(idx).map(|e| e.name.clone()));
+        let pos = self.catalog_visible().iter().position(|&i| i == idx);
+        match (pos, name) {
+            (Some(p), Some(name)) => {
+                let (sel, _) = self.catalog_sel_mut();
+                *sel = p;
+                self.push_log(format!("跳到订阅册并选中 {name}"));
+            }
+            (None, Some(name)) => self.push_log(format!(
+                "跳到订阅册:{name} 不在当前过滤后的可见行里——册内按 / 改过滤词"
+            )),
+            _ => self.push_log("跳到订阅册:这一条不在回音里了(可能刚被删)"),
+        }
+        self.catalog_clamp();
     }
 
     /// 编目册屏当前这一本的投影(四本各自的数据源汇到同一个
@@ -4081,6 +4264,192 @@ mod tests {
         app
     }
 
+    // ---- #108 引擎版本对照(数据面在 release 模块,这里只钉 App 行为缝) ----
+
+    /// 对照用的就绪态:注入回放式查询(零网络),本地版本给定。
+    fn release_app(script: Vec<crate::release::ReleaseProbe>) -> App {
+        let mut app = settings_app();
+        app.engine_version = "0.1.0".into();
+        app.release_lookup = Arc::new(crate::release::FakeReleaseLookup::new(script));
+        app
+    }
+
+    #[tokio::test]
+    async fn 版本对照_打开设置屏才发起一次查询_结论一到就锁latch() {
+        let mut app = release_app(vec![crate::release::ReleaseProbe::Latest("v0.2.0".into())]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // 打开设置屏:主循环每帧调这个,这里连调三次模拟三帧
+        app.ensure_release_probe(&tx);
+        app.ensure_release_probe(&tx);
+        app.ensure_release_probe(&tx);
+        let probe = rx.recv().await.expect("应有一次查询回音");
+        assert_eq!(
+            probe,
+            crate::release::ReleaseProbe::Latest("v0.2.0".into()),
+            "回音是拿到的 tag"
+        );
+        assert!(rx.try_recv().is_err(), "只发起一次,不轮询");
+        // 结论落账后 latch 锁上:再调也不该发起第二次
+        app.update(Message::Release(probe));
+        app.ensure_release_probe(&tx);
+        app.ensure_release_probe(&tx);
+        assert!(rx.try_recv().is_err(), "结论一到就锁 latch,不轮询");
+    }
+
+    #[tokio::test]
+    async fn 版本对照_不在设置屏不发起查询() {
+        let mut app = release_app(vec![crate::release::ReleaseProbe::Latest("v0.2.0".into())]);
+        app.screen = Screen::Overview;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.ensure_release_probe(&tx);
+        // 给在途任务一个调度机会,再断言什么都没发生
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "概览屏不该对照 release 仓");
+    }
+
+    #[tokio::test]
+    async fn 版本对照_按r重查才清结论再问一次() {
+        let mut app = release_app(vec![
+            crate::release::ReleaseProbe::Latest("v0.2.0".into()),
+            crate::release::ReleaseProbe::Unreachable,
+        ]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.ensure_release_probe(&tx);
+        app.update(Message::Release(rx.recv().await.unwrap()));
+        assert!(app.release_remote.is_some(), "首次结论已入账");
+        // 先按 v 翻开对照页(r 只在该页上有分支),再按 r 清结论
+        app.update(Message::Key(key('v')));
+        app.update(Message::Key(key('r')));
+        assert!(app.release_remote.is_none(), "r 清掉旧结论");
+        app.ensure_release_probe(&tx);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            crate::release::ReleaseProbe::Unreachable,
+            "重查走的是同一条缝"
+        );
+    }
+
+    #[test]
+    fn 版本对照_落后时建议命令只进日志区_不代跑() {
+        let mut app = release_app(vec![]);
+        app.update(Message::Release(crate::release::ReleaseProbe::Latest(
+            "v0.2.0".into(),
+        )));
+        let hint = crate::release::upgrade_hint();
+        assert!(
+            app.log.iter().any(|l| l.contains(hint)),
+            "升级指路进日志区:{:?}",
+            app.log
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("不代跑")),
+            "指路带「不代跑」的口径:{:?}",
+            app.log
+        );
+        // 只给文案:没有任何东西被排进引擎队列
+        assert!(app.queue.is_empty(), "不排引擎命令:{:?}", app.queue);
+        assert!(app.fed_queue.is_empty(), "不排喂入命令:{:?}", app.fed_queue);
+    }
+
+    #[test]
+    fn 版本对照_本地版本后到也补判落后() {
+        // 真实时序:release 常比 `--version` 先到,本地还是「探测中」
+        let mut app = release_app(vec![]);
+        app.engine_version = "探测中".into();
+        app.update(Message::Release(crate::release::ReleaseProbe::Latest(
+            "v0.2.0".into(),
+        )));
+        let hint = crate::release::upgrade_hint();
+        assert!(
+            !app.log.iter().any(|l| l.contains(hint)),
+            "本地还没探到版本时不瞎判落后:{:?}",
+            app.log
+        );
+        // 版本回音到达:补判一次,指路不遗漏
+        let out = EngineOutput {
+            args: vec!["--version".into()],
+            exit_code: crate::engine::ExitCode::Ok,
+            ok: true,
+            stderr_tail: vec!["0.1.0".into()],
+            envelope: None,
+            raw_stdout: String::new(),
+            parse_error: None,
+        };
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
+        assert_eq!(app.engine_version, "0.1.0", "版本入账");
+        assert!(
+            app.log.iter().any(|l| l.contains(hint)),
+            "版本后到也要补指路:{:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn 版本对照_取不到远端时降级为只显示本地_两种理由分开说() {
+        for (probe, needle) in [
+            (
+                crate::release::ReleaseProbe::Unreachable,
+                "取不到引擎 release 仓",
+            ),
+            (crate::release::ReleaseProbe::Garbage, "回话不是可用 tag"),
+        ] {
+            let mut app = release_app(vec![]);
+            app.update(Message::Release(probe));
+            assert!(
+                app.log.iter().any(|l| l.contains(needle)),
+                "{needle} 该出现在日志里:{:?}",
+                app.log
+            );
+            assert!(
+                !app.log
+                    .iter()
+                    .any(|l| l.contains(crate::release::upgrade_hint())),
+                "取不到远端就不该给升级指路:{:?}",
+                app.log
+            );
+        }
+    }
+
+    #[test]
+    fn 版本对照_v键翻开对照页_esc返回_且不排引擎命令() {
+        let mut app = release_app(vec![]);
+        app.update(Message::Key(key('v')));
+        assert_eq!(
+            app.settings_page,
+            crate::app::SettingsPage::Version,
+            "v 翻开版本对照页"
+        );
+        assert!(app.queue.is_empty(), "翻页不排引擎命令:{:?}", app.queue);
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.settings_page,
+            crate::app::SettingsPage::Panel,
+            "Esc 从对照页返航"
+        );
+        app.update(Message::Key(key('v')));
+        app.update(Message::Key(key('v')));
+        assert_eq!(
+            app.settings_page,
+            crate::app::SettingsPage::Panel,
+            "再按 v 也回常驻面板"
+        );
+    }
+
+    #[test]
+    fn 版本对照_引擎没找到时v键不翻页() {
+        let mut app = release_app(vec![]);
+        app.engine.found = false;
+        app.update(Message::Key(key('v')));
+        assert_eq!(
+            app.settings_page,
+            crate::app::SettingsPage::Panel,
+            "没有本地版本可比,对照页不登场"
+        );
+    }
+
     fn type_str(app: &mut App, s: &str) {
         for c in s.chars() {
             app.update(Message::Key(KeyEvent::new(
@@ -5063,6 +5432,90 @@ mod tests {
         wheel(&mut app, row, MouseEventKind::ScrollDown);
         assert_eq!(app.sub_sel, 2, "订阅册滚轮动 sub_sel");
         assert_eq!(app.vps_sel, 0, "订阅册滚轮不误写 vps_sel");
+    }
+
+    // ---- #94 工单 #105:点概览警示带的订阅到期条目直跳订阅册 ----
+
+    /// 点警示带上的到期订阅 = 跳到订阅册并选中那一条(#105 用户故事 12)。
+    /// 三步与键盘 `v` 到编目屏同族(定册内维度 → 切屏 → 落册级选中槽),选中落在
+    /// **可见行**上(#69 过滤的口径);`CAT_SUB_LS` 按名排序后 soon 在投影第 3 条
+    /// (下标 2),无过滤时可见位置就是 2。两档都点得中,全程零引擎调用——回音是
+    /// 既有的 `sub_ls`,面板只换视图。
+    #[test]
+    fn 概览_点警示带到期订阅_跳到订阅册并选中那一条_两档零调用() {
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let mut app = catalog_four_books_app();
+            app.screen = Screen::Overview;
+            app.size = Rect::new(0, 0, w, h);
+            let entry = hit_target(&app, |t| matches!(t, Target::AlertSubEntry(2)));
+            click(&mut app, entry);
+            assert_eq!(app.screen, Screen::Vps, "{w}×{h} 跳到编目屏");
+            assert_eq!(
+                app.catalog_kind,
+                catalog::CatalogKind::Subscription,
+                "{w}×{h} 屏内维度落到订阅册"
+            );
+            assert_eq!(app.sub_sel, 2, "{w}×{h} 选中 soon 那一条");
+            assert_eq!(
+                app.catalog_sel(),
+                2,
+                "{w}×{h} 册级查表读到的就是订阅册的选中槽"
+            );
+            assert!(app.queue.is_empty(), "{w}×{h} 零引擎调用:只换视图");
+            assert!(
+                app.log.iter().any(|l| l.contains("soon")),
+                "{w}×{h} 日志记下选中了哪一条:{:?}",
+                app.log
+            );
+        }
+    }
+
+    /// 册内过滤把这一条筛掉时(#69):点击照旧发生,但不落到一个看不见的选中位上
+    /// ——复现册体「无选中行时点下去给指路」的既有口径,不新造禁用态。
+    #[test]
+    fn 概览_点警示带到期订阅_被册内过滤筛掉时给指路不硬选中() {
+        let mut app = catalog_four_books_app();
+        app.screen = Screen::Overview;
+        app.size = Rect::new(0, 0, 80, 30);
+        // 订阅册的过滤词筛掉 soon(只剩 airport / forever 两条 active)
+        app.catalog_filter[catalog::CatalogKind::Subscription.idx()] = "airport".into();
+        let entry = hit_target(&app, |t| matches!(t, Target::AlertSubEntry(2)));
+        click(&mut app, entry);
+        assert_eq!(app.screen, Screen::Vps, "仍然跳到订阅册");
+        assert_eq!(app.catalog_kind, catalog::CatalogKind::Subscription);
+        assert_eq!(
+            app.catalog_sel(),
+            0,
+            "可见行里没有它:选中钳在可见范围内(2 条可见 → 0),不落在看不见的行上"
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("soon") && l.contains("过滤")),
+            "指路说清它被过滤词挡住了:{:?}",
+            app.log
+        );
+        assert!(app.queue.is_empty(), "零引擎调用");
+    }
+
+    /// 点哪打哪(ADR-0005):命中区不是另推一份几何——坐标取自整帧真显示里
+    /// `soon` 所在的那一列(警示带第一行),点下去落在订阅册并选中它。
+    #[test]
+    fn 概览_点警示带上soon所在列_整帧定位也中_落到订阅册选中它() {
+        let mut app = catalog_four_books_app();
+        app.screen = Screen::Overview;
+        app.splash = false;
+        app.size = Rect::new(0, 0, 80, 30);
+        let (col, row) = locate_col_row(&app, 80, 30, "soon");
+        app.update(Message::Mouse(mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            row,
+        )));
+        assert_eq!(app.screen, Screen::Vps, "整帧定位点下去也跳订阅册");
+        assert_eq!(app.catalog_kind, catalog::CatalogKind::Subscription);
+        assert_eq!(app.sub_sel, 2, "选中 soon 那一条");
+        assert!(app.queue.is_empty(), "零引擎调用");
     }
 
     // ---- #67 正文键位行命中接缝:点「换册」段 = 按 m ----
@@ -6567,6 +7020,7 @@ mod tests {
         as_history_raw_on: bool,
         pending_editor: bool,
         mouse_enabled: bool,
+        settings_page: SettingsPage,
         nw_home: String,
         log_len: usize,
         queue_len: usize,
@@ -6598,6 +7052,7 @@ mod tests {
             as_history_raw_on: a.as_history_raw.is_some(),
             pending_editor: a.pending_editor,
             mouse_enabled: a.mouse_enabled,
+            settings_page: a.settings_page,
             nw_home: a.nw_home.clone(),
             log_len: a.log.len(),
             queue_len: a.queue.len(),

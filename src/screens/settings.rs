@@ -17,9 +17,13 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if !app.engine.found {
+        // 指路屏优先:没有本地版本可比,版本对照页在场只会多一块空信息
         render_signpost(frame, inner, app);
     } else {
-        render_panel(frame, inner, app);
+        match app.settings_page {
+            crate::app::SettingsPage::Panel => render_panel(frame, inner, app),
+            crate::app::SettingsPage::Version => render_version(frame, inner, app),
+        }
     }
     // 浮层优先级最低的常屏之上:手填输入浮层盖在指路屏上也成立
     if app.home_input {
@@ -173,6 +177,89 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
         }
         None => lines.push(Line::from(Span::styled("  config 状态  解析正常", p.dim()))),
     }
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().border_style(p.dim())),
+        inner,
+    );
+}
+
+/// 引擎版本对照页(#108,spec #94 用户故事 24/25/26):本地 `nw` 版本 ↔ 引擎
+/// release 仓最新 tag,并排两行摊开。
+///
+/// 四态互不冒充:拿到 tag 才判词;取不到就明说「本地版本 + 取不到远端」——
+/// 离线机器上不报错、只少一块信息;落后才给升级指路(ADR-0003:只给可复制的
+/// 命令文案,执行权留给操作者,面板不代跑)。
+fn render_version(frame: &mut Frame, inner: Rect, app: &App) {
+    use crate::release::{upgrade_hint, verdict, ReleaseProbe, Verdict};
+    let p = &app.palette;
+    // 本地版本的原话与常驻面板 / 顶栏同一拼法(`nw {}`),不造第二种说法
+    let local = format!("nw {}", app.engine_version);
+    let mut lines = vec![
+        Line::from(Span::styled("版本对照", p.accent())),
+        Line::from(format!("  本地     {local}")),
+    ];
+    // 落后与否只在这里判一次:判词行与升级指路共用同一个结论
+    let behind = match &app.release_remote {
+        Some(ReleaseProbe::Latest(tag)) => {
+            lines.push(Line::from(format!("  远端     {tag}")));
+            let v = verdict(&app.engine_version, Some(tag));
+            let (word, style) = match v {
+                Verdict::Same => ("一致:本地就是引擎 release 仓最新 tag", p.ok()),
+                Verdict::Behind => ("落后:引擎 release 仓有更新的 tag", p.warn()),
+                Verdict::Ahead => ("领先:本地比最新 tag 还新(自编或预发布)", p.dim()),
+                // 比不了就把两边原话并排摆着,不猜大小
+                Verdict::Incomparable => ("比不了:两边不都是 x.y.z 形态,原话并排不猜", p.dim()),
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  判词     {word}"),
+                style,
+            )));
+            v == Verdict::Behind
+        }
+        // 在途:不拿旧结论冒充本次,也不说「取不到」
+        None if app.release_probing => {
+            lines.push(Line::from(Span::styled("  远端     对照中…", p.dim())));
+            false
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "  远端     未对照(打开本屏即对照;r 重查)",
+                p.dim(),
+            )));
+            false
+        }
+        // 两种「取不到」理由分开说,都不报错、都不猜(spec 用户故事 25)
+        Some(ReleaseProbe::Garbage) => {
+            lines.push(Line::from(Span::styled(
+                "  远端     取不到:回话不是可用 tag",
+                p.dim(),
+            )));
+            false
+        }
+        Some(ReleaseProbe::Unreachable) => {
+            lines.push(Line::from(Span::styled(
+                "  远端     取不到:gh 不在 PATH 或没网",
+                p.dim(),
+            )));
+            false
+        }
+    };
+    lines.push(Line::from(Span::styled(
+        "  只标记不治理:判词不改退出码、不自动升级",
+        p.dim(),
+    )));
+    if behind {
+        // 指路拆两行:命令文案独占一行,紧凑态 62 列也放得下整条
+        lines.push(Line::from(Span::styled(
+            "  升级指路(不代跑,升不升你定):",
+            p.warn(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", upgrade_hint()),
+            p.warn(),
+        )));
+    }
+    lines.push(Line::from(Span::styled("  r 重查 · v / Esc 返回", p.dim())));
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().border_style(p.dim())),
         inner,

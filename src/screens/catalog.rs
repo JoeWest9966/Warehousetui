@@ -3548,11 +3548,186 @@ fn sub_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
     )
 }
 
+/// 钥匙轮换账龄的 amber 阈值(天,spec #94 第 5 项)。**照订阅到期 7 天的
+/// 先例,不配置化**;订阅那 7 天是上游 `status.go` 算好随回音下发的,这一条
+/// 是面板自己的展示阈值——两处不同源,不许互相「对齐」成一套。只标记不治理:
+/// 不碰退出码、不提醒、不自动轮换。
+const KEY_AGE_WARN_DAYS: u32 = 7;
+
+/// UTC 日历日——账龄运算的唯一时间粒度(整天,不涉时刻)。
+///
+/// 面板不引 chrono:账龄是**纯展示运算**(`rotated-at` 是静态登记字段,引擎
+/// 不下发账龄;订阅三态「引擎在回音里算好、面板零日期运算」那条口径讲的是
+/// 订阅,不禁这一处——spec #94 实现决策点名开了这个口子)。要的只是两个日历
+/// 日之间的整天数,整数运算就够,不值得为一个差引一整个时区库。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct UtcDay {
+    y: i32,
+    m: u32,
+    d: u32,
+}
+
+impl UtcDay {
+    /// 严格 `YYYY-MM-DD`(引擎 `rotatedAt` 的契约形状)**且真是日历日**;
+    /// 空串 / 形状不认 / `2026-02-30` 这种不存在的日子 = None。
+    ///
+    /// 形状那一层与登记表单共用同一条 strict 校验([`valid_expires`]);这里
+    /// 多要一层「真是日历日」,是因为账龄要把日期换成天数——`2026-02-30`
+    /// 会被静默滚成 3 月 2 日,印一个看着精确、其实无依据的天数。算不出就
+    /// 说算不出,不猜(与 `days_left_line` 同一口径)。
+    fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() || !valid_expires(s) {
+            return None;
+        }
+        let y: i32 = s.get(0..4)?.parse().ok()?;
+        let m: u32 = s.get(5..7)?.parse().ok()?;
+        let d: u32 = s.get(8..10)?.parse().ok()?;
+        if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
+            return None;
+        }
+        Some(Self { y, m, d })
+    }
+
+    /// 日历日 → Unix 纪元天数(Howard Hinnant `days_from_civil`,纯整数,
+    /// 无时区无库)。
+    fn epoch_days(self) -> i64 {
+        let y = i64::from(self.y) - i64::from(self.m <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400; // [0, 399]
+        let m = i64::from(self.m);
+        let d = i64::from(self.d);
+        let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+        let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+        era * 146_097 + doe - 719_468
+    }
+
+    /// Unix 纪元天数 → 日历日(Hinnant `civil_from_days`)。
+    fn from_epoch_days(z: i64) -> Self {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097; // [0, 146096]
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+        let mp = (5 * doy + 2) / 153; // [0, 11]
+        let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1); // [1, 31]
+        let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1); // [1, 12]
+        Self {
+            y: i32::try_from(if m <= 2 { y + 1 } else { y }).unwrap_or(1970),
+            m,
+            d,
+        }
+    }
+
+    /// 今天(UTC):本模块唯一读时钟的地方。
+    ///
+    /// 每帧每条目读一次(廉价,`clock_gettime` 而已);要收成「一帧一次」得把
+    /// today 传进 [`EntryDetail`] 签名,那是动骨架,本票不做。时钟早于 1970
+    /// (不存在的机器)按纪元日算,账龄会大得离谱 → 亮 amber,方向安全。
+    fn today() -> Self {
+        #[cfg(test)]
+        if let Some(d) = pinned_today() {
+            return d;
+        }
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self::from_epoch_days(i64::try_from(secs).unwrap_or(i64::MAX) / 86_400)
+    }
+}
+
+// 测试钉死的「今天」。账龄随墙钟走,而 golden 是逐字节的字面量——不钉的话
+// 同一帧每天都漂一次,钥匙册两档 golden 会天天红。thread_local 让并行测试
+// 各钉各的,不必像 env 那样上串行锁(`testutil::ConfigGuard` 的取舍)。
+#[cfg(test)]
+thread_local! {
+    static PINNED_TODAY: std::cell::Cell<Option<UtcDay>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn pinned_today() -> Option<UtcDay> {
+    PINNED_TODAY.with(|c| c.get())
+}
+
+/// 钉死「今天」,见 `PINNED_TODAY`。
+#[cfg(test)]
+fn pin_today_for_test(y: i32, m: u32, d: u32) {
+    PINNED_TODAY.with(|c| c.set(Some(UtcDay { y, m, d })));
+}
+
+/// 某年某月有几天(含闰年)。月越界返回 0——调用方据此判「不是真日历日」。
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// 钥匙册的轮换账龄(spec #94 第 5 项):`rotated-at` 至今的 UTC 整天数。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RotationAge {
+    /// 算得出:0 = 今天刚轮换。
+    Days(u32),
+    /// 算不出:没给轮换日 / 形状或日历日不认 / 轮换日在未来。**不拿 0 冒充**
+    /// (规格用户故事 16:0 天是「今天刚换」,与「不知道」是两件事)。
+    Unknown,
+}
+
+impl RotationAge {
+    fn of(e: &CatalogEntryView, today: UtcDay) -> Self {
+        let Some(r) = e.rotated_at.as_deref().and_then(UtcDay::parse) else {
+            return Self::Unknown;
+        };
+        let days = today.epoch_days() - r.epoch_days();
+        if days < 0 {
+            // 轮换日在未来(时钟漂移或预登记):印负数没有意义,拿 0 冒充
+            // 「今天刚换」更是假话——两类都归未知。
+            return Self::Unknown;
+        }
+        // 现实中到不了(天数溢出 u32 等于一千多万年);真到了也读成 amber,
+        // 比 panic 或悄悄截断成小数好。
+        Self::Days(u32::try_from(days).unwrap_or(u32::MAX))
+    }
+
+    /// 「账龄 N 天」/「账龄 未知」——算不出就说算不出,不拿 0 占位。
+    fn line(self) -> String {
+        match self {
+            Self::Days(n) => format!("账龄 {n} 天"),
+            Self::Unknown => "账龄 未知".to_string(),
+        }
+    }
+
+    /// 超阈(见 [`KEY_AGE_WARN_DAYS`]);「超」是严格大于,7 天本身不算超。
+    /// 未知不算超:没有依据就不亮。
+    fn over_threshold(self) -> bool {
+        matches!(self, Self::Days(n) if n > KEY_AGE_WARN_DAYS)
+    }
+}
+
 /// 钥匙册的条目明细:名字行后缀给 kind(条目级,恒 `github-key`),之下给
-/// **主机 / 作用域 / 轮换日**(缺字段显式「——」)。**没有本体槽,也不印
+/// **主机 / 作用域 / 轮换日 + 账龄**(缺字段显式「——」)。**没有本体槽,也不印
 /// 指纹**——投影里就没有这两格(上游 `KeySummary` 五键冻结),面板连「这像是
 /// 哪把钥匙」都不该让人推断出来。作用域**原样逐条报**(只登记不设闸,面板不代管、
 /// 不提醒、不评审;它们是登记元数据,与 secret 槽的「不印指纹」是两回事)。
+///
+/// 账龄那一列(#106):轮换日之后跟「账龄 N 天」,超 [`KEY_AGE_WARN_DAYS`] 天
+/// 亮 amber、其余 dim。**只标记不治理**——不动退出码、不动 doctor 档位、不
+/// 提醒、不自动轮换;册面其余读法逐字节不变。宽度上给它留位:超宽先砍日期
+/// (截断,不折行),账龄文案一个字节不砍——砍了等于这一列白加。
+///
+/// 两档 golden 里的 345 / 271 天是**钉出来的**:测试经 `pin_today_for_test`
+/// 把「今天」钉在 2026-10-13(见 `PINNED_TODAY`),所以这两帧不随墙钟漂。
 fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDetailOut {
     let kind = e
         .kind
@@ -3560,6 +3735,11 @@ fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
         .map(str::trim)
         .filter(|k| !k.is_empty())
         .unwrap_or("——");
+    let age = RotationAge::of(e, UtcDay::today());
+    let age_line = age.line();
+    let date_w = width
+        .saturating_sub(12) // 字段标签的既有预算(与另外两行同一口径)
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(age_line.as_str()) + 2); // 两个空格 + 账龄文案
     (
         Some(format!("kind {kind}")),
         vec![
@@ -3576,9 +3756,15 @@ fn key_detail_rows(e: &CatalogEntryView, width: usize, p: &Palette) -> EntryDeta
             ]),
             Line::from(vec![
                 Span::raw("    轮换日 "),
+                Span::styled(clip(&e.rotated_at_line(), date_w), p.text()),
+                Span::raw("  "),
                 Span::styled(
-                    clip(&e.rotated_at_line(), width.saturating_sub(12)),
-                    p.text(),
+                    age_line,
+                    if age.over_threshold() {
+                        p.warn()
+                    } else {
+                        p.dim()
+                    },
                 ),
             ]),
         ],
@@ -8392,18 +8578,19 @@ mod tests {
 │  ↑/↓ 选订阅 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤    │
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
-    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动)。
+    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动;
+    /// #106 轮换日那一行加了账龄列——本轮唯二变动,来历记在这里)。
     const KEY_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                      │
 │  ⚙ 装配  ││  ▸ ci  kind github-key                                           │
 │  ✚ 健康  ││    主机 ghe.internal                                             │
 │  ▤ 配方  ││    作用域 未声明(0 条)                                           │
-│▸ ▩ 编目  ││    轮换日 2025-11-02                                             │
+│▸ ▩ 编目  ││    轮换日 2025-11-02  账龄 345 天                                │
 │  ✦ 设置  ││    deploy  kind github-key                                       │
 │          ││    主机 github.com                                               │
 │          ││    作用域 repo · read:org                                        │
-│          ││    轮换日 2026-01-15                                             │
+│          ││    轮换日 2026-01-15  账龄 271 天                                │
 │          ││  取回钥匙(面板不代跑,按 g 收进日志):                             │
 │          ││nw key get --name ci --root /tmp | jq -r .data.key                │
 │          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
@@ -8423,7 +8610,7 @@ mod tests {
 │          ││  ↑/↓ 选钥匙 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤      │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 t 主题 ? 帮助   q 退出       主题:暗色仓库                 "####;
-    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档)。
+    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档;#106 同因加账龄列)。
     const KEY_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
 ┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
@@ -8431,11 +8618,11 @@ mod tests {
 │  ▸ ci  kind github-key                                         │
 │    主机 ghe.internal                                           │
 │    作用域 未声明(0 条)                                         │
-│    轮换日 2025-11-02                                           │
+│    轮换日 2025-11-02  账龄 345 天                              │
 │    deploy  kind github-key                                     │
 │    主机 github.com                                             │
 │    作用域 repo · read:org                                      │
-│    轮换日 2026-01-15                                           │
+│    轮换日 2026-01-15  账龄 271 天                              │
 │  取回钥匙(面板不代跑,按 g 收进日志):                           │
 │nw key get --name ci --root /tmp | jq -r .data.key              │
 │  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
@@ -8510,9 +8697,163 @@ mod tests {
     /// 此后的每次刷新都记在本族头注的来历里,不再一句「本票之前」带过)。
     #[test]
     fn 钥匙册整帧golden_两档golden() {
+        pin_today_for_test(2026, 10, 13);
         let app = book("钥匙");
         assert_book_frame(&app, 80, 30, KEY_80X30);
         assert_book_frame(&app, 66, 50, KEY_66X50);
+    }
+
+    // ---- 钥匙轮换账龄(spec #94 第 5 项 / 工单 #106) ----
+
+    /// 造一条只填了轮换日的钥匙条目——账龄只依赖这一格(其余槽与本票无关)。
+    fn key_entry(rotated_at: Option<&str>) -> CatalogEntryView {
+        CatalogEntryView {
+            name: "ci".into(),
+            rotated_at: rotated_at.map(str::to_string),
+            ..CatalogEntryView::default()
+        }
+    }
+
+    fn age_of(rotated_at: Option<&str>, today: UtcDay) -> RotationAge {
+        RotationAge::of(&key_entry(rotated_at), today)
+    }
+
+    /// 账龄是 UTC **日历日**差(不是 30 天月、不是 365 天年)。期望值取自独立
+    /// 算法(python3 `datetime.date` 减法),不按实现里的同一套公式反推。
+    #[test]
+    fn 轮换账龄_按日历日差算_同一天为0() {
+        let today = UtcDay {
+            y: 2026,
+            m: 10,
+            d: 13,
+        };
+        assert_eq!(age_of(Some("2026-10-13"), today), RotationAge::Days(0));
+        assert_eq!(age_of(Some("2026-10-12"), today), RotationAge::Days(1));
+        assert_eq!(age_of(Some("2026-10-06"), today), RotationAge::Days(7));
+        assert_eq!(age_of(Some("2026-01-15"), today), RotationAge::Days(271));
+        assert_eq!(age_of(Some("2025-11-02"), today), RotationAge::Days(345));
+        // 跨闰年与闰日本身:2024-02-29 是真日子,2025-02-29 不是
+        assert_eq!(age_of(Some("2024-02-29"), today), RotationAge::Days(957));
+        assert_eq!(age_of(Some("2025-02-29"), today), RotationAge::Unknown);
+    }
+
+    /// 算不出的五类(没这一格 / 空 / 形状不认 / 不是真日历日 / 未来日)全归
+    /// 未知,**没有一类拿 0 冒充**——0 天只有「今天刚轮换」一种来路。
+    #[test]
+    fn 轮换账龄_算不出就说未知_不拿0冒充() {
+        let today = UtcDay {
+            y: 2026,
+            m: 10,
+            d: 13,
+        };
+        for r in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("2026-1-5"),
+            Some("2026-13-01"),
+            Some("2026-02-30"),
+            Some("2025-02-29"),
+            Some("昨天"),
+        ] {
+            assert_eq!(age_of(r, today), RotationAge::Unknown, "{r:?} 应算不出");
+        }
+        assert_eq!(
+            age_of(Some("2026-10-14"), today),
+            RotationAge::Unknown,
+            "轮换日在未来:不印负数,也不拿 0 冒充今天刚换"
+        );
+    }
+
+    #[test]
+    fn 账龄一行_算得出报天数_算不出说未知() {
+        assert_eq!(RotationAge::Days(0).line(), "账龄 0 天");
+        assert_eq!(RotationAge::Days(345).line(), "账龄 345 天");
+        assert_eq!(RotationAge::Unknown.line(), "账龄 未知");
+    }
+
+    /// 阈值为 7 天、「超」是严格大于:7 天本身不亮,8 天亮;未知不亮
+    /// (没有依据就不标记)。
+    #[test]
+    fn 账龄超7天才亮_未知与7天本身不亮() {
+        assert!(!RotationAge::Days(0).over_threshold());
+        assert!(!RotationAge::Days(7).over_threshold(), "7 天本身不算超");
+        assert!(RotationAge::Days(8).over_threshold());
+        assert!(
+            !RotationAge::Unknown.over_threshold(),
+            "算不出不亮:没有依据就不标记"
+        );
+    }
+
+    /// 一把老钥匙 + 一把新钥匙:老的那把亮 amber,新的那把不亮(今天钉在
+    /// 2026-10-13,账龄 345 天 / 1 天)。
+    const KEY_LS_AGE_MIX: &str = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[{"name":"old","kind":"github-key","host":"github.com","scopes":[],"rotatedAt":"2025-11-02"},{"name":"fresh","kind":"github-key","host":"github.com","scopes":[],"rotatedAt":"2026-10-12"}]}}"#;
+
+    /// 册面真画出了账龄,且两档都不溢宽(66×50 是响应式下限)。
+    #[test]
+    fn 钥匙册_轮换日行带账龄_两档都在且不溢宽() {
+        pin_today_for_test(2026, 10, 13);
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        app.nw_home = "/nw".into();
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        for (w, h) in [(80u16, 30u16), (66, 50)] {
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("账龄 345 天"), "{w}×{h} 老钥匙的账龄应在场:{s}");
+            assert!(s.contains("账龄 271 天"), "{w}×{h} 另一把的账龄应在场:{s}");
+            assert!(
+                s.contains("轮换日 2025-11-02"),
+                "{w}×{h} 轮换日原文应在场:{s}"
+            );
+            for ln in s.lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(ln) <= w as usize,
+                    "{w}×{h} 有行超宽:{ln}"
+                );
+            }
+        }
+    }
+
+    /// 账龄列只标记不治理:超阈的那条亮 amber,未超的那条不亮,册面其余读法
+    /// (主机 / 作用域 / 轮换日原文)逐字节不变。
+    #[test]
+    fn 钥匙册_账龄超阈亮amber_未超不亮() {
+        pin_today_for_test(2026, 10, 13);
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_AGE_MIX)]);
+        app.nw_home = "/nw".into();
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        let p = app.palette;
+        assert_ne!(
+            p.warn().fg,
+            p.dim().fg,
+            "两种样式得能分辨,否则这条什么都没测"
+        );
+        let old = crate::testutil::frame_span_fg(&app, 80, 30, "账龄 345 天");
+        let fresh = crate::testutil::frame_span_fg(&app, 80, 30, "账龄 1 天");
+        assert_eq!(old, p.warn().fg, "超阈账龄应亮 amber");
+        assert_eq!(fresh, p.dim().fg, "未超阈账龄不应亮");
+        assert_ne!(fresh, p.warn().fg);
+        // 轮换日原文不跟着变色(只标记账龄,不动册面其余读法)
+        assert_eq!(
+            crate::testutil::frame_span_fg(&app, 80, 30, "2025-11-02"),
+            p.text().fg,
+            "轮换日原文仍是正文色"
+        );
+    }
+
+    /// 没给轮换日 = 「账龄 未知」,不是「账龄 0 天」;也不该把整册带炸。
+    #[test]
+    fn 钥匙册_没给轮换日_账龄未知且不顶替0天() {
+        pin_today_for_test(2026, 10, 13);
+        let ls = r#"{"schema":"nw/key-ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"catalogPath":"/r/keys.json","keys":[{"name":"ci","kind":"github-key","host":"ghe.internal","scopes":[]}]}}"#;
+        let (mut app, _r) = key_app(&[("key ls", 0, ls)]);
+        app.nw_home = "/nw".into();
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("账龄 未知"), "没给轮换日应说未知:{s}");
+        assert!(!s.contains("账龄 0 天"), "不许拿 0 天冒充不知道:{s}");
     }
 
     /// 四本册走同一条键位路径(#66 验收第 4 条):对四本册各驱动一次**相同**

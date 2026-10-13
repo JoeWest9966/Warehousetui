@@ -9,6 +9,7 @@ mod datarepo;
 mod engine;
 mod input;
 pub mod layout;
+mod release;
 mod screens;
 mod term;
 #[cfg(test)]
@@ -92,8 +93,20 @@ async fn main() -> Result<()> {
     // 引擎事件通道 + 开机自举(版本探测 + 首次 ls)。
     let (etx, mut erx) = mpsc::unbounded_channel::<engine::EngineEvent>();
     app.bootstrap(&etx);
+    // 引擎版本对照(#108)的回音通道:与引擎通道并列而不同路——release 查询
+    // 不是 `nw` 的进程输出,不借道 EngineEvent(见 `Message::Release`)。
+    let (rtx, mut rrx) = mpsc::unbounded_channel::<release::ReleaseProbe>();
 
-    let result = run_loop(&mut terminal, &mut app, &mut rx, &mut erx, &etx).await;
+    let result = run_loop(
+        &mut terminal,
+        &mut app,
+        &mut rx,
+        &mut erx,
+        &etx,
+        &rtx,
+        &mut rrx,
+    )
+    .await;
 
     term::restore();
     result
@@ -105,6 +118,8 @@ async fn run_loop(
     rx: &mut mpsc::UnboundedReceiver<Event>,
     erx: &mut mpsc::UnboundedReceiver<engine::EngineEvent>,
     etx: &mpsc::UnboundedSender<engine::EngineEvent>,
+    rtx: &mpsc::UnboundedSender<release::ReleaseProbe>,
+    rrx: &mut mpsc::UnboundedReceiver<release::ReleaseProbe>,
 ) -> Result<()> {
     let mut tick = interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -140,6 +155,9 @@ async fn run_loop(
         if std::mem::take(&mut app.pending_editor) {
             open_editor(terminal, app)?;
         }
+        // 引擎版本对照(#108):打开设置屏才对照一次(spec 把定时轮询划在范围外)。
+        // 闸是幂等的——结论一到就锁 latch,不重查;按 r 才清结论重来。
+        app.ensure_release_probe(rtx);
         tokio::select! {
             Some(ev) = rx.recv() => match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Press => app.update(Message::Key(k)),
@@ -148,6 +166,8 @@ async fn run_loop(
                 _ => {}
             },
             Some(ev) = erx.recv() => app.update(Message::Engine(ev)),
+            // 版本对照回音:与引擎回音并列收,不借道 EngineEvent
+            Some(p) = rrx.recv() => app.update(Message::Release(p)),
             _ = tick.tick(), if app.assembling => app.update(Message::Tick),
         }
     }

@@ -563,6 +563,17 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         code: KeyCode::Char('m'),
     },
     HelpRow {
+        key: "v",
+        desc: "设置:引擎版本对照(v / Esc 返回,r 重查)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('v'),
+    },
+    HelpRow {
         key: "Esc",
         desc: "返回 / 关闭浮层",
         screen: None,
@@ -623,6 +634,7 @@ pub(crate) const MOUSE_LINES: &[&str] = &[
     "编目册键位行可点段:换册 / 过滤 / 反查(点它 = 按对应键)",
     "取回段只订阅/钥匙册:点它 = 按 g(只收建议命令,不代跑)",
     "删除段四本册可点 = 按 d(先确认;标签册是「d 摘/删」)",
+    "概览警示带点名到期订阅,点那一条 = 跳到订阅册并选中它",
     "捕获默认开的代价:复制要按 Shift",
     "逃逸:--no-mouse / 设置屏 m 关(重启生效)",
 ];
