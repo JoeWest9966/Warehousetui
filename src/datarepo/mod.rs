@@ -5,6 +5,11 @@
 //! 读文件的事(清单存档 / 回收站 / 派枚举 / 日志存档 / 版本对照的数据面)
 //! 一律问本模块,屏幕层与 app 层不自己拼 `$NW_HOME` 路径。
 //!
+//! **唯一的写例外**(ADR-0010 §6,spec #94 工单 #103):装配 stderr 的旁路
+//! 副本落盘在 `$NW_HOME/logs/<lockId>/`。那是日志,不是状态——面板永不写
+//! `.nw-manifest`(上游把它当唯一提交点、永远最后写),作者侧 spec #95 也永不
+//! 写 NW_HOME。例外只有这一处,且必须在 ADR 里记账。
+//!
 //! 本模块只拥有**路径布局知识**(上游既有事实,面板只读不写):
 //! `$NW_HOME/profiles/<派>/.nw-manifest`、`locks/`、`pruned/<时间戳>/`、
 //! `logs/`。布局变更由「跟随引擎」纪律兜住(ADR-0007):上游改了,这里改,
@@ -199,6 +204,124 @@ pub fn read_manifest(nw_home: &str, profile: &str) -> ManifestStatus {
         }),
         Err(e) => ManifestStatus::Broken {
             reason: format!("清单 schema 认得、字段形状不对:{e}"),
+        },
+    }
+}
+
+/// 装配日志目录名(安装根下;ADR-0010 §6 的写例外落点)。
+pub const LOGS_DIR: &str = "logs";
+
+/// 存档日志文件的扩展名(确定命名的一部分,不是可配置项)。
+pub const LOG_SUFFIX: &str = ".log";
+
+/// 某次装配的存档日志目录:`$NW_HOME/logs/<lockId>/`
+/// (ADR-0010 §6:按 lockId 组织,一台安装根下每次装配一个目录)。
+///
+/// `~` 走 [`expand_tilde`] 那一份展开器;尾巴斜杠吃不掉一个,与
+/// [`lock_carrier`] 同一条纪律(不拼出 `//`)。
+pub fn log_dir(nw_home: &str, lock_id: &str) -> PathBuf {
+    expand_tilde(nw_home).join(LOGS_DIR).join(lock_id)
+}
+
+/// 某次装配的存档日志文件:`$NW_HOME/logs/<lockId>/<lockId>.log`
+///
+/// **确定命名**:目录与文件名都由 lockId 决定,一个时钟都不看——所以
+/// ① 同一条装配命令重跑,落点是同一个文件(追加,不另起一个);
+/// ② 操作者在 shell 里 `cat $NW_HOME/logs/<lockId>/<lockId>.log` 直接找得到,
+///  glob `logs/*/*.log` 也认得出每一份属于哪一条锁(规格故事 19)。
+/// 时间戳方案(规格给的另一个选项)被否:它让「哪一份是刚才那次」要靠
+/// 排序猜,而重跑同一条锁时会攒下一串分不清先后的文件。
+pub fn log_path(nw_home: &str, lock_id: &str) -> PathBuf {
+    let mut p = log_dir(nw_home, lock_id);
+    p.push(format!("{lock_id}{LOG_SUFFIX}"));
+    p
+}
+
+/// 装配 stderr 的落盘 tee(#103):开一次文件、逐行追加、显式收尾。
+///
+/// **追加语义,不是「结束时原子写」**:中止(进程级真止)时文件里必须留着
+/// 已经收到的那几行——操作者判断「上次装配停在哪一步」的唯一依据就是它
+/// (与内存里 `as_log` 中止不清空同一条纪律,ADR-0010 §6)。原子写只在
+/// **收尾**时发生:写坏一行不留半个文件(见 [`LogTee::line`])。
+///
+/// 目录不存在就建(`create_dir_all`):这是面板唯一被准许写 NW_HOME 的地方,
+/// 建的是 `logs/<lockId>/` 这一棵,不碰 `profiles/` / `locks/` / `pruned/`。
+pub struct LogTee {
+    file: std::fs::File,
+    /// 落点(只为收尾报告与测试断言;不参与写)。
+    path: PathBuf,
+}
+
+impl LogTee {
+    /// 为某条锁开一个 tee(追加模式;文件不在则建)。
+    ///
+    /// **安装根本身不在/读不了时不开**:写例外只许写 `logs/<lockId>/` 这一棵,
+    /// 不许 `create_dir_all` 顺手造出一座安装根(规格故事 28 的写侧对应:
+    /// 不出现拼错路径、也不凭空造目录的假象)。调用方据此走既有指路语义。
+    pub fn open(nw_home: &str, lock_id: &str) -> std::io::Result<Self> {
+        if let Some(cause) = home_cause(nw_home) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("安装根不可用({cause:?}):不凭空造 logs/ 树"),
+            ));
+        }
+        let path = log_path(nw_home, lock_id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        Ok(Self { file, path })
+    }
+
+    /// 追加一行 stderr。
+    ///
+    /// **一行一写、写完即 flush**:进程被 kill 的瞬间,已 flush 的行在盘上,
+    /// 没写完的那半行不在——不会留下一个「看起来是完整一行、其实被腰斩」的
+    /// 文件。测试据此断言「中止不留半个文件」。
+    pub fn line(&mut self, line: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        // 只写这一行 + 换行:一行一次 write_all,不跨行缓冲。
+        self.file.write_all(line.as_bytes())?;
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        Ok(())
+    }
+
+    /// 落点(回读与报告用)。
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+/// 存档日志的读取结论(**三种分类,没有第四种**):与
+/// [`ManifestStatus`] 同口径——一条读不通的存档只坏它自己,不炸回看浮层。
+#[derive(Clone, Debug)]
+pub enum LogArchive {
+    /// 读到了:正文 + 落点。
+    Ok { path: String, body: String },
+    /// 没有这一份(那条锁从没在面板里跑过装配,或日志被清过)。
+    Missing,
+    /// 文件在但读不通(权限 / IO)。
+    Broken { reason: String },
+}
+
+/// 读某条锁的存档日志(只读;回看浮层的数据面,#103)。
+///
+/// 空文件是 `Ok { body: "" }` 而不是 `Missing`:「有一份、里面没有行」与
+/// 「没有这一份」在屏上是两件事(与清单的 Missing / Ok 分野同口径)。
+pub fn read_log(nw_home: &str, lock_id: &str) -> LogArchive {
+    let path = log_path(nw_home, lock_id);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => LogArchive::Ok {
+            path: path.display().to_string(),
+            body,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LogArchive::Missing,
+        Err(e) => LogArchive::Broken {
+            reason: format!("存档日志读不出:{e}"),
         },
     }
 }
@@ -421,6 +544,124 @@ mod tests {
             }
             other => panic!("不认识的 schema 该走契约守卫,实得 {other:?}"),
         }
+    }
+
+    // ---- #103 装配日志落盘与回看 ----
+
+    /// 装配 stderr 的夹具:形状照引擎真样本的口径——七步人话 + env **布尔**
+    /// (引擎纪律:env 只报 present,本体只从 stdin 进,stderr 不含机密)。
+    const UP_STDERR: &str =
+        "铺骨架…\n落组件 retention\nenv present: GH_TOKEN\n装配完成:convergeHash 3cf6a584";
+
+    #[test]
+    fn 落盘_按lock_id确定命名_shell里直接找得到() {
+        let home = fixture_home("log-path");
+        assert_eq!(
+            log_path(home.to_str().unwrap(), "9f8e"),
+            home.join(LOGS_DIR).join("9f8e").join("9f8e.log"),
+            "目录与文件名都由 lockId 决定,一个时钟都不看"
+        );
+        assert_eq!(
+            log_path("/nw-home/", "9f8e"),
+            std::path::PathBuf::from("/nw-home/logs/9f8e/9f8e.log"),
+            "尾巴斜杠吃不掉一个,不拼出 //"
+        );
+    }
+
+    #[test]
+    fn 落盘_逐行追加_每行写完即落盘() {
+        let home = fixture_home("log-write");
+        let mut tee = LogTee::open(home.to_str().unwrap(), "9f8e").unwrap();
+        for l in UP_STDERR.lines() {
+            tee.line(l).unwrap();
+        }
+        // 不调 finish 就读:tear-down 之前盘上必须已经是全部四行
+        // (「写完即落盘」是中止场景的依据,不能等到收尾)。
+        let body = std::fs::read_to_string(tee.path()).unwrap();
+        assert_eq!(
+            body,
+            format!("{UP_STDERR}\n"),
+            "逐行原样落盘,一行不多一行不少"
+        );
+    }
+
+    #[test]
+    fn 落盘_同一条锁重跑是追加_不另起一个文件() {
+        let home = fixture_home("log-append");
+        {
+            let mut tee = LogTee::open(home.to_str().unwrap(), "9f8e").unwrap();
+            tee.line("第一程:铺骨架…").unwrap();
+        }
+        {
+            let mut tee = LogTee::open(home.to_str().unwrap(), "9f8e").unwrap();
+            tee.line("第二程:铺骨架…").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(log_path(home.to_str().unwrap(), "9f8e")).unwrap(),
+            "第一程:铺骨架…\n第二程:铺骨架…\n",
+            "确定命名 ⇒ 重跑同一条锁落在同一个文件上,两程都在(日志不丢)"
+        );
+    }
+
+    #[test]
+    fn 读回_读到了给正文与落点() {
+        let home = fixture_home("log-read");
+        {
+            let mut tee = LogTee::open(home.to_str().unwrap(), "9f8e").unwrap();
+            for l in UP_STDERR.lines() {
+                tee.line(l).unwrap();
+            }
+        }
+        match read_log(home.to_str().unwrap(), "9f8e") {
+            LogArchive::Ok { path, body } => {
+                assert!(
+                    body.contains("env present: GH_TOKEN"),
+                    "stderr 流原样在:{body}"
+                );
+                assert!(
+                    path.ends_with("logs/9f8e/9f8e.log"),
+                    "落点由 datarepo 给出,屏幕层不拼:{path}"
+                );
+            }
+            other => panic!("写过的存档该读得到,实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 读回_从没跑过这条锁报缺失_与空文件是两件事() {
+        let home = fixture_home("log-missing");
+        assert!(
+            matches!(
+                read_log(home.to_str().unwrap(), "9f8e"),
+                LogArchive::Missing
+            ),
+            "没有这一份:不是错误,是事实"
+        );
+        // 建了目录但文件不在:同样是缺失(建目录不等于有日志)
+        std::fs::create_dir_all(log_dir(home.to_str().unwrap(), "9f8e")).unwrap();
+        assert!(matches!(
+            read_log(home.to_str().unwrap(), "9f8e"),
+            LogArchive::Missing
+        ));
+        // 空文件:Ok + 空正文——「有一份、里面没有行」不与「没有这一份」混淆
+        std::fs::write(log_path(home.to_str().unwrap(), "9f8e"), "").unwrap();
+        match read_log(home.to_str().unwrap(), "9f8e") {
+            LogArchive::Ok { body, .. } => assert!(body.is_empty(), "空文件是 Ok,不是 Missing"),
+            other => panic!("空文件该是 Ok,实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 落盘_安装根不在时不建目录_不凭空造一棵树() {
+        // 写例外的边界:NW_HOME 不在时面板不 create_dir_all 出一座安装根
+        // (规格故事 28:不出现拼错路径读空目录的假象;写也一样不许凭空造)。
+        let gone = std::env::temp_dir().join(format!("nwt-log-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gone);
+        assert!(
+            LogTee::open(gone.to_str().unwrap(), "9f8e").is_err(),
+            "安装根不在:开不出 tee(调用方据此走指路,不写盘)"
+        );
+        assert!(!gone.exists(), "更不许顺手把安装根建出来");
     }
 
     #[test]
