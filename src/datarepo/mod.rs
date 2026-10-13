@@ -241,6 +241,16 @@ struct EngineFile {
     nw: String,
 }
 
+/// 选中锁定集的载体文件路径:`$NW_HOME/locks/<lockId>.nwlock`(引擎 `ls` 的
+/// locks 域与装配命令交锁段的同一落点)。`~` 展开走全仓唯一那份展开器。
+pub fn lock_carrier(nw_home: &str, lock_id: &str) -> String {
+    let home = crate::engine::discover::expand_tilde(nw_home);
+    format!(
+        "{}/{LOCKS_DIR}/{lock_id}.nwlock",
+        home.display().to_string().trim_end_matches('/')
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,14 +433,4 @@ mod tests {
             );
         }
     }
-}
-
-/// 选中锁定集的载体文件路径:`$NW_HOME/locks/<lockId>.nwlock`(引擎 `ls` 的
-/// locks 域与装配命令交锁段的同一落点)。`~` 展开走全仓唯一那份展开器。
-pub fn lock_carrier(nw_home: &str, lock_id: &str) -> String {
-    let home = crate::engine::discover::expand_tilde(nw_home);
-    format!(
-        "{}/{LOCKS_DIR}/{lock_id}.nwlock",
-        home.display().to_string().trim_end_matches('/')
-    )
 }

@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
     result
 }
 
+#[allow(clippy::too_many_arguments)] // 两条回音通道(引擎/版本对照/扫描)并列,参数随接缝累加
 async fn run_loop(
     terminal: &mut term::Term,
     app: &mut App,

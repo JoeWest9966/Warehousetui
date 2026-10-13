@@ -6,7 +6,6 @@ use ratatui::Terminal;
 use crate::app::{App, HealthMode, Message, Screen};
 use crate::engine::{CommandRunner, EngineEvent, EngineOutput, ExitCode, FakeRunner};
 use crate::screens::render;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::Arc;
 
 fn fake_app() -> App {
