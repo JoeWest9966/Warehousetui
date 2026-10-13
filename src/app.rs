@@ -4144,7 +4144,7 @@ mod tests {
     }
 
     #[test]
-    fn 版本照对_v键翻开照对页_esc返回_且不排引擎命令() {
+    fn 版本对照_v键翻开对照页_esc返回_且不排引擎命令() {
         let mut app = release_app(vec![]);
         app.update(Message::Key(key('v')));
         assert_eq!(
