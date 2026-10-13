@@ -89,8 +89,20 @@ _Avoid_: 自动执行、一键执行
 _Avoid_: 命令提示、待办
 
 **作者侧工具（author-side tools）**：
-spec #95 起面板第一次拥有写数据仓的授权——skill / extension 脚手架、组件打包、配方编辑等八项，全部经 `datarepo` 写侧接口落盘：拟落账摊开（路径 + 内容 + 将写文件清单）→ 图形确认 → 原子落盘（tmp + rename），确认前一个字节不落。准许面只有数据仓根之下的配方 / 组件 / 技能脚手架文件；引擎仓、NW_HOME、装配产物、机密编目文件（keys / subscriptions / tags）一律不碰，git 更不碰（ADR-0011）。
+spec #95 起面板第一次拥有写数据仓的授权——skill / extension 脚手架、组件打包、配方编辑等八项,全部经 `datarepo` 写侧接口落盘:拟落账摊开(路径 + 内容 + 将写文件清单)→ 图形确认 → 原子落盘(tmp + rename),确认前一个字节不落。准许面只有数据仓根之下的配方 / 组件 / 技能脚手架文件(外加 #113 预跑暂存档这一行窄准许面);引擎仓、NW_HOME、装配产物、机密编目文件(keys / subscriptions / tags)一律不碰,git 更不碰(ADR-0011)。
 _Avoid_: 编辑器、生成器（面板不是通用文件编辑器：只写数据仓根之下三类脚手架文件且全过确认闸；「配方编辑器」只是八项之一，别以偏概全）
+
+**组件打包器（component packager）**：
+选中数据仓内一个本地 skill / extension 目录，图形化打成组件：面板自己算**目录校验和**（逐文件「相对路径 + 内容 sha256」一行，按行字典序拼起来再 sha256，排除 `.git/` 与 `node_modules/`——与上游 `manifest.DirHash` 同算法，于是面板算的值就是 bake / `up` 后来在同一棵树上算的值）、生成**组件清单**（`component.yaml`，schema 以数据仓现有组件为样本钉死：`apiVersion/kind/name/version/pi.package/packages/vendored/depends/params/config/env/requires`）。校验和与拟生成清单在确认闸摊开，确认才经 datarepo 写侧原子落盘（ADR-0011）。
+_Avoid_: 压缩包、打包命令（产物是一份组件清单，不是 tarball；面板不代跑 bake，也不复制 payload 文件——只写确认过的那一个文件）
+
+**配方编辑器（recipe editor）**：
+配方屏从只读升级为结构化编辑（spec #95 工单 #113）：加/删组件槽、改 env 声明（required 及默认）。编辑态经**结构化中间形状**往返（`datarepo::recipe::RecipeDoc`——块状 YAML 手写解析，不引 serde_yaml，只解析面板要编辑的 `components:` / `env:` 两条序列，其余顶层块原样保留），**面板不认识的自定义字段原样保留**（硬约束，fixture 断言往返不丢）。写回 `recipe.yaml` 走 datarepo 写侧：先把编辑态暂存成配方同目录的隐藏 scratch 喂引擎 `validate`（引擎代跑、argv 与健康屏同源）预跑，结果四态摊开，拟落账 + 图形确认后才经写侧原子落盘（tmp+rename）——确认前 `recipe.yaml` 一个字节都不落，预跑不过可不写回、数据仓状态不变。scratch 是「确认前的一次写盘」，ADR-0011 §1 为它单开一行**窄准许面**（隐藏名、确定名、跑完即清、返航/换根也清），落点由 `datarepo::recipe::ScratchSlot` 持（记住暂存时那个数据仓根）。是「作者侧工具」八项之一（ADR-0011 §4 #113 行）。
+_Avoid_: 通用 yaml 编辑器（面板只写数据仓根之下的配方文件且全过确认闸；不是任意文件编辑器，也不是引擎命令）
+
+**extension 脚手架（extension scaffold）**：
+作者侧工具之一：图形表单生成 **pi-extension landing 契约**骨架——条目子树自带 `package.json` 且 `pi.extensions` 非空、入口文件（缺省 `index.ts`）就是那份清单指着的一个，两件一起落进数据仓 `extensions/<条目名>/`（条目身份 = 子树目录名，上游 #21：扩展没有 frontmatter 可当身份）。字段形状与自审判据对齐上游 `--kind extension` 的验收第六条（缺清单 = 装上了不加载）；派内落点 `<agent-dir>/nw/extensions/<仓库>/<条目>/` 与 `settings.packages` 登记是 `up` 的事，面板只写数据仓里的源、不写 `catalog.json`。与 skill 脚手架共用同一条表单流（阶段机 / 拟落账 / 确认闸 / 原子落盘），换的只有表单与规格。
+_Avoid_: 扩展生成器、扩展模板（面板不是通用代码生成器：只写数据仓根之下 manifest + 入口两件且全过确认闸；「模板」是面板静态资产，不是引擎概念）
 
 **跟随引擎（upstream-first）**：
 本面板不拥有任何领域决策：CLI 契约、领域词汇、「准许代跑哪些命令」的边界,一律以上游 Nous Warehouse 仓为唯一真相源;上游改,面板跟,不自创、不背离、不复刻引擎逻辑。
