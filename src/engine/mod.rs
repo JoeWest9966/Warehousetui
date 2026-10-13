@@ -174,6 +174,26 @@ impl ExitCode {
     pub fn is_ok(self) -> bool {
         matches!(self, ExitCode::Ok)
     }
+
+    /// doctor 四档(0 / 10 / 11 / 12)落到[`State`]的哪一档。
+    ///
+    /// **全仓唯一一处「退出码 → 状态」的映射**:健康屏的 doctor 横幅与设置屏
+    /// 多派总览(spec #94 工单 #107)的「一行一派一档」都问它,不各写一份
+    /// `match`——两处各写一份,上游改档位时就会漏改一处,而两处的结论会在
+    /// 同一块屏上互相矛盾。
+    ///
+    /// 其余码(2 / 3 / 4 / 5)不是 doctor 的健康档:归 [`State::Skip`]
+    /// (「这一格没有健康结论」),由呈现层另给 rc 原话——把「输入无效」画成
+    /// 破损,是把面板的呈现错误说成引擎的健康判决。
+    pub fn doctor_state(self) -> State {
+        match self {
+            ExitCode::Ok => State::Ok,
+            ExitCode::Degraded => State::Degraded,
+            ExitCode::Drift => State::Drift,
+            ExitCode::ManifestBroken => State::Broken,
+            _ => State::Skip,
+        }
+    }
 }
 
 /// 引擎就绪状态:顶栏与指路屏的共同数据源。
@@ -250,6 +270,27 @@ mod tests {
         assert_eq!(ExitCode::LockConflict.code(), "LOCK_CONFLICT");
         assert!(ExitCode::Ok.is_ok());
         assert!(!ExitCode::Drift.is_ok());
+    }
+
+    /// doctor 四档 → 状态的映射(#107 与健康屏横幅共用这一处):
+    /// 档位词与颜色都从既有 `State` / `Palette` 来,不另立一套措辞。
+    #[test]
+    fn doctor四档落到结果四态_其余码没有健康结论() {
+        assert_eq!(ExitCode::Ok.doctor_state(), State::Ok);
+        assert_eq!(ExitCode::Degraded.doctor_state(), State::Degraded);
+        assert_eq!(ExitCode::Drift.doctor_state(), State::Drift);
+        assert_eq!(ExitCode::ManifestBroken.doctor_state(), State::Broken);
+        // 2/3/4/5 不是 doctor 的健康档:归 Skip(「没有健康结论」),
+        // 呈现层另给 rc 原话,不把输入无效画成破损。
+        for rc in [
+            ExitCode::EnvMissing,
+            ExitCode::InputInvalid,
+            ExitCode::VerifyFailed,
+            ExitCode::ApplyFailed,
+            ExitCode::LockConflict,
+        ] {
+            assert_eq!(rc.doctor_state(), State::Skip, "{rc:?} 没有健康档");
+        }
     }
 
     #[test]
