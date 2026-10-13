@@ -47,7 +47,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         // `area_pad(area,1)` 同源,浮层可见区与「点任意处关」命中区永不分歧。
         render_help(frame, rows[1], app);
     }
-    // 全局命令面板(#119):Ctrl+P 呼出的叠加浮层。与帮助浮层同族——同一份
+    // 全局命令面板(#119):`Ctrl+P` 呼出的叠加浮层,与帮助浮层同族——同一份
     // body 区、同一个 `popup_rect`,几何在 `layout::cmd_*` 一处算,渲染与命中
     // 共用。它在帮助浮层之后画:两者都是「查询型」浮层,而 `on_key` 里帮助
     // 浮层是最外层(它开着时其余键一律不收),所以这个次序只是兜底,真正常
@@ -55,17 +55,125 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.cmd_open {
         commands::render(frame, rows[1], app);
     }
+    // 自升级浮层(#121):与帮助浮层同族——同一个 body 区、同一个 popup_rect。
+    // 在帮助之后画只是兜底(两者都是查询型浮层,正常态只开一个)。
+    if app.upgrade.is_open() {
+        render_upgrade(frame, rows[1], app);
+    }
     let _ = p;
+}
+
+/// 自升级浮层(#121):全屏叠加层,六态两两可区分(版本输入 / 干跑在途 /
+/// 计划摊开 / 真跑在途 / 完成 / 失败)。几何与命中区共用 `layout::upgrade_*`
+/// ——渲染与「点任意处关」永不分歧(ADR-0005)。
+fn render_upgrade(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = crate::layout::upgrade_popup_rect(area);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        app.upgrade.headline(),
+        match &app.upgrade {
+            crate::upgrade::UpgradePhase::Failed { .. } => p.fail().bold(),
+            crate::upgrade::UpgradePhase::Done { .. } => p.ok().bold(),
+            _ => p.accent().bold(),
+        },
+    )));
+    match &app.upgrade {
+        crate::upgrade::UpgradePhase::Version { buf } => {
+            lines.push(Line::from(Span::styled(
+                format!("  目标版本  {buf}█"),
+                p.text(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  latest = 装最新;也可钉一个 tag(如 0.4.0 或 v0.4.0)",
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Enter 取安装计划(零下载、零落盘)· Esc/q 放弃",
+                p.dim(),
+            )));
+        }
+        crate::upgrade::UpgradePhase::Plan { version } => {
+            lines.push(Line::from(Span::styled(
+                format!("  目标版本  {version}"),
+                p.text(),
+            )));
+            // 计划原文:install.sh 的 `--dry-run` 输出,面板不翻译。
+            for l in app.upgrade_log.iter().take(6) {
+                lines.push(Line::from(Span::styled(format!("  {l}"), p.dim())));
+            }
+            lines.push(Line::from(Span::styled(
+                "  Enter 开始下载并校验 · Esc/q 放弃",
+                p.dim(),
+            )));
+        }
+        crate::upgrade::UpgradePhase::Planning { .. }
+        | crate::upgrade::UpgradePhase::Running { .. } => {
+            lines.push(Line::from(Span::styled(
+                "  过程原文(install.sh 逐行来,面板不翻译):",
+                p.dim(),
+            )));
+            let inner = crate::layout::upgrade_inner(area);
+            let view = (inner.height as usize).saturating_sub(6);
+            let max_off = app.upgrade_log.len().saturating_sub(view);
+            let off = app.upgrade_offset.min(max_off);
+            for l in app.upgrade_log.iter().skip(off).take(view) {
+                lines.push(Line::from(Span::styled(format!("  {l}"), p.text())));
+            }
+            lines.push(Line::from(Span::styled(
+                "  升级期间其余动作已锁(与装配态同款互斥);↑/↓ 翻进度",
+                p.dim(),
+            )));
+        }
+        crate::upgrade::UpgradePhase::Done { version, sha256 } => {
+            lines.push(Line::from(Span::styled(
+                format!("  已装到  v{version}"),
+                p.text(),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  sha256  {sha256}"),
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  ** 重启面板后新版本才在场 **",
+                p.accent(),
+            )));
+            lines.push(Line::from(Span::styled("  Enter/Esc/q 关", p.dim())));
+        }
+        crate::upgrade::UpgradePhase::Failed { reason } => {
+            lines.push(Line::from(Span::styled(format!("  {reason}"), p.fail())));
+            lines.push(Line::from(Span::styled(
+                "  旧二进制原样不动,未安装任何文件。",
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled("  Enter/Esc/q 关", p.dim())));
+        }
+        crate::upgrade::UpgradePhase::Idle => {}
+    }
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 自升级 nwt ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
 }
 
 fn render_top_bar(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let lamp = if app.assembling {
-        "◉ 装配中"
+    // 升级在途也点 assembling 那盏灯(#121:与装配态同款互斥),但文案说
+    // 「升级中」——两件事不许共用一个词冒充。
+    let (lamp, lamp_style) = if app.upgrade.in_flight() {
+        ("◉ 升级中", p.accent())
+    } else if app.assembling {
+        ("◉ 装配中", p.accent())
     } else {
-        "○ 空闲"
+        ("○ 空闲", p.dim())
     };
-    let lamp_style = if app.assembling { p.accent() } else { p.dim() };
     // 紧凑态精简:去副品牌与版本细节,只留装配态灯与 NW_HOME
     // (ADR-0004「顶栏去副品牌/版本细节」,spec #15 ticket #17)。
     let line = if size_class(area) == SizeClass::Compact {
@@ -175,7 +283,13 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled("Ctrl+P", p.accent()));
         spans.push(Span::raw(" 命令 "));
     }
-    if app.assembling {
+    if app.upgrade.in_flight() {
+        // 升级在途(#121):与装配态同款互斥,但话术说「升级中」不冒充装配。
+        // 放在装配态那一支**之前**并直接接管:升级期间 as_running 恒 false,
+        // 若让下面的 assembling 支也跑一趟,屏上会出现两句互斥话术。
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("升级中:动作已锁定 · ↑/↓ 翻进度", p.dim()));
+    } else if app.assembling {
         spans.push(Span::raw(" "));
         // 中止键只在真有 up 在途时给(#59):登记落账也点这盏灯,但它的
         // 返航语义归登记流自己,不在这里混成一个键。
@@ -240,15 +354,13 @@ pub(crate) struct HelpRow {
     pub(crate) book: Option<crate::screens::CatalogKind>,
     pub(crate) prep: Prep,
     pub(crate) code: KeyCode,
-    /// 派发这一条时要带的修饰键(对照测试据此造 KeyEvent)。绝大多数键位是
-    /// 裸键(`NONE`);`Ctrl+P`(#119)要带 `CONTROL`——不带修饰符的 `p` 在
-    /// 任何屏都没有分支,所以照 `NONE` 派发会让「帮助列的键实现里都有分支」
-    /// 这条测试对 Ctrl+P 假红。
+    /// 派发这个键时要带的修饰键(#119:`Ctrl+P` 需要 CONTROL;其余一律 NONE)。
+    /// 帮助↔实现对照测试按它派发,所以带修饰键的键位也能被正向验证。
     pub(crate) modifiers: KeyModifiers,
     /// 派发前先把 App 布成「有 up 在途」(#59 中止键的受理面前提)。
     pub(crate) running: bool,
-    /// 这一条的后果是**写**(登记 / 删除 / 打开发射仪式):装配态下命令
-    /// 面板不透出它(规格故事 9:不许从面板绕过装配互斥)。帮助浮层照旧
+    /// 这一条的后果是**写**(登记 / 删除 / 打开发射仪式):装配态下命令面板
+    /// 不透出它(#119 规格故事 9:不许从面板绕过装配互斥)。帮助浮层照旧
     /// 全列——它是文档,不是执行面。
     pub(crate) write: bool,
 }
@@ -605,6 +717,19 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('e'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "U",
+        desc: "设置:自升级 nwt(复用 install.sh 同一道 sha256 闸)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('u'),
         modifiers: KeyModifiers::NONE,
         write: false,
     },

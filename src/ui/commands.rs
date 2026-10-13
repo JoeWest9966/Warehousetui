@@ -212,8 +212,14 @@ mod tests {
     }
 
     /// 就绪的面板夹具:越过 splash,免得首帧被 splash 挡住。
+    /// 面板测试的就绪态:引擎「已发现」+ 数据仓根可用——`App::new()` 会真
+    /// 探机器上的 nw 与真读用户 config,测试因此随机器漂移(在没装 nw 的开
+    /// 发机上整个面板走到指路屏,断言全假红)。与 `app::tests::fake_app`
+    // 同口径注入 FakeRunner。
     fn panel_app() -> App {
-        let mut app = App::new();
+        use crate::engine::FakeRunner;
+        use std::sync::Arc;
+        let mut app = crate::app::App::with_runner(Arc::new(FakeRunner::new(&[])));
         app.splash = false;
         app
     }

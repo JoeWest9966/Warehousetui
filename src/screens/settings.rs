@@ -147,8 +147,12 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled("配置", p.accent())),
         Line::from(format!("  文件     {}", config::config_path().display())),
+        // 自升级入口(#121):`U` 复用 install.sh 同一道 sha256 闸,双出口
+        // 共享同一套校验纪律(见 docs/release.md「双出口」)。**并进上一行**
+        // 而不是新起一行:设置屏竖向预算钉死(见能力节头注「只许 +3」),
+        // config 解析失败告警必须留在屏内,多起一行就把它挤出去。
         Line::from(Span::styled(
-            "  只读展示;按 e 用 $EDITOR 打开(终端会让出来)",
+            "  只读展示;按 e 用 $EDITOR 打开 · 按 U 自升级 nwt(sha256 同款闸)",
             p.dim(),
         )),
         Line::from(""),
