@@ -7,6 +7,9 @@
 
 use std::path::PathBuf;
 
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+
 pub struct ConfigGuard {
     prev: Option<String>,
     dir: PathBuf,
@@ -41,14 +44,46 @@ impl Drop for ConfigGuard {
 /// 占两格,第二格是隐藏延续格,跳过——拼出的行即肉眼所见(ADR-0005
 /// 「渲染与命中同源」的测量基准)。
 pub fn frame_display(app: &crate::app::App, w: u16, h: u16) -> String {
+    render_frame(app, w, h).1.join("\n")
+}
+
+/// 帧上某段文案所在格的**前景色**(None = 这句不在帧上)。
+///
+/// 文本断言走 [`frame_display`],颜色断言走这里:一行里前后格的样式可能
+/// 不同(钥匙册「轮换日」那行的日期与账龄就是两种色),按文案定位才说得清
+/// 「哪一段是什么色」,而不是「这一行有个 warn 格」。取第一个命中——测试
+/// 里的文案都钉在唯一一处。
+pub fn frame_span_fg(
+    app: &crate::app::App,
+    w: u16,
+    h: u16,
+    needle: &str,
+) -> Option<ratatui::style::Color> {
+    let (term, lines) = render_frame(app, w, h);
+    let buf = term.backend().buffer();
+    for (y, line) in lines.iter().enumerate() {
+        let Some(at) = line.find(needle) else {
+            continue;
+        };
+        // 宽字符占两格:显示列 = 缓冲区列(续格被 `render_frame` 跳过),
+        // 所以前缀的显示宽就是 needle 首格的 x。
+        let x = unicode_width::UnicodeWidthStr::width(&line[..at]);
+        return buf
+            .cell((u16::try_from(x).ok()?, u16::try_from(y).ok()?))
+            .and_then(|c| c.style().fg);
+    }
+    None
+}
+
+/// 渲染一帧,连同一行一格的显示文本一起交出来(两条公开断言共用,免得
+/// 各写一份逐格拚行的逻辑)。
+fn render_frame(app: &crate::app::App, w: u16, h: u16) -> (Terminal<TestBackend>, Vec<String>) {
     use crate::ui::render;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use unicode_width::UnicodeWidthStr;
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| render(f, app)).unwrap();
     let buf = term.backend().buffer();
-    (0..h)
+    let lines = (0..h)
         .map(|y| {
             let mut line = String::new();
             let mut x: u16 = 0;
@@ -66,8 +101,8 @@ pub fn frame_display(app: &crate::app::App, w: u16, h: u16) -> String {
             }
             line
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Vec<_>>();
+    (term, lines)
 }
 
 #[cfg(test)]
