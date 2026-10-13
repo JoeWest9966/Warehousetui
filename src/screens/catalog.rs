@@ -7046,6 +7046,9 @@ mod tests {
         app.splash = false;
         app.screen = crate::app::Screen::Vps;
         app.catalog_kind = kind;
+        // 开机形态:`--version` 回音已落地(与 8 条探针同一个 tick 下发,回音
+        // 顺序不定——版本由 `EngineFacts` 实时给,不快照进证据)。
+        app.engine_version = "0.1.0".into();
         app.capabilities.record(cap, verdict, ev);
         app
     }
@@ -7056,7 +7059,6 @@ mod tests {
             argv: vec!["vps".into()],
             bin: bin.into(),
             source: "PATH",
-            version: "0.1.0".into(),
             words: words.into(),
             exit_code: rc,
         }
@@ -7178,6 +7180,55 @@ mod tests {
             s_bad.contains("0.1.0"),
             "两个构建同版本号,版本照实呈现但不作为能力依据:{s_bad}"
         );
+    }
+
+    /// 紧凑档与三档主题(#122 验收):66×50 下限下证据带整段在场、不溢宽;
+    /// 真彩 / 256 / 16 三档都可辨。设置屏侧早有同款断言,册体侧这一条补上
+    /// ——`clip` 的行为要被钉住,不能只靠 80×30 那一档。
+    #[test]
+    fn 册体关门_紧凑档与三档主题_证据带可辨不溢宽() {
+        let app = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unavailable,
+            Some(probe_ev("/tmp/nw", "nw: 未知子命令 \"vps\"", 3)),
+        );
+        // 66×50(面板支持的最小终端):证据带两行整段在场
+        let c = crate::testutil::frame_display(&app, 66, 50);
+        assert!(
+            c.contains("引擎 /tmp/nw (PATH, 0.1.0) · 探针 nw vps"),
+            "紧凑档证据带首行整段在场:{c}"
+        );
+        assert!(
+            c.contains("引擎原话:nw: 未知子命令 \"vps\" (rc 3)"),
+            "紧凑档证据带次行整段在场:{c}"
+        );
+        for l in c.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= 66,
+                "66×50 册体行不溢出:{l}"
+            );
+        }
+        // 三档主题:同一段证据在真彩 / 256 / 16 都整段在场(只用 palette 既有档)
+        for cap in [
+            crate::term::ColorCap::Truecolor,
+            crate::term::ColorCap::C256,
+            crate::term::ColorCap::C16,
+        ] {
+            let mut a = gated_book(
+                CatalogKind::Vps,
+                crate::engine::Capability::Vps,
+                crate::engine::Probe::Unavailable,
+                Some(probe_ev("/tmp/nw", "nw: 未知子命令 \"vps\"", 3)),
+            );
+            a.cap = cap;
+            a.palette = crate::theme::Palette::resolve(a.theme, cap);
+            let t = crate::testutil::frame_display(&a, 80, 30);
+            assert!(
+                t.contains("引擎 /tmp/nw (PATH, 0.1.0) · 探针 nw vps"),
+                "{cap:?} 档证据带可辨:{t}"
+            );
+        }
     }
 
     /// 四本册同一套心智模型(故事 8):任一关门都拿到同构的指路与证据带。
@@ -7637,8 +7688,9 @@ mod tests {
             false,
         );
         // 同机双构建同版本号的实证形态:这个构建对 `nw tag` 回「未知子命令」。
+        app.engine_version = "0.1.0".into(); // 开机版本回音已落地
         let echo = probe_echo(&["tag"], 3, "nw: 未知子命令 \"tag\"");
-        let ev = crate::engine::ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = crate::engine::ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH");
         app.capabilities.record(
             crate::engine::Capability::Tag,
             crate::engine::Probe::Unavailable,

@@ -191,9 +191,6 @@ pub struct ProbeEvidence {
     /// 引擎来源,口径同 `discover::Source::label()`(--nw-bin 指定 / 配置文件 /
     /// PATH / $NW_HOME/nw)。
     pub source: &'static str,
-    /// 引擎版本:复用开机版本探测结论,不新增引擎调用;「探测中」/「未知」
-    /// 两态如实呈现,不当成确定性版本号。
-    pub version: String,
     /// 引擎那一跑的原文:stderr 首条非空人话优先(判定顺序:人话优先于
     /// envelope,与 [`interpret`] 同源);没有则 envelope 的 schema 原文
     /// (契约守卫命中也如实记 schema 原文);两者皆无 = 「引擎未给出可解回答」。
@@ -211,14 +208,15 @@ impl ProbeEvidence {
     /// 从那一跑的回放与开机已探明的引擎身份立一份证据(纯函数)。
     ///
     /// `bin` 为 `None` = 发现失败、那一跑没到过真引擎:此刻引擎无话可说,
-    /// 证据不拿 `MissingRunner` 的指路素材冒充原话。`version` 取开机的
-    /// `--version` 回音(已探明,不在这里再问引擎一次)。
-    pub fn capture(
-        out: &EngineOutput,
-        bin: Option<&str>,
-        source: &'static str,
-        version: &str,
-    ) -> Self {
+    /// 证据不拿 `MissingRunner` 的指路素材冒充原话。
+    ///
+    /// **为什么不收版本**:开机 `bootstrap` 把 `--version` 与 8 条能力探针在
+    /// 同一个 tick 里下发,谁先回音不定。版本若在收账时快照进证据,探针回音
+    /// 早到的那几个能力就会永久记着「探测中」,且不会随后续版本回音刷新
+    /// (每能力只收账一次)——操作者看到的版本号是假的。版本是**当前引擎**的
+    /// 属性、不是那一跑的属性,所以由 [`EngineFacts`] 在呈现时实时给
+    /// (spec #90 故事 5:版本号要看得见,且不当成能力依据)。
+    pub fn capture(out: &EngineOutput, bin: Option<&str>, source: &'static str) -> Self {
         // 没到过真引擎就没有「引擎原话」可言;到过了才按判定顺序取原文。
         let reached_engine = bin.is_some() || out.envelope.is_some();
         let words = if reached_engine {
@@ -236,7 +234,6 @@ impl ProbeEvidence {
             argv: out.args.clone(),
             bin: bin.unwrap_or("未发现").to_string(),
             source,
-            version: version.to_string(),
             words,
             exit_code: out.exit_code.number(),
         }
@@ -380,7 +377,7 @@ pub fn gate_signpost(
     }
     Some(GateSignpost {
         verdict: verdict_lines(subject, verdict, facts),
-        evidence: evidence_band(cap, gate),
+        evidence: evidence_band(cap, gate, facts),
     })
 }
 
@@ -483,7 +480,11 @@ fn next_steps(verdict: Probe, facts: &EngineFacts) -> Vec<String> {
 
 /// 证据带:全部取自 [`Gate::evidence`] 的 [`ProbeEvidence`],原样呈现。
 /// 没收到证据 = 空带,不编造。
-fn evidence_band(cap: Capability, gate: &Gate) -> Vec<String> {
+///
+/// 版本取 [`EngineFacts`] 的实时值而非证据快照——理由见
+/// [`ProbeEvidence::capture`](为什么不收版本):`--version` 与能力探针同一个
+/// tick 下发,快照会永久停在「探测中」。
+fn evidence_band(cap: Capability, gate: &Gate, facts: &EngineFacts) -> Vec<String> {
     let Some(ev) = gate.evidence(cap) else {
         return Vec::new();
     };
@@ -492,7 +493,7 @@ fn evidence_band(cap: Capability, gate: &Gate) -> Vec<String> {
             "引擎 {} ({}, {}) · 探针 {}",
             ev.bin,
             ev.source,
-            ev.version,
+            facts.version,
             ev.probe_display()
         ),
         format!("引擎原话:{} (rc {})", ev.words, ev.exit_code),
@@ -606,7 +607,7 @@ mod tests {
         // 「问错二进制」的实证形态:同机另一个自称 0.1.0 的构建对 `nw vps`
         // 回「未知子命令」。判禁用的同时,证据要留住引擎那一跑的原话。
         let out = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
-        let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH");
         let mut gate = Gate::default();
         gate.record(Capability::Vps, interpret(&out), Some(ev));
         assert_eq!(gate.get(Capability::Vps), Probe::Unavailable);
@@ -615,7 +616,6 @@ mod tests {
         assert_eq!(ev.argv, vec!["vps".to_string()], "探针 argv 原样入账");
         assert_eq!(ev.bin, "/tmp/nw");
         assert_eq!(ev.source, "PATH");
-        assert_eq!(ev.version, "0.1.0");
         assert_eq!(ev.words, "nw: 未知子命令 \"vps\"", "引擎原话不改写");
         assert_eq!(ev.exit_code, 3);
     }
@@ -631,7 +631,7 @@ mod tests {
             &[],
         )
         .await;
-        let ev = ProbeEvidence::capture(&out, Some("/usr/local/bin/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&out, Some("/usr/local/bin/nw"), "PATH");
         let mut gate = Gate::default();
         gate.record(Capability::Vps, interpret(&out), Some(ev));
         assert_eq!(gate.get(Capability::Vps), Probe::Available);
@@ -652,17 +652,17 @@ mod tests {
         .run(&["vps".to_string()])
         .await;
         assert_eq!(interpret(&missing), Probe::Unknown);
-        let ev = ProbeEvidence::capture(&missing, None, "未发现", "未知");
+        let ev = ProbeEvidence::capture(&missing, None, "未发现");
         assert_eq!(ev.words, "引擎未给出可解回答");
         assert_eq!(ev.exit_code, 2);
         assert_eq!(ev.bin, "未发现", "没找到二进制也如实记");
         let blank = out_for(&["vps"], 0, "", &[]).await;
-        let ev = ProbeEvidence::capture(&blank, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&blank, Some("/tmp/nw"), "PATH");
         assert_eq!(interpret(&blank), Probe::Unknown);
         assert_eq!(ev.words, "引擎未给出可解回答");
         assert_eq!(ev.exit_code, 0);
         let unsolvable = out_for(&["vps"], 3, "这不是 envelope", &[]).await;
-        let ev = ProbeEvidence::capture(&unsolvable, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&unsolvable, Some("/tmp/nw"), "PATH");
         assert_eq!(interpret(&unsolvable), Probe::Unknown);
         assert_eq!(ev.words, "引擎未给出可解回答");
         assert_eq!(ev.exit_code, 3);
@@ -741,7 +741,7 @@ mod tests {
         // 这一行同时是日志结论句与册体证据带(#122 起共用同一措辞与字段),
         // 所以禁用态与未决态都要带齐证据,且各说各话、不互相冒充。
         let bad = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
-        let ev = ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH");
         let line = signpost_of(&ev, Capability::Vps, Probe::Unavailable)
             .line(Capability::Vps, Probe::Unavailable);
         assert!(line.contains("能力探测:vps 入口禁用"), "{line}");
@@ -758,7 +758,7 @@ mod tests {
         }
         .run(&["vps".to_string()])
         .await;
-        let ev = ProbeEvidence::capture(&missing, None, "未发现", "未知");
+        let ev = ProbeEvidence::capture(&missing, None, "未发现");
         let line =
             signpost_of(&ev, Capability::Vps, Probe::Unknown).line(Capability::Vps, Probe::Unknown);
         assert!(line.contains("能力探测:vps 未决"), "{line}");
@@ -790,7 +790,6 @@ mod tests {
                 &good,
                 Some("/usr/local/bin/nw"),
                 "PATH",
-                "0.1.0",
             )),
         );
         assert!(gate.enabled(Capability::Vps), "回 envelope 判可用");
@@ -799,16 +798,10 @@ mod tests {
         gate.record(
             Capability::Vps,
             interpret(&bad),
-            Some(ProbeEvidence::capture(
-                &bad,
-                Some("/tmp/nw"),
-                "PATH",
-                "0.1.0",
-            )),
+            Some(ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH")),
         );
         assert!(!gate.enabled(Capability::Vps), "回未知子命令判禁用");
         let ev = gate.evidence(Capability::Vps).expect("禁用也要收证据");
-        assert_eq!(ev.version, "0.1.0", "两个构建同版本号");
         assert_eq!(ev.bin, "/tmp/nw", "bin 可分辨");
         assert_eq!(ev.words, "nw: 未知子命令 \"vps\"", "引擎原话可分辨");
         let line = signpost_of(ev, Capability::Vps, Probe::Unavailable)
@@ -832,7 +825,7 @@ mod tests {
             &[],
         )
         .await;
-        let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH");
         // 可用态不产指路(`gate_signpost` 返回 None),所以这一条直接钉证据
         // 载体本身:证据只可能碰到 argv / stderr 人话 / envelope schema / rc。
         assert_eq!(ev.words, "nw/key-register.v1", "只取 schema 原文:{ev:?}");
@@ -939,7 +932,7 @@ mod tests {
         // 真禁用(引擎没有 vps 命令组):禁用话术 + 「不可信也不呈现」 +
         // 证据带(引擎 bin/来源/版本 · 探针 argv · 引擎原话 + rc)。
         let out = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
-        let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH");
         let mut gate = Gate::default();
         gate.record(Capability::Vps, interpret(&out), Some(ev));
         let facts = EngineFacts {
@@ -984,7 +977,7 @@ mod tests {
         }
         .run(&["vps".to_string()])
         .await;
-        let ev = ProbeEvidence::capture(&out, None, "未发现", "未知");
+        let ev = ProbeEvidence::capture(&out, None, "未发现");
         let mut gate = Gate::default();
         gate.record(Capability::Vps, interpret(&out), Some(ev));
         let attempted = vec!["PATH".to_string(), "$NW_HOME/nw".to_string()];
@@ -1020,7 +1013,7 @@ mod tests {
     async fn 单行指路_禁用态给升级下一步_未决态只给重启重探_互不冒充() {
         // 真禁用:下一步是升级所配 nw(整句引用 GATE_HINT),四要素证据在场。
         let bad = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
-        let ev = ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH");
         let mut gate = Gate::default();
         gate.record(Capability::Vps, interpret(&bad), Some(ev));
         let facts = EngineFacts {
@@ -1047,7 +1040,7 @@ mod tests {
         }
         .run(&["vps".to_string()])
         .await;
-        let ev = ProbeEvidence::capture(&missing, None, "未发现", "未知");
+        let ev = ProbeEvidence::capture(&missing, None, "未发现");
         let mut gate = Gate::default();
         gate.record(Capability::Vps, interpret(&missing), Some(ev));
         let attempted = ["PATH".to_string(), "$NW_HOME/nw".to_string()];
@@ -1067,6 +1060,52 @@ mod tests {
         assert!(
             hint.contains("引擎原话:引擎未给出可解回答 (rc 2)"),
             "没答上就如实说没答上:{hint}"
+        );
+    }
+
+    /// 版本竞态的回归钉(#124-review 的 P2):`--version` 与 8 条能力探针在
+    /// 同一个 tick 下发,回音顺序不定。证据**不快照版本**——呈现时从
+    /// [`EngineFacts`] 实时取,所以哪怕探针回音早到、`engine_version` 还是
+    /// 「探测中」,等版本回音一落地,证据带立刻跟着变,不会永久停在假版本上。
+    #[tokio::test]
+    async fn 版本不快照进证据_探针先回音也不永久停在探测中() {
+        // 探针先回音(引擎亲口说没有 vps 命令组),此刻版本还没回
+        let bad = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
+        let mut gate = Gate::default();
+        gate.record(
+            Capability::Vps,
+            interpret(&bad),
+            Some(ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH")),
+        );
+        // 版本回音还没到:如实呈现「探测中」,不编一个版本号
+        let early = EngineFacts {
+            bin: Some("/tmp/nw"),
+            source: "PATH",
+            version: "探测中",
+            attempted: &[],
+        };
+        let band = evidence_band(Capability::Vps, &gate, &early);
+        assert!(
+            band[0].contains("(PATH, 探测中)"),
+            "版本没回音时如实说探测中:{band:?}"
+        );
+        // 版本回音落地后:同一个账、同一条证据,版本立刻变成真值
+        let late = EngineFacts {
+            bin: Some("/tmp/nw"),
+            source: "PATH",
+            version: "0.1.0",
+            attempted: &[],
+        };
+        let band = evidence_band(Capability::Vps, &gate, &late);
+        assert!(
+            band[0].contains("(PATH, 0.1.0)"),
+            "版本回音落地后证据带跟着刷新:{band:?}"
+        );
+        // 证据载体本身不带版本字段:没有第二份版本真相可漂
+        let ev = gate.evidence(Capability::Vps).expect("禁用也要收证据");
+        assert!(
+            !format!("{ev:?}").contains("version"),
+            "证据不存版本,版本只有 EngineFacts 一个出处:{ev:?}"
         );
     }
 
@@ -1122,7 +1161,6 @@ mod tests {
                 &good,
                 Some("/usr/local/bin/nw"),
                 "PATH",
-                "0.1.0",
             )),
         );
         assert!(
@@ -1133,12 +1171,7 @@ mod tests {
         bad_gate.record(
             Capability::Vps,
             interpret(&bad),
-            Some(ProbeEvidence::capture(
-                &bad,
-                Some("/tmp/nw"),
-                "PATH",
-                "0.1.0",
-            )),
+            Some(ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH")),
         );
         let facts_bad = EngineFacts {
             bin: Some("/tmp/nw"),

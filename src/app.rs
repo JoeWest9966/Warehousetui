@@ -1158,13 +1158,14 @@ impl App {
                 if let Some(cap) = Capability::from_probe(&out.args) {
                     let verdict = capability::interpret(&out);
                     // 证据(#118):探针 argv 与引擎那一跑的原文随 verdict 一并
-                    // 入账;bin / 来源取开机发现结论,版本复用开机版本探测
-                    // (已探明,不在这里再问引擎一次)。
+                    // 入账;bin / 来源取开机发现结论。**版本不进证据**——它与
+                    // 8 条探针在同一个 tick 下发,谁先回音不定,快照进去会永久
+                    // 停在「探测中」;版本由 `EngineFacts` 在呈现时实时给
+                    // (见 `ProbeEvidence::capture` 的说明)。
                     let ev = ProbeEvidence::capture(
                         &out,
                         self.engine.bin.as_deref(),
                         self.engine.source,
-                        &self.engine_version,
                     );
                     // 先入账再取指路:共享构造器从账上读证据带,顺序反了
                     // 日志那句就会缺证据(#118 的验收正是「日志带证据」)。
@@ -4478,8 +4479,9 @@ mod tests {
     fn 建议命令_烘焙闸_禁用与未决各给各的下一步_互不冒充() {
         // 真禁用:所配引擎对 `nw recipe bake` 回「未知子命令」(rc 3)
         let echo = probe_echo(&["recipe", "bake"], 3, "nw: 未知子命令 \"bake\"");
-        let ev = ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH");
         let mut app = bake_app();
+        app.engine_version = "0.1.0".into(); // 开机版本回音已落地
         app.capabilities.record(
             Capability::RecipeBake,
             capability::Probe::Unavailable,
@@ -4529,8 +4531,9 @@ mod tests {
     #[test]
     fn 建议命令_新建闸_禁用与未决各给各的下一步_互不冒充() {
         let echo = probe_echo(&["recipe", "new"], 3, "nw: 未知子命令 \"new\"");
-        let ev = ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH", "0.1.0");
+        let ev = ProbeEvidence::capture(&echo, Some("/tmp/nw"), "PATH");
         let mut app = bake_app();
+        app.engine_version = "0.1.0".into(); // 开机版本回音已落地
         app.capabilities.record(
             Capability::RecipeNew,
             capability::Probe::Unavailable,
