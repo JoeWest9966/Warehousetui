@@ -362,6 +362,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('h'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "/",
@@ -373,6 +375,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::HistoryView,
         code: KeyCode::Char('/'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "r",
@@ -384,6 +388,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::HistoryView,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "m",
@@ -668,6 +674,8 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('v'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
     },
     HelpRow {
         key: "Esc",
