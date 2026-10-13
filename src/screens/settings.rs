@@ -1,4 +1,5 @@
-//! 设置屏:引擎发现状态、NW_HOME、主题、配置入口、指路屏。
+//! 设置屏:引擎发现状态、NW_HOME、数据仓根、主题、配置入口、指路屏,
+//! 以及两个次级页——引擎版本对照(#108,`v`)与多派总览(#107,`p`)。
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -342,13 +343,7 @@ fn render_profiles(frame: &mut Frame, inner: Rect, app: &App) {
         p.dim(),
     )));
     head.push(Line::from(Span::styled(
-        "  ↑/↓ 选派 · Enter 跳这一派的装配历史",
-        p.dim(),
-    )));
-    // 回收站的挂点(#102 在途):明写「等 #102 落地」,不画一个假动作段——
-    // 点不到一个当前不存在的动作,比点得到更糟(#67 纪律,ADR-0010 §7 同款)。
-    head.push(Line::from(Span::styled(
-        "  回收站入口等 #102 落地:现在点不到,好过点到一个不存在的动作",
+        "  ↑/↓ 选派 · Enter 跳这一派的装配历史与回收站(#101 / #102 都已落地)",
         p.dim(),
     )));
     let Some(rows) = app.mp_rows.as_ref() else {
@@ -358,11 +353,23 @@ fn render_profiles(frame: &mut Frame, inner: Rect, app: &App) {
         return;
     };
     if rows.is_empty() {
-        // 安装根在、profiles/ 里没有派:这是「还没装过」,不是「读不到」
-        head.push(Line::from(Span::styled(
-            "  还没有任何派:装第一个派之后这里才有东西可看",
-            p.dim(),
-        )));
+        // 两件事分开说(#107 验收「派目录异常降级呈现」):`profiles/` 读不到
+        // 与「读到了一部都没有」不是同一句话——拿后者冒充前者,操作者会以
+        // 为面板读了、只是没数据(规格故事 28 同款纪律)。
+        match crate::datarepo::profiles_cause(&app.nw_home) {
+            crate::datarepo::ProfilesCause::Unreadable { reason } => {
+                head.push(Line::from(Span::styled(
+                    format!("  派目录读不了:{reason}"),
+                    p.warn(),
+                )));
+            }
+            crate::datarepo::ProfilesCause::Readable => {
+                head.push(Line::from(Span::styled(
+                    "  还没有任何派:装第一个派之后这里才有东西可看",
+                    p.dim(),
+                )));
+            }
+        }
         frame.render_widget(Paragraph::new(head), inner);
         return;
     }

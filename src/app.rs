@@ -2500,7 +2500,15 @@ impl App {
                 self.as_history_sel = i;
             }
         }
-        self.push_log(format!("跳到 {profile} 的装配历史(只读)"));
+        // 回收站(#102)也接上:同一派的视角翻进去,复用历史的选中——不另立
+        // 一个派选择槽(规格用户故事 23:从某一条派跳到它的历史与回收站)。
+        self.as_bin_from = Some(profile.clone());
+        self.as_bin = true;
+        self.load_bin();
+        self.push_log(format!(
+            "跳到 {profile} 的装配历史与回收站(只读;回收站 {n} 个被换下的旧组件)",
+            n = self.bin_total()
+        ));
     }
 
     /// 多派总览的 doctor 回音认领(#107)。
@@ -4354,7 +4362,8 @@ fn history_row_fields(row: &crate::screens::HistoryRow) -> Vec<String> {
 ///
 /// 为什么按 argv 认领而不按「当前在哪一屏」:健康屏的 doctor 也带
 /// `--profile`(`commands::doctor_profile`),两处下发形状相同,能区分的
-/// 只有「这一份是不是总览自己在等的」。迟到回音(已翻走 / 已重查过)/// 因此仍走健康屏那条老路,不冒充总览快照。
+/// 只有「这一份是不是总览自己在等的」。迟到回音(已翻走 / 已重查过)
+/// 因此仍走健康屏那条老路,不冒充总览快照。
 fn doctor_arg_profile(args: &[String]) -> Option<String> {
     let i = args.iter().position(|a| a == "--profile")?;
     args.get(i + 1).cloned()
@@ -4687,7 +4696,6 @@ mod tests {
         }
     }
 
-    /// 落盘文件的内容(读盘,不通过 App)。
     /// 落盘文件的内容(读盘,不通过 App)。
     ///
     /// **只算路径、不建目录**:`log_home` 每个用例开头会 `remove_dir_all`
@@ -5405,6 +5413,49 @@ mod tests {
             "选中行按派名对过去,不靠两个列表的下标巧合"
         );
         assert!(app.queue.is_empty(), "跳转零引擎命令");
+    }
+
+    /// 同一次跳转也落到**回收站**(规格用户故事 23 + #107 验收「派间跳转到
+    /// 历史/回收站视图」):复用历史的选中,不另立一个派选择槽。
+    #[test]
+    fn 多派总览_跳到选中派的历史与回收站() {
+        let mut app = mp_app("jump-bin");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.screen, Screen::Assemble, "跳到装配屏");
+        assert!(app.as_history, "历史次级视图在场");
+        assert!(app.as_bin, "回收站次级视图也在场");
+        assert_eq!(
+            app.as_bin_from.as_deref(),
+            Some("mid"),
+            "回收站的视角就是跳过来的那一派,不是第二份选择"
+        );
+        assert!(app.queue.is_empty(), "跳转零引擎命令");
+    }
+
+    /// 多派总览:派目录读不到(profiles/ 不是目录)与「一个派都没有」是两句
+    /// 话——不拿后者冒充前者(#107 验收「派目录异常降级呈现」)。
+    #[test]
+    fn 多派总览_派目录读不到时降级_不拿空列表冒充() {
+        let dir = std::env::temp_dir().join(format!("nwt-mp-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("profiles"), "x").unwrap(); // 是个文件,不是目录
+        let mut app = settings_app();
+        app.splash = false;
+        app.nw_home = dir.display().to_string();
+        app.update(Message::Key(key('p')));
+        for (w, h) in [(110u16, 30u16), (66, 50)] {
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("派目录读不了"), "{w}×{h} 说清读不到:{s}");
+            assert!(!s.contains("还没有任何派"), "{w}×{h} 不拿空列表冒充:{s}");
+        }
     }
 
     /// 总览的 doctor 回音认领是**按 argv 认领**的:别处发起的 doctor(不在
@@ -6566,7 +6617,8 @@ mod tests {
 
     /// 键盘路:概览按 `v` 一键到第六屏(编目),且纯导航零引擎调用、不写流水。
     /// 键位选 `v`(屏枚举 `Screen::Vps` 首字母)与既有 `a`/`h`/`l` 跳屏同构,
-    /// 全仓无 `Char('v')` 冲突;指令栏 / 帮助 / README 三处同写 `v`
+    /// 概览屏内无 `Char('v')` 冲突(#108 起设置屏也用 `v` 翻版本对照页,冲突按屏各算);
+    /// 指令栏 / 帮助 / README 三处同写 `v`
     /// (屏上=按下,#68 故事 5)。HUD 不写它:壳级提示栏只写 j/k、Enter、t、?、q。
     #[test]
     fn 概览_按v跳到编目屏_零引擎调用() {
@@ -8564,6 +8616,48 @@ mod tests {
             .find(|l| l.trim_start().starts_with('|') && l.contains(cn))
             .unwrap_or_else(|| panic!("README 六屏表应有「{cn}」行"))
             .to_string()
+    }
+
+    /// 六屏表一屏一行,且行名与 `Screen::ALL` 一一对应。
+    ///
+    /// 为什么单独立一条:上面的双向比对用 `find()` 取**第一行**匹配,一行屏
+    /// 出现两次时第二行是谁都不看的——并行的分支合并曾把「装配」「健康」
+    /// 各留两行(旧行缺 `d` 翻对比页 / 缺引用自查),`d` 只因 haystack 里
+    /// 「stderr」含一个 d 而侥幸通过。表的形状本身必须是可断言的。
+    #[test]
+    fn readme_六屏表一屏一行_行名与屏枚举一一对应() {
+        let readme = std::fs::read_to_string("README.md").expect("README 在场");
+        let rows: Vec<&str> = readme
+            .lines()
+            .filter(|l| l.trim_start().starts_with('|'))
+            .filter(|l| {
+                let head = l.trim_start().trim_start_matches('|').trim();
+                // 只收六屏表的行:行首是中文屏名,后面还有两列
+                head.starts_with(|c: char| ('\u{4e00}'..='\u{9fff}').contains(&c))
+                    && head.matches('|').count() >= 2
+                    && !head.starts_with("屏")
+            })
+            .collect();
+        for s in Screen::ALL {
+            let cn = readme_screen_cn(s);
+            let hits = rows
+                .iter()
+                .filter(|l| {
+                    l.trim_start()
+                        .trim_start_matches('|')
+                        .trim()
+                        .starts_with(cn)
+                })
+                .count();
+            assert_eq!(hits, 1, "README 六屏表里「{cn}」应恰有一行,实得 {hits}");
+        }
+        assert_eq!(
+            rows.len(),
+            Screen::ALL.len(),
+            "六屏表行数应等于屏数({}),实得 {}:多出来的行是合并残留",
+            Screen::ALL.len(),
+            rows.len()
+        );
     }
 
     /// 守「README 键位表与帮助浮层自此一致,不再互相漏」(#62 验收钉,

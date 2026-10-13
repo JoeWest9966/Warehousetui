@@ -2567,7 +2567,7 @@ fn 装配历史_不认识的schema走契约守卫话术() {
 /// 原样不动(看原文不写任何选中态)。
 #[test]
 fn 装配历史_回车看清单原文_照贴且关掉不动选中() {
-    let mut app = history_app("snap2");
+    let mut app = history_app("snap2-raw");
     app.update(Message::Key(KeyEvent::new(
         KeyCode::Enter,
         KeyModifiers::NONE,

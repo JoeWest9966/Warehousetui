@@ -157,10 +157,18 @@ pub fn render_assemble(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// 存档日志浮层(#103,规格故事 18):居中薄浮层, stderr 副本照贴。
-/// 与清单原文浮层同族同几何(同一块 `popup` 算式),只换标题与收尾提示——
-/// 两个浮层的「点任意处 / Enter / Esc / q 关闭」也走同一条 `dismiss_popup`。
-fn render_history_log(frame: &mut Frame, area: Rect, app: &App, body: &str) {
+/// 装配屏两个顶层浮层(清单原文 #101 / 存档日志 #103)共用的薄浮层。
+///
+/// 居中、72×20(受终端大小收窄)、只折行不裁剪。两个浮层的几何与边框逐字节
+/// 相同,抽一件共用——各写一份,迟早有一份先改(ADR-0005 同款纪律)。
+fn render_text_popup(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    title: &'static str,
+    mut lines: Vec<Line<'static>>,
+    footer: &'static str,
+) {
     let p = &app.palette;
     let w = 72u16.min(area.width.saturating_sub(4));
     let h = 20u16.min(area.height.saturating_sub(2));
@@ -171,6 +179,26 @@ fn render_history_log(frame: &mut Frame, area: Rect, app: &App, body: &str) {
         h,
     );
     frame.render_widget(Clear, popup);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(footer, p.dim())));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(title, p.accent().bold())),
+            )
+            .style(p.surface())
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        popup,
+    );
+}
+
+/// 存档日志浮层(#103,规格故事 18):居中薄浮层, stderr 副本照贴。
+/// 与清单原文浮层同族同几何(同一块 `popup` 算式),只换标题与收尾提示——
+/// 两个浮层的「点任意处 / Enter / Esc / q 关闭」也走同一条 `dismiss_popup`。
+fn render_history_log(frame: &mut Frame, area: Rect, app: &App, body: &str) {
+    let p = &app.palette;
     let mut lines: Vec<Line> = body
         .lines()
         .map(|l| Line::from(Span::raw(l.to_string())))
@@ -180,28 +208,21 @@ fn render_history_log(frame: &mut Frame, area: Rect, app: &App, body: &str) {
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("(这一份里没有行)", p.dim())));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
+    render_text_popup(
+        frame,
+        area,
+        app,
+        " 存档日志 ",
+        lines,
         "  Enter / Esc 返回(stderr 旁路副本,只读)",
-        p.dim(),
-    )));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::bordered()
-                    .border_style(p.accent())
-                    .title(Span::styled(" 存档日志 ", p.accent().bold())),
-            )
-            .style(p.surface())
-            .wrap(ratatui::widgets::Wrap { trim: false }),
-        popup,
     );
 }
 
 fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let cols =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
+    // 几何与命中侧同一来源(`layout::h_split2` / `layout::subview_list`):
+    // 渲染与命中各写一份 Layout,迟早有一份先改(ADR-0005)。
+    let cols = crate::layout::h_split2(area, 55, 45);
     // 锁定集属五域之一:根不对时入口给指路,不摆空清单(票 #27)。
     if app.data_root_cause().is_some() {
         frame.render_widget(
@@ -259,7 +280,7 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
                     .title(Span::styled(" 选锁定集 ", p.accent())),
             )
             .highlight_style(p.sel()),
-        cols[0],
+        cols.0,
         &mut st,
     );
     frame.render_widget(
@@ -287,7 +308,7 @@ fn render_picker(frame: &mut Frame, area: Rect, app: &App) {
                 .border_style(p.dim())
                 .title(Span::styled(" 仪式说明 ", p.dim())),
         ),
-        cols[1],
+        cols.1,
     );
 }
 
@@ -875,36 +896,30 @@ fn render_bin(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_bin_comfy(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let cols =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
-    frame.render_stateful_widget(
-        bin_list(app, p, cols[0].width),
-        cols[0],
-        &mut bin_state(app),
-    );
+    // 几何与命中侧同一来源(`layout::h_split2`):渲染与命中各写一份 Layout,
+    // 迟早有一份先改(ADR-0005 一处几何真相)。
+    let cols = crate::layout::h_split2(area, 55, 45);
+    frame.render_stateful_widget(bin_list(app, p, cols.0.width), cols.0, &mut bin_state(app));
     frame.render_widget(
-        Paragraph::new(bin_detail_lines(app, cols[1].width))
+        Paragraph::new(bin_detail_lines(app, cols.1.width))
             .block(
                 Block::bordered()
                     .border_style(p.dim())
                     .title(Span::styled(" 选中条目的恢复地址 ", p.accent())),
             )
             .style(p.surface()),
-        cols[1],
+        cols.1,
     );
 }
 
 fn render_bin_compact(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(12)]).split(area);
-    frame.render_stateful_widget(
-        bin_list(app, p, rows[0].width),
-        rows[0],
-        &mut bin_state(app),
-    );
+    // 同上:紧凑态两块也走共用件(常畅的那一栏由 `subview_list` 给)。
+    let rows = crate::layout::subview_rows(area);
+    frame.render_stateful_widget(bin_list(app, p, rows.0.width), rows.0, &mut bin_state(app));
     frame.render_widget(
-        Paragraph::new(bin_detail_lines(app, rows[1].width)).style(p.surface()),
-        rows[1],
+        Paragraph::new(bin_detail_lines(app, rows.1.width)).style(p.surface()),
+        rows.1,
     );
 }
 
@@ -1017,37 +1032,39 @@ fn bin_detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 
 fn render_history_comfy(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let cols =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
+    // 几何与命中侧同一来源(`layout::h_split2`):渲染与命中各写一份 Layout,
+    // 迟早有一份先改(ADR-0005 一处几何真相)。
+    let cols = crate::layout::h_split2(area, 55, 45);
     frame.render_stateful_widget(
-        history_list(app, p, cols[0].width),
-        cols[0],
+        history_list(app, p, cols.0.width),
+        cols.0,
         &mut history_state(app),
     );
     frame.render_widget(
-        Paragraph::new(history_detail_lines(app, cols[1].width))
+        Paragraph::new(history_detail_lines(app, cols.1.width))
             .block(
                 Block::bordered()
                     .border_style(p.dim())
                     .title(Span::styled(" 选中派的清单 ", p.accent())),
             )
             .style(p.surface()),
-        cols[1],
+        cols.1,
     );
 }
 
 /// 紧凑态:派清单在上、明细在下(66 宽放不下两栏,明细改竖排)。
 fn render_history_compact(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
-    let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(12)]).split(area);
+    // 同上:紧凑态两块也走共用件(常畅的那一栏由 `subview_list` 给)。
+    let rows = crate::layout::subview_rows(area);
     frame.render_stateful_widget(
-        history_list(app, p, rows[0].width),
-        rows[0],
+        history_list(app, p, rows.0.width),
+        rows.0,
         &mut history_state(app),
     );
     frame.render_widget(
-        Paragraph::new(history_detail_lines(app, rows[1].width)).style(p.surface()),
-        rows[1],
+        Paragraph::new(history_detail_lines(app, rows.1.width)).style(p.surface()),
+        rows.1,
     );
 }
 
@@ -1259,34 +1276,16 @@ fn history_detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 /// 清单原文浮层(#101,规格故事 3):居中薄浮层,原文照贴、只折行不裁剪。
 /// Enter / Esc / q 或点任意处关闭(`dismiss_popup` 同一条链)。
 fn render_history_raw(frame: &mut Frame, area: Rect, app: &App, raw: &str) {
-    let p = &app.palette;
-    let w = 72u16.min(area.width.saturating_sub(4));
-    let h = 20u16.min(area.height.saturating_sub(2));
-    let popup = Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
-    );
-    frame.render_widget(Clear, popup);
-    let mut lines: Vec<Line> = raw
+    let lines: Vec<Line> = raw
         .lines()
         .map(|l| Line::from(Span::raw(l.to_string())))
         .collect();
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
+    render_text_popup(
+        frame,
+        area,
+        app,
+        " 清单原文 ",
+        lines,
         "  Enter / Esc 返回(原文照贴,未改写)",
-        p.dim(),
-    )));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::bordered()
-                    .border_style(p.accent())
-                    .title(Span::styled(" 清单原文 ", p.accent().bold())),
-            )
-            .style(p.surface())
-            .wrap(ratatui::widgets::Wrap { trim: false }),
-        popup,
     );
 }
