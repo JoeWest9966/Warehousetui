@@ -77,7 +77,7 @@ cargo test --all-targets     # 单测:契约解析 / 发现策略 / 六屏快照
 cargo build --release
 ```
 
-本仓不跑 CI(GitHub Actions 被账号级计费挡住全部 job,业主裁定不付钱,见 [docs/release.md](./docs/release.md));闸门在本地,两条路任选:
+CI(GitHub Actions,公库免费额度):push 到 main / 开 PR 时三平台(ubuntu / macos / windows)自动跑齐上面四项,红了就挡住;公库公开后计费门槛消失,见 [docs/release.md](./docs/release.md)。本地闸门保留,两条路任选:
 
 - **自动(推荐)**:`git config core.hooksPath githooks` 启用 `githooks/pre-push`——每次 push 前自动跑齐上面四项,红了就挡住(恢复默认:`git config --unset core.hooksPath`)
 - **手动**:改动合入前,上面四项在开发机上跑齐即闸门
@@ -93,3 +93,5 @@ cargo build --release
 - 调研底稿:[docs/research/](./docs/research/)(nw CLI 契约面 / 用户旅程 / 环境验证)
 - 发布矩阵:[docs/release.md](./docs/release.md)(安装 / 校验 / 打 tag 发布)
 - 工单:[GitHub Issues](https://github.com/JoeWest9966/Warehousetui/issues)(wayfinder 蓝图 #1)
+
+[![CI](https://github.com/JoeWest9966/Warehousetui/actions/workflows/ci.yml/badge.svg)](https://github.com/JoeWest9966/Warehousetui/actions/workflows/ci.yml)

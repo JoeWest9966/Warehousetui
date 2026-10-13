@@ -138,7 +138,7 @@ apt install gcc-aarch64-linux-gnu mingw-w64 zip
 - **公开仓匿名安装即用**:`curl | sh` 一行装开箱即用;未认证 API 有 60 次/小时限流,install.sh 带 `GH_TOKEN`/`GITHUB_TOKEN` 时自动改走 API 资产面(既避限流、也兼容私有仓场景)。
 - **glibc 基线 2.41(v0.2.0 linux 包)**:v0.1.0 的 linux 包构建于 ubuntu-24.04(glibc 2.39);v0.2.0 起在本机(Debian 13)构建,基线升到 2.41,老发行版运行会报 `GLIBC_2.41 not found`。需要更宽兼容时用更老的构建机重打这两个 linux 包(命名不变)。
 - 包管理器分发(Homebrew / Scoop / AUR):后续票据。
-- **跨平台回归只剩一台 Linux 机**:不再有 CI 三平台;已被 macOS/Windows 专属问题咬过两次(建议命令测试的 OS 临时目录长度依赖;见 README「开发」节),改渲染/路径相关代码时手动在脑内过一遍另外两个平台。
+- **三平台回归已回 CI**:公库公开后 GitHub Actions 免费额度恢复,ci.yml 在 ubuntu / macos / windows 三平台跑 fmt/clippy/test/build;曾被 macOS/Windows 专属问题咬过两次(建议命令测试的 OS 临时目录长度依赖;见 README「开发」节),CI 回归后这类回归会被当场抓住。
 
 ## 发布记录
 
