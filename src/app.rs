@@ -101,14 +101,18 @@ impl Domain {
     }
 }
 
-/// 健康屏三种复核模式:doctor 七面 / validate 27 项 / 外部源漂移(recheck,
-/// spec #34 工单 #40)。三者并列,语义互不冒充。
+/// 健康屏四种复核模式:doctor 七面 / validate 27 项 / 外部源漂移(recheck,
+/// spec #34 工单 #40)/ 引用完整性(spec #95 工单 #116)。前三项结论来自引擎
+/// 回音,第四项是**面板自有检查**(经 datarepo 读侧扫数据仓,零引擎调用)。
+/// 四者并列,语义互不冒充——来源标注见 `screens::health::CheckSource`。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HealthMode {
     Doctor,
     Validate,
     /// 外部源漂移复核:只读,结论按结果四态呈现,与 doctor 三档并列不合并。
     Recheck,
+    /// 引用完整性:面板自有检查(配方×组件目录引用图),只读、只报不修。
+    Integrity,
 }
 
 /// 数据仓根门控的三种不可用原因(spec #24:「没设 / 目录不可用 / 引擎缺能力」
@@ -329,6 +333,10 @@ pub struct App {
     /// 外部源漂移复核的**本次**结论(#40):只由刚下发的那一次 recheck 的回音
     /// 写入,面板不缓存、不轮询、不冒充「上次结果」。换数据仓根即清空。
     pub hl_recheck: Option<EngineOutput>,
+    /// 引用完整性检查的**本次**快照(#116):面板自有检查,经 datarepo 读侧
+    /// 每次现扫(与 recheck 同一条「无缓存」纪律:换数据仓根即清空)。
+    /// `None` = 还没扫 / 根不就绪(屏上是指路,不是空列表)。
+    pub hl_integrity: Option<crate::datarepo::ReferenceScan>,
 
     // ---- 配方 ----
     pub rc_domain: Domain,
@@ -588,6 +596,8 @@ impl App {
             hl_result: None,
             hl_loading: false,
             hl_recheck: None,
+            // 引用完整性(#116):面板自有检查的当次快照;None = 还没扫。
+            hl_integrity: None,
             rc_domain: Domain::Recipes,
             rc_sel: 0,
             // 反向溯源浮层(#115):选中行的派落点只读快照;None = 不在场。
@@ -1645,13 +1655,20 @@ impl App {
     }
 
     fn key_health(&mut self, k: KeyEvent) {
-        // m 在三模式间轮转:doctor → validate → 外部源漂移 → doctor。
+        // m 在四种模式间轮转:doctor → validate → 外部源漂移 → 引用完整性 → doctor。
         if let KeyCode::Char('m') = k.code {
             self.hl_mode = match self.hl_mode {
                 HealthMode::Doctor => HealthMode::Validate,
                 HealthMode::Validate => HealthMode::Recheck,
-                HealthMode::Recheck => HealthMode::Doctor,
+                HealthMode::Recheck => HealthMode::Integrity,
+                HealthMode::Integrity => HealthMode::Doctor,
             };
+            // 切进引用完整性即现扫一次(#116):本地只读扫描,没有「在途」态
+            // 可言,不摆「按 r 才查」的空场。三个引擎模式不受影响——它们
+            // 仍由各自的 r / Enter 触发(未查就是未查,不冒充结论)。
+            if self.hl_mode == HealthMode::Integrity {
+                self.run_integrity();
+            }
             return;
         }
         match self.hl_mode {
@@ -1668,6 +1685,17 @@ impl App {
                             .map(|s| s.name.clone());
                         self.run_recheck(name);
                     }
+                    KeyCode::Down if n > 0 => self.hl_sel = (self.hl_sel + 1) % n,
+                    KeyCode::Up if n > 0 => self.hl_sel = (self.hl_sel + n - 1) % n,
+                    _ => {}
+                }
+            }
+            // 引用完整性(#116):面板自有检查,r = 重扫(每次现扫,不缓存上次
+            // 结论);↑/↓ 选行(右栏明细跟着选中行走)。
+            HealthMode::Integrity => {
+                let n = self.hl_integrity_len();
+                match k.code {
+                    KeyCode::Char('r') => self.run_integrity(),
                     KeyCode::Down if n > 0 => self.hl_sel = (self.hl_sel + 1) % n,
                     KeyCode::Up if n > 0 => self.hl_sel = (self.hl_sel + n - 1) % n,
                     _ => {}
@@ -1750,6 +1778,42 @@ impl App {
         self.queue
             .push(commands::source_recheck(name.as_deref(), &root));
         self.push_log(format!("recheck 已入队({scope},只读不写账)"));
+    }
+
+    /// 引用完整性检查行数(#116):↑/↓ / 鼠标选行与右栏明细共用这一条。
+    pub fn hl_integrity_len(&self) -> usize {
+        self.hl_integrity
+            .as_ref()
+            .map(|s| s.rows.len())
+            .unwrap_or(0)
+    }
+
+    /// 下发引用完整性扫描(#116):**面板自有检查**,与引擎三项并列而不混。
+    ///
+    /// 只读铁律:经 datarepo 读侧扫数据仓的配方×组件目录引用图——
+    /// **零引擎调用**(队列一个字节都不加)、**零文件写入**(只报不修,
+    /// 修不修、怎么修是作者的事)。门只有一道:数据仓根不就绪走既有
+    /// 指路语义,不摆空列表、不冒充「0 个问题」。
+    pub fn run_integrity(&mut self) {
+        let Some(root) = self.usable_data_root() else {
+            let why = self
+                .data_root_cause()
+                .map(|c| c.title())
+                .unwrap_or("数据仓根不可用");
+            self.hl_integrity = None; // 根不对:不留旧仓的结论冒充新根的
+            self.push_log(format!("引用完整性未扫描:{why}"));
+            return;
+        };
+        let scan = crate::datarepo::DataRepo::new(&root).reference_scan();
+        self.push_log(format!(
+            "引用完整性已扫描(面板自有检查,只读零写):{} 个 skill/extension、{} 处断链、{} 个孤儿",
+            scan.skills + scan.extensions,
+            scan.broken().len(),
+            scan.orphans().len()
+        ));
+        self.hl_integrity = Some(scan);
+        let n = self.hl_integrity_len();
+        self.hl_sel = self.hl_sel.min(n.saturating_sub(1));
     }
 
     fn key_recipes(&mut self, k: KeyEvent) {
@@ -2050,9 +2114,13 @@ impl App {
             self.clamp_rc_sel();
             self.push_log(format!("ls 未下发:{}", self.data_root_gate_msg()));
         }
-        // 换根即作废上一轮的漂移结论(#40 无缓存语义):旧根的结论不冒充新根的。
+        // 换根即作废上一轮的漂移结论与引用图(#40 / #116 无缓存语义):
+        // 旧根的结论不冒充新根的。
         if self.hl_recheck.take().is_some() {
             self.push_log("漂移结论已作废:数据仓根已换(旧根结论不入账)");
+        }
+        if self.hl_integrity.take().is_some() {
+            self.push_log("引用完整性结论已作废:数据仓根已换(旧仓扫的不是这个仓)");
         }
     }
 
@@ -3391,6 +3459,12 @@ impl App {
 
     /// 对当前选中派跑 doctor / validate。
     pub fn run_health(&mut self) {
+        // 引用完整性(#116)是面板自有检查:不挑派、不读 ls,只扫数据仓 ——
+        // 「没有选中的派」这道门对它是废话(它跟派无关)。
+        if self.hl_mode == HealthMode::Integrity {
+            self.run_integrity();
+            return;
+        }
         let profile = self
             .ls
             .as_ref()
@@ -3407,8 +3481,10 @@ impl App {
         match self.hl_mode {
             HealthMode::Doctor => self.queue.push(commands::doctor_profile(&profile, None)),
             HealthMode::Validate => self.queue_validate(&profile),
-            // 漂移复核走 run_recheck(三道门 + 按名/全查),不在这条派体检路上。
+            // 漂移复核走 run_recheck(三道门 + 按名/全查),不在这条派体检路上;
+            // 引用完整性(#116)在函数开头就分流出去了(它跟派无关)。
             HealthMode::Recheck => self.run_recheck(None),
+            HealthMode::Integrity => {}
         }
     }
 
@@ -6701,15 +6777,21 @@ mod tests {
     }
 
     #[test]
-    fn m_在三模式间轮转_漂移与doctor不互冒充() {
+    fn m_在四种模式间轮转_引用完整性与引擎三项不互冒充() {
         let mut app = recheck_app();
-        assert_eq!(app.hl_mode, HealthMode::Recheck);
-        app.update(Message::Key(key('m')));
-        assert_eq!(app.hl_mode, HealthMode::Doctor);
+        app.hl_mode = HealthMode::Doctor;
         app.update(Message::Key(key('m')));
         assert_eq!(app.hl_mode, HealthMode::Validate);
         app.update(Message::Key(key('m')));
-        assert_eq!(app.hl_mode, HealthMode::Recheck, "轮转回漂移模式");
+        assert_eq!(app.hl_mode, HealthMode::Recheck, "外部源漂移");
+        app.update(Message::Key(key('m')));
+        assert_eq!(
+            app.hl_mode,
+            HealthMode::Integrity,
+            "第四种模式:面板自有检查,与三个引擎模式并列"
+        );
+        app.update(Message::Key(key('m')));
+        assert_eq!(app.hl_mode, HealthMode::Doctor, "轮转回体检");
     }
 
     #[test]
@@ -6916,6 +6998,170 @@ mod tests {
         );
     }
 
+    // ---- #116 引用完整性:面板自有检查,只读、零引擎调用、只报不修 ----
+
+    /// 夹具数据仓:孤儿 / 断链 / 正常三态俱全(web-scout + ribbon 进了配方,
+    /// lonely + dropped 没进任何配方,ghost 被两条配方点名而本体不在)。
+    fn integrity_repo(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("nwt-refs-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&root);
+        let put = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        put("skills/web-scout/SKILL.md", "---\nname: web-scout\n---\n");
+        put("skills/lonely/SKILL.md", "---\nname: lonely\n---\n");
+        put("extensions/ribbon/package.json", "{}");
+        put("extensions/dropped/package.json", "{}");
+        put(
+            "components/scout/component.yaml",
+            "kind: pi-local-package\n",
+        );
+        put(
+            "recipes/research-desk/recipe.yaml",
+            "kind: recipe\nname: research-desk\ncomponents:\n  - component: scout\n  - component: web-scout\n  - component: ribbon\n  - component: ghost\n",
+        );
+        put(
+            "recipes/lab/recipe.yaml",
+            "kind: recipe\nname: lab\ncomponents:\n  - component: ghost\n  - component: hello-world\n    source: external\n",
+        );
+        root
+    }
+
+    /// 夹具 App:数据仓根指向夹具仓,模式切到引用完整性。
+    fn integrity_app(tag: &str) -> (App, std::path::PathBuf) {
+        let root = integrity_repo(tag);
+        let mut app = fake_app();
+        app.splash = false;
+        app.screen = Screen::Health;
+        app.hl_mode = HealthMode::Integrity;
+        app.data_root = Some(root.display().to_string());
+        (app, root)
+    }
+
+    /// 夹具文件树快照(相对路径 + 长度):写动作(新建 / 改内容)都会被抓到。
+    fn refs_tree(root: &std::path::Path) -> Vec<(String, u64)> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, u64)>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().to_string();
+                let md = e.metadata().unwrap();
+                out.push((rel.clone(), md.len()));
+                if md.is_dir() {
+                    walk(root, &p, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn 引用完整性_零写动作_不打引擎命令也不落一个文件() {
+        let runner = Arc::new(FakeRunner::new(&[]));
+        let root = integrity_repo("ro");
+        let mut app = App::with_runner(runner.clone());
+        app.splash = false;
+        app.screen = Screen::Health;
+        app.hl_mode = HealthMode::Integrity;
+        app.data_root = Some(root.display().to_string());
+        let before = refs_tree(&root);
+        app.run_integrity();
+        assert!(app.queue.is_empty(), "面板自有检查不下发任何引擎命令");
+        assert!(
+            runner.call_argvs().is_empty(),
+            "整个扫描期零引擎调用:{:?}",
+            runner.call_argvs()
+        );
+        assert_eq!(app.hl_integrity_len(), 5, "1 处断链 + 2 个孤儿 + 2 个正常");
+        assert!(
+            app.log.iter().any(|l| l.contains("只读零写")),
+            "日志写明只读:{:?}",
+            app.log
+        );
+        assert_eq!(refs_tree(&root), before, "一个文件都不落(只读扫描)");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn 引用完整性_数据仓根未设_不扫描不摆空列表() {
+        let (mut app, root) = integrity_app("noroot");
+        app.data_root = None;
+        app.run_integrity();
+        assert!(app.hl_integrity.is_none(), "根不对不留结论");
+        assert!(app.queue.is_empty(), "不下发命令");
+        assert!(
+            app.log.iter().any(|l| l.contains("数据仓根未设")),
+            "日志走既有指路措辞:{:?}",
+            app.log
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn 引用完整性_换数据仓根即作废旧快照() {
+        let (mut app, root) = integrity_app("swap");
+        app.run_integrity();
+        assert!(app.hl_integrity.is_some(), "扫过一次有快照");
+        let (_g, _cfg) = env_locked();
+        app.apply_data_root(_cfg.dir().display().to_string());
+        assert!(
+            app.hl_integrity.is_none(),
+            "换根作废旧快照(无缓存语义:旧仓扫的不是这个仓)"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("引用完整性结论已作废")),
+            "作废留证据:{:?}",
+            app.log
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn 引用完整性_键位_r重扫_上下选行_鼠标点行同路() {
+        let (mut app, root) = integrity_app("keys");
+        app.run_integrity();
+        assert_eq!(app.hl_sel, 0, "首行是断链(问题在前)");
+        app.update(Message::Key(key('r')));
+        assert!(app.hl_integrity.is_some(), "r 重扫");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.hl_sel, 1, "↓ 移到下一个检查行");
+        app.update(Message::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(app.hl_sel, 0, "↑ 回第一行");
+        // 鼠标点检查行 = 与 ↑/↓ 同一条选中语义,不下发命令
+        app.size = Rect::new(0, 0, 80, 30);
+        let row = hit_target(&app, |t| matches!(t, Target::SelectRow(2)));
+        let qlen = app.queue.len();
+        click(&mut app, row);
+        assert_eq!(app.hl_sel, 2, "点检查行选中(渲染与命中共用同一组分栏)");
+        assert_eq!(app.queue.len(), qlen, "点行只选中,零引擎调用");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn 引用完整性_切进模式即现扫_不摆还没查的空场() {
+        let (mut app, root) = integrity_app("auto");
+        app.hl_mode = HealthMode::Doctor;
+        app.update(Message::Key(key('m'))); // → Validate
+        app.update(Message::Key(key('m'))); // → Recheck
+        app.update(Message::Key(key('m'))); // → Integrity
+        assert_eq!(app.hl_mode, HealthMode::Integrity);
+        assert!(
+            app.hl_integrity.is_some(),
+            "本地只读扫描没有「在途」态:切进即扫,不摆「按 r 才查」的空场"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     // ---- #62 帮助浮层↔实现 双向对齐(纯文档,零行为变更) ----
 
     /// 可观测状态快照:帮助对照测试据此判断「这个键按下去到底动没动」。
@@ -6932,6 +7178,7 @@ mod tests {
         as_confirm: bool,
         hl_mode: HealthMode,
         hl_sel: usize,
+        hl_integrity: Option<crate::datarepo::ReferenceScan>,
         rc_domain: Domain,
         rc_sel: usize,
         rc_landing: Option<crate::screens::recipes::LandingTrace>,
@@ -6962,6 +7209,7 @@ mod tests {
             ah_sel: a.ah_sel,
             hl_mode: a.hl_mode,
             hl_sel: a.hl_sel,
+            hl_integrity: a.hl_integrity.clone(),
             rc_domain: a.rc_domain,
             rc_sel: a.rc_sel,
             rc_bake_sel: a.rc_bake_sel,

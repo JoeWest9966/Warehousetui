@@ -313,7 +313,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
     },
     HelpRow {
         key: "m",
-        desc: "健康:切 体检 / 校验 / 复核",
+        desc: "健康:切 体检 / 校验 / 复核 / 引用完整性",
         screen: Some(Screen::Health),
         domain: None,
         mode: None,
@@ -328,6 +328,19 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         screen: Some(Screen::Health),
         domain: None,
         mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('r'),
+    },
+    // 引用完整性(#116):同一个 r 键在第四种模式下是「重扫数据仓」——
+    // 面板自有检查,与引擎三项的复核分开写,免得读成同一件事。
+    HelpRow {
+        key: "r",
+        desc: "健康:重扫引用完整性(面板自有,只读)",
+        screen: Some(Screen::Health),
+        domain: None,
+        mode: Some(HealthMode::Integrity),
         book: None,
         running: false,
         prep: Prep::Shell,

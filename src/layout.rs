@@ -543,10 +543,35 @@ pub(crate) fn recheck_cols(area: Rect) -> (Rect, Rect) {
     )
 }
 
+/// 引用完整性(#116)三块几何:与 [`recheck_panels`] 同一组 55/45 分栏常量,
+/// 左栏 = 结论横幅 + 四态检查行清单,右栏 = 面板自读事实(规模与选中行明细)。
+/// 渲染(`screens::health::render_integrity`)与命中共用这一处,几何零分歧
+/// (ADR-0005)。
+pub(crate) fn integrity_panels(area: Rect) -> [Rect; 3] {
+    let (left, right) = h_split2(area, 55, 45);
+    let l = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(5),
+        ratatui::layout::Constraint::Min(4),
+    ])
+    .split(left);
+    [l[0], l[1], right]
+}
+
+/// 引用完整性的左右两栏(门一只铺指路时用):由 [`integrity_panels`] 的同一组
+/// 常量合回来,不再另写一份 55/45。
+pub(crate) fn integrity_cols(area: Rect) -> (Rect, Rect) {
+    let p = integrity_panels(area);
+    (
+        Rect::new(p[0].x, p[0].y, p[0].width, p[0].height + p[1].height),
+        p[2],
+    )
+}
+
 /// 健康屏:validate 模式下「27 项」列表在 55% 左栏、带边框、首行即数据
 /// (doctor 模式是只读七面卡,无选中目标);外部源漂移模式(#40)的左栏是
 /// 「结论横幅 + 已登记外部源清单」,清单行在横幅之下,几何见
-/// [`recheck_panels`]。
+/// [`recheck_panels`];引用完整性模式(#116)的左栏是「结论横幅 + 四态检查行」,
+/// 几何见 [`integrity_panels`]。
 fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     if matches!(app.hl_mode, crate::app::HealthMode::Recheck) {
         // 三道门任一不过:整栏是指路,没有可选中行
@@ -563,6 +588,21 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
             shrink_border(recheck_panels(area)[1]),
             0,
             app.recheck_source_len(),
+            hits,
+            Target::SelectRow,
+        );
+        return;
+    }
+    // 引用完整性(#116):检查行清单与渲染同一个 integrity_panels;数据仓根
+    // 不就绪时整栏是指路,没有可选中行(与 recheck 门一同形)。
+    if matches!(app.hl_mode, crate::app::HealthMode::Integrity) {
+        if app.data_root_cause().is_some() {
+            return;
+        }
+        row_hits(
+            shrink_border(integrity_panels(area)[1]),
+            0,
+            app.hl_integrity_len(),
             hits,
             Target::SelectRow,
         );
@@ -1400,6 +1440,59 @@ mod tests {
         app.screen = Screen::Assemble;
         app.as_confirm = true;
         assert_ritual_column_aligned(&app, 66, 31);
+    }
+
+    /// 引用完整性(#116)三块几何:横幅占 5 行,命中侧的检查行首行就是渲染侧的
+    /// 首行(与 recheck 同一条纪律:几何收在一处,渲染与命中不可能各写一套);
+    /// 数据仓根不就绪时整栏是指路,不产可选中行。
+    #[test]
+    fn hitmap_引用完整性_横幅占五行_检查行与渲染同一行() {
+        let mut app = test_app();
+        app.screen = Screen::Health;
+        app.hl_mode = crate::app::HealthMode::Integrity;
+        let dir = std::env::temp_dir().join(format!("nwt-layout-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let put = |rel: &str, body: &str| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        put("skills/lonely/SKILL.md", "x");
+        put(
+            "recipes/only/recipe.yaml",
+            "kind: recipe\nname: only\ncomponents:\n  - component: ghost\n",
+        );
+        app.data_root = Some(dir.display().to_string());
+        app.run_integrity();
+        let a = area(80, 30);
+        assert_eq!(
+            integrity_panels(a)[0].height,
+            5,
+            "横幅 = 3 行文案 + 2 行边框(与 recheck_panels 同组常量)"
+        );
+        let hits = hitmap(a, &app, size_class(a));
+        let row0 = first(&hits, |t| *t == Target::SelectRow(0)).expect("检查行首行可点");
+        let frame = crate::testutil::frame_display(&app, a.width, a.height);
+        let rendered = frame
+            .split('\n')
+            .nth(row0.y as usize)
+            .expect("命中行在渲染中在场");
+        assert!(
+            rendered.contains("ghost"),
+            "命中行 = 渲染检查行首行(断链在前):{rendered}"
+        );
+        // 数据仓根不就绪:整栏是指路,没有可选中行(与 recheck 门一同形)
+        let mut gated = test_app();
+        gated.screen = Screen::Health;
+        gated.hl_mode = crate::app::HealthMode::Integrity;
+        gated.data_root = None;
+        assert!(
+            hitmap(a, &gated, size_class(a))
+                .iter()
+                .all(|(_, t)| !matches!(t, Target::SelectRow(_))),
+            "根不就绪时没有可选中行(指路屏)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// recheck 屏(#40)四块几何:横幅确实占 5 行(3 行文案 + 2 行块边框,
