@@ -22,6 +22,10 @@ pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
     // 登记两段式的浮层(#30):盖在屏体之上(几何与 layout::register_hits
     // 共用 popup_rect 与同一组常量,点哪打哪)。
     render_register_overlay(frame, area, app);
+    // 作者侧脚手架浮层(#110):与登记/落点浮层同层覆盖(它在场时键位/命中都被
+    // 吞,见 on_key 守卫与 layout::hitmap;三个浮层不会同时在场的语义由各自
+    // 的入口门 + dismiss_popup 受理次序保证)。
+    crate::screens::scaffold::render_scaffold_overlay(frame, area, app);
     // 落点溯源浮层(#115):与登记浮层同层覆盖(它在场时键位/命中都被吞,
     // 见 on_key 守卫与 layout::recipes_hits;两个浮层不会同时在场的语义由
     // dismiss_popup 的受理次序保证)。
@@ -139,6 +143,15 @@ fn register_entry_hint(app: &App) -> Line<'static> {
     }
 }
 
+/// 组件域新建入口提示(#110):与登记入口提示同级的**入口行**(不是数据行),
+/// 始终留在列表尾行。skill 是组件(CONTEXT),脚手架落进数据仓 `skills/`;
+/// 入口门(数据仓根就绪 / 不重入)在 `App::start_scaffold` 把守,根不可用时
+/// 整域已走上方的 `data_root_signpost`,不进此路。
+fn scaffold_entry_hint(app: &App) -> Line<'static> {
+    let p = &app.palette;
+    Line::from(Span::styled("  按 n 新建 skill 脚手架…", p.info()))
+}
+
 fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
     let p = &app.palette;
     // 根不对 → 当前域的入口给指路,不摆空列表(票 #27)。
@@ -252,6 +265,11 @@ fn render_rows(frame: &mut Frame, area: Rect, app: &App) {
     // 过滤后也不例外(根不可用时整个域已走上方 signpost,不进此分支)。
     if app.rc_domain == Domain::Sources && app.ls.is_some() {
         items.push(register_entry_hint(app));
+    }
+    // 组件域新建入口(#110):与外部源域登记入口同级的尾行入口(根不可用时
+    // 整域已走上方 signpost,不进此分支)。
+    if app.rc_domain == Domain::Components && app.ls.is_some() {
+        items.push(scaffold_entry_hint(app));
     }
     let mut st = ListState::default();
     let n = app.domain_len();
