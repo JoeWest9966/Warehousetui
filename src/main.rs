@@ -126,6 +126,16 @@ async fn run_loop(
         if app.quit {
             break;
         }
+        // 装配完成通知出匣(#117):bell / OSC 9 序列由主循环写进 stdout。
+        // 渲染保持无副作用(ADR-0004),所以「收尾时序列确实发出」走这里——
+        // 状态树只攒序列,不碰终端。OSC 9 在不支持的环境是静默 no-op,
+        // 所以照发不探测、不报错(规格 Further Notes)。
+        for seq in app.take_pending_notify() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(seq.as_bytes());
+            let _ = out.flush();
+        }
         // 键位处理器排队的引擎命令在这里统一执行(键位没有 tx)。
         for args in std::mem::take(&mut app.queue) {
             app.spawn_engine(args, etx);
