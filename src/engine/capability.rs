@@ -303,6 +303,137 @@ impl Gate {
     }
 }
 
+/// 引擎发现事实:开机已探明,证据带只**读取**、不重新采集。
+///
+/// 能力账([`Gate`])只存探针那一跑;引擎身份三元组与「找 nw 试过哪」在开机
+/// 发现结论里,这里原样引用——版本复用开机 `--version` 回音(已探明,不在这里
+/// 再问引擎一次),`attempted` 是未决态唯一现成的指路素材(指路屏同源)。
+pub struct EngineFacts<'a> {
+    /// 生效引擎 bin(`App.engine.bin`);`None` = 发现失败,那一跑没到过真引擎。
+    pub bin: Option<&'a str>,
+    /// 引擎来源,口径同 `discover::Source::label()`(--nw-bin 指定 / 配置文件 /
+    /// PATH / $NW_HOME/nw)。
+    pub source: &'static str,
+    /// 引擎版本:复用开机版本探测结论;「探测中」/「未知」两态如实呈现,
+    /// **不当成确定性版本号**——版本号推不出能力结论。
+    pub version: &'a str,
+    /// 引擎发现试过的地方(`App.engine.attempted`):未决态「修引擎发现」的
+    /// 指路素材,操作者按图索骥。
+    pub attempted: &'a [String],
+}
+
+/// 能力门关门的规范指路:三态措辞 + 证据带。
+///
+/// # 不变量
+///
+/// - **三态互不冒充**:`Unavailable` 才出现 [`GATE_HINT`](那句「缺的是引擎
+///   能力」的唯一出处就是那个常量,这里只引用、不复制字符串);`Unknown`
+///   走未决话术 + 引擎发现素材 + 重启重探,绝不出现「入口禁用」「缺的是引擎
+///   能力」「升级所配 nw」任何一样;`Available` 不产指路。
+/// - **证据是引擎原文**:字段全部取自 [`Gate::evidence`] 的 [`ProbeEvidence`],
+///   原样呈现、不猜测、不改写、不回显任何本体。**没收到证据时证据带为空**
+///   ——不编造一份证据(未探测过 / 记账时没带证据)。
+pub struct GateSignpost {
+    /// 真相行:这一态开不开、这一态最短的下一步(1-2 行)。
+    pub verdict: Vec<String>,
+    /// 证据带:探的是哪个引擎、引擎那一跑怎么答的;空 = 没收到证据。
+    pub evidence: Vec<String>,
+}
+
+impl GateSignpost {
+    /// 单行形态:日志结论句。三态与证据压成一行,与册体多行形态共用同一份
+    /// 证据字段——措辞一处真相(spec #90 故事 12:事后翻日志能复现当时的判断)。
+    pub fn line(&self, cap: Capability, verdict: Probe) -> String {
+        let mut s = format!("能力探测:{} {}", cap.label(), verdict.label());
+        for e in &self.evidence {
+            s.push_str(" · ");
+            s.push_str(e);
+        }
+        s
+    }
+}
+
+/// 能力门关门的规范指路(spec #90 / 工单 #122 的**唯一新缝针**):册体(#122)、
+/// 设置屏能力节(#123)、四处单行指路(#124)都从这里取「三态措辞 + 证据带」,
+/// 不各自再排一遍。
+///
+/// 输入 = 册或入口标识 + 能力账 + 开机已探明的引擎发现事实;`Available`
+/// 返回 `None`(可用不占指路行,健康时册体无噪音)。
+///
+/// `subject` 是册体传的册名(「机器」/「钥匙」);日志结论句只取
+/// [`GateSignpost::line`],传入口名即可——真相行不归单行形态用。
+pub fn gate_signpost(
+    subject: &str,
+    cap: Capability,
+    gate: &Gate,
+    facts: &EngineFacts,
+) -> Option<GateSignpost> {
+    let verdict = gate.get(cap);
+    if verdict == Probe::Available {
+        return None;
+    }
+    Some(GateSignpost {
+        verdict: verdict_lines(subject, verdict, facts),
+        evidence: evidence_band(cap, gate),
+    })
+}
+
+/// 三态各自的真相行。`Unavailable` 的禁用话术唯一出处是 [`GATE_HINT`];
+/// `Unknown` 只说「引擎这一跑没答上」,不碰禁用那三样字样。
+fn verdict_lines(subject: &str, verdict: Probe, facts: &EngineFacts) -> Vec<String> {
+    match verdict {
+        // 真禁用:升级所配 nw(入口下次启动自动开启)+ 册体不呈现。
+        // 第二行只讲「不可信也不呈现」,不再复述 GATE_HINT 的前半句——
+        // 同一句话有两个出处正是本票要收掉的重复。
+        Probe::Unavailable => vec![
+            format!("⚠ {subject} 册入口禁用:{GATE_HINT}"),
+            "编目册内容此时不可信也不呈现。".to_string(),
+        ],
+        // 未决:引擎这一跑没答上,不是缺能力。修引擎发现(attempted 素材)
+        // 后重启重探——升级 nw 对未决未必管用,所以这里绝不出现那句禁用
+        // 话术(spec #90 故事 2 / 22 / 23:两态互不冒充)。
+        Probe::Unknown => {
+            let mut v = vec![format!(
+                "? {subject} 册入口未决:引擎这一跑没答上,册体不可信也不呈现。"
+            )];
+            // 问的是哪个引擎(故事 3/4/5):与证据带同源,这里说「谁没答上」;
+            // 没找到二进制时如实说没找到,不拿一个路径冒充。
+            match facts.bin {
+                Some(b) => v.push(format!(
+                    "问的是 {b} ({}, {});重启重探。",
+                    facts.source, facts.version
+                )),
+                None => v.push("没找到 nw 二进制;重启重探。".to_string()),
+            }
+            // 引擎发现素材(故事 15):没找到时把试过的地方摊开,操作者按图索骥。
+            if !facts.attempted.is_empty() {
+                v.push(format!("找 nw 试过:{}", facts.attempted.join("、")));
+            }
+            v
+        }
+        // 可用不产指路(`gate_signpost` 已在上面拦掉)。
+        Probe::Available => Vec::new(),
+    }
+}
+
+/// 证据带:全部取自 [`Gate::evidence`] 的 [`ProbeEvidence`],原样呈现。
+/// 没收到证据 = 空带,不编造。
+fn evidence_band(cap: Capability, gate: &Gate) -> Vec<String> {
+    let Some(ev) = gate.evidence(cap) else {
+        return Vec::new();
+    };
+    vec![
+        format!(
+            "引擎 {} ({}, {}) · 探针 {}",
+            ev.bin,
+            ev.source,
+            ev.version,
+            ev.probe_display()
+        ),
+        format!("引擎原话:{} (rc {})", ev.words, ev.exit_code),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +809,201 @@ mod tests {
             Capability::SourceRecheck.probe_args(),
             vec!["source", "recheck"]
         );
+    }
+
+    // ---- 共享纯行构造器(#122 的唯一新缝针):三态措辞 + 证据带 ----
+
+    /// 未决态的事实:引擎缺失(那一跑没到过真引擎),attempted 是指路素材。
+    fn facts_missing<'a>(attempted: &'a [String]) -> EngineFacts<'a> {
+        EngineFacts {
+            bin: None,
+            source: "未发现",
+            version: "未知",
+            attempted,
+        }
+    }
+
+    /// 三态判据只认 Available 才放行,所以可用态构造器直接不产指路——
+    /// 健康时册体一个字节都不多(规格故事 28:可用入口无噪音)。
+    #[test]
+    fn 构造器_可用态不产指路() {
+        let mut gate = Gate::default();
+        gate.record(Capability::Vps, Probe::Available, None);
+        let facts = EngineFacts {
+            bin: Some("/usr/local/bin/nw"),
+            source: "PATH",
+            version: "0.1.0",
+            attempted: &[],
+        };
+        assert!(
+            gate_signpost("机器", Capability::Vps, &gate, &facts).is_none(),
+            "可用态不产指路"
+        );
+    }
+
+    #[tokio::test]
+    async fn 构造器_禁用态_升级指路与证据带四要素都在() {
+        // 真禁用(引擎没有 vps 命令组):禁用话术 + 「不可信也不呈现」 +
+        // 证据带(引擎 bin/来源/版本 · 探针 argv · 引擎原话 + rc)。
+        let out = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
+        let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH", "0.1.0");
+        let mut gate = Gate::default();
+        gate.record(Capability::Vps, interpret(&out), Some(ev));
+        let facts = EngineFacts {
+            bin: Some("/tmp/nw"),
+            source: "PATH",
+            version: "0.1.0",
+            attempted: &[],
+        };
+        let s = gate_signpost("机器", Capability::Vps, &gate, &facts).expect("禁用要产指路");
+        let all = s.verdict.join("\n");
+        assert!(all.contains("入口禁用"), "禁用话术在场:{all}");
+        assert!(
+            all.contains(GATE_HINT),
+            "禁用话术唯一出处是 GATE_HINT 常量:{all}"
+        );
+        assert!(all.contains("不可信也不呈现"), "册体不呈现:{all}");
+        assert!(!all.contains("重启重探"), "禁用态不给未决话术:{all}");
+        // 证据带四要素
+        let evl = s.evidence.join("\n");
+        assert!(evl.contains("/tmp/nw"), "bin 在场:{evl}");
+        assert!(evl.contains("(PATH, 0.1.0)"), "来源与版本在场:{evl}");
+        assert!(evl.contains("探针 nw vps"), "探针 argv 在场:{evl}");
+        assert!(
+            evl.contains("引擎原话:nw: 未知子命令 \"vps\" (rc 3)"),
+            "引擎原话与 rc 在场:{evl}"
+        );
+        // 单行形态(日志结论句):三态 + 同一份证据
+        let line = s.line(Capability::Vps, Probe::Unavailable);
+        assert!(line.contains("能力探测:vps 入口禁用"), "{line}");
+        assert!(
+            line.contains("引擎原话:nw: 未知子命令 \"vps\" (rc 3)"),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn 构造器_未决态_不冒充禁用_带attempted素材与重启重探() {
+        // 未决(引擎缺失):绝不出「入口禁用」「缺的是引擎能力」「升级所配 nw」
+        // 任何一样;改走未决话术 + 引擎发现素材 + 重启重探,证据带同构在场。
+        let out = MissingRunner {
+            attempted: vec!["PATH".into()],
+        }
+        .run(&["vps".to_string()])
+        .await;
+        let ev = ProbeEvidence::capture(&out, None, "未发现", "未知");
+        let mut gate = Gate::default();
+        gate.record(Capability::Vps, interpret(&out), Some(ev));
+        let attempted = vec!["PATH".to_string(), "$NW_HOME/nw".to_string()];
+        let facts = facts_missing(&attempted);
+        let s = gate_signpost("机器", Capability::Vps, &gate, &facts).expect("未决要产指路");
+        let all = s.verdict.join("\n");
+        assert!(all.contains("入口未决"), "未决话术在场:{all}");
+        assert!(!all.contains("入口禁用"), "未决不冒充禁用:{all}");
+        assert!(!all.contains("缺的是引擎能力"), "未决不冒充缺能力:{all}");
+        assert!(!all.contains("升级所配 nw"), "未决不给误导性下一步:{all}");
+        assert!(all.contains("重启重探"), "重启重探在场:{all}");
+        assert!(
+            all.contains("PATH、$NW_HOME/nw"),
+            "attempted 素材在场:{all}"
+        );
+        assert!(all.contains("不可信也不呈现"), "册体同样不呈现:{all}");
+        // 证据带同构(字段一个不少)
+        let evl = s.evidence.join("\n");
+        assert!(evl.contains("探针 nw vps"), "未决也带探针:{evl}");
+        assert!(
+            evl.contains("引擎原话:引擎未给出可解回答 (rc 2)"),
+            "没答上就如实说没答上:{evl}"
+        );
+        let line = s.line(Capability::Vps, Probe::Unknown);
+        assert!(line.contains("能力探测:vps 未决"), "{line}");
+        assert!(!line.contains("入口禁用"), "单行形态也不冒充:{line}");
+    }
+
+    /// 没收到证据时(测试里 `record(cap, verdict, None)` / 未探测过):
+    /// 真相行照常给,证据带**不出现**——不编造一份证据。
+    #[test]
+    fn 构造器_没收证据_真相行照常给_证据带不出现() {
+        let mut gate = Gate::default();
+        gate.record(Capability::Vps, Probe::Unavailable, None);
+        let facts = EngineFacts {
+            bin: Some("/tmp/nw"),
+            source: "PATH",
+            version: "0.1.0",
+            attempted: &[],
+        };
+        let s = gate_signpost("机器", Capability::Vps, &gate, &facts).expect("禁用要产指路");
+        assert!(
+            s.verdict.join("\n").contains("入口禁用"),
+            "真相行照常:{:?}",
+            s.verdict
+        );
+        assert!(s.evidence.is_empty(), "没证据就不编造:{:?}", s.evidence);
+        // 未探测过同理
+        let empty = Gate::default();
+        let s2 = gate_signpost("机器", Capability::Vps, &empty, &facts).expect("未探测也要产指路");
+        assert!(s2.verdict.join("\n").contains("入口未决"), "未探测归未决");
+        assert!(s2.evidence.is_empty(), "未探测没有证据");
+    }
+
+    #[tokio::test]
+    async fn 构造器_同版本号双构建_证据可分辨问错二进制与引擎旧() {
+        // 立项实证:两个都自称 0.1.0 的构建,`nw vps` 一个回 envelope、一个回
+        // 「未知子命令」。版本号推不出能力结论,证据要能分辨问错了二进制。
+        let good = out_for(
+            &["vps"],
+            3,
+            r#"{"schema":"nw/vps-register.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[],"data":{}}"#,
+            &[],
+        )
+        .await;
+        let bad = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
+        let facts_good = EngineFacts {
+            bin: Some("/usr/local/bin/nw"),
+            source: "PATH",
+            version: "0.1.0",
+            attempted: &[],
+        };
+        let mut good_gate = Gate::default();
+        good_gate.record(
+            Capability::Vps,
+            interpret(&good),
+            Some(ProbeEvidence::capture(
+                &good,
+                Some("/usr/local/bin/nw"),
+                "PATH",
+                "0.1.0",
+            )),
+        );
+        assert!(
+            gate_signpost("机器", Capability::Vps, &good_gate, &facts_good).is_none(),
+            "回 envelope 判可用,不产指路"
+        );
+        let mut bad_gate = Gate::default();
+        bad_gate.record(
+            Capability::Vps,
+            interpret(&bad),
+            Some(ProbeEvidence::capture(
+                &bad,
+                Some("/tmp/nw"),
+                "PATH",
+                "0.1.0",
+            )),
+        );
+        let facts_bad = EngineFacts {
+            bin: Some("/tmp/nw"),
+            source: "PATH",
+            version: "0.1.0",
+            attempted: &[],
+        };
+        let s =
+            gate_signpost("机器", Capability::Vps, &bad_gate, &facts_bad).expect("禁用要产指路");
+        let evl = s.evidence.join("\n");
+        assert!(evl.contains("/tmp/nw"), "问错二进制可分辨:{evl}");
+        assert!(
+            evl.contains("引擎原话:nw: 未知子命令 \"vps\""),
+            "引擎旧/没这命令组可分辨:{evl}"
+        );
+        assert!(evl.contains("0.1.0"), "同版本号照实呈现但不作依据:{evl}");
     }
 }
