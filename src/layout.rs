@@ -585,6 +585,19 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
 /// (45% 栏),紧凑态在 Tab 行之下(52% 栏)。两支都用与渲染同一套
 /// ratatui `Layout` 常量,几何零分歧(#18 收起内层栏后命中自动跟随)。
 fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    // 落点溯源浮层(#115):与反查浮层同一条弹层纪律 —— 在场时整块正文只有
+    // 一个「点任意处返航」命中区,底层列表行与键位行(含「Enter 落点」之外
+    // 的一切)一段都不产:浮层吞点击、不穿透底层。
+    //
+    // 命中区取**整块正文**而不是浮层矩形:规格钉的是「Esc 或点任意处关闭」,
+    // 点浮层外的空白也算返航;只给浮层矩形会变成「点外面没反应」,与规格
+    // 原文相反(#70 反查浮层同款,渲染与命中共用 `landing_open()` 判据)。
+    if app.landing_open() {
+        if area.width > 0 && area.height > 0 {
+            hits.push((area, Target::DismissPopup));
+        }
+        return;
+    }
     let list = match class {
         SizeClass::Comfy => ratatui::layout::Layout::horizontal([
             ratatui::layout::Constraint::Length(14),

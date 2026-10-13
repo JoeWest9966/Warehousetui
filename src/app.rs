@@ -333,6 +333,10 @@ pub struct App {
     // ---- 配方 ----
     pub rc_domain: Domain,
     pub rc_sel: usize,
+    /// 反向溯源(#115):配方屏选中行的派落点浮层 —— 纯只读呈现(零引擎调用、
+    /// 零文件读取),落点规则取自上游 docs/external-sources.md,面板不另造。
+    /// 打开时从当次 ls 五域数据算定快照,之后不随刷新漂。
+    pub rc_landing: Option<crate::screens::recipes::LandingTrace>,
     /// 外部源登记·预审段状态机(spec #25 / 工单 #30)。
     pub reg_state: RegState,
     /// repo 链接缓冲(通用单行输入态机,[`input::BUF_CAP`] 封顶)。
@@ -586,6 +590,8 @@ impl App {
             hl_recheck: None,
             rc_domain: Domain::Recipes,
             rc_sel: 0,
+            // 反向溯源浮层(#115):选中行的派落点只读快照;None = 不在场。
+            rc_landing: None,
             reg_state: RegState::Idle,
             reg_repo_buf: String::new(),
             reg_kind: RegKind::Skill,
@@ -1038,6 +1044,11 @@ impl App {
             // 落地只按当前册钳位),所以「回到原选中行」不需要一次恢复动作,只
             // 需要不在返航时顺手改它。Esc 与点任意处走这一条同路(语义不漂移)。
             self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
+        } else if self.landing_open() {
+            // 落点溯源浮层返航(#115):只收状态。配方屏选中行原样在场——浮层
+            // 读的是打开那一刻的落点快照(`recipes::LandingTrace`),返航不顺手
+            // 改 rc_sel/rc_domain。Esc 与点任意处走这一条同路(语义不漂移)。
+            self.rc_landing = None;
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
@@ -1279,6 +1290,17 @@ impl App {
         // 机器册原选中行因此原样不动(规格故事 37:返航后回到原选中行)。
         // 与 `dismiss_popup` 同路:鼠标点任意处与键盘 Esc 一个后果。
         if self.vps_reverse_open() {
+            if matches!(k.code, KeyCode::Esc) {
+                self.dismiss_popup();
+            }
+            return;
+        }
+        // 落点溯源浮层(#115):与反查浮层同级的顶层浮层 —— 在场时吞键,只有
+        // Esc 返航;五域键位(切域/选行/过滤/建议命令)一个都不受理,配方屏原
+        // 选中行因此原样不动(浮层读的是打开那一刻的快照,返航不顺手改
+        // rc_sel/rc_domain)。鼠标点任意处与键盘 Esc 一个后果(走 `dismiss_popup`
+        // 同一条路)。
+        if self.landing_open() {
             if matches!(k.code, KeyCode::Esc) {
                 self.dismiss_popup();
             }
@@ -1763,6 +1785,10 @@ impl App {
             // 外部源域登记入口(#30):两道门在 start_register 里把守,
             // 不可用时只留一句指路,不进流程。
             KeyCode::Char('r') if self.rc_domain == Domain::Sources => self.start_register(),
+            // 反向溯源(#115):Enter 看选中组件/外部源铺进派后的落点 —— 纯只读
+            // 呈现,不读派目录、不发引擎命令(落点规则是上游 external-sources.md
+            // 的只读知识,面板不另造)。无落点语义的域静默不摆(open_landing 三道门)。
+            KeyCode::Enter => self.open_landing(),
             KeyCode::Down => {
                 let n = self.domain_len();
                 if n > 0 {
@@ -3531,6 +3557,23 @@ impl App {
 
     pub fn domain_len(&self) -> usize {
         self.rc_visible().len()
+    }
+
+    /// 落点溯源浮层在不在场(#115):渲染(`recipes::render_landing_overlay`)
+    /// 与命中(`layout::recipes_hits` 的弹层分支)共用这一判据 —— 点哪打哪
+    /// (ADR-0005),与 `vps_reverse_open` 同一条弹层纪律。
+    pub fn landing_open(&self) -> bool {
+        self.rc_landing.is_some()
+    }
+
+    /// Enter 打开落点浮层(#115):纯只读呈现 —— 门只有三道,与五域同源:
+    /// 数据仓根不就绪不摆、当前域无落点语义(recipes/profiles/locks)不摆、
+    /// 没有选中行不摆。不满足时静默无动作(不缺能力、不发调用、不落文件);
+    /// 快照由 `recipes::landing_trace` 从当次 ls 数据算定。
+    fn open_landing(&mut self) {
+        if let Some(trace) = crate::screens::recipes::landing_trace(self) {
+            self.rc_landing = Some(trace);
+        }
     }
 }
 
@@ -6891,6 +6934,7 @@ mod tests {
         hl_sel: usize,
         rc_domain: Domain,
         rc_sel: usize,
+        rc_landing: Option<crate::screens::recipes::LandingTrace>,
         rc_bake_sel: bool,
         reg_state: RegState,
         help: bool,
@@ -6928,6 +6972,7 @@ mod tests {
             home_input: a.home_input,
             data_input: a.data_input,
             rc_filter_on: a.rc_filter_on,
+            rc_landing: a.rc_landing.clone(),
             rc_filter: a.rc_filter.clone(),
             catalog_filter_on: a.catalog_filter_on,
             catalog_filter: a.catalog_filter.clone(),

@@ -45,6 +45,9 @@ fn out(args: &[&str], rc: i32, json: &str) -> EngineOutput {
 
 const LS_FULL: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0"}],"components":[{"name":"retention","depends":[]}],"sources":[],"profiles":[{"name":"desk","state":"drift","lockId":"9f8e","installedAt":"2026-10-01"},{"name":"lab","state":"ok","lockId":"a1b2"}],"locks":[{"lockId":"9f8e","recipe":"research-desk","bakedAt":"2026-10-01"}]}"#;
 
+/// #115 落点浮层夹具:两个本地组件 + 一条 skill 外部源 + 一条 extension 外部源。
+const LOCAL_LS: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0"}],"components":[{"name":"retention"},{"name":"scout"}],"sources":[{"name":"hello-world","repo":"https://github.com/o/hello-world","kind":"skill","entries":[{"name":"web-scout","path":"skills/web-scout"},{"name":"doc-lookup","path":"skills/doc-lookup"}]},{"name":"theme-pack","kind":"extension","entries":[{"name":"ribbon","path":"extensions/ribbon"}]}],"profiles":[{"name":"desk","state":"ok","lockId":"9f8e"}],"locks":[]}"#;
+
 // ---- 五屏快照 ----
 
 #[test]
@@ -2184,4 +2187,434 @@ fn 装配历史_过滤无命中给可区分空态() {
     assert!(app.ah_visible().is_empty(), "无命中");
     let f = draw(&app, 110, 30);
     assert!(f.contains("没有派命中过滤词"), "空态与真空册可区分:{f}");
+}
+
+// ---- #115 反向溯源:派落点(纯函数 + 选中行快照) ----
+
+/// 本地组件的落点 = `nw/components/<组件名>/`:上游 external-sources.md
+/// 「本地组件的 skill 仍住 nw/components/<组件>/ 里 —— 机制不同,家就不同」
+/// (2026-10-03 家长裁定)。纯函数,零 IO;规则只读知识,面板不另造。
+#[test]
+fn 落点纯函数_本地组件落nw_components() {
+    assert_eq!(
+        super::recipes::local_component_landing("retention"),
+        "nw/components/retention/"
+    );
+}
+
+/// 外部 skill 的落点 = `skills/<仓库名>/<条目名>/`:上游 external-sources.md
+/// 「选中的 skill 铺到 <派目录>/skills/<仓库名>/<skill 名>/ —— 仓库名就是
+/// 命名空间」;锁定集 landing.path 同形(`<agent-dir>/skills/hello-world/
+/// web-scout`,kind `pi-skill`)。
+#[test]
+fn 落点纯函数_外部skill落skills_仓库名是命名空间() {
+    assert_eq!(
+        super::recipes::external_entry_landing("hello-world", "web-scout", Some("skill")),
+        "skills/hello-world/web-scout/"
+    );
+}
+
+/// 外部 extension 的落点 = `nw/extensions/<仓库名>/<条目名>/`:上游
+/// external-sources.md「扩展这半」§1 —— 与本地组件同一屋檐(`nw/`)但
+/// **不进 nw/components/**(外部扩展本体没有 component.yaml,塞进去会让
+/// up 步 3 的拓扑与 pruneRemoved 的语义变味)。
+#[test]
+fn 落点纯函数_外部extension落nw_extensions() {
+    assert_eq!(
+        super::recipes::external_entry_landing("theme-pack", "ribbon", Some("extension")),
+        "nw/extensions/theme-pack/ribbon/"
+    );
+}
+
+/// 选中行 → 落点快照(#115):components 域恒为本地组件(上游 ls.go 的
+/// readComponents 只扫 <root>/components/<名>/component.yaml,外部条目住在
+/// sources 域);sources 域一条记录 = 一个仓库 + 条目清单,按 kind 分派落点。
+/// 无落点语义的域(recipes/profiles/locks)不给快照。
+#[test]
+fn 落点快照_组件域取本地_源域取外部条目_其它域无() {
+    let ls: crate::engine::LsData = serde_json::from_str(
+        r#"{"domain":"all","recipes":[{"name":"r1"}],"components":[{"name":"retention"},{"name":"scout"}],"sources":[{"name":"hello-world","repo":"https://github.com/o/hello-world","kind":"skill","entries":[{"name":"web-scout","path":"skills/web-scout"}]},{"name":"theme-pack","kind":"extension","entries":[{"name":"ribbon","path":"extensions/ribbon"}]}],"profiles":[],"locks":[]}"#,
+    )
+    .unwrap();
+    let mut app = fake_app();
+    app.ls = Some(ls);
+    // components 域:选中第二行(scout)
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_sel = 1;
+    assert!(matches!(
+        super::recipes::landing_trace(&app),
+        Some(super::recipes::LandingTrace::Local { name }) if name == "scout"
+    ));
+    // sources 域:第一条记录(hello-world / skill)
+    app.rc_domain = crate::app::Domain::Sources;
+    app.rc_sel = 0;
+    match super::recipes::landing_trace(&app) {
+        Some(super::recipes::LandingTrace::External {
+            repo,
+            kind,
+            entries,
+        }) => {
+            assert_eq!(repo, "hello-world");
+            assert_eq!(kind.as_deref(), Some("skill"));
+            assert_eq!(entries, vec!["web-scout".to_string()]);
+        }
+        other => panic!("sources 域应给外部快照,得到 {other:?}"),
+    }
+    // 无落点语义的域
+    app.rc_domain = crate::app::Domain::Profiles;
+    assert!(
+        super::recipes::landing_trace(&app).is_none(),
+        "profiles 域无落点语义"
+    );
+    app.rc_domain = crate::app::Domain::Locks;
+    assert!(
+        super::recipes::landing_trace(&app).is_none(),
+        "locks 域无落点语义"
+    );
+    app.rc_domain = crate::app::Domain::Recipes;
+    assert!(
+        super::recipes::landing_trace(&app).is_none(),
+        "recipes 域无落点语义"
+    );
+}
+
+/// 过滤后选中行跟随「看得见的那一行」(#61 同源):过滤词把 scout 筛掉后,
+/// 原下标 1 不再有落点快照。
+#[test]
+fn 落点快照_过滤后取看得见的那一行() {
+    let mut app = fake_app();
+    app.ls = Some(
+        serde_json::from_str(
+            r#"{"domain":"all","recipes":[],"components":[{"name":"retention"},{"name":"scout"}],"sources":[],"profiles":[],"locks":[]}"#,
+        )
+        .unwrap(),
+    );
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_sel = 1;
+    app.rc_filter = "retention".into();
+    assert!(
+        super::recipes::landing_trace(&app).is_none(),
+        " scout 被过滤掉:原下标不再有快照(与详情取同一行)"
+    );
+    app.rc_sel = 0;
+    assert!(matches!(
+        super::recipes::landing_trace(&app),
+        Some(super::recipes::LandingTrace::Local { name }) if name == "retention"
+    ));
+}
+
+// ---- #115 落点浮层:两类分列的内容与两档快照(纯呈现) ----
+
+/// 规格验收 1 / 故事 19:选中本地组件,浮层两类分列 —— 本地类摊实指
+/// (`nw/components/<名>/`,上游 external-sources.md「本地组件的 skill 仍住
+/// nw/components/<组件>/ 里」),外部类给上游规则作对照:两类落点差异一目了然。
+#[test]
+fn 落点浮层_本地组件_实指与外部规则分列() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.ls = Some(serde_json::from_str(LOCAL_LS).unwrap());
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_landing = Some(super::recipes::LandingTrace::Local {
+        name: "retention".into(),
+    });
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("nw/components/retention/"),
+        "本地组件实指落点:{s}"
+    );
+    assert!(
+        s.contains("skills/<仓库名>/<条目名>/"),
+        "外部 skill 规则作对照:{s}"
+    );
+    assert!(
+        s.contains("nw/extensions/<仓库名>/<条目名>/"),
+        "外部 extension 规则作对照:{s}"
+    );
+    assert!(s.contains("Esc 或点击任意处关闭"), "收口给返航路:{s}");
+}
+
+/// 规格验收 1 / 故事 18:选中外部 skill 源,条目逐个落
+/// `skills/<仓库名>/<条目名>/`(仓库名即命名空间,上游 2026-10-03 裁定);
+/// 本地类规则作对照。一条记录 = 一个仓库 + 一次扫描的条目清单。
+#[test]
+fn 落点浮层_外部源skill_条目逐个落点() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "hello-world".into(),
+        kind: Some("skill".into()),
+        entries: vec!["web-scout".into(), "doc-lookup".into()],
+    });
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("skills/hello-world/web-scout/"),
+        "skill 条目落点:{s}"
+    );
+    assert!(
+        s.contains("skills/hello-world/doc-lookup/"),
+        "同仓第二条条目同规则:{s}"
+    );
+    assert!(
+        s.contains("nw/components/<组件名>/"),
+        "本地类规则作对照:{s}"
+    );
+}
+
+/// 规格验收 1:外部 extension 落 `nw/extensions/<仓库名>/<条目名>/` —— 上游
+/// external-sources.md「扩展这半」§1:与本地组件同一屋檐但不进 components/。
+#[test]
+fn 落点浮层_外部源extension_落nw_extensions() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "theme-pack".into(),
+        kind: Some("extension".into()),
+        entries: vec!["ribbon".into()],
+    });
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("nw/extensions/theme-pack/ribbon/"),
+        "extension 条目落点:{s}"
+    );
+}
+
+/// kind 缺省不静默冒充:标题明说「kind 未给出」,落点按 skill 呈现
+/// (上游编目两条数组必居其一;面板不猜,只把「按什么呈现」摊开)。
+#[test]
+fn 落点浮层_外部源kind缺失_明说按skill落点() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "bare".into(),
+        kind: None,
+        entries: vec!["x".into()],
+    });
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("kind 未给出"), "kind 缺失明说:{s}");
+    assert!(s.contains("skills/bare/x/"), "按 skill 落点呈现:{s}");
+}
+
+/// 规格验收 4:常畅(110×30)与紧凑(66×50)两档浮层都在帧上、不炸。
+#[test]
+fn 落点浮层_两档快照() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.ls = Some(serde_json::from_str(LOCAL_LS).unwrap());
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_landing = Some(super::recipes::LandingTrace::Local {
+        name: "retention".into(),
+    });
+    for (w, h) in [(110u16, 30u16), (66, 50)] {
+        app.splash = false;
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(
+            f.contains("nw/components/retention/"),
+            "{w}×{h} 本地落点:{f}"
+        );
+        assert!(f.contains("Esc 或点击任意处关闭"), "{w}×{h} 收口在帧:{f}");
+    }
+}
+
+// ---- #115 落点浮层:键位 / 鼠标行为(纯呈现可证) ----
+
+/// 落点浮层行为夹具:数据仓根指向真实可读临时目录(三道闸放行)、五域有料、
+/// FakeRunner 可见 —— 这些测试要能证明「零引擎调用」。
+fn landing_app() -> (Arc<FakeRunner>, App) {
+    let dir = std::env::temp_dir().join(format!("nwt-landing-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let runner = Arc::new(FakeRunner::new(&[(
+        "ls",
+        0,
+        r#"{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"domain":"all","recipes":[],"components":[],"sources":[],"profiles":[],"locks":[]}}"#,
+    )]));
+    let mut app = App::with_runner(runner.clone());
+    app.screen = Screen::Recipes;
+    app.data_root = Some(dir.to_string_lossy().to_string());
+    app.ls = Some(serde_json::from_str(LOCAL_LS).unwrap());
+    (runner, app)
+}
+
+/// 规格验收 2:Enter 打开浮层 = 纯呈现 —— 一个引擎调用都不发、一个字节都
+/// 不入队(落点规则是面板侧只读知识,不读派目录、不代跑)。
+#[test]
+fn 落点浮层_enter打开_零引擎调用零入队() {
+    let (runner, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.landing_open(), "Enter 打开落点浮层");
+    assert!(
+        matches!(&app.rc_landing, Some(super::recipes::LandingTrace::Local { name }) if name == "retention"),
+        "快照取选中行(第一行 retention)"
+    );
+    assert!(
+        runner.call_argvs().is_empty(),
+        "零引擎调用:{:?}",
+        runner.call_argvs()
+    );
+    assert!(app.queue.is_empty(), "零入队");
+}
+
+/// 外部源域 Enter 给外部快照(一条记录 = 一个仓库 + 条目清单,按 kind 分派)。
+#[test]
+fn 落点浮层_外部源域enter给外部快照() {
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Sources;
+    app.rc_sel = 1; // theme-pack(extension)
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    match &app.rc_landing {
+        Some(super::recipes::LandingTrace::External {
+            repo,
+            kind,
+            entries,
+        }) => {
+            assert_eq!(repo, "theme-pack");
+            assert_eq!(kind.as_deref(), Some("extension"));
+            assert_eq!(entries, &vec!["ribbon".to_string()]);
+        }
+        other => panic!("应给外部快照,得到 {other:?}"),
+    }
+    assert!(_r.call_argvs().is_empty(), "零引擎调用");
+}
+
+/// 三道门各说各话:无落点语义的域(recipes/profiles/locks)、没有选中行、
+/// 数据仓根未设 —— Enter 静默不摆浮层(不缺能力、不发调用、不摆空浮层)。
+#[test]
+fn 落点浮层_三道门_不满足不摆() {
+    // 无落点语义的域
+    for d in [
+        crate::app::Domain::Recipes,
+        crate::app::Domain::Profiles,
+        crate::app::Domain::Locks,
+    ] {
+        let (_r, mut app) = landing_app();
+        app.rc_domain = d;
+        key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(!app.landing_open(), "{d:?} 域无落点语义,不摆浮层");
+    }
+    // 没有选中行(components 域被过滤空)
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_filter = "查无此件".into();
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(!app.landing_open(), "无选中行不摆浮层");
+    // 数据仓根未设:与五域同门,不摆(也不拿落点冒充)
+    let dir = std::env::temp_dir().join(format!("nwt-landing-noroot-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let runner = Arc::new(FakeRunner::new(&[]));
+    let mut app = App::with_runner(runner);
+    app.screen = Screen::Recipes;
+    app.data_root = None;
+    app.ls = Some(serde_json::from_str(LOCAL_LS).unwrap());
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(!app.landing_open(), "数据仓根未设不摆浮层");
+}
+
+/// 规格验收 3:Esc 返航只收浮层状态 —— 配方屏选中行原样在场(浮层读的是
+/// 打开那一刻的快照,返航不顺手改 rc_sel/rc_domain)。
+#[test]
+fn 落点浮层_esc返航_选中行原样在场() {
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    app.rc_sel = 1;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(app.landing_open());
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.landing_open(), "Esc 关浮层");
+    assert_eq!(app.rc_sel, 1, "选中行原样在场");
+    assert_eq!(app.rc_domain, crate::app::Domain::Components, "域原样在场");
+}
+
+/// 规格验收 3:浮层在场时吞键 —— 五域键位(h 切域 / ↑↓ 选行 / c 建议命令)
+/// 一个都不受理,与反查浮层同一条弹层纪律;再按 Esc 才返航。
+#[test]
+fn 落点浮层_在场吞键_五域键位不受理() {
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    let sel = app.rc_sel;
+    key(&mut app, crossterm::event::KeyCode::Char('h'));
+    key(&mut app, crossterm::event::KeyCode::Down);
+    key(&mut app, crossterm::event::KeyCode::Char('c'));
+    assert_eq!(app.rc_sel, sel, "浮层吞键:选中行不动");
+    assert_eq!(
+        app.rc_domain,
+        crate::app::Domain::Components,
+        "浮层吞键:不切域"
+    );
+    assert!(!app.rc_bake_sel, "浮层吞键:c 不受理");
+    assert!(app.landing_open(), "非 Esc 键不返航");
+}
+
+/// 规格验收 3:鼠标点任意处关闭(与键盘 Esc 一个后果)—— 命中区取整块正文,
+/// 点浮层外的空白也算返航(与 #70 反查浮层同一条弹层纪律)。
+#[test]
+fn 落点浮层_点任意处关闭_整块正文都是返航命中() {
+    let (_r, mut app) = landing_app();
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    app.size = ratatui::layout::Rect::new(0, 0, 110, 30);
+    let class = crate::layout::size_class(app.size);
+    let hits = crate::layout::hitmap(app.size, &app, class);
+    assert!(
+        hits.iter()
+            .any(|(_, t)| *t == crate::layout::Target::DismissPopup),
+        "浮层在场:整块正文产「点任意处返航」命中"
+    );
+    assert!(
+        hits.iter()
+            .all(|(_, t)| !matches!(t, crate::layout::Target::SelectRow(_))),
+        "浮层吞点击:底层列表行不产命中(不穿透)"
+    );
+    // 点命中区中心(浮层外空白)= 返航(坐标取自布局模型,不硬编码)
+    let dismiss = hits
+        .iter()
+        .find(|(_, t)| *t == crate::layout::Target::DismissPopup)
+        .map(|(r, _)| *r)
+        .expect("上面已断言有 DismissPopup 命中");
+    app.update(Message::Mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: dismiss.x + dismiss.width / 2,
+        row: dismiss.y + dismiss.height / 2,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    }));
+    assert!(!app.landing_open(), "点任意处关闭");
+}
+
+/// 外部源记录还没有扫出条目(register 预审时才有):明说,不画成空列表也不
+/// 拿本地落点冒充;本地类规则仍在(两类分列的读法不因条目空而缺一半)。
+#[test]
+fn 落点浮层_外部源无条目_明说与规则对照() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "tiny-skills".into(),
+        kind: Some("skill".into()),
+        entries: vec![],
+    });
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("该仓库还没有扫出条目"), "无条明说:{s}");
+    assert!(
+        s.contains("nw/components/<组件名>/"),
+        "本地类规则仍作对照:{s}"
+    );
+}
+
+/// 一仓扫出超过上限的条目:浮层不无限长,摊前 6 条 + 明说其余条数
+/// (与健康屏证据面板上限同一种纪律)。
+#[test]
+fn 落点浮层_外部源条目超上限_明说其余条数() {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    let entries: Vec<String> = (0..9).map(|i| format!("e{i}")).collect();
+    app.rc_landing = Some(super::recipes::LandingTrace::External {
+        repo: "many".into(),
+        kind: Some("skill".into()),
+        entries: entries.clone(),
+    });
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("skills/many/e0/"), "首条在:{s}");
+    assert!(s.contains("skills/many/e5/"), "第 6 条在:{s}");
+    assert!(!s.contains("skills/many/e6/"), "第 7 条不进浮层:{s}");
+    assert!(s.contains("…其余 3 条"), "超出明说条数:{s}");
 }
