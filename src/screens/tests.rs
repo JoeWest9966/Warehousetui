@@ -3131,6 +3131,131 @@ fn 打包_确认闸两档快照() {
     std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
 }
 
+/// 三道门收成一处(`App::author_side_gate`)后,三处入口的指路措辞仍逐字同调:
+/// 装配互斥说「<动作>与装配互斥」、根不就绪说「<动作>入口:…」。收拢不改语义。
+#[test]
+fn 作者侧三道门_三处入口措辞同调() {
+    // 装配互斥:三个入口同一句话形状(动作词各自)
+    let (mut app, _r) = recipe_app("gate-word", 0, VALIDATE_PASS);
+    app.assembling = true;
+    for (what, code, domain) in [
+        (
+            "脚手架",
+            crossterm::event::KeyCode::Char('n'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "打包",
+            crossterm::event::KeyCode::Char('p'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "配方编辑",
+            crossterm::event::KeyCode::Char('e'),
+            crate::app::Domain::Recipes,
+        ),
+    ] {
+        app.rc_domain = domain;
+        let before = app.log.len();
+        key(&mut app, code);
+        // 日志是新近在前(push_log 前插),取最新一行
+        assert_eq!(
+            app.log.first().map(|l| l.as_str()),
+            Some(format!("装配进行中:{what}与装配互斥,稍后再试").as_str()),
+            "{what} 入口的互斥措辞与另外两处同调"
+        );
+        assert!(app.log.len() > before, "{what} 要留一行指路");
+    }
+    // 根不就绪:三个入口同一句话形状
+    let (mut app2, _r2) = recipe_app("gate-root-word", 0, VALIDATE_PASS);
+    let app2_root = std::path::PathBuf::from(app2.data_root.clone().unwrap());
+    app2.data_root = None;
+    for (what, code, domain) in [
+        (
+            "脚手架",
+            crossterm::event::KeyCode::Char('n'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "打包",
+            crossterm::event::KeyCode::Char('p'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "配方编辑",
+            crossterm::event::KeyCode::Char('e'),
+            crate::app::Domain::Recipes,
+        ),
+    ] {
+        app2.rc_domain = domain;
+        key(&mut app2, code);
+        let last = app2.log.first().cloned().unwrap_or_default();
+        assert!(last.starts_with(&format!("{what}入口:")), "{what}:{last}");
+        assert!(
+            last.contains("数据仓"),
+            "{what} 根不就绪的指路带数据仓词:{last}"
+        );
+    }
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+    std::fs::remove_dir_all(&app2_root).ok();
+}
+
+/// 规格验收 5(ADR-0010 §5):落盘失败是磁盘 / 权限问题,要在**确认闸**里看得见
+/// ——与脚手架同款(fail() + 预览态渲染),不是只写一行日志让操作者对浮层干瞪眼。
+#[test]
+fn 打包_落盘失败_确认闸里看得见_不冒充成功() {
+    let mut app = pack_app("commit-fail");
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    pack_fill(&mut app, "payloads/web-scout", "web-scout", "1.0.0");
+    assert_eq!(
+        app.pk_flow.as_ref().unwrap().phase,
+        crate::screens::recipes::PackPhase::Review,
+        "拟落账在手,进确认闸"
+    );
+    // 抢占落点:让 rename 必败(目标处是个目录)——磁盘 / 权限类失败
+    std::fs::create_dir_all(root.join("payloads/web-scout/component.yaml")).unwrap();
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    // 留在确认态(不回表单、不假装成功),err 在手
+    assert_eq!(
+        app.pk_flow.as_ref().unwrap().phase,
+        crate::screens::recipes::PackPhase::Review,
+        "落盘失败留在确认态,不冒充成功"
+    );
+    let err = app
+        .pk_flow
+        .as_ref()
+        .unwrap()
+        .err
+        .clone()
+        .expect("失败原因要留下来");
+    assert!(err.contains("落盘失败"), "人话点题:{err}");
+    assert!(
+        err.contains("payloads/web-scout/component.yaml"),
+        "带上相对路径:{err}"
+    );
+    // 浮层里渲染得见(常畅 / 紧凑两档)
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("落盘失败"), "{w}×{h} 确认闸渲染落盘失败:{f}");
+        assert!(
+            f.contains("payloads/web-scout/component.yaml"),
+            "{w}×{h} 带路径:{f}"
+        );
+    }
+    // 目标处原样(没写进去),也不留半文件
+    assert!(
+        root.join("payloads/web-scout/component.yaml").is_dir(),
+        "失败不覆盖目标"
+    );
+    assert!(
+        !root
+            .join("payloads/web-scout/.component.yaml.nwt-tmp")
+            .exists(),
+        "失败清 tmp"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// 表单两档快照:三字段 + 当前字段块光标 + 键位提示。
 #[test]
 fn 打包_表单两档快照() {

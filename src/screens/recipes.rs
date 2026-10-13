@@ -2012,6 +2012,14 @@ fn render_pack_overlay(frame: &mut Frame, area: Rect, app: &App) {
                 crate::layout::SizeClass::Compact => PACK_MANIFEST_LINES_COMPACT,
             };
             lines = pack_review_lines(app, inner_w, cap);
+            // 落盘失败(磁盘 / 权限)在确认闸里说得清(ADR-0010 §5:不混同
+            // 「输入无效」,也别只写一行日志让操作者对浮层干瞪眼)。
+            if let Some(err) = flow.err.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", clip(err, inner_w.saturating_sub(4))),
+                    p.fail(),
+                )));
+            }
         }
         PackPhase::Done => {
             lines.push(Line::from(Span::styled(
