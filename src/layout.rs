@@ -485,6 +485,23 @@ fn assemble_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, 
         }
         return;
     }
+    // 装配历史次级视图(#101):一行一派,命中区与渲染的 `history_list` 同一组
+    // Layout 常量(常畅 55/45 左栏 / 紧凑上下两块的上一块),点行 = 选中
+    // (与 ↑/↓ 同语义,`on_mouse` 的 `SelectRow` 臂按 `as_history` 分派到
+    // `as_history_sel`)。安装根不在时视图整块换成指路,不产命中。
+    if app.as_history && app.home_cause().is_none() {
+        let list = match class {
+            SizeClass::Comfy => h_split2(area, 55, 45).0,
+            SizeClass::Compact => ratatui::layout::Layout::vertical([
+                ratatui::layout::Constraint::Min(6),
+                ratatui::layout::Constraint::Length(12),
+            ])
+            .split(area)[0],
+        };
+        let lst = shrink_border(list);
+        row_hits(lst, 0, app.history_visible().len(), hits, Target::SelectRow);
+        return;
+    }
     if app.as_result.is_some() {
         return;
     }

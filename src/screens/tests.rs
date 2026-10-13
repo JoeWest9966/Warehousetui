@@ -6,6 +6,7 @@ use ratatui::Terminal;
 use crate::app::{App, HealthMode, Message, Screen};
 use crate::engine::{CommandRunner, EngineEvent, EngineOutput, ExitCode, FakeRunner};
 use crate::screens::render;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::Arc;
 
 fn fake_app() -> App {
@@ -1995,4 +1996,158 @@ fn 不过滤时渲染与过滤前逐字节相同() {
         before,
         "无过滤词时 Esc 空动作"
     );
+}
+
+// ---- #101 装配历史次级视图:只读档案,两档快照,坏记录不废屏 ----
+
+/// 清单 fixture:字段与取值照引擎真样本
+/// (`docs/real-first-run/envelopes/doctor-profile.json` 的 `data.manifest`)。
+const HISTORY_MANIFEST_OK: &str = r#"{"schema":"nw/manifest.v1","lockId":"research-desk-1.0.0-360ae68","profile":"research-desk","recipe":"research-desk","version":"1.0.0","runtimeKey":"node-22.19.0+pi-1.0.2","installedAt":"2026-10-09T03:00:07Z","convergeHash":"3cf6a584a523b35ec42630766a9eb6a84d3dcf11d2347d5aa3f3ae879b420502","engine":"0.1.0"}"#;
+
+/// 造一座 fixture 安装根(#101):一部装好的、一部清单写坏了的、一部还没装的。
+fn history_home(tag: &str) -> std::path::PathBuf {
+    // 每个用例一座目录:测试并行跑,共用一个路径会互相 remove_dir_all。
+    let dir = std::env::temp_dir().join(format!("nwt-hist-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (p, text) in [
+        ("research-desk", HISTORY_MANIFEST_OK),
+        ("half", "{\"schema\":\"nw/manifest.v1\",\"lockId\""),
+        ("fresh", ""),
+    ] {
+        let d = dir.join("profiles").join(p);
+        std::fs::create_dir_all(&d).unwrap();
+        if !text.is_empty() {
+            std::fs::write(d.join(".nw-manifest"), text).unwrap();
+        }
+    }
+    dir
+}
+
+/// 一部好派 + 一部坏派 + 一部没装的派,历史视图在场。
+fn history_app(tag: &str) -> App {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.splash = false; // 整帧量要过 splash 那一关(既有 frame_display 测试同款)
+    app.nw_home = history_home(tag).display().to_string();
+    app.as_history = true;
+    app.load_history();
+    // 默认选中装好的那一派(字典序 fresh / half / research-desk → 2):
+    // 明细栏要能摊开全字段,不然两档快照只钉到一个空态。
+    app.as_history_sel = 2;
+    app
+}
+
+/// 两档都在场、无行超宽,且认得的那一派把三个字段都给出来(#101 验收:
+/// 常畅/紧凑两档快照)。
+#[test]
+fn 装配历史屏_两档不溢出_列出锁装于收敛() {
+    let app = history_app("snap");
+    // 最宽那一档:字段全文明出(截断还没吃到它)
+    let wide = crate::testutil::frame_display(&app, 110, 30);
+    assert!(
+        wide.contains("research-desk-1.0.0-360ae68"),
+        "锁 id:{wide:?}"
+    );
+    assert!(wide.contains("2026-10-09T03:00:07Z"), "装配时刻:{wide:?}");
+    assert!(wide.contains("3cf6a584a523b35ec4"), "收敛指纹:{wide:?}");
+    // 三档都在场、无行超宽:窄档字段按 `clip` 截断(不折行——折行会多占
+    // 一行,命中区整体错位),所以断言前缀而不是全文明。
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let s = crate::testutil::frame_display(&app, w, h);
+        assert!(s.contains("research-desk-1.0."), "{w}×{h} 锁 id 前缀:{s:?}");
+        assert!(
+            s.contains("2026-10-09T03:00:0"),
+            "{w}×{h} 装配时刻前缀:{s:?}"
+        );
+        assert!(s.contains("3cf6a584"), "{w}×{h} 收敛指纹前缀:{s:?}");
+        assert!(s.contains("只读"), "{w}×{h} 注脚标明只读:{s:?}");
+        for line in s.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line) <= w as usize,
+                "{w}×{h} 有行超宽:{line:?}"
+            );
+        }
+    }
+}
+
+/// 一条坏记录只坏它自己那一行(规格故事 4):坏派显破损、好派照常、没装的那派
+/// 显缺失——整屏不炸,其余条目一个字节不少。
+#[test]
+fn 装配历史_坏清单呈破损态_其余条目照常() {
+    let mut app = history_app("snap2");
+    app.as_history_sel = 1; // 字典序第二位:写坏清单的 half
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("清单破损"), "坏派显破损:{s:?}");
+    assert!(s.contains("还没装(清单缺失)"), "没装的派显缺失:{s:?}");
+    assert!(
+        s.contains("research-desk-1.0.0-360ae68"),
+        "好派照常给锁 id:{s:?}"
+    );
+    // 明细里明说「其余派照常」——坏记录不废整屏这句话写在屏上
+    assert!(s.contains("其余派照常"), "屏上明说坏记录不连坐:{s:?}");
+}
+
+/// 安装根不在(#101 验收:NW_HOME 未设走既有指路语义):走指路,不画空列表——
+/// 「NW_HOME 指错了」与「一个派都还没装」在屏上是两件事。
+#[test]
+fn 装配历史_安装根不在走指路_不画空列表() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    app.nw_home = std::env::temp_dir()
+        .join(format!("nwt-hist-gone-{}", std::process::id()))
+        .display()
+        .to_string();
+    app.as_history = true;
+    app.load_history();
+    for (w, h) in [(110u16, 30u16), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(s.contains("NW_HOME 目录不在"), "{w}×{h} 给指路:{s:?}");
+        assert!(s.contains("n 轮换"), "{w}×{h} 指路带下一步:{s:?}");
+        assert!(!s.contains("还没有任何派"), "{w}×{h} 不拿空列表冒充:{s:?}");
+    }
+}
+
+/// 不认识的 schema 走契约守卫同款话术(规格:不猜、不按旧形状降级解析),
+/// 且**不**给原文浮层——面板拒绝解释它。
+#[test]
+fn 装配历史_不认识的schema走契约守卫话术() {
+    let mut app = fake_app();
+    app.screen = Screen::Assemble;
+    let dir = std::env::temp_dir().join(format!("nwt-hist-v2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = dir.join("profiles").join("future");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join(".nw-manifest"),
+        r#"{"schema":"nw/manifest.v2","lockId":"x-1.0.0-bbb","engine":"9.9.9"}"#,
+    )
+    .unwrap();
+    app.nw_home = dir.display().to_string();
+    app.as_history = true;
+    app.load_history();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("需升级 nw"), "契约守卫同款话术:{s:?}");
+    assert!(s.contains("不按旧形状降级解析"), "屏上写明立场:{s:?}");
+    assert!(!s.contains("装于"), "不按旧形状解析出一排字段:{s:?}");
+}
+
+/// 回车看清单原文(规格故事 3):原文照贴,Enter / Esc 关闭,历史视图与选中行
+/// 原样不动(看原文不写任何选中态)。
+#[test]
+fn 装配历史_回车看清单原文_照贴且关掉不动选中() {
+    let mut app = history_app("snap2");
+    app.update(Message::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    let raw = app.as_history_raw.clone().expect("原文浮层在场");
+    assert!(raw.contains("convergeHash"), "原文照贴:{raw}");
+    assert!(raw.contains("nw/manifest.v1"), "schema 原文也在:{raw}");
+    app.update(Message::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    )));
+    assert!(app.as_history_raw.is_none(), "Esc 关浮层");
+    assert!(app.as_history, "历史视图原样在场");
+    assert_eq!(app.as_history_sel, 2, "选中行一个字节不动");
 }
