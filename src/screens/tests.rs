@@ -2334,6 +2334,137 @@ fn 回收站_明细给选中条目的恢复地址() {
     assert!(s.contains("面板不代恢复"), "只读立场写在屏上:{s:?}");
 }
 
+// ---- #116 引用完整性自查:面板自有,只读,四态,来源与引擎可区分 ----
+
+/// 造一座 fixture 数据仓(#116):一本配方点名两个组件,其中 `retention`
+/// 的目录不在(断链),另有一个谁都没引用的 `ghost-tools`(孤儿)。
+fn reference_repo(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nwt-ref-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("recipes").join("research-desk")).unwrap();
+    std::fs::write(
+        dir.join("recipes/research-desk/recipe.yaml"),
+        "components:\n  - component: scout\n    version: 1.0.0\n  - component: retention\n    version: 0.4.1\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("components/scout")).unwrap();
+    std::fs::create_dir_all(dir.join("components/ghost-tools")).unwrap();
+    dir
+}
+
+/// 引用自查就绪:数据仓根指向 fixture 仓,按 r 扫一遍。
+fn reference_app(tag: &str) -> App {
+    let mut app = fake_app();
+    app.screen = Screen::Health;
+    app.splash = false;
+    app.data_root = Some(reference_repo(tag).display().to_string());
+    app.hl_mode = HealthMode::Reference;
+    app.load_references();
+    app
+}
+
+#[test]
+fn 引用自查_断链是败孤儿是警_两档都在且不溢宽() {
+    let app = reference_app("findings");
+    for (w, h) in [(110u16, 30u16), (80, 30), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        // 断链:配方点名了 retention,目录却不在
+        assert!(f.contains("retention"), "{w}×{h} 断链点名:{f}");
+        assert!(
+            f.contains("← research-desk"),
+            "{w}×{h} 断链行说清是谁引用的:{f}"
+        );
+        // 孤儿:ghost-tools 有目录,没进任何配方
+        assert!(f.contains("ghost-tools"), "{w}×{h} 孤儿点名:{f}");
+        assert!(f.contains("未入配方"), "{w}×{h} 孤儿的判据:{f}");
+        // 判据全文在右栏(行里放不下),不在左栏行内
+        assert!(f.contains("配方点了没目录"), "{w}×{h} 断链判据写全:{f}");
+        assert!(f.contains("有目录没进配方"), "{w}×{h} 孤儿判据写全:{f}");
+        for l in f.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= w as usize,
+                "{w}×{h} 有行超宽:{l:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn 引用自查_来源标注与引擎检查可区分() {
+    let app = reference_app("source");
+    // CJK 重的帧走 frame_display:draw() 的 TestBackend 串带「隐藏格」注记,
+    // 会把中文串拆散,contains 就找不着了(既有测试同一把尺)。
+    let s = crate::testutil::frame_display(&app, 110, 30);
+    // 块标题自带来源标注:这一栏是面板自己扫的,不是引擎回答的
+    assert!(s.contains("引用完整性·面板自查"), "来源标注在块标题上:{s}");
+    // 右栏把来源说全
+    assert!(s.contains("来源:面板自查"), "右栏写明来源:{s}");
+    assert!(s.contains("自己读数据仓,不调 nw"), "写明不问引擎:{s}");
+    // 引擎那两栏的词汇一个都不在场:不并进同一张清单
+    assert!(!s.contains("27 项"), "不借用引擎 27 项的块标题:{s}");
+    assert!(!s.contains("七面"), "不借用引擎七面的块标题:{s}");
+    // 只读纪律写在屏上
+    assert!(s.contains("只读"), "只读明示:{s}");
+    assert!(s.contains("只报不修"), "只报不修明示:{s}");
+}
+
+#[test]
+fn 引用自查_数据仓根未设_走指路不画空列表() {
+    let mut app = fake_app();
+    app.screen = Screen::Health;
+    app.splash = false;
+    app.hl_mode = HealthMode::Reference;
+    app.data_root = None; // 未设:不猜、不拿当前目录兜底
+    for (w, h) in [(110u16, 30u16), (66, 50)] {
+        let s = draw(&app, w, h);
+        assert!(s.contains("数据仓根未设"), "{w}×{h} 走既有指路:{s}");
+        // 指路那句被紧凑栏宽折成两行:按折行后的原文断言,不按折行前的一句
+        assert!(s.contains("去设置屏按 d"), "{w}×{h} 指路带下一步:{s}");
+        assert!(
+            s.contains("面板不拿当前目录兜底"),
+            "{w}×{h} 不猜当前目录那句也在:{s}"
+        );
+        assert!(
+            !s.contains("还没扫:按 r 扫一遍"),
+            "{w}×{h} 未设根时不画「还没扫」:{s}"
+        );
+    }
+}
+
+#[test]
+fn 引用自查_干净仓与空仓是两态() {
+    // 干净:配方点名的组件都在
+    let clean = std::env::temp_dir().join(format!("nwt-ref-clean-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&clean);
+    std::fs::create_dir_all(clean.join("recipes/d")).unwrap();
+    std::fs::write(
+        clean.join("recipes/d/recipe.yaml"),
+        "components:\n  - component: a\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(clean.join("components/a")).unwrap();
+    let mut app = fake_app();
+    app.screen = Screen::Health;
+    app.splash = false;
+    app.data_root = Some(clean.display().to_string());
+    app.hl_mode = HealthMode::Reference;
+    app.load_references();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("两头都对得上"), "干净是「过」:{s}");
+
+    // 空仓:一本配方、一个组件都没有 —— 四态之「略」,与「过」可区分
+    let empty = std::env::temp_dir().join(format!("nwt-ref-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&empty);
+    std::fs::create_dir_all(&empty).unwrap();
+    app.data_root = Some(empty.display().to_string());
+    app.load_references();
+    let s2 = draw(&app, 110, 30);
+    assert!(s2.contains("没什么可对照的"), "空仓是「略」:{s2}");
+    assert!(!s2.contains("两头都对得上"), "空仓不冒充「过」:{s2}");
+    let _ = std::fs::remove_dir_all(&clean);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
 // ---- #108 引擎版本对照(设置屏次级页) ----
 
 /// 版本对照页的就绪态:注入回放式查询(零网络),本地版本给定。
