@@ -15,7 +15,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # 工具链版本的单一真相源 = 仓库根的 rust-toolchain.toml(本地 pre-push
+      # 闸门跑同一个文件,两边从此逐版本相同)。
+      # 不用 dtolnay/rust-toolchain@v1:它的 toolchain 输入必填、且不读该
+      # 文件,用了就要在 ci.yml 与 rust-toolchain.toml 两处各写一遍版本——
+      # 那正是本次要消灭的漂移。rustup show 会按文件里的 channel 装好
+      # 工具链及其 components。
+      - name: 安装钉版工具链
+        run: rustup show
       - name: fmt
         run: cargo fmt --check
       - name: clippy

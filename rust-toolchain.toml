@@ -1,0 +1,16 @@
+# 工具链钉版(#142 / #144 两次 CI 红的根因)
+#
+# 本地 pre-push 闸门与 GitHub Actions 的 CI 必须跑**同一个** rustc:今天之前
+# 两边各跑各的——开发机默认 1.88、CI 追最新 stable,于是「本地全绿、CI 三平台
+# 红」反复出现(clippy::unnecessary_unwrap 本机 1.88 没有这条 lint,CI 的
+# 1.99 有;金色帧烘 OS 临时路径也只有换一台机器才暴露)。
+#
+# 钉在这里,`cargo` 在本目录下的每次调用都走这一版(rustup 自动解析,无需
+# `rustup run`);CI 侧改用 dtolnay/rust-toolchain@1(不带 toolchain 输入时
+# 读本文件),两边从此同版本。
+#
+# 升版 = 改下面这个 channel 一个字符,单独一个提交,让全量闸门替你看见新 lint
+# 打破了什么。别写成 "stable"——那等于没钉,新 stable 一落地两边又会错开。
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
