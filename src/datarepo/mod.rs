@@ -217,6 +217,10 @@ pub fn read_manifest(nw_home: &str, profile: &str) -> ManifestStatus {
 /// 与另一侧的读取结论并排时没有比较的意义,测试按字段断言)。
 #[derive(Clone, Debug)]
 pub struct LockArchive {
+    /// 这份锁定集的目标派(`nw/lock.v1` 的 `profile`)。发射前 diff 靠它
+    /// 指到「该看哪个派的清单」——`ls` 的锁行不一定带这个字段(真样本
+    /// 只有 lockId / recipe / bakedAt / assets),所以以文件为准。
+    pub profile: Option<String>,
     /// 组件名,**照文件里的顺序**(引擎写盘确定性:同输入重烤同锁,
     /// 上游 `nw/lock.v1` 文档明写「同 lock 连跑两次 manifest 逐字节
     /// 一致」)。集合差按名比,呈现顺序各侧保持原样——不重排,
@@ -304,6 +308,10 @@ pub fn read_lock(nw_home: &str, lock_id: &str) -> LockStatus {
         })
         .unwrap_or_default();
     LockStatus::Ok(LockArchive {
+        profile: value
+            .get("profile")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
         components,
         path: path.display().to_string(),
     })
@@ -566,6 +574,7 @@ mod tests {
             LockStatus::Ok(l) => {
                 // 组件名照文件顺序(引擎写盘确定性:同输入重烤同锁),不重排
                 assert_eq!(l.components, vec!["scout", "retention"]);
+                assert_eq!(l.profile.as_deref(), Some("research-desk"));
                 assert!(l.path.ends_with("locks/research-desk-1.0.0-360ae68.nwlock"));
             }
             other => panic!("认得该读到,实得 {other:?}"),

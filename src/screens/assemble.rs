@@ -57,6 +57,61 @@ fn history_text_width(inner: Rect) -> usize {
     inner.width.saturating_sub(2) as usize
 }
 
+/// 发射仪式的页码(#104,规格故事 10)。
+///
+/// 仪式从一页长成两页:`Brief` 是既有的「将要发生什么」,`Diff` 是新增的
+/// 「新旧对比」。**两页共用同一套键位语义**——`Enter` 发射、`Esc` 返航
+/// 在兩页一个字节不改;`d` 只是翻页(进出一个键,与 #101 历史视图的
+/// `h` 同口径)。预览因此是仪式的中间一页,不是第二道闸。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RitualPage {
+    /// 简报页(默认):锁定集 / 配方 / 目标派 / NW_HOME + 将写入的两行说明。
+    #[default]
+    Brief,
+    /// 新旧对比页(#104):组件增 / 删两列 + convergeHash 相同与否。
+    Diff,
+}
+
+/// 发射前新旧对比的快照(#104)。
+///
+/// 两侧各贡献自己有的字段,**面板不重算引擎的任何结论**:
+/// - 新态 = 选中锁定集的载体文件(`nw/lock.v1`,经
+///   [`crate::datarepo::read_lock`]);
+/// - 旧态 = 当前清单(`nw/manifest.v1`,经
+///   [`crate::datarepo::read_manifest`])
+///   **以及清单自己记的那个 lockId 对应的锁定集文件**——上游
+///   `nw/manifest.v1` 不记组件(真样本见
+///   `docs/real-first-run/envelopes/doctor-profile.json` 的
+///   `data.manifest`),组件集合只住在锁定集里。所以「上一轮装了哪些
+///   组件」在文件面上只有一个答案:清单指名的那个 lock。
+///
+/// 这不是复制引擎的收敛逻辑:两份文件各读一遍,组件名集合差按名比,
+/// 指纹不变/会变的判据只有「清单记的 lockId 与在途这一份是否相同」
+/// (上游铁律:同 lock 连跑两次 `up`,manifest 逐字节一致 —— 调研底稿
+/// `docs/research/nw-cli-surface.md`)。
+#[derive(Clone, Debug, Default)]
+pub struct RitualDiff {
+    /// 清单侧的读取结论(四种分类;屏幕负责措辞与颜色)。
+    pub manifest: Option<crate::datarepo::ManifestStatus>,
+    /// 在途锁定集的读取结论。
+    pub lock: Option<crate::datarepo::LockStatus>,
+    /// 上一轮锁定集的读取结论(清单指名的那个 lock;`None` = 没去读)。
+    pub old_lock: Option<crate::datarepo::LockStatus>,
+    /// 清单记的 lockId(旧态)。
+    pub old_lock_id: Option<String>,
+    /// 清单记的 convergeHash 现值(旧态;面板不重算)。
+    pub old_hash: Option<String>,
+    /// 组件增:在途有、上一轮没有(按在途文件的顺序)。
+    pub added: Vec<String>,
+    /// 组件删:上一轮有、在途没有(按上一轮文件的顺序)。
+    pub removed: Vec<String>,
+    /// 清单缺失:首次装配、无旧态可比(规格故事 9)。
+    pub first_assembly: bool,
+    /// 指纹会不会变。判据只有 lockId 是否相同;没有旧指纹可比时为
+    /// `false`——不说「会变」也不说「不变」,屏上明说无从对比。
+    pub hash_changes: bool,
+}
+
 pub fn render_assemble(frame: &mut Frame, area: Rect, app: &App) {
     if app.as_confirm {
         render_launch_ritual(frame, area, app);

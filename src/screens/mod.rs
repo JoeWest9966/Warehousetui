@@ -13,7 +13,7 @@ mod overview;
 pub(crate) mod recipes;
 mod settings;
 
-pub use assemble::{render_assemble, HistoryRow};
+pub use assemble::{render_assemble, HistoryRow, RitualDiff, RitualPage};
 #[allow(unused_imports)]
 pub use catalog::{
     new_form, new_key_form, new_sub_form, new_tag_form, on_key_form, on_key_key_form,
