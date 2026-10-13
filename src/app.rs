@@ -1166,11 +1166,22 @@ impl App {
                         self.engine.source,
                         &self.engine_version,
                     );
-                    if verdict != Probe::Available {
-                        // 日志只记一句带证据的结论;指路全文归设置屏能力清单。
-                        self.push_log(ev.conclusion(cap, verdict));
-                    }
+                    // 先入账再取指路:共享构造器从账上读证据带,顺序反了
+                    // 日志那句就会缺证据(#118 的验收正是「日志带证据」)。
                     self.capabilities.record(cap, verdict, Some(ev));
+                    if verdict != Probe::Available {
+                        // 日志只记一句带证据的结论(构造器的单行形态,与册体
+                        // 证据带 #122 同一份字段);指路全文归册体 / 设置屏
+                        // 能力清单。可用态不占日志。
+                        let signpost = capability::gate_signpost(
+                            cap.label(),
+                            cap,
+                            &self.capabilities,
+                            &self.engine_facts(),
+                        )
+                        .expect("非可用态必有指路");
+                        self.push_log(signpost.line(cap, verdict));
+                    }
                 }
             }
         }
@@ -1811,6 +1822,19 @@ impl App {
     /// 并给能力指路。两态都不会启动登记流程。
     pub fn reg_entry_enabled(&self) -> bool {
         self.data_root_cause().is_none() && self.capabilities.enabled(Capability::SourceRegister)
+    }
+
+    /// 开机已探明的引擎发现事实:共享指路构造器
+    /// ([`crate::engine::capability::gate_signpost`])的输入。册体、设置屏
+    /// 能力节、日志结论句都从这里取同一份事实,不各自再拼一遍——版本复用
+    /// 开机 `--version` 回音(已探明,不再问引擎一次)。
+    pub fn engine_facts(&self) -> crate::engine::EngineFacts<'_> {
+        crate::engine::EngineFacts {
+            bin: self.engine.bin.as_deref(),
+            source: self.engine.source,
+            version: &self.engine_version,
+            attempted: &self.engine.attempted,
+        }
     }
 
     /// 入口不可用时的一句指路(与入口行提示同源)。

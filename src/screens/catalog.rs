@@ -2631,16 +2631,34 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
     let p = &app.palette;
     let kind = app.catalog_kind;
     let mut lines: Vec<Line> = Vec::new();
-    // 引擎没有这一本的能力:入口禁用并指路(既有门控语义不变,面板不自造替代品)
-    if !app.capabilities.enabled(kind.capability()) {
-        lines.push(Line::from(Span::styled(
-            format!(" ⚠ {} 册入口禁用:{}", kind.label(), capability::GATE_HINT),
-            p.warn().bold(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  缺的是引擎能力,不是面板坏了;编目册内容此时不可信也不呈现。",
-            p.dim(),
-        )));
+    // 能力门(#122):关门指路按探测三态如实分措辞 + 证据带。措辞与字段
+    // 一处真相——共享纯行构造器 `engine::capability::gate_signpost`,日志
+    // 结论句(#118)与设置屏能力节(#123)调的是同一个,册体不再自己排一遍。
+    //
+    // 三态互不冒充:真禁用才出现「缺的是引擎能力…升级所配 nw」;未决只说
+    // 「引擎这一跑没答上」+ 引擎发现素材 + 重启重探,那三样字样一个都不
+    // 出现;可用态不产指路(下面的 `if let` 直接落空),册体与改前逐字节
+    // 相同——健康时零噪音。
+    //
+    // 优先级不变:能力门仍先于数据仓根指路(能力那句不抢跑,根那句也不被
+    // 能力盖掉——两态互不冒充,既有测试钉着)。
+    if let Some(signpost) = capability::gate_signpost(
+        kind.label(),
+        kind.capability(),
+        &app.capabilities,
+        &app.engine_facts(),
+    ) {
+        // 真相行:第一行 warn 加粗(这一态开不开),其余 dim。证据带同 dim——
+        // 它是引擎原文,不是面板的结论,不抢真相行的视觉重量。每条单行,
+        // 超宽按册体既有纪律 `clip` 收(截断不折行:折行会多占一行,
+        // 键位行末行几何即失真)。
+        for (i, v) in signpost.verdict.iter().enumerate() {
+            let style = if i == 0 { p.warn().bold() } else { p.dim() };
+            lines.push(Line::from(Span::styled(clip(v, w), style)));
+        }
+        for e in &signpost.evidence {
+            lines.push(Line::from(Span::styled(clip(e, w), p.dim())));
+        }
     } else if app.data_root_cause().is_some() {
         lines.extend(data_root_signpost(app));
     } else {
@@ -7010,6 +7028,218 @@ mod tests {
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(s.contains("入口禁用"), "{s}");
         assert!(s.contains("缺的是引擎能力"), "{s}");
+    }
+
+    // ---- 工单 #122:册体关门指路三态如实分呈 + 证据带 ----
+
+    /// 一本「能力关门」的册(#122):判据与那一跑的探测证据一并入账(生产
+    /// 同路),引擎身份走 `App::engine` / `engine_version` 两个既有槽——
+    /// 共享构造器只读这两个槽加能力账,不自己再探一次。
+    fn gated_book(
+        kind: CatalogKind,
+        cap: crate::engine::Capability,
+        verdict: crate::engine::Probe,
+        ev: Option<crate::engine::ProbeEvidence>,
+    ) -> crate::app::App {
+        let mut app =
+            crate::app::App::with_runner(std::sync::Arc::new(crate::engine::FakeRunner::new(&[])));
+        app.splash = false;
+        app.screen = crate::app::Screen::Vps;
+        app.catalog_kind = kind;
+        app.capabilities.record(cap, verdict, ev);
+        app
+    }
+
+    /// 一条探针证据(字段即 #118 立的 schema,直接立,不再跑一次引擎)。
+    fn probe_ev(bin: &str, words: &str, rc: i32) -> crate::engine::ProbeEvidence {
+        crate::engine::ProbeEvidence {
+            argv: vec!["vps".into()],
+            bin: bin.into(),
+            source: "PATH",
+            version: "0.1.0".into(),
+            words: words.into(),
+            exit_code: rc,
+        }
+    }
+
+    /// 真禁用:禁用话术 + 证据带四要素(引擎 bin / 来源 / 版本、探针 argv、
+    /// 引擎原话 + rc)都在册体可见,且册体内容不呈现(不可信不呈现)。
+    #[test]
+    fn 册体关门_真禁用_给禁用话术与证据带四要素() {
+        let app = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unavailable,
+            Some(probe_ev("/tmp/nw", "nw: 未知子命令 \"vps\"", 3)),
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("入口禁用"), "禁用态说清是入口禁用:{s}");
+        assert!(
+            s.contains("缺的是引擎能力,不是面板坏了;升级所配 nw 后入口自动开启。"),
+            "禁用话术整句在场(不被 clip 从中间吃掉):{s}"
+        );
+        assert!(s.contains("/tmp/nw"), "问的是哪个引擎(bin):{s}");
+        assert!(s.contains("(PATH, 0.1.0)"), "来源与版本在场:{s}");
+        assert!(s.contains("探针 nw vps"), "探针 argv 在场:{s}");
+        assert!(
+            s.contains("引擎原话:nw: 未知子命令 \"vps\" (rc 3)"),
+            "引擎原话与 rc 在场:{s}"
+        );
+        assert!(
+            s.contains("编目册内容此时不可信也不呈现。"),
+            "不开门就不呈现册体内容:{s}"
+        );
+    }
+
+    /// 未决:不冒充禁用——「入口禁用」「缺的是引擎能力」「升级所配 nw」三样
+    /// 一个都不出现;改走未决话术 + 引擎身份 + 重启重探,证据带同构在场。
+    #[test]
+    fn 册体关门_未决_不冒充禁用_给未决话术与重启重探() {
+        let mut app = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unknown,
+            Some(probe_ev("/tmp/nw", "引擎未给出可解回答", 2)),
+        );
+        // 生产同形:真相行读开机发现结论,证据带读探针那一跑,两边同一个引擎。
+        app.engine.bin = Some("/tmp/nw".into());
+        app.engine.source = "PATH";
+        app.engine_version = "0.1.0".into();
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("未决"), "无响应回未决:{s}");
+        assert!(!s.contains("入口禁用"), "未决不冒充禁用:{s}");
+        assert!(!s.contains("缺的是引擎能力"), "未决不给缺能力指路:{s}");
+        assert!(
+            !s.contains("升级所配 nw"),
+            "未决绝不出现「升级 nw」这类误导性下一步:{s}"
+        );
+        assert!(s.contains("引擎这一跑没答上"), "未决话说清是没答上:{s}");
+        assert!(s.contains("问的是 /tmp/nw"), "未决也点名问的是哪个引擎:{s}");
+        assert!(s.contains("重启重探"), "未决的最短下一步:{s}");
+        assert!(
+            s.contains("引擎原话:引擎未给出可解回答 (rc 2)"),
+            "没答上就如实说没答上,证据带同构:{s}"
+        );
+    }
+
+    /// 未决且根本没找到二进制:attempted 素材摊开(故事 15),操作者按图索骥;
+    /// 没收到的证据不编造——证据带整条不出现。
+    #[test]
+    fn 册体关门_未决且没找到二进制_摊开引擎发现素材且不编造证据() {
+        let mut app = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unknown,
+            None,
+        );
+        app.engine.bin = None;
+        app.engine.source = "未发现";
+        app.engine.attempted = vec!["--nw-bin /nope/nw(不可执行)".into(), "PATH(无 nw)".into()];
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("没找到 nw 二进制"), "如实说没找到:{s}");
+        assert!(
+            s.contains("PATH(无 nw)"),
+            "引擎发现 attempted 素材在场(故事 15):{s}"
+        );
+        assert!(s.contains("重启重探"), "{s}");
+        assert!(!s.contains("引擎原话"), "没收到证据就不编造一条:{s}");
+    }
+
+    /// 双构建回放(立项实证):两个都自称 0.1.0 的引擎,问 `/usr/local/bin/nw`
+    /// 回 envelope 判可用、问 `/tmp/nw` 回「未知子命令」判禁用。版本号一样,
+    /// 册体却点名了「问的是哪个二进制、引擎自己怎么答的」——「问错二进制」
+    /// 与「引擎旧」在册体上一眼可分。
+    #[test]
+    fn 册体关门_双构建同版本号_证据分辨问错二进制() {
+        // 指着对的构建:可用,册体照常呈现(无指路、无噪音)
+        let good = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Available,
+            Some(probe_ev("/usr/local/bin/nw", "nw/vps-register.v1", 3)),
+        );
+        let s_good = crate::testutil::frame_display(&good, 80, 30);
+        assert!(!s_good.contains("入口禁用"), "可用态册体无指路:{s_good}");
+        assert!(!s_good.contains("引擎原话"), "可用态不占证据行:{s_good}");
+        // 指着旧的构建:禁用,册体点名那个二进制与它的原话
+        let bad = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unavailable,
+            Some(probe_ev("/tmp/nw", "nw: 未知子命令 \"vps\"", 3)),
+        );
+        let s_bad = crate::testutil::frame_display(&bad, 80, 30);
+        assert!(s_bad.contains("/tmp/nw"), "点名问错了的那个二进制:{s_bad}");
+        assert!(
+            s_bad.contains("nw: 未知子命令 \"vps\""),
+            "引擎原话可分辨:{s_bad}"
+        );
+        assert!(
+            s_bad.contains("0.1.0"),
+            "两个构建同版本号,版本照实呈现但不作为能力依据:{s_bad}"
+        );
+    }
+
+    /// 四本册同一套心智模型(故事 8):任一关门都拿到同构的指路与证据带。
+    #[test]
+    fn 册体关门_四本册同构指路与证据带() {
+        for (kind, cap) in [
+            (CatalogKind::Vps, crate::engine::Capability::Vps),
+            (CatalogKind::Tag, crate::engine::Capability::Tag),
+            (
+                CatalogKind::Subscription,
+                crate::engine::Capability::Subscription,
+            ),
+            (CatalogKind::Key, crate::engine::Capability::Key),
+        ] {
+            let app = gated_book(
+                kind,
+                cap,
+                crate::engine::Probe::Unavailable,
+                Some(probe_ev("/tmp/nw", "nw: 未知子命令", 3)),
+            );
+            let s = crate::testutil::frame_display(&app, 80, 30);
+            let book = kind.label();
+            assert!(
+                s.contains(&format!("⚠ {book} 册入口禁用")),
+                "{book} 册点名自己:{s}"
+            );
+            assert!(s.contains("缺的是引擎能力"), "{book} 册同构话术:{s}");
+            assert!(
+                s.contains("引擎 /tmp/nw (PATH, 0.1.0)"),
+                "{book} 册同构证据带:{s}"
+            );
+        }
+    }
+
+    /// 动作边界(#122 验收最后一条):鼠标点到关门指路区仍只给指路、不发任何
+    /// 命令。关门态把屏上每一个命中区都点一遍,一条引擎调用都不许发。
+    #[test]
+    fn 册体关门_鼠标点指路区只给指路不发命令() {
+        let mut app = gated_book(
+            CatalogKind::Vps,
+            crate::engine::Capability::Vps,
+            crate::engine::Probe::Unavailable,
+            Some(probe_ev("/tmp/nw", "nw: 未知子命令 \"vps\"", 3)),
+        );
+        let size = Rect::new(0, 0, 80, 30);
+        app.size = size;
+        let hits = crate::layout::hitmap(size, &app, crate::layout::size_class(size));
+        assert!(!hits.is_empty(), "键位行段仍可点(点哪打哪不断)");
+        for (r, _t) in hits {
+            let ev = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: r.x + r.width / 2,
+                row: r.y + r.height / 2,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.update(crate::app::Message::Mouse(ev));
+        }
+        assert!(
+            app.fed_queue.is_empty(),
+            "关门态点任何区都不发命令:{:?}",
+            app.fed_queue
+        );
     }
 
     // ---- 工单 #70:反查上浮(机器册上一个键问「什么标签引用了这一条」) ----

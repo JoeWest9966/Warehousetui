@@ -247,25 +247,6 @@ impl ProbeEvidence {
     pub fn probe_display(&self) -> String {
         format!("nw {}", self.argv.join(" "))
     }
-
-    /// 把「入口 + 三态 + 证据」排成一行结论句。
-    ///
-    /// 措辞与字段一处真相:日志结论句与册体证据带(#122 起)共用这一行,
-    /// 所以不写日志腔 —— 三态由 [`Probe::label`] 如实分呈,证据字段一样
-    /// 不少,操作者据此可分辨「引擎旧」「探测未决」「问错二进制」三种真相。
-    pub fn conclusion(&self, cap: Capability, verdict: Probe) -> String {
-        format!(
-            "能力探测:{} {} · {} ({}, {}) · 探针 {} · 引擎原话:{} (rc {})",
-            cap.label(),
-            verdict.label(),
-            self.bin,
-            self.source,
-            self.version,
-            self.probe_display(),
-            self.words,
-            self.exit_code,
-        )
-    }
 }
 
 /// 探测结果账:入口可用性的唯一事实来源(默认全 Unknown = 未决)。
@@ -380,34 +361,54 @@ pub fn gate_signpost(
 
 /// 三态各自的真相行。`Unavailable` 的禁用话术唯一出处是 [`GATE_HINT`];
 /// `Unknown` 只说「引擎这一跑没答上」,不碰禁用那三样字样。
+///
+/// # 为什么按句读断行、不按列硬切
+///
+/// 册体正文行宽预算只有 64 列(80×30 常畅态;66×50 紧凑态 62 列),而
+/// 「⚠ 机器 册入口禁用:缺的是引擎能力,不是面板坏了;升级所配 nw 后入口自动开启。」
+/// 整行 74 列——硬塞会被 [`crate::screens::recipes::clip`] 从中间吃掉,操作者
+/// 正好看不到「自动开启。」那句最关键的下一步(spec #90 故事 18:常畅态 /
+/// 紧凑态两档都完整可读、不截断)。所以断行点取在句读上,每行都短于预算。
+///
+/// 竖向预算红线因此仍然没破:册体关门时本来就不画条目,键位行照旧钉在
+/// 内层末行(`catalog_key_row`),这几行远在 27 行预算内——多两行不等于
+/// 几何失真,截断才是。
+///
+/// 每态 2-3 行:第一行说这一态开不开,后面补事实与下一步。证据带另两行,
+/// 合起来仍落在既有关门行位置上。
 fn verdict_lines(subject: &str, verdict: Probe, facts: &EngineFacts) -> Vec<String> {
     match verdict {
         // 真禁用:升级所配 nw(入口下次启动自动开启)+ 册体不呈现。
-        // 第二行只讲「不可信也不呈现」,不再复述 GATE_HINT 的前半句——
-        // 同一句话有两个出处正是本票要收掉的重复。
+        // 中间一行整句引用 [`GATE_HINT`]——那句话的唯一出处就是那个常量,
+        // 这里只引用、不复制字符串(同一句话两个出处正是本票要收掉的重复)。
         Probe::Unavailable => vec![
-            format!("⚠ {subject} 册入口禁用:{GATE_HINT}"),
+            format!("⚠ {subject} 册入口禁用"),
+            GATE_HINT.to_string(),
             "编目册内容此时不可信也不呈现。".to_string(),
         ],
         // 未决:引擎这一跑没答上,不是缺能力。修引擎发现(attempted 素材)
         // 后重启重探——升级 nw 对未决未必管用,所以这里绝不出现那句禁用
         // 话术(spec #90 故事 2 / 22 / 23:两态互不冒充)。
         Probe::Unknown => {
+            // 问的是哪个引擎(故事 3/4/5):与证据带同源,这里说「谁没答上」。
             let mut v = vec![format!(
                 "? {subject} 册入口未决:引擎这一跑没答上,册体不可信也不呈现。"
             )];
-            // 问的是哪个引擎(故事 3/4/5):与证据带同源,这里说「谁没答上」;
-            // 没找到二进制时如实说没找到,不拿一个路径冒充。
             match facts.bin {
                 Some(b) => v.push(format!(
-                    "问的是 {b} ({}, {});重启重探。",
+                    "问的是 {b} ({}, {});修引擎发现后重启重探。",
                     facts.source, facts.version
                 )),
-                None => v.push("没找到 nw 二进制;重启重探。".to_string()),
-            }
-            // 引擎发现素材(故事 15):没找到时把试过的地方摊开,操作者按图索骥。
-            if !facts.attempted.is_empty() {
-                v.push(format!("找 nw 试过:{}", facts.attempted.join("、")));
+                None => {
+                    // 没找到二进制:如实说没找到,不拿一个路径冒充(故事 3)。
+                    v.push("没找到 nw 二进制;修引擎发现后重启重探。".to_string());
+                    // 引擎发现素材(故事 15):把试过的地方摊开,操作者按图索骥。
+                    // 这一行可能长,超预算时由册体的 clip 收尾——素材本身
+                    // 宁可被截,也不为省一行把它并进上一句。
+                    if !facts.attempted.is_empty() {
+                        v.push(format!("找 nw 试过:{}", facts.attempted.join("、")));
+                    }
+                }
             }
             v
         }
@@ -650,13 +651,35 @@ mod tests {
         );
     }
 
+    /// 按一条证据立一份规范指路(测试专用):把证据记进一个一次性账,再走与
+    /// 生产同一个入口 [`gate_signpost`]——断言的是操作者可见的那行。
+    /// `line()` 只取「入口 + 三态 + 证据带」,不碰真相行,所以引擎发现事实
+    /// 给空值即可(真相行另有测试盯着)。
+    fn signpost_of(ev: &ProbeEvidence, cap: Capability, verdict: Probe) -> GateSignpost {
+        let mut gate = Gate::default();
+        gate.record(cap, verdict, Some(ev.clone()));
+        gate_signpost(
+            cap.label(),
+            cap,
+            &gate,
+            &EngineFacts {
+                bin: None,
+                source: "测试注入",
+                version: "0.1.0",
+                attempted: &[],
+            },
+        )
+        .expect("非可用态必有指路")
+    }
+
     #[tokio::test]
     async fn 结论句_禁用态与未决态各带齐证据字段_互不冒充() {
         // 这一行同时是日志结论句与册体证据带(#122 起共用同一措辞与字段),
         // 所以禁用态与未决态都要带齐证据,且各说各话、不互相冒充。
         let bad = out_for(&["vps"], 3, "", &["nw: 未知子命令 \"vps\""]).await;
         let ev = ProbeEvidence::capture(&bad, Some("/tmp/nw"), "PATH", "0.1.0");
-        let line = ev.conclusion(Capability::Vps, Probe::Unavailable);
+        let line = signpost_of(&ev, Capability::Vps, Probe::Unavailable)
+            .line(Capability::Vps, Probe::Unavailable);
         assert!(line.contains("能力探测:vps 入口禁用"), "{line}");
         assert!(line.contains("/tmp/nw"), "bin 在场:{line}");
         assert!(line.contains("(PATH, 0.1.0)"), "来源与版本在场:{line}");
@@ -672,7 +695,8 @@ mod tests {
         .run(&["vps".to_string()])
         .await;
         let ev = ProbeEvidence::capture(&missing, None, "未发现", "未知");
-        let line = ev.conclusion(Capability::Vps, Probe::Unknown);
+        let line =
+            signpost_of(&ev, Capability::Vps, Probe::Unknown).line(Capability::Vps, Probe::Unknown);
         assert!(line.contains("能力探测:vps 未决"), "{line}");
         assert!(!line.contains("入口禁用"), "未决不冒充禁用:{line}");
         assert!(line.contains("探针 nw vps"), "未决也带探针:{line}");
@@ -723,7 +747,8 @@ mod tests {
         assert_eq!(ev.version, "0.1.0", "两个构建同版本号");
         assert_eq!(ev.bin, "/tmp/nw", "bin 可分辨");
         assert_eq!(ev.words, "nw: 未知子命令 \"vps\"", "引擎原话可分辨");
-        let line = ev.conclusion(Capability::Vps, Probe::Unavailable);
+        let line = signpost_of(ev, Capability::Vps, Probe::Unavailable)
+            .line(Capability::Vps, Probe::Unavailable);
         assert!(line.contains("/tmp/nw"), "结论句点名生效二进制:{line}");
         assert!(
             line.contains("0.1.0"),
@@ -744,14 +769,18 @@ mod tests {
         )
         .await;
         let ev = ProbeEvidence::capture(&out, Some("/tmp/nw"), "PATH", "0.1.0");
-        let line = ev.conclusion(Capability::Key, Probe::Available);
+        // 可用态不产指路(`gate_signpost` 返回 None),所以这一条直接钉证据
+        // 载体本身:证据只可能碰到 argv / stderr 人话 / envelope schema / rc。
+        assert_eq!(ev.words, "nw/key-register.v1", "只取 schema 原文:{ev:?}");
+        assert!(!ev.words.contains("sk-live"), "本体不进证据:{ev:?}");
         assert!(
-            line.contains("nw/key-register.v1"),
-            "schema 原文在场:{line}"
+            !ev.words.contains("绝密"),
+            "本体字样一个字节都不出现:{ev:?}"
         );
-        assert!(!line.contains("sk-live"), "本体不进证据:{line}");
-        assert!(!line.contains("绝密"), "本体字样一个字节都不出现:{line}");
-        assert!(!line.contains("data"), "只取 schema,不摊 data:{line}");
+        assert!(
+            !format!("{ev:?}").contains("sk-live"),
+            "Debug 输出同样不回显本体:{ev:?}"
+        );
         assert!(
             ev.argv.iter().all(|a| !a.starts_with('-')),
             "探针 argv 无旗标:{:?}",

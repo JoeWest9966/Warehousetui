@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-pub use capability::{Capability, Gate, Probe, ProbeEvidence, GATE_HINT};
+pub use capability::{Capability, EngineFacts, Gate, Probe, ProbeEvidence, GATE_HINT};
 #[allow(unused_imports)]
 pub use envelope::{
     CatalogAddr, CatalogEntryView, CatalogGate, CatalogLogin, CatalogRef, CatalogSheet,
