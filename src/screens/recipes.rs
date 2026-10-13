@@ -1842,8 +1842,9 @@ pub const PACK_DONE_H: u16 = 9;
 
 /// 确认闸键位行左段(渲染与命中共用,与 [`crate::layout::RITUAL_KEY_RETURN`] 同法)。
 pub const PACK_KEY_COMMIT: &str = "  Enter 落盘 ";
-/// 表单键位行左段(算校验和 + 出拟落账,仍不落一个字节)。
-pub const PACK_KEY_PREVIEW: &str = "  Enter 算校验和 ";
+/// 表单键位行(算校验和 + 出拟落账,仍不落一个字节)。表单段鼠标惰性
+/// (键入归键盘),故没有命中区——文案仍是单一真相源,别在渲染里另抄一份。
+pub const PACK_KEY_FORM: &str = "  ↑/↓ 移字段 · Enter 算校验和 · Esc/q 返航";
 
 /// 打包浮层矩形:按态取尺寸,`popup_rect` 再按终端收窄(渲染与命中共用)。
 ///
@@ -1943,7 +1944,7 @@ fn render_pack_overlay(frame: &mut Frame, area: Rect, app: &App) {
     // popup.height - 2`),正文行放不下就让位给它——键位提示不许被挤掉。
     let content_h = popup.height.saturating_sub(2) as usize;
     let key_line = match flow.phase {
-        PackPhase::Form => "  ↑/↓ 移字段 · Enter 算校验和 · Esc/q 返航",
+        PackPhase::Form => PACK_KEY_FORM,
         PackPhase::Review => "  Enter 落盘(原子写 tmp+rename)· Esc 返航(不落一个字节)",
         PackPhase::Done => "  Esc/q/Enter 返航 ",
     };

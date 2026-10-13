@@ -68,6 +68,7 @@ cargo build --release
 - **降级 ≠ 失败**:required env 缺失、provider 未就绪是 amber 横幅;`skip` 是正常态(pi 懒创建)。
 - **证据原样**:errors/warnings 五字段(code/exitCode/message/hint/details)原文呈现,建议动作只给命令不代跑(ADR-0003)。
 - **永不回显密钥**:env 只显示 present 布尔;details 可含任意 JSON,但面板不做值猜测。
+- **面板写数据仓（作者侧工具）**:只写数据仓根之下的配方 / 组件 / 技能脚手架文件,全部走「拟落账摊开(路径 + 内容 + 将写文件清单)→ 图形确认 → 原子落盘(tmp + rename)」;确认前一个字节不落,永不写 NW_HOME、永不改已装配的派、不碰 git(ADR-0010)。组件打包器的目录校验和与上游 `manifest.DirHash` 同算法,与 `sha256sum` 逐字节对拍。
 - **装配幂等**:`up` 可取消、可重入;并发锁(rc 5)明示「同一派已在装配」。取消有两档,话术不许混:**发射前 `Esc` 返航** = 命令还没下发,什么都没发生;**发射后 `x` 中止** = 在途子进程进程级真止,可能停在未收敛中间态——面板不宣布成功也不假装失败,stderr 日志一行不清(停在哪一步看它),重跑同一条装配命令即可收敛,收敛与否以健康屏 `doctor` 复核为准。
 
 ## 开发
@@ -91,7 +92,7 @@ cargo build --release
 ## 文档
 
 - 领域词汇:[CONTEXT.md](./CONTEXT.md)
-- 架构决策:[docs/adr/](./docs/adr/)(0001 子进程契约 / 0002 技术栈 / 0003 动作边界 / 0004 响应式双态 / 0005 鼠标命中区 / 0006 外部源登记两段式 / 0007 面板跟随引擎 / 0008 跟随引擎三层 / 0009 编目册写动作边界与机密纪律)
+- 架构决策:[docs/adr/](./docs/adr/)(0001 子进程契约 / 0002 技术栈 / 0003 动作边界 / 0004 响应式双态 / 0005 鼠标命中区 / 0006 外部源登记两段式 / 0007 面板跟随引擎 / 0008 跟随引擎三层 / 0009 编目册写动作边界与机密纪律 / 0010 作者侧写数据仓边界与 datarepo 写侧接缝)
 - 调研底稿:[docs/research/](./docs/research/)(nw CLI 契约面 / 用户旅程 / 环境验证)
 - 发布矩阵:[docs/release.md](./docs/release.md)(安装 / 校验 / 打 tag 发布)
 - 工单:[GitHub Issues](https://github.com/JoeWest9966/Warehousetui/issues)(wayfinder 蓝图 #1)
