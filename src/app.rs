@@ -345,6 +345,10 @@ pub struct App {
     /// 零文件读取),落点规则取自上游 docs/external-sources.md,面板不另造。
     /// 打开时从当次 ls 五域数据算定快照,之后不随刷新漂。
     pub rc_landing: Option<crate::screens::recipes::LandingTrace>,
+    /// 组件打包器(spec #95 工单 #112):选中数据仓内一个本地 skill/extension
+    /// 目录,面板自己算 sha256、生成组件清单,拟落账摊开后图形确认才经
+    /// datarepo 写侧原子落盘(ADR-0010)。`None` = 浮层不在场。
+    pub pk_flow: Option<crate::screens::recipes::PackFlow>,
     /// 外部源登记·预审段状态机(spec #25 / 工单 #30)。
     pub reg_state: RegState,
     /// repo 链接缓冲(通用单行输入态机,[`input::BUF_CAP`] 封顶)。
@@ -610,6 +614,8 @@ impl App {
             rc_sel: 0,
             // 反向溯源浮层(#115):选中行的派落点只读快照;None = 不在场。
             rc_landing: None,
+            // 组件打包器浮层(#112):None = 不在场。
+            pk_flow: None,
             reg_state: RegState::Idle,
             reg_repo_buf: String::new(),
             reg_kind: RegKind::Skill,
@@ -848,6 +854,12 @@ impl App {
             return;
         }
         match target {
+            // 组件打包器浮层(#112):与键盘完全同路 —— 确认段点「Enter 落盘」
+            // 段 = `pack_commit`,点「Esc 返航」段 / 结果屏任意处 = 收起浮层
+            // (一个字节都不落)。命中区只由 `pack_hits` 在场时产出,故这两个
+            // 带守卫的臂到达即确有此态;鼠标与键盘不可能给出两种后果。
+            Target::Activate if self.pack_open() => self.pack_commit(),
+            Target::DismissPopup if self.pack_open() => self.pk_flow = None,
             // 点导航(常畅)/屏 Tab(紧凑)切屏,与 j/k 同语义。
             Target::NavTo(s) => {
                 self.screen = s;
@@ -1083,6 +1095,10 @@ impl App {
         } else if self.scaffold_flow.in_flight() {
             // 脚手架浮层(#110):鼠标点任意处与键盘 Esc/q 同路返航(结论态即关闭)。
             self.cancel_scaffold();
+        } else if self.pack_open() {
+            // 组件打包器返航(#112):只收状态,一个字节都不落(拟落账随浮层
+            // 一起丢)。确认前不落盘的纪律在这里也成立——返航不等于落盘。
+            self.pk_flow = None;
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
@@ -1338,6 +1354,14 @@ impl App {
             if matches!(k.code, KeyCode::Esc) {
                 self.dismiss_popup();
             }
+            return;
+        }
+        // 组件打包器浮层(#112):与落点溯源浮层同级的顶层浮层 —— 在场时吞键,
+        // 五域键位(切域/选行/过滤/建议命令/落点)一个都不受理,配方屏原选中行
+        // 因此原样不动。表单段键入归表单(通用单行态机),确认段只认
+        // 「Enter 落盘 / Esc 返航」,结果段只认返航。
+        if self.pack_open() {
+            self.on_key_pack(k);
             return;
         }
         // 浮层优先级:帮助浮层 > 发射确认 > 手填输入(NW_HOME / 数据仓根) > 指路屏/常屏(见 spec #9)
@@ -1884,6 +1908,10 @@ impl App {
             // (入口门在 start_scaffold 里把守:装配互斥 / 流程不重入 / 数据仓根
             // 就绪,不可用只留指路)。skill 是组件(CONTEXT),落进数据仓 skills/。
             KeyCode::Char('n') if self.rc_domain == Domain::Components => self.start_scaffold(),
+            // 组件打包器入口(#112):只组件域给(与 `r` 只外部源域同构) ——
+            // 打包的对象是数据仓里的本地 skill/extension 目录。三道门在
+            // start_pack 里把守(装配互斥 / 不重入 / 数据仓根就绪)。
+            KeyCode::Char('p') if self.rc_domain == Domain::Components => self.start_pack(),
             // 反向溯源(#115):Enter 看选中组件/外部源铺进派后的落点 —— 纯只读
             // 呈现,不读派目录、不发引擎命令(落点规则是上游 external-sources.md
             // 的只读知识,面板不另造)。无落点语义的域静默不摆(open_landing 三道门)。
@@ -3808,6 +3836,147 @@ impl App {
     fn open_landing(&mut self) {
         if let Some(trace) = crate::screens::recipes::landing_trace(self) {
             self.rc_landing = Some(trace);
+        }
+    }
+
+    // ---- 组件打包器(spec #95 工单 #112,ADR-0010 §4 表格 #112 行) ----
+
+    /// 打包浮层在不在场(渲染 / 键位守卫 / 命中弹层优先级共用这一判据)。
+    pub fn pack_open(&self) -> bool {
+        self.pk_flow.is_some()
+    }
+
+    /// `p` 键发起打包(只组件域给):三道门与 `start_register` 同族 ——
+    /// 装配互斥(写互斥,ADR-0010 §5)、不重入、数据仓根就绪(未设/不可用
+    /// 都给指路,不拿当前目录兜底)。过后开一张空表单。
+    fn start_pack(&mut self) {
+        if self.assembling {
+            self.push_log("装配进行中:打包与装配互斥,稍后再试".to_string());
+            return;
+        }
+        if self.pack_open() {
+            return; // 流程进行中不重入
+        }
+        if self.data_root_cause().is_some() {
+            self.push_log(format!("打包入口:{}", self.data_root_gate_msg()));
+            return;
+        }
+        self.pk_flow = Some(crate::screens::recipes::PackFlow::new());
+        self.push_log("组件打包:填源目录/组件名/版本,算完摊开校验和与拟生成清单再确认".to_string());
+    }
+
+    /// 打包浮层键位(三态):表单段键入归表单(↑/↓ 移字段,其余走通用单行
+    /// 态机 [`input::on_key`]);确认段只认「Enter 落盘 / Esc/q 返航」;
+    /// 结果段只认返航。
+    fn on_key_pack(&mut self, k: KeyEvent) {
+        let Some(phase) = self.pk_flow.as_ref().map(|f| f.phase) else {
+            return;
+        };
+        match phase {
+            crate::screens::recipes::PackPhase::Form => {
+                match k.code {
+                    KeyCode::Up => {
+                        if let Some(f) = self.pk_flow.as_mut() {
+                            f.move_field(false);
+                        }
+                        return;
+                    }
+                    KeyCode::Down => {
+                        if let Some(f) = self.pk_flow.as_mut() {
+                            f.move_field(true);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                let action = match self.pk_flow.as_mut() {
+                    Some(f) => input::on_key(f.buf_mut(), k),
+                    None => return,
+                };
+                match action {
+                    InputAction::Submit => self.pack_plan(),
+                    InputAction::Cancel => self.pk_flow = None,
+                    InputAction::Edited | InputAction::Ignored => {}
+                }
+            }
+            crate::screens::recipes::PackPhase::Review => match k.code {
+                KeyCode::Enter => self.pack_commit(),
+                KeyCode::Esc | KeyCode::Char('q') => self.pk_flow = None,
+                _ => {}
+            },
+            crate::screens::recipes::PackPhase::Done => {
+                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
+                    self.pk_flow = None;
+                }
+            }
+        }
+    }
+
+    /// 表单 Enter:算目录校验和 + 生成清单 + 过写前校验 —— **一个字节都不落**
+    /// (ADR-0010 §5:拟落账摊开才谈确认)。面板侧就拒的(形状不合 / 目录不在 /
+    /// 空目录)留在表单可改,不喂给写侧跑一趟。
+    fn pack_plan(&mut self) {
+        let Some(flow) = self.pk_flow.as_ref() else {
+            return;
+        };
+        let draft = flow.draft();
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("打包:{}", self.data_root_gate_msg()));
+            self.pk_flow = None;
+            return;
+        };
+        let repo = crate::datarepo::write::DataRepo::new(&root);
+        match crate::datarepo::pack::plan_pack(&repo, &draft) {
+            Ok(plan) => {
+                self.push_log(format!(
+                    "打包拟落账就绪:{} · {} 个文件 · 校验和 {}…(确认才落盘)",
+                    plan.target,
+                    plan.files,
+                    &plan.digest[..8]
+                ));
+                if let Some(f) = self.pk_flow.as_mut() {
+                    f.err = None;
+                    f.plan = Some(plan);
+                    f.phase = crate::screens::recipes::PackPhase::Review;
+                }
+            }
+            Err(e) => {
+                let why = e.why();
+                self.push_log(format!("打包被拒:{why},留表单可改"));
+                if let Some(f) = self.pk_flow.as_mut() {
+                    f.err = Some(why);
+                }
+            }
+        }
+    }
+
+    /// 确认闸放行:把拟落账递去写侧原子落盘(tmp + rename,ADR-0010 §4)。
+    /// 失败不回表单、也不假装成功 —— 留在确认态把结论说清(ADR-0010 §5:
+    /// 「落盘失败」是磁盘/权限问题,不混同「输入无效」)。
+    fn pack_commit(&mut self) {
+        let Some(plan) = self.pk_flow.as_ref().and_then(|f| f.plan.clone()) else {
+            return;
+        };
+        let Some(root) = self.usable_data_root() else {
+            self.push_log(format!("打包落盘:{}", self.data_root_gate_msg()));
+            return;
+        };
+        let repo = crate::datarepo::write::DataRepo::new(&root);
+        match crate::datarepo::pack::commit_pack(&repo, &plan) {
+            Ok(receipt) => {
+                self.push_log(format!(
+                    "组件已落盘:{} · 校验和 {}… · git 变更走 PR + 家长审",
+                    receipt.written.join(", "),
+                    &plan.digest[..8]
+                ));
+                if let Some(f) = self.pk_flow.as_mut() {
+                    f.receipt = Some(format!("已写入 {}", receipt.written.join(", ")));
+                    f.phase = crate::screens::recipes::PackPhase::Done;
+                }
+            }
+            Err(e) => {
+                self.push_log(e.why());
+            }
         }
     }
 }
@@ -7341,6 +7510,7 @@ mod tests {
         rc_domain: Domain,
         rc_sel: usize,
         rc_landing: Option<crate::screens::recipes::LandingTrace>,
+        pk_flow: Option<crate::screens::recipes::PackFlow>,
         rc_bake_sel: bool,
         reg_state: RegState,
         help: bool,
@@ -7380,6 +7550,7 @@ mod tests {
             data_input: a.data_input,
             rc_filter_on: a.rc_filter_on,
             rc_landing: a.rc_landing.clone(),
+            pk_flow: a.pk_flow.clone(),
             rc_filter: a.rc_filter.clone(),
             catalog_filter_on: a.catalog_filter_on,
             catalog_filter: a.catalog_filter.clone(),

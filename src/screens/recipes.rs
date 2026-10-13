@@ -30,6 +30,10 @@ pub fn render_recipes(frame: &mut Frame, area: Rect, app: &App) {
     // 见 on_key 守卫与 layout::recipes_hits;两个浮层不会同时在场的语义由
     // dismiss_popup 的受理次序保证)。
     render_landing_overlay(frame, area, app);
+    // 组件打包器浮层(#112):表单 → 拟落账摊开 → 确认 → 原子落盘。与另两个
+    // 浮层同层覆盖、同一条弹层优先级(键位见 `App::on_key` 的守卫,鼠标见
+    // `layout::recipes_hits`);它在场时五域键位一个都不受理。
+    render_pack_overlay(frame, area, app);
 }
 
 /// 常畅态:五域轨(定宽 14)/ 列表 / 详情三栏,既有外观逐像素不变。
@@ -1712,6 +1716,336 @@ fn render_reg_done(frame: &mut Frame, area: Rect, app: &App) {
                 Block::bordered()
                     .border_style(p.accent())
                     .title(Span::styled(" 登记外部源 · 落账结果 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+// ---- 组件打包器浮层(spec #95 工单 #112):表单 → 拟落账 → 确认 → 落盘 ----
+
+/// 表单的三个字段(顺序即 ↑/↓ 轮转顺序)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PackField {
+    #[default]
+    Source,
+    Name,
+    Version,
+}
+
+impl PackField {
+    pub const ALL: [PackField; 3] = [PackField::Source, PackField::Name, PackField::Version];
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
+    }
+
+    pub fn from_index(i: usize) -> Self {
+        Self::ALL.get(i).copied().unwrap_or_default()
+    }
+
+    /// 字段标签(渲染与命中共用同一份词)。
+    pub fn label(self) -> &'static str {
+        match self {
+            PackField::Source => "源目录",
+            PackField::Name => "组件名",
+            PackField::Version => "版  本",
+        }
+    }
+
+    /// 一句字段说明(表单里的 dim 行)。
+    pub fn hint(self) -> &'static str {
+        match self {
+            PackField::Source => "数据仓根之下的相对目录(要打包的那个)",
+            PackField::Name => "落进清单 name;只用字母/数字/-/_/.",
+            PackField::Version => "形如 1.0.0;本地组件的 version 必填",
+        }
+    }
+}
+
+/// 打包流程三态:表单 → 确认闸(校验和 + 拟生成清单摊开)→ 落盘结果。
+/// 与外部源登记的 [`RegState`] 同级、不同族:那条走引擎两段式,这条走
+/// 数据仓写侧(ADR-0010 §4 表格里 #112 那一行)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PackPhase {
+    Form,
+    Review,
+    Done,
+}
+
+/// 打包浮层的全部状态(屏幕层持意图级字段 + 拟落账,零路径拼接)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackFlow {
+    pub phase: PackPhase,
+    pub field: PackField,
+    pub source: String,
+    pub name: String,
+    pub version: String,
+    /// 拟落账:确认闸摊开的三样(校验和 / 拟生成清单 / 将写文件)都从它读。
+    pub plan: Option<crate::datarepo::pack::PackPlan>,
+    /// 面板侧就拒的人话(留在表单可改,不喂给写侧跑一趟)。
+    pub err: Option<String>,
+    /// 落盘结论(Done 态呈现)。
+    pub receipt: Option<String>,
+}
+
+impl PackFlow {
+    pub fn new() -> Self {
+        Self {
+            phase: PackPhase::Form,
+            field: PackField::Source,
+            source: String::new(),
+            name: String::new(),
+            version: String::new(),
+            plan: None,
+            err: None,
+            receipt: None,
+        }
+    }
+
+    /// 表单 → 打包草稿(意图级;路径与校验和都在接缝里算)。
+    pub fn draft(&self) -> crate::datarepo::pack::PackDraft {
+        crate::datarepo::pack::PackDraft {
+            source: self.source.trim().to_string(),
+            name: self.name.trim().to_string(),
+            version: self.version.trim().to_string(),
+        }
+    }
+
+    /// 当前字段的缓冲(↑/↓ 移字段,键入归当前字段)。
+    pub fn buf_mut(&mut self) -> &mut String {
+        match self.field {
+            PackField::Source => &mut self.source,
+            PackField::Name => &mut self.name,
+            PackField::Version => &mut self.version,
+        }
+    }
+
+    /// ↑/↓ 移字段(三字段轮转,到顶/到底不越界、不绕回)。
+    pub fn move_field(&mut self, down: bool) {
+        let i = self.field.index();
+        let n = PackField::ALL.len();
+        self.field = PackField::ALL[if down {
+            (i + 1).min(n - 1)
+        } else {
+            i.saturating_sub(1)
+        }];
+    }
+}
+
+impl Default for PackFlow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 打包浮层在不在场(渲染 / 键位守卫 / 命中弹层优先级共用这一句)。
+pub fn pack_open(app: &App) -> bool {
+    app.pk_flow.is_some()
+}
+
+/// 表单浮层尺寸(渲染与命中同一组常量)。
+pub const PACK_FORM_W: u16 = 64;
+pub const PACK_FORM_H: u16 = 10;
+/// 确认闸浮层尺寸:**两档各一份**——常畅摊得开整份清单,紧凑只预览前几行
+/// (ADR-0004:同一内容两档呈现,不收窄成同一副面孔)。
+pub const PACK_REVIEW_W: u16 = 76;
+pub const PACK_REVIEW_H_COMFY: u16 = 22;
+pub const PACK_REVIEW_H_COMPACT: u16 = 17;
+pub const PACK_MANIFEST_LINES_COMFY: usize = 12;
+pub const PACK_MANIFEST_LINES_COMPACT: usize = 6;
+/// 结果浮层尺寸。
+pub const PACK_DONE_W: u16 = 64;
+pub const PACK_DONE_H: u16 = 9;
+
+/// 确认闸键位行左段(渲染与命中共用,与 [`crate::layout::RITUAL_KEY_RETURN`] 同法)。
+pub const PACK_KEY_COMMIT: &str = "  Enter 落盘 ";
+/// 表单键位行(算校验和 + 出拟落账,仍不落一个字节)。表单段鼠标惰性
+/// (键入归键盘),故没有命中区——文案仍是单一真相源,别在渲染里另抄一份。
+pub const PACK_KEY_FORM: &str = "  ↑/↓ 移字段 · Enter 算校验和 · Esc/q 返航";
+
+/// 打包浮层矩形:按态取尺寸,`popup_rect` 再按终端收窄(渲染与命中共用)。
+///
+/// **尺寸档由调用方给**(渲染侧传 `size_class(frame.area())`、命中侧传
+/// `recipes_hits` 的 `class`):本屏的常畅/紧凑判据看**整帧**宽(与
+/// `render_recipes` 同源),不是看内容列宽——80 宽下去掉左导航还有 68 列,
+/// 按内容列判会把常畅屏上的确认闸画成紧凑尺寸。
+pub(crate) fn pack_popup_rect(
+    area: ratatui::layout::Rect,
+    app: &App,
+    class: crate::layout::SizeClass,
+) -> Option<Rect> {
+    let f = app.pk_flow.as_ref()?;
+    let (w, h) = match f.phase {
+        PackPhase::Form => (PACK_FORM_W, PACK_FORM_H),
+        PackPhase::Review => (
+            PACK_REVIEW_W,
+            match class {
+                crate::layout::SizeClass::Comfy => PACK_REVIEW_H_COMFY,
+                crate::layout::SizeClass::Compact => PACK_REVIEW_H_COMPACT,
+            },
+        ),
+        PackPhase::Done => (PACK_DONE_W, PACK_DONE_H),
+    };
+    let popup = crate::layout::popup_rect(area, w, h);
+    (popup.width > 0 && popup.height > 0).then_some(popup)
+}
+
+/// 确认闸的内容行(渲染与命中共用:键位行恒为末行,两边同一条算式)。
+fn pack_review_lines(app: &App, inner_w: usize, manifest_cap: usize) -> Vec<Line<'static>> {
+    let p = &app.palette;
+    let plan = match app.pk_flow.as_ref().and_then(|f| f.plan.as_ref()) {
+        Some(pl) => pl,
+        None => return Vec::new(),
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::raw("  源目录  "),
+        Span::styled(plan.source.clone(), p.text()),
+    ]));
+    // 校验和:64 hex 一律**两行各 32** —— 不按终端宽折行(那会让同一份
+    // 摘要在两档里断成不同的两截),也不截断(截半等于没显示)。10 + 32 = 42
+    // 列,66 宽下限内也放得下。
+    lines.push(Line::from(vec![
+        Span::raw("  校验和  "),
+        Span::styled(plan.digest[..32].to_string(), p.info().bold()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("          {}", &plan.digest[32..]),
+        p.info().bold(),
+    )));
+    lines.push(Line::from(vec![
+        Span::raw("  体量    "),
+        Span::styled(
+            format!("{} 个文件 · {} 字节", plan.files, plan.bytes),
+            p.dim(),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  将写    "),
+        Span::styled(clip(&plan.target, inner_w.saturating_sub(10)), p.text()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "  拟生成清单(字节确定,与数据仓现有组件样本同键序):",
+        p.dim().bold(),
+    )));
+    let manifest_lines: Vec<&str> = plan.manifest.lines().collect();
+    for l in manifest_lines.iter().take(manifest_cap) {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", clip(l, inner_w.saturating_sub(4))),
+            p.text(),
+        )));
+    }
+    let rest = manifest_lines.len().saturating_sub(manifest_cap);
+    if rest > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("    …其余 {rest} 行见拟落账(确认闸已全量拿到,落盘逐字节相同)"),
+            p.dim(),
+        )));
+    }
+    lines
+}
+
+/// 打包浮层渲染:三态一份(表单 / 确认闸 / 结果),尺寸档在
+/// [`pack_popup_rect`] 里分(常畅摊全清单,紧凑只预览前几行)。
+fn render_pack_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(flow) = app.pk_flow.as_ref() else {
+        return;
+    };
+    let Some(popup) = pack_popup_rect(area, app, size_class(frame.area())) else {
+        return;
+    };
+    let p = &app.palette;
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    // 键位行恒为浮层内层末行(渲染与命中同一条算式:`key_y = popup.y +
+    // popup.height - 2`),正文行放不下就让位给它——键位提示不许被挤掉。
+    let content_h = popup.height.saturating_sub(2) as usize;
+    let key_line = match flow.phase {
+        PackPhase::Form => PACK_KEY_FORM,
+        PackPhase::Review => "  Enter 落盘(原子写 tmp+rename)· Esc 返航(不落一个字节)",
+        PackPhase::Done => "  Esc/q/Enter 返航 ",
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match flow.phase {
+        PackPhase::Form => {
+            for f in PackField::ALL {
+                let cur = f == flow.field;
+                let text = match f {
+                    PackField::Source => flow.source.clone(),
+                    PackField::Name => flow.name.clone(),
+                    PackField::Version => flow.version.clone(),
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  {}  ", f.label())),
+                    Span::styled(
+                        if cur { format!("{text}█") } else { text },
+                        if cur { p.sel().bold() } else { p.text() },
+                    ),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {}", PackField::Source.hint()),
+                p.dim(),
+            )));
+            if let Some(err) = flow.err.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⚠ {}", clip(err, inner_w.saturating_sub(4))),
+                    p.fail(),
+                )));
+            }
+        }
+        PackPhase::Review => {
+            let cap = match size_class(frame.area()) {
+                crate::layout::SizeClass::Comfy => PACK_MANIFEST_LINES_COMFY,
+                crate::layout::SizeClass::Compact => PACK_MANIFEST_LINES_COMPACT,
+            };
+            lines = pack_review_lines(app, inner_w, cap);
+        }
+        PackPhase::Done => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {}",
+                    flow.receipt.clone().unwrap_or_else(|| "已落盘".into())
+                ),
+                p.info().bold(),
+            )));
+            if let Some(plan) = flow.plan.as_ref() {
+                lines.push(Line::from(vec![
+                    Span::raw("  将写    "),
+                    Span::styled(clip(&plan.target, inner_w.saturating_sub(10)), p.dim()),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  校验和  "),
+                    Span::styled(clip(&plan.digest, inner_w.saturating_sub(10)), p.dim()),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                "  ⚠ component.yaml 是一次 git 变更:走 PR + 家长审,",
+                p.warn(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "    面板只负责把确认过的字节写对地方(ADR-0010 §6)。",
+                p.warn(),
+            )));
+        }
+    }
+    lines.truncate(content_h.saturating_sub(1));
+    while lines.len() < content_h.saturating_sub(1) {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(key_line, p.dim())));
+    let title = match flow.phase {
+        PackPhase::Form => " 组件打包器 · 表单 ",
+        PackPhase::Review => " 组件打包器 · 确认闸 ",
+        PackPhase::Done => " 组件打包器 · 落盘结果 ",
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(title, p.accent().bold())),
             )
             .style(p.surface()),
         popup,
