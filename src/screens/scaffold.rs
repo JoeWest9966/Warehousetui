@@ -28,14 +28,16 @@
 //! `skills/<名>/`)。extension 侧对齐 #21 的第六条验收:条目子树自带
 //! `package.json` 且 `pi.extensions` 非空、清单里每条路径真实存在
 //! (上游 `internal/source/scan.go` 的 `ExtensionManifestIssue`;validate 的
-//! 形态面 = `catalog.extension_entries`),面板侧镜像见
-//! [`ext_manifest_audit`]。产出内容是**面板自有资产**
-//! (内置模板),不是引擎逻辑复刻(ADR-0010 §3)。
+//! 形态面 = `catalog.extension_entries`),面板侧镜像在
+//! [`crate::datarepo::scaffold::ext_manifest_audit`](与落点计算同处)。产出内容是
+//! **面板自有资产**(内置模板),不是引擎逻辑复刻(ADR-0010 §3)。
 //!
 //! 两份规格的落点同源:数据仓的组件家是 `skills/` 与 `extensions/`
-//! (`datarepo` 读侧 `SKILLS_DIR` / `EXTENSIONS_DIR` 是路径知识的单源,
-//! #114 预扫与 #116 引用完整性都按它认条目)。上游那半的**派内**落点是
-//! `<agent-dir>/nw/extensions/<仓库>/<条目>/` 且必须登记
+//! (路径知识的单源在 `datarepo`——读侧 `SKILLS_DIR` / `EXTENSIONS_DIR`,写侧
+//! [`crate::datarepo::scaffold`] 的落点计算;#114 预扫与 #116 引用完整性都按它
+//! 认条目)。屏幕层只交「条目名 + 内容」这种意图级形状,拿回拟落账条目,
+//! 自己拼不出一个路径(code-review H1:落点下沉,读写两侧认同一批组件家)。
+//! 上游那半的**派内**落点是 `<agent-dir>/nw/extensions/<仓库>/<条目>/` 且必须登记
 //! `settings.packages`(external-sources.md「扩展这半」)——那是 `up` 铺下
 //! 去的事,面板脚手架只写数据仓里的源,不写派、也不写 `catalog.json`。
 
@@ -46,7 +48,8 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::datarepo::write::{PlannedWrite, RepoRelPath, WritePlan, WriteReceipt};
+use crate::datarepo::scaffold;
+use crate::datarepo::write::{PlannedWrite, WritePlan, WriteReceipt};
 use crate::input::{self, InputAction};
 use crate::layout::popup_rect;
 use crate::screens::recipes::clip;
@@ -249,10 +252,11 @@ impl ScaffoldSpec for SkillForm {
         }
         let triggers = split_triggers(&self.triggers);
         let content = skill_md(name, description, &triggers, self.template);
-        // 落点:数据仓 skills/<名>/SKILL.md。name 已校验为合法目录名,拼得出合法相对路径。
-        let path = RepoRelPath::new(&format!("skills/{name}/SKILL.md"))
-            .expect("name 已校验:拼得出的相对路径合法");
-        Ok(vec![PlannedWrite::text(path, &content)])
+        // 落点:数据仓 skills/<名>/SKILL.md(家目录与文件名是 datarepo 的路径
+        // 知识,这里只交「名 + 正文」——屏幕层零路径拼接)。
+        scaffold::skill_write(name, &content)
+            .map(|w| vec![w])
+            .map_err(|e| vec![e.why()])
     }
 }
 
@@ -427,9 +431,6 @@ pub const DEFAULT_ENTRY: &str = "index.ts";
 /// `version` 才被 validate 查),给一个诚实的起步值,作者自己 bump。
 const EXT_VERSION: &str = "0.1.0";
 
-/// 条目清单的文件名:上游样本 `docs/samples/components/scout/package.json`。
-const EXT_MANIFEST_FILE: &str = "package.json";
-
 /// extension 脚手架表单:名称 / 描述 / 入口文件 + 模板起步开关。
 /// `name` = 条目身份(= 条目子树目录名,上游 #21:扩展没有 frontmatter 可当
 /// 身份),也是数据仓落点 `extensions/<名>/` 的目录名。
@@ -509,28 +510,17 @@ impl ScaffoldSpec for ExtensionForm {
         if !errs.is_empty() {
             return Err(errs);
         }
-        // 落点:数据仓 extensions/<名>/(作者侧脚手架的扩展家,与 skills/ 对称;
-        // 见 datarepo::SKILLS_DIR / EXTENSIONS_DIR 的路径知识单源)。
-        let dir = format!("extensions/{name}");
-        let writes = vec![
-            PlannedWrite::text(
-                RepoRelPath::new(&format!("{dir}/{EXT_MANIFEST_FILE}"))
-                    .expect("name 已校验:拼得出的相对路径合法"),
-                &ext_package_json(name, description, entry),
-            ),
-            PlannedWrite::text(
-                RepoRelPath::new(&format!("{dir}/{entry}"))
-                    .expect("name/entry 已校验:拼得出的相对路径合法"),
-                &ext_entry_ts(name, description, self.template),
-            ),
-        ];
-        // 自审:上游 register 验收第六条(仅 --kind extension)的面板侧镜像。
-        // 面板自己生成 manifest 与入口两边,这里保证两边对得上 —— 对不上就是
-        // 「装上了不加载」的形状,上游 register 会拒。
-        if let Some(reason) = ext_manifest_audit(&dir, &writes) {
-            return Err(vec![reason]);
-        }
-        Ok(writes)
+        // 落点:数据仓 extensions/<名>/ 下的清单与入口两件(家目录与文件名
+        // 是 datarepo 的路径知识,这里只交「条目名 + 两份正文 + 入口文件名」
+        // ——屏幕层零路径拼接)。自审(上游 register 验收第六条)也在接缝里:
+        // 面板自己生成 manifest 与入口两边,对不上 = 装上了不加载,过不去。
+        scaffold::ext_writes(
+            name,
+            &ext_package_json(name, description, entry),
+            entry,
+            &ext_entry_ts(name, description, self.template),
+        )
+        .map_err(|e| vec![e.why()])
     }
 }
 
@@ -649,50 +639,6 @@ fn ext_entry_ts(name: &str, description: &str, template: bool) -> String {
     }
     s.push_str("}\n");
     s
-}
-
-/// 上游 register 验收第六条(仅 `--kind extension`,#21)的面板侧镜像:
-/// 条目子树自带 `package.json`、`pi.extensions` 非空、清单里每条路径在条目
-/// 子树里真实存在。判据逐条对齐上游 `internal/source/scan.go` 的
-/// `ExtensionManifestIssue`(路径不许绝对、不许越级,匹配得到文件)。
-///
-/// 面板自己生成 manifest 与入口两边,这个自审把「两边对不上」挡在拟落账
-/// 之前 —— 那种形状上游 register 会拒(装上了不加载),不该流到确认闸。
-fn ext_manifest_audit(dir: &str, writes: &[PlannedWrite]) -> Option<String> {
-    let manifest_rel = format!("{dir}/{EXT_MANIFEST_FILE}");
-    let at = |rel: &str| writes.iter().find(|w| w.path.as_str() == rel);
-    let Some(manifest) = at(&manifest_rel) else {
-        return Some(format!(
-            "条目子树没有 {EXT_MANIFEST_FILE}:pi 的包登记不兜底这种形状"
-        ));
-    };
-    let text = String::from_utf8_lossy(&manifest.content);
-    let v: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => return Some(format!("{EXT_MANIFEST_FILE} 解析失败:{e}")),
-    };
-    let Some(patterns) = v.pointer("/pi/extensions").and_then(|p| p.as_array()) else {
-        return Some(format!(
-            "{EXT_MANIFEST_FILE} 缺 pi.extensions:这不是一个 pi 扩展条目"
-        ));
-    };
-    if patterns.is_empty() {
-        return Some(format!(
-            "{EXT_MANIFEST_FILE} 的 pi.extensions 为空:这不是一个 pi 扩展条目"
-        ));
-    }
-    for p in patterns.iter().filter_map(|p| p.as_str()) {
-        if p.starts_with('/') || p.contains("..") {
-            return Some(format!("pi.extensions 里的 {p:?} 不许绝对路径或越级"));
-        }
-        let rel = p.trim_start_matches("./");
-        if at(&format!("{dir}/{rel}")).is_none() {
-            return Some(format!(
-                "pi.extensions 里的 {p:?} 在条目子树里一个文件都没匹配上"
-            ));
-        }
-    }
-    None
 }
 
 /// 表单键位(规格自己的键入分发):与 [`on_key_skill_form`] 同一只形状 ——
@@ -1330,8 +1276,8 @@ mod tests {
             manifest.contains("\"extensions\": [\"./main.js\"]"),
             "manifest 的 pi.extensions 跟着入口文件走:{manifest}"
         );
-        // 自定义入口名也过自审(manifest 与入口两边对得上)
-        assert_eq!(ext_manifest_audit("extensions/ribbon", &writes), None);
+        // 落点由接缝算:manifest 仍是 extensions/ribbon/package.json
+        assert_eq!(writes[0].path.as_str(), "extensions/ribbon/package.json");
     }
 
     #[test]
@@ -1363,55 +1309,11 @@ mod tests {
         let f = ext_form("ribbon", "他说\"你好\" \\ 走人");
         let writes = f.planned_writes().unwrap();
         let manifest = String::from_utf8(writes[0].content.clone()).unwrap();
-        // 仍是合法 JSON(自审要能解析),且转义落在字节里
+        // 仍是合法 JSON(接缝里的自审要能解析),且转义落在字节里
         assert!(manifest.contains("\\\"你好\\\""), "双引号转义:{manifest}");
-        assert_eq!(ext_manifest_audit("extensions/ribbon", &writes), None);
+        assert_eq!(writes.len(), 2, "manifest 与入口两件都在拟落账里");
         let ts = String::from_utf8(writes[1].content.clone()).unwrap();
         assert!(ts.contains("// 他说\"你好\" \\ 走人"), "注释单行化:{ts}");
-    }
-
-    #[test]
-    fn extension_自审_对齐上游验收第六条_对不上就拦() {
-        // 合法形状:manifest + 入口都在,pi.extensions 指着入口
-        let ok = ext_form("ribbon", "d").planned_writes().unwrap();
-        assert_eq!(ext_manifest_audit("extensions/ribbon", &ok), None);
-        // ① 缺 manifest
-        let no_manifest = vec![PlannedWrite::text(
-            RepoRelPath::new("extensions/ribbon/index.ts").unwrap(),
-            "x",
-        )];
-        assert!(ext_manifest_audit("extensions/ribbon", &no_manifest)
-            .unwrap()
-            .contains("package.json"));
-        // ② pi.extensions 为空
-        let empty_pi = vec![PlannedWrite::text(
-            RepoRelPath::new("extensions/ribbon/package.json").unwrap(),
-            "{\n  \"pi\": {\n    \"extensions\": []\n  }\n}\n",
-        )];
-        assert!(ext_manifest_audit("extensions/ribbon", &empty_pi)
-            .unwrap()
-            .contains("pi.extensions"));
-        // ③ 清单指着一个不存在的文件(= 装上了不加载)
-        let dangling = vec![
-            PlannedWrite::text(
-                RepoRelPath::new("extensions/ribbon/package.json").unwrap(),
-                "{\n  \"pi\": {\n    \"extensions\": [\"./gone.ts\"]\n  }\n}\n",
-            ),
-            PlannedWrite::text(RepoRelPath::new("extensions/ribbon/index.ts").unwrap(), "x"),
-        ];
-        assert!(ext_manifest_audit("extensions/ribbon", &dangling)
-            .unwrap()
-            .contains("一个文件都没匹配上"));
-        // ④ 绝对路径 / 越级
-        for bad in ["/etc/passwd", "../outside.ts"] {
-            let evil = vec![PlannedWrite::text(
-                RepoRelPath::new("extensions/ribbon/package.json").unwrap(),
-                &format!("{{\n  \"pi\": {{\n    \"extensions\": [\"{bad}\"]\n  }}\n}}\n"),
-            )];
-            assert!(ext_manifest_audit("extensions/ribbon", &evil)
-                .unwrap()
-                .contains("不许绝对路径或越级"));
-        }
     }
 
     #[test]
