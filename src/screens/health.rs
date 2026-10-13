@@ -242,18 +242,22 @@ fn render_recheck(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     // 门二:引擎没有 source 能力(缺的是引擎能力,不是面板坏了)。
+    //
+    // #124:两行(标题 + GATE_HINT)收成共享构造器的**单行形态**——三态措辞
+    // 与探针证据带一处真相(与册体 #122、日志结论句 #118 同源)。真禁用才说
+    // 「升级所配 nw」;未决只说「修引擎发现后重启重探」,两态互不冒充。
     if !app
         .capabilities
         .enabled(crate::engine::Capability::SourceRecheck)
     {
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled("  ⚠ 引擎缺 source 能力 ", p.warn().bold())),
-                Line::from(Span::styled(
-                    format!("  {}", crate::engine::capability::GATE_HINT),
-                    p.dim(),
-                )),
-            ])
+            Paragraph::new(vec![Line::from(Span::styled(
+                app.capability_gate_line(crate::engine::Capability::SourceRecheck),
+                p.warn().bold(),
+            ))])
+            // 单行指路带证据带,比原来的两行长;不折行会被栏宽截掉证据
+            // (与门一同一处理: trim 掉折行补位的空格)。
+            .wrap(ratatui::widgets::Wrap { trim: true })
             .block(
                 Block::bordered()
                     .border_style(p.dim())

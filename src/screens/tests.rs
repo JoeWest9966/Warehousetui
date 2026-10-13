@@ -1251,18 +1251,25 @@ fn 配方域建议命令_引擎无bake能力给指路_不冒充面板故障() {
     app.capabilities
         .record(Capability::RecipeBake, Probe::Unavailable, None);
     let s = draw(&app, 110, 30);
-    assert!(s.contains("引擎缺 recipe bake 能力"), "缺能力指路:{s}");
-    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    // #124 起这一支整句走共享行构造器的单行形态。详情栏窄(~34 列),
+    // `recipes::wrap` 在前缀内找最后一个空格断行、找不到就硬切——CJK 长句
+    // 会被切成「不是面板 / 坏了;」这种形态,所以跨词的断言一律在**去掉空白
+    // 的扁平串**上做(测的是操作者读到的内容,不是某一行的列断点)。
+    let flat: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(s.contains("⚠ 配方烘焙"), "缺能力指路点名是哪一项:{s}");
+    assert!(s.contains("入口禁用"), "说清是入口禁用:{s}");
+    assert!(flat.contains("不是面板坏了"), "不冒充面板故障:{flat}");
+    assert!(flat.contains("升级所配nw"), "真禁用才给升级下一步:{flat}");
     assert!(!s.contains("nw recipe bake"), "缺能力不给半条命令:{s}");
-    // 未决(探测失败)同样不给命令,且说法与禁用可区分
+    // 未决(探测失败)同样不给命令,且说法与禁用可区分:不再出现那句
+    // 「缺的是引擎能力…升级所配 nw」,换成「修引擎发现后重启重探」
     app.capabilities
         .record(Capability::RecipeBake, Probe::Unknown, None);
     let s2 = draw(&app, 110, 30);
     assert!(!s2.contains("nw recipe bake"), "未决不给命令:{s2}");
-    assert!(
-        s2.contains("引擎缺 recipe bake 能力"),
-        "未决与禁用同走缺能力指路:{s2}"
-    );
+    assert!(s2.contains("配方烘焙 未决"), "未决换一套说法:{s2}");
+    assert!(!s2.contains("不是面板坏了"), "未决不冒充缺能力:{s2}");
+    assert!(!s2.contains("升级所配 nw"), "未决不给误导性下一步:{s2}");
 }
 
 // ---- #58 配方域建议命令补 recipe new:与 bake 同源同层,执行权留给操作者 ----
@@ -1332,18 +1339,19 @@ fn 配方域建议命令_recipe_new_三种缺前提各有可区分指路_不给�
     app.capabilities
         .record(Capability::RecipeNew, Probe::Unavailable, None);
     let s = draw(&app, 110, 30);
-    assert!(s.contains("引擎缺 recipe new 能力"), "缺能力指路:{s}");
-    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    let flat: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(s.contains("⚠ 配方新建"), "缺能力指路点名是哪一项:{s}");
+    assert!(s.contains("入口禁用"), "说清是入口禁用:{s}");
+    assert!(flat.contains("不是面板坏了"), "不冒充面板故障:{flat}");
     assert!(!s.contains("nw recipe new"), "缺能力不给半条命令:{s}");
-    // 未决(探测失败)同样不给命令,且与禁用同走缺能力指路
+    // 未决(探测失败)同样不给命令,且换一套说法:不给「升级所配 nw」那一步
     app.capabilities
         .record(Capability::RecipeNew, Probe::Unknown, None);
     let s3 = draw(&app, 110, 30);
     assert!(!s3.contains("nw recipe new"), "未决不给命令:{s3}");
-    assert!(
-        s3.contains("引擎缺 recipe new 能力"),
-        "未决与禁用同走缺能力指路:{s3}"
-    );
+    assert!(s3.contains("配方新建 未决"), "未决换一套说法:{s3}");
+    assert!(!s3.contains("不是面板坏了"), "未决不冒充缺能力:{s3}");
+    assert!(!s3.contains("升级所配 nw"), "未决不给误导性下一步:{s3}");
     // 未设数据仓根:--out-dir 指不到本地仓,同样不给半条命令
     let mut app = bake_app();
     app.capabilities
@@ -1604,14 +1612,36 @@ fn 外部源漂移_三种缺前提各有可区分指路() {
     let s = draw(&app, 110, 30);
     assert!(s.contains("数据仓根未设"), "未设根指路:{s}");
     assert!(!s.contains("还没查"), "未设根不摆查询态:{s}");
-    // 引擎无 source 能力
+    // 引擎无 source 能力(#124:门二两行收成共享构造器的单行形态)
     use crate::engine::{Capability, Probe};
     let mut app = recheck_app();
     app.capabilities
         .record(Capability::SourceRecheck, Probe::Unavailable, None);
     let s = draw(&app, 110, 30);
-    assert!(s.contains("引擎缺 source 能力"), "缺能力指路:{s}");
-    assert!(s.contains("不是面板坏了"), "不冒充面板故障:{s}");
+    assert!(
+        s.contains("外部源复核 入口禁用"),
+        "缺能力指路点名是哪一项(单行形态):{s}"
+    );
+    assert!(
+        s.contains("缺的是引擎能力,不是面板坏了"),
+        "不冒充面板故障:{s}"
+    );
+    assert!(
+        s.contains("nw 后入口自动开启"),
+        "真禁用才给「升级所配 nw」这一步:{s}"
+    );
+    assert!(
+        !s.contains("引擎缺 source 能力"),
+        "标题行与 GATE_HINT 行已收成一行,不再两行铺:{s}"
+    );
+    // 未决:同一道门走未决话术,「升级所配 nw」一步都不给
+    app.capabilities
+        .record(Capability::SourceRecheck, Probe::Unknown, None);
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("外部源复核 未决"), "未决话术:{s}");
+    assert!(s.contains("修引擎发现后重启重探"), "未决的下一步:{s}");
+    assert!(!s.contains("缺的是引擎能力"), "未决不冒充缺能力:{s}");
+    assert!(!s.contains("升级所配 nw"), "未决不给误导性下一步:{s}");
     // 编目为空
     let mut app = recheck_app();
     app.ls = Some(
