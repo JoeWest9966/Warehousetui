@@ -13,8 +13,38 @@ const SURFACES: [&str; 7] = [
     "manifest", "consist", "converge", "config", "env", "runtime", "provider",
 ];
 
+/// 检查项来源(spec #95 工单 #116):「面板自有检查 vs 引擎检查」的**最小**
+/// 区分机制。
+///
+/// 结果四态读法一字不改(同一套 [`crate::engine::State`] 灯、同一套
+/// `Palette::state` 配色);来源只加一个徽标——挂在块标题上,并给面板
+/// 自有检查的每一行也带一份,**不重画引擎项的灯与文案**(别把引擎项也改花)。
+/// 四个模式各声明自己的来源,屏上一眼可辨谁说了算。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CheckSource {
+    /// 结论来自引擎回音(doctor 七面 / validate 27 项 / 外部源漂移)。
+    Engine,
+    /// 结论来自面板自己扫数据仓(引用完整性,#116)。
+    Panel,
+}
+
+impl CheckSource {
+    /// 徽标一字(块标题后缀与行内标注共用)。
+    pub fn badge(self) -> &'static str {
+        match self {
+            CheckSource::Engine => "引擎",
+            CheckSource::Panel => "面板",
+        }
+    }
+
+    /// 块标题的来源后缀:`· 引擎` / `· 面板`。
+    pub fn title_suffix(self) -> String {
+        format!("· {}", self.badge())
+    }
+}
+
 pub fn render_health(frame: &mut Frame, area: Rect, app: &App) {
-    let block = body(app, "doctor · validate · 外部源漂移");
+    let block = body(app, "doctor · validate · 外部源漂移 · 引用完整性");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -25,6 +55,13 @@ pub fn render_health(frame: &mut Frame, area: Rect, app: &App) {
     // 结论按结果四态呈现,与 doctor 的降级/漂移/破损三档并列但不合并。
     if app.hl_mode == crate::app::HealthMode::Recheck {
         render_recheck(frame, inner, app);
+        return;
+    }
+
+    // 引用完整性(#116):第四种模式,**面板自有检查**——与三个引擎模式
+    // 并列而不混,来源标注见 `CheckSource`。
+    if app.hl_mode == crate::app::HealthMode::Integrity {
+        render_integrity(frame, inner, app);
         return;
     }
 
@@ -47,6 +84,8 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App, out: &crate::engine:
     match app.hl_mode {
         // 漂移复核走 render_recheck(左栏清单 + 右栏证据),不在这条 match 里。
         crate::app::HealthMode::Recheck => {}
+        // 引用完整性走 render_integrity(面板自有检查,右栏不是引擎证据)。
+        crate::app::HealthMode::Integrity => {}
         HealthMode::Doctor => {
             let results = out
                 .envelope
@@ -89,11 +128,12 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App, out: &crate::engine:
             ];
             all.extend(lines);
             frame.render_widget(
-                Paragraph::new(all).block(
-                    Block::bordered()
-                        .border_style(p.dim())
-                        .title(Span::styled(" 七面 ", p.accent())),
-                ),
+                Paragraph::new(all).block(Block::bordered().border_style(p.dim()).title(
+                    Span::styled(
+                        format!(" 七面 {} ", CheckSource::Engine.title_suffix()),
+                        p.accent(),
+                    ),
+                )),
                 area,
             );
         }
@@ -146,7 +186,10 @@ fn render_results(frame: &mut Frame, area: Rect, app: &App, out: &crate::engine:
                     .block(
                         Block::bordered()
                             .border_style(p.dim())
-                            .title(Span::styled(" 27 项 ", p.accent()))
+                            .title(Span::styled(
+                                format!(" 27 项 {} ", CheckSource::Engine.title_suffix()),
+                                p.accent(),
+                            ))
                             .title_top(Line::from(Span::raw(summary)).right_aligned()),
                     )
                     .highlight_style(p.sel()),
@@ -215,6 +258,15 @@ fn render_evidence(frame: &mut Frame, area: Rect, app: &App, out: &crate::engine
 
 // ---- 外部源漂移复核(spec #34 / 工单 #40):只读,四态,口径以引擎为唯一真相 ----
 
+/// 外部源漂移块的标题(#40):带来源标注(`CheckSource::Engine`)——与 doctor /
+/// validate 两个引擎模式同一条标注机制,四个健康模式各自声明来源。
+fn recheck_title(p: &crate::theme::Palette) -> Span<'static> {
+    Span::styled(
+        format!(" 外部源漂移 {} ", CheckSource::Engine.title_suffix()),
+        p.accent(),
+    )
+}
+
 /// 左栏:结论横幅 + 已登记外部源清单(四态);右栏:漂移条目 + 证据五字段。
 /// 三道门(未设数据仓根 / 引擎无 source 能力 / 清单为空)各有可区分指路。
 ///
@@ -231,7 +283,7 @@ fn render_recheck(frame: &mut Frame, area: Rect, app: &App) {
                 .block(
                     Block::bordered()
                         .border_style(p.dim())
-                        .title(Span::styled(" 外部源漂移 ", p.accent())),
+                        .title(recheck_title(p)),
                 ),
             left,
         );
@@ -261,7 +313,7 @@ fn render_recheck(frame: &mut Frame, area: Rect, app: &App) {
             .block(
                 Block::bordered()
                     .border_style(p.dim())
-                    .title(Span::styled(" 外部源漂移 ", p.accent())),
+                    .title(recheck_title(p)),
             ),
             left,
         );
@@ -279,7 +331,7 @@ fn render_recheck(frame: &mut Frame, area: Rect, app: &App) {
             .block(
                 Block::bordered()
                     .border_style(p.dim())
-                    .title(Span::styled(" 外部源漂移 ", p.accent())),
+                    .title(recheck_title(p)),
             ),
             left,
         );
@@ -306,7 +358,7 @@ fn render_recheck(frame: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::bordered()
                 .border_style(p.dim())
-                .title(Span::styled(" 外部源漂移 ", p.accent())),
+                .title(recheck_title(p)),
         ),
         banner_rect,
     );
@@ -458,5 +510,233 @@ fn drift_lines(app: &App) -> Vec<Line<'static>> {
             p.dim(),
         )));
     }
+    lines
+}
+
+// ---- 引用完整性(spec #95 工单 #116):**面板自有检查**,只读、只报不修 ----
+
+/// 左栏结论横幅 + 四态检查行,右栏面板自读事实。
+///
+/// 与 [`render_recheck`] 同一条门槛纪律:数据仓根不就绪 → 左栏铺指路
+/// (`data_root_signpost`,措辞单源在 `DataRootCause`),右栏只说「补上前提」,
+/// **不摆空列表、不冒充 0 个问题**。四块几何与命中侧共用
+/// [`crate::layout::integrity_panels`](ADR-0005)。
+fn render_integrity(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    if app.data_root_cause().is_some() {
+        let (left, right) = crate::layout::integrity_cols(area);
+        frame.render_widget(
+            Paragraph::new(crate::screens::data_root_signpost(app))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(Block::bordered().border_style(p.dim()).title(Span::styled(
+                    format!(" 引用完整性 {} ", CheckSource::Panel.title_suffix()),
+                    p.accent(),
+                ))),
+            left,
+        );
+        frame.render_widget(
+            Paragraph::new("指路说清了缺的是什么;补上前提再回来扫。").style(p.dim()),
+            right,
+        );
+        return;
+    }
+    let [banner_rect, list_rect, fact_rect] = crate::layout::integrity_panels(area);
+    frame.render_widget(
+        Paragraph::new(integrity_banner(app)).block(Block::bordered().border_style(p.dim()).title(
+            Span::styled(
+                format!(" 引用完整性 {} ", CheckSource::Panel.title_suffix()),
+                p.accent(),
+            ),
+        )),
+        banner_rect,
+    );
+    let mut st = ListState::default();
+    let n = app.hl_integrity_len();
+    if n > 0 {
+        st.select(Some(app.hl_sel.min(n - 1)));
+    }
+    let items: Vec<Line> = if n == 0 {
+        vec![Line::from(Span::styled(
+            "  还没有检查行:按 r 扫一次。",
+            p.dim(),
+        ))]
+    } else {
+        app.hl_integrity
+            .as_ref()
+            .map(|s| s.rows.iter().map(|r| integrity_row(r, p)).collect())
+            .unwrap_or_default()
+    };
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::bordered()
+                    .border_style(p.dim())
+                    .title(Span::styled(" 检查行 ", p.accent())),
+            )
+            .highlight_style(p.sel()),
+        list_rect,
+        &mut st,
+    );
+    frame.render_widget(
+        Paragraph::new(integrity_facts(app))
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(
+                Block::bordered()
+                    .border_style(p.dim())
+                    .title(Span::styled(" 自读事实 ", p.dim())),
+            ),
+        fact_rect,
+    );
+}
+
+/// 一行检查项:结果四态灯 + 来源徽标 + 种类 + 名字 + 人话结论。
+/// 灯的读法与 validate 27 项逐字同构(`engine::State` 同一套)。
+fn integrity_row(r: &crate::datarepo::ReferenceRow, p: &crate::theme::Palette) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{} ", p.lamp(r.lamp)), p.state(r.lamp)),
+        Span::styled(format!("{} ", CheckSource::Panel.badge()), p.info()),
+        Span::styled(format!("{:<10}", r.kind.label()), p.dim()),
+        Span::raw(r.name.clone()),
+        Span::raw(" "),
+        Span::raw(r.detail.clone()),
+    ])
+}
+
+/// 结论横幅:四态一句话(与 validate 的 summary 读法一致)+ 两条口径行。
+/// 「没扫到组件目录」与「全部正常」是两态,不摆空列表冒充 0。
+fn integrity_banner(app: &App) -> Vec<Line<'static>> {
+    let p = &app.palette;
+    let Some(scan) = app.hl_integrity.as_ref() else {
+        return vec![
+            Line::from(Span::styled("  还没扫:按 r 扫这个数据仓。", p.dim())),
+            Line::from(Span::styled("  ↑/↓ 选行 · r 重扫 · m 切回 doctor", p.dim())),
+        ];
+    };
+    let (lamp, text, style) = if scan.nothing_to_scan {
+        (
+            crate::engine::State::Skip,
+            format!(
+                "  没扫到组件目录:这个仓里没有 skill/extension 目录(扫了 {} 个配方)",
+                scan.recipes
+            ),
+            p.dim(),
+        )
+    } else if !scan.broken().is_empty() {
+        (
+            crate::engine::State::Fail,
+            format!(
+                "  {} 处断链 · {} 个孤儿(共 {} 个 skill/extension)",
+                scan.broken().len(),
+                scan.orphans().len(),
+                scan.skills + scan.extensions
+            ),
+            p.fail(),
+        )
+    } else if !scan.orphans().is_empty() {
+        (
+            crate::engine::State::Warn,
+            format!(
+                "  没有断链,{} 个孤儿(共 {} 个 skill/extension)",
+                scan.orphans().len(),
+                scan.skills + scan.extensions
+            ),
+            p.warn(),
+        )
+    } else {
+        (
+            crate::engine::State::Pass,
+            format!(
+                "  引用完整:{} 个 skill/extension 全进配方",
+                scan.skills + scan.extensions
+            ),
+            p.ok(),
+        )
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{} ", p.lamp(lamp)), p.state(lamp)),
+        Span::styled(text, style),
+    ])];
+    if !scan.unreadable_recipes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ⚠ {} 个配方读不出({}):引用图不完整,「没进配方」可能只是没读到",
+                scan.unreadable_recipes.len(),
+                scan.unreadable_recipes.join("、")
+            ),
+            p.warn(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "  面板自有检查(不经引擎):只读零写,只报不修。",
+        p.dim(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ 选行 · r 重扫 · m 切回 doctor",
+        p.dim(),
+    )));
+    lines
+}
+
+/// 右栏:面板自读事实——扫到的规模 + 选中行的引用方。
+/// 只摆本面板自己读到的事实,不摆引擎结论(那是另外三个模式的事)。
+fn integrity_facts(app: &App) -> Vec<Line<'static>> {
+    let p = &app.palette;
+    let Some(scan) = app.hl_integrity.as_ref() else {
+        return vec![
+            Line::from(Span::styled("本次还没扫。", p.dim())),
+            Line::from(Span::styled(
+                "按 r 现扫一次(不缓存上次结论,换数据仓根即作废)。",
+                p.dim(),
+            )),
+        ];
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "扫到 {} 个配方 · {} 个 skill · {} 个 extension · {} 个本地组件",
+            scan.recipes, scan.skills, scan.extensions, scan.components
+        ),
+        p.dim(),
+    ))];
+    lines.push(Line::from(Span::styled(
+        format!(
+            "外部源引用 {} 条:查 catalog.json,不进本图(口径以引擎为准)",
+            scan.external_refs
+        ),
+        p.dim(),
+    )));
+    lines.push(Line::from(""));
+    let n = app.hl_integrity_len();
+    match scan.rows.get(app.hl_sel.min(n.saturating_sub(1))) {
+        Some(row) => {
+            lines.push(Line::from(vec![
+                Span::styled("选中:", p.accent()),
+                Span::raw(format!("{} {}", row.kind.label(), row.name)),
+            ]));
+            // 结论与细节分两行:单行拼起来在 45% 栏里会被裁掉半边,
+            // 「引用了谁」是「该动哪」的关键,不能看不见。
+            lines.push(Line::from(Span::styled(
+                format!("结论:{}", row.lamp.label()),
+                p.state(row.lamp),
+            )));
+            lines.push(Line::from(Span::styled(row.detail.clone(), p.dim())));
+            if row.used_by.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "引用方:无(没有配方点它)。",
+                    p.dim(),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("引用方:{}", row.used_by.join("、")),
+                    p.info(),
+                )));
+            }
+        }
+        None => lines.push(Line::from(Span::styled("没有检查行。", p.dim()))),
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "修不修、怎么修是作者的事:本项只报不修(spec #95)。",
+        p.dim(),
+    )));
     lines
 }

@@ -303,6 +303,12 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         register_hits(body, class, app, &mut hits);
         return hits;
     }
+    // 作者侧脚手架浮层(#110):与登记两段式同级的顶层浮层——表单态对鼠标惰性
+    // (键位-only),预览态只产键位行命中,结论态点任意处返航(弹层优先级)。
+    if app.scaffold_flow.in_flight() {
+        scaffold_hits(body, class, app, &mut hits);
+        return hits;
+    }
     match class {
         SizeClass::Comfy => {
             comfy_shell(body, &mut hits);
@@ -699,10 +705,35 @@ pub(crate) fn recheck_cols(area: Rect) -> (Rect, Rect) {
     )
 }
 
+/// 引用完整性(#116)三块几何:与 [`recheck_panels`] 同一组 55/45 分栏常量,
+/// 左栏 = 结论横幅 + 四态检查行清单,右栏 = 面板自读事实(规模与选中行明细)。
+/// 渲染(`screens::health::render_integrity`)与命中共用这一处,几何零分歧
+/// (ADR-0005)。
+pub(crate) fn integrity_panels(area: Rect) -> [Rect; 3] {
+    let (left, right) = h_split2(area, 55, 45);
+    let l = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(5),
+        ratatui::layout::Constraint::Min(4),
+    ])
+    .split(left);
+    [l[0], l[1], right]
+}
+
+/// 引用完整性的左右两栏(门一只铺指路时用):由 [`integrity_panels`] 的同一组
+/// 常量合回来,不再另写一份 55/45。
+pub(crate) fn integrity_cols(area: Rect) -> (Rect, Rect) {
+    let p = integrity_panels(area);
+    (
+        Rect::new(p[0].x, p[0].y, p[0].width, p[0].height + p[1].height),
+        p[2],
+    )
+}
+
 /// 健康屏:validate 模式下「27 项」列表在 55% 左栏、带边框、首行即数据
 /// (doctor 模式是只读七面卡,无选中目标);外部源漂移模式(#40)的左栏是
 /// 「结论横幅 + 已登记外部源清单」,清单行在横幅之下,几何见
-/// [`recheck_panels`]。
+/// [`recheck_panels`];引用完整性模式(#116)的左栏是「结论横幅 + 四态检查行」,
+/// 几何见 [`integrity_panels`]。
 fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     if matches!(app.hl_mode, crate::app::HealthMode::Recheck) {
         // 三道门任一不过:整栏是指路,没有可选中行
@@ -719,6 +750,21 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
             shrink_border(recheck_panels(area)[1]),
             0,
             app.recheck_source_len(),
+            hits,
+            Target::SelectRow,
+        );
+        return;
+    }
+    // 引用完整性(#116):检查行清单与渲染同一个 integrity_panels;数据仓根
+    // 不就绪时整栏是指路,没有可选中行(与 recheck 门一同形)。
+    if matches!(app.hl_mode, crate::app::HealthMode::Integrity) {
+        if app.data_root_cause().is_some() {
+            return;
+        }
+        row_hits(
+            shrink_border(integrity_panels(area)[1]),
+            0,
+            app.hl_integrity_len(),
             hits,
             Target::SelectRow,
         );
@@ -741,6 +787,26 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
 /// (45% 栏),紧凑态在 Tab 行之下(52% 栏)。两支都用与渲染同一套
 /// ratatui `Layout` 常量,几何零分歧(#18 收起内层栏后命中自动跟随)。
 fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    // 组件打包器浮层(#112):与落点溯源浮层同一条弹层纪律 —— 在场时整块正文
+    // 只有浮层自己的命中区,底层列表行与键位行一段都不产。表单段鼠标惰性
+    // (打字归键盘,同手填浮层先例);确认段键位行两段(Enter 落盘 /
+    // Esc 返航);结果段点任意处 = 返航。
+    //
+    // 次序与 `on_key` / 鼠标分派同序(先 pack 后 recipe_edit):两张浮层本就
+    // 互斥(入口门同族),但两站顺序相反会让人以为存在优先级差异——同一判据
+    // 只在壳层写一遍,这里照抄同序。
+    if app.pack_open() {
+        pack_hits(area, app, class, hits);
+        return;
+    }
+    // 配方编辑器浮层(#113):与打包器同一条弹层纪律 —— 在场时整块正文
+    // 只有浮层自己的命中区,底层列表行与键位行一段都不产。表单/预跑段鼠标惰性
+    // (打字归键盘);确认段(预跑通过时)键位行两段(Enter 写回 / Esc 返航),
+    // 预跑未过只产返航;结果段点任意处 = 返航。
+    if app.recipe_edit_open() {
+        recipe_edit_hits(area, app, class, hits);
+        return;
+    }
     // 落点溯源浮层(#115):与反查浮层同一条弹层纪律 —— 在场时整块正文只有
     // 一个「点任意处返航」命中区,底层列表行与键位行(含「Enter 落点」之外
     // 的一切)一段都不产:浮层吞点击、不穿透底层。
@@ -817,6 +883,91 @@ fn recipes_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, T
     }
 }
 
+/// 组件打包器浮层(#112)的命中区:几何与 `recipes::render_pack_overlay`
+/// 同一组常量、同一个 `pack_popup_rect`(渲染与命中共用一份,ADR-0005)。
+/// 表单段鼠标惰性(键入归键盘);确认段键位行两段(Enter 落盘 /
+/// Esc 返航);结果段整块点任意处 = 返航。浮层外无任何命中区。
+fn pack_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    let Some(popup) = crate::screens::recipes::pack_popup_rect(area, app, class) else {
+        return;
+    };
+    let phase = match app.pk_flow.as_ref() {
+        Some(f) => f.phase,
+        None => return,
+    };
+    match phase {
+        // 表单:打字归键盘,鼠标不分派(同 NW_HOME / 数据仓根手填浮层先例)。
+        crate::screens::recipes::PackPhase::Form => {}
+        // 确认闸:键位行两段。左段 Enter 落盘(与键盘 Enter 同一条路),
+        // 右段 Esc 返航(与键盘 Esc 同一条路)。
+        crate::screens::recipes::PackPhase::Review => {
+            if popup.height < 4 {
+                return; // 收窄后键位行不再可信,不产命中
+            }
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(
+                popup,
+                key_y,
+                crate::screens::recipes::PACK_KEY_COMMIT,
+                RITUAL_KEY_RETURN,
+                hits,
+            );
+        }
+        // 结果屏:点任意处 = 返航(同登记结果屏先例)。
+        crate::screens::recipes::PackPhase::Done => {
+            if popup.width > 0 && popup.height > 0 {
+                hits.push((popup, Target::DismissPopup));
+            }
+        }
+    }
+}
+
+/// 配方编辑器浮层(#113)的命中区:几何与 `recipes::render_recipe_edit_overlay`
+/// 同一组常量、同一个 `recipe_edit_popup_rect`(渲染与命中共用一份,ADR-0005)。
+/// 表单 / 预跑段鼠标惰性(键入归键盘,同手填浮层先例);确认段预跑通过时键位行
+/// 两段(Enter 写回 / Esc 返航),预跑未过整块归返航(点哪都是放弃,不误写回);
+/// 结果段点任意处 = 返航。浮层外无任何命中区。
+fn recipe_edit_hits(area: Rect, app: &App, class: SizeClass, hits: &mut Vec<(Rect, Target)>) {
+    let Some(popup) = crate::screens::recipes::recipe_edit_popup_rect(area, app, class) else {
+        return;
+    };
+    let flow = match app.rc_edit_flow.as_ref() {
+        Some(f) => f,
+        None => return,
+    };
+    use crate::screens::recipes::RecipeEditPhase;
+    match flow.phase {
+        // 表单 / 预跑:打字归键盘,鼠标不分派(同 NW_HOME / 数据仓根手填浮层)。
+        RecipeEditPhase::Form | RecipeEditPhase::PreRun => {}
+        // 确认闸:预跑通过才产「Enter 写回」段;未过整块归返航(不可写回)。
+        RecipeEditPhase::Review => {
+            if !flow.validate_pass {
+                if popup.width > 0 && popup.height > 0 {
+                    hits.push((popup, Target::DismissPopup));
+                }
+                return;
+            }
+            if popup.height < 4 {
+                return; // 收窄后键位行不再可信,不产命中
+            }
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(
+                popup,
+                key_y,
+                crate::screens::recipes::RC_EDIT_KEY_COMMIT,
+                RITUAL_KEY_RETURN,
+                hits,
+            );
+        }
+        // 结果屏:点任意处 = 返航(同登记 / 打包结果屏先例)。
+        RecipeEditPhase::Done => {
+            if popup.width > 0 && popup.height > 0 {
+                hits.push((popup, Target::DismissPopup));
+            }
+        }
+    }
+}
+
 /// 发射仪式键位行的三段文案:渲染与命中共用(与 [`tab_cell`] 同法,
 /// 点哪打哪)——`assemble::render_launch_ritual` 用同一组常量铺行,
 /// [`ritual_hits`] 按同一组量宽分半。
@@ -853,6 +1004,20 @@ pub const REG_REVIEW_W: u16 = 76;
 pub const REG_REVIEW_H: u16 = 24;
 pub const REG_DONE_W: u16 = 76;
 pub const REG_DONE_H: u16 = 20;
+
+/// 脚手架拟落账预览屏键位行的左段(#110 落盘段,与 [`REG_KEY_REVIEW_COMMIT`]
+/// 同法):渲染(`scaffold::render_scaffold_review`)与命中(`scaffold_hits`)
+/// 同一份文案。右段复用 [`RITUAL_KEY_RETURN`]。
+pub const SCAFFOLD_KEY_COMMIT: &str = "  Enter 落盘 ";
+
+/// 脚手架三个浮层的尺寸(#110):渲染与命中同一组常量,几何零分歧;
+/// `popup_rect` 的收窄规则两边同用(紧凑态 66 宽下自动收窄)。
+pub const SCAFFOLD_FORM_W: u16 = 64;
+pub const SCAFFOLD_FORM_H: u16 = 14;
+pub const SCAFFOLD_REVIEW_W: u16 = 76;
+pub const SCAFFOLD_REVIEW_H: u16 = 24;
+pub const SCAFFOLD_DONE_W: u16 = 64;
+pub const SCAFFOLD_DONE_H: u16 = 12;
 
 /// 发射仪式浮层:与 `render_launch_ritual` 同尺寸、在**正文区**内居中;
 /// 底部键位行按渲染同一文案对半分——「Enter 发射」段给
@@ -1085,6 +1250,41 @@ fn register_hits(
                 hits.push((popup, Target::DismissPopup));
             }
         }
+    }
+}
+
+/// 脚手架浮层命中(#110):表单态对鼠标惰性(同登记输入态——键入归键盘);
+/// 拟落账预览态键位行两段(「Enter 落盘」→ Activate 落盘,「Esc 返航」→
+/// Dismiss);结论态点任意处 = 返航。几何与 `scaffold::render_scaffold_*`
+/// 同一组常量同一 `popup_rect`,点哪打哪。
+fn scaffold_hits(
+    body: Rect,
+    class: SizeClass,
+    app: &crate::app::App,
+    hits: &mut Vec<(Rect, Target)>,
+) {
+    use crate::screens::ScaffoldPhase;
+    let Some(content) = popup_content(body, class) else {
+        return;
+    };
+    match app.scaffold_flow.phase {
+        // 表单态:纯键入,鼠标惰性(点浮层不误触底层,也不分派任何命中)。
+        ScaffoldPhase::Form => {}
+        ScaffoldPhase::Review => {
+            let popup = popup_rect(content, SCAFFOLD_REVIEW_W, SCAFFOLD_REVIEW_H);
+            if popup.width == 0 || popup.height == 0 {
+                return;
+            }
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(popup, key_y, SCAFFOLD_KEY_COMMIT, RITUAL_KEY_RETURN, hits);
+        }
+        ScaffoldPhase::Done => {
+            let popup = popup_rect(content, SCAFFOLD_DONE_W, SCAFFOLD_DONE_H);
+            if popup.width > 0 && popup.height > 0 {
+                hits.push((popup, Target::DismissPopup));
+            }
+        }
+        ScaffoldPhase::Idle => {}
     }
 }
 
@@ -1615,6 +1815,59 @@ mod tests {
         app.screen = Screen::Assemble;
         app.as_confirm = true;
         assert_ritual_column_aligned(&app, 66, 31);
+    }
+
+    /// 引用完整性(#116)三块几何:横幅占 5 行,命中侧的检查行首行就是渲染侧的
+    /// 首行(与 recheck 同一条纪律:几何收在一处,渲染与命中不可能各写一套);
+    /// 数据仓根不就绪时整栏是指路,不产可选中行。
+    #[test]
+    fn hitmap_引用完整性_横幅占五行_检查行与渲染同一行() {
+        let mut app = test_app();
+        app.screen = Screen::Health;
+        app.hl_mode = crate::app::HealthMode::Integrity;
+        let dir = std::env::temp_dir().join(format!("nwt-layout-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let put = |rel: &str, body: &str| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        put("skills/lonely/SKILL.md", "x");
+        put(
+            "recipes/only/recipe.yaml",
+            "kind: recipe\nname: only\ncomponents:\n  - component: ghost\n",
+        );
+        app.data_root = Some(dir.display().to_string());
+        app.run_integrity();
+        let a = area(80, 30);
+        assert_eq!(
+            integrity_panels(a)[0].height,
+            5,
+            "横幅 = 3 行文案 + 2 行边框(与 recheck_panels 同组常量)"
+        );
+        let hits = hitmap(a, &app, size_class(a));
+        let row0 = first(&hits, |t| *t == Target::SelectRow(0)).expect("检查行首行可点");
+        let frame = crate::testutil::frame_display(&app, a.width, a.height);
+        let rendered = frame
+            .split('\n')
+            .nth(row0.y as usize)
+            .expect("命中行在渲染中在场");
+        assert!(
+            rendered.contains("ghost"),
+            "命中行 = 渲染检查行首行(断链在前):{rendered}"
+        );
+        // 数据仓根不就绪:整栏是指路,没有可选中行(与 recheck 门一同形)
+        let mut gated = test_app();
+        gated.screen = Screen::Health;
+        gated.hl_mode = crate::app::HealthMode::Integrity;
+        gated.data_root = None;
+        assert!(
+            hitmap(a, &gated, size_class(a))
+                .iter()
+                .all(|(_, t)| !matches!(t, Target::SelectRow(_))),
+            "根不就绪时没有可选中行(指路屏)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// recheck 屏(#40)四块几何:横幅确实占 5 行(3 行文案 + 2 行块边框,

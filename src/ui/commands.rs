@@ -238,8 +238,15 @@ mod tests {
             for b in HELP_ROWS.iter().skip(i + 1) {
                 // 册子也是槽位的一部分:订阅册与钥匙册同在编目屏、同是 `g`,
                 // 但翻的不是同一本册(`book` 不同)——那是两条,不是重复。
+                // 健康屏的复核模式同理:doctor/validate 的 `r` 与引用完整性模态的
+                // `r` 同在健康屏、同键,但 `mode` 不同(复核 vs 重扫)——两条,不是重复。
+                // 配方屏的域也是槽位的一部分:组件域的 `e`(新建 extension 脚手架)
+                // 与配方域的 `e`(编辑选中配方)同在配方屏、同键,但 `domain`
+                // 不同——那是两条,不是重复(与 book/mode 同理)。
                 let same_slot = a.screen == b.screen
                     && a.book == b.book
+                    && a.mode == b.mode
+                    && a.domain == b.domain
                     && a.modifiers == b.modifiers
                     && a.key == b.key;
                 assert!(
@@ -373,9 +380,13 @@ mod tests {
         app.update(crate::app::Message::Key(ctrl_p()));
         let all = offered(&app);
         let writes: Vec<&str> = all.iter().filter(|r| r.write).map(|r| r.key).collect();
+        // Enter=打开发射仪式;r=外部源登记;r=编目册登记;d=删除。作者侧工具
+        // (spec #95)再添四条写入口:n=skill 脚手架、e=extension 脚手架、
+        // p=组件打包、e=配方编辑器写回——都是「拟落账+确认闸」的写流,
+        // 装配态下一并收起,口径与上面四条一致。
         assert_eq!(
             writes,
-            vec!["Enter", "r", "r", "d"],
+            vec!["Enter", "r", "p", "e", "n", "e", "r", "d"],
             "登记表里的写动作:{writes:?}"
         );
 
@@ -392,12 +403,13 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(gated.len() < all.len(), "收起了写动作,条数该变少");
-        assert_eq!(hidden_write_count(&app), 4, "该说清收起了几条");
+        // 4 条原有写入口 + 作者侧工具 4 条(n/e/p/e)= 8
+        assert_eq!(hidden_write_count(&app), 8, "该说清收起了几条");
 
         // 屏上给得出说明,不是静默消失
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(
-            s.contains("装配中收起 4 个写动作"),
+            s.contains("装配中收起 8 个写动作"),
             "提示行说明收起原因:{s}"
         );
         // 收敛后写动作回来(互斥是装配态专属,不是永久过滤)

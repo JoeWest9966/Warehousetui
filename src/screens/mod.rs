@@ -11,6 +11,7 @@ pub(crate) mod catalog;
 mod health;
 mod overview;
 pub(crate) mod recipes;
+pub(crate) mod scaffold;
 mod settings;
 
 pub use assemble::render_assemble;
@@ -26,7 +27,44 @@ pub use catalog::{
 pub use health::render_health;
 pub use overview::{alert_parts, render_overview};
 pub use recipes::render_recipes;
+pub use recipes::{RecipeEditFlow, RecipeEditInput, RecipeEditPhase, RecipeEditSection};
+pub use scaffold::{
+    on_key_ext_form, on_key_skill_form, ExtensionForm, ScaffoldFlow, ScaffoldKind, ScaffoldPhase,
+    ScaffoldSpec, SkillForm,
+};
 pub use settings::render_settings;
+
+/// 表单字段光标:三张作者侧表单(skill 脚手架 / extension 脚手架 / 组件打包)
+/// 的字段枚举同形 —— [`ALL`](Self::ALL) 定序、[`index`](Self::index) 定位、
+/// [`label`](Self::label) 出文案、[`moved`](Self::moved) 移光标。收成一份形状,
+/// ↑/↓ 移光标只写一处:字段枚举各自不同,操作者的肌肉记忆不分叉
+/// (到顶 / 到底不越界、不绕回)。
+///
+/// 编目册那四张表单(`VpsField` / `SubField` / `KeyField` / `TagField`)同形,
+/// 但属 #53 一族、不在本次收敛面上——别顺手改,那会扩大评审范围。
+pub trait FormField: Copy + PartialEq + 'static {
+    /// 全部字段,顺序即 ↑/↓ 轮转顺序。
+    const ALL: &'static [Self];
+
+    /// 字段标签(渲染与命中共用同一份词)。
+    fn label(self) -> &'static str;
+
+    /// 在 [`ALL`](Self::ALL) 里的下标(不在表内给 0:不该发生,但不 panic)。
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|f| *f == self).unwrap_or(0)
+    }
+
+    /// ↑/↓ 移一格(`down` = 向下):到顶 / 到底不越界、不绕回。
+    fn moved(self, down: bool) -> Self {
+        let i = self.index();
+        let n = Self::ALL.len();
+        Self::ALL[if down {
+            (i + 1).min(n - 1)
+        } else {
+            i.saturating_sub(1)
+        }]
+    }
+}
 
 #[cfg(test)]
 mod tests;

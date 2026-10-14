@@ -2074,6 +2074,229 @@ fn 外部源漂移_紧凑66x50_结论与证据可读不溢出() {
     }
 }
 
+// ---- #116 引用完整性:面板自有检查,四态、来源标注、两档快照 ----
+
+/// 夹具数据仓:孤儿 / 断链 / 正常三态俱全(与 `app::tests` 的夹具同构,
+/// 屏层自己建一份——测试夹具不跨模块共享)。
+fn integrity_repo(tag: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("nwt-integrity-{}-{}", std::process::id(), tag));
+    let _ = std::fs::remove_dir_all(&root);
+    let put = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    put("skills/web-scout/SKILL.md", "---\nname: web-scout\n---\n");
+    put("skills/lonely/SKILL.md", "---\nname: lonely\n---\n");
+    put("extensions/ribbon/package.json", "{}");
+    put("extensions/dropped/package.json", "{}");
+    put(
+        "components/scout/component.yaml",
+        "kind: pi-local-package\n",
+    );
+    put(
+        "recipes/research-desk/recipe.yaml",
+        "kind: recipe\nname: research-desk\ncomponents:\n  - component: scout\n  - component: web-scout\n  - component: ribbon\n  - component: ghost\n",
+    );
+    put(
+        "recipes/lab/recipe.yaml",
+        "kind: recipe\nname: lab\ncomponents:\n  - component: ghost\n  - component: hello-world\n    source: external\n",
+    );
+    root
+}
+
+/// 夹具 App:数据仓根指向夹具仓、切到引用完整性并现扫一次。
+fn integrity_app(tag: &str) -> (App, std::path::PathBuf) {
+    let root = integrity_repo(tag);
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Integrity;
+    app.data_root = Some(root.to_str().unwrap().to_string());
+    app.run_integrity();
+    (app, root)
+}
+
+#[test]
+fn 引用完整性_四态呈现_与引擎读法一致_来源标注可区分() {
+    let (app, root) = integrity_app("four");
+    let s = draw(&app, 110, 30);
+    // 三态分类:孤儿 / 断链 / 正常各就各位
+    assert!(s.contains("ghost"), "断链点名组件:{s}");
+    assert!(s.contains("lonely"), "孤儿 skill 在列:{s}");
+    assert!(s.contains("dropped"), "孤儿 extension 在列:{s}");
+    assert!(s.contains("web-scout"), "正常 skill 也在列:{s}");
+    assert!(s.contains("ribbon"), "正常 extension 也在列:{s}");
+    // 结果四态:与 validate 同一套灯字符(✗ 败 / ◐ 警 / ● 过)
+    assert!(s.contains("✗"), "断链是败:{s}");
+    assert!(s.contains("◐"), "孤儿是警:{s}");
+    assert!(s.contains("●"), "进了配方是过:{s}");
+    // 人话点题
+    assert!(s.contains("没进任何配方"), "孤儿点题:{s}");
+    assert!(s.contains("本体不在"), "断链点题:{s}");
+    assert!(
+        s.contains("被 lab、research-desk 引用"),
+        "断链点名是哪几条配方:{s}"
+    );
+    assert!(s.contains("进了配方"), "正常态点题:{s}");
+    // 来源标注:面板自有检查可区分于引擎检查(引擎三项的块标题带「· 引擎」)
+    assert!(
+        s.contains(crate::screens::health::CheckSource::Panel.badge()),
+        "来源徽标在屏:{s}"
+    );
+    assert!(
+        !s.contains(&format!(
+            "· {}",
+            crate::screens::health::CheckSource::Engine.badge()
+        )),
+        "本模式的块标题不标引擎来源:{s}"
+    );
+    // 只读口径
+    assert!(s.contains("只读"), "明示只读:{s}");
+    assert!(s.contains("只报不修"), "只报不修:{s}");
+    // 自读事实:规模与外部源口径
+    assert!(s.contains("扫到 2 个配方"), "规模在右栏:{s}");
+    assert!(s.contains("外部源引用 1 条"), "外部源引用不进本图:{s}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn 引用完整性_引擎三项的块标题带来源徽标_面板项也带() {
+    // 来源标注是**机制**:四个模式各自声明,不是只给面板那一项贴花。
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Health;
+    let doctor = r#"{"schema":"nw/doctor.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"results":[{"surface":"manifest","status":"pass","message":"在位"}],"exit":0,"converged":true}}"#;
+    feed(&mut app, out(&["doctor", "--profile", "desk"], 0, doctor));
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains(&format!(
+            "七面 {}",
+            crate::screens::health::CheckSource::Engine.title_suffix()
+        )),
+        "doctor 块标题标来源:{s}"
+    );
+    assert!(
+        !s.contains(crate::screens::health::CheckSource::Panel.badge()),
+        "引擎模式不出现面板徽标:{s}"
+    );
+    // 引擎项的灯与文案没被改花:四态灯仍在、原文消息仍在
+    assert!(s.contains("manifest"), "引擎项原文在场:{s}");
+    assert!(s.contains("在位"), "引擎项消息原文在场:{s}");
+    assert!(s.contains("●"), "四态灯读法不变:{s}");
+}
+
+#[test]
+fn 引用完整性_数据仓根未设走指路_不摆空列表不冒充0() {
+    let (mut app, root) = integrity_app("noroot");
+    app.data_root = None;
+    app.run_integrity();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("数据仓根未设"), "未设根走既有指路:{s}");
+    assert!(
+        s.contains(crate::screens::health::CheckSource::Panel.badge()),
+        "来源标注仍在:{s}"
+    );
+    assert!(!s.contains("没进任何配方"), "不摆空列表冒充没问题:{s}");
+    assert!(!s.contains("本体不在"), "不摆断链行:{s}");
+    assert!(!s.contains("ghost"), "没有半个检查行:{s}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn 引用完整性_无可扫对象与全正常两态不互冒充() {
+    // 扫了个空:一个组件家都没有——说「没扫到」,不说「没问题」
+    let empty = std::env::temp_dir().join(format!("nwt-integrity-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&empty);
+    std::fs::create_dir_all(&empty).unwrap();
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Integrity;
+    app.data_root = Some(empty.to_str().unwrap().to_string());
+    app.run_integrity();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("没扫到组件目录"), "空仓说空仓:{s}");
+    assert!(!s.contains("全进配方"), "空仓不冒充全绿:{s}");
+    std::fs::remove_dir_all(&empty).ok();
+    // 全正常:扫到了且全部进配方
+    let root = integrity_repo("clean");
+    std::fs::remove_dir_all(root.join("skills/lonely")).unwrap();
+    std::fs::remove_dir_all(root.join("extensions/dropped")).unwrap();
+    let desk = root.join("recipes/research-desk/recipe.yaml");
+    std::fs::write(&desk, "kind: recipe\nname: research-desk\ncomponents:\n  - component: scout\n  - component: web-scout\n  - component: ribbon\n").unwrap();
+    let lab = root.join("recipes/lab/recipe.yaml");
+    std::fs::write(
+        &lab,
+        "kind: recipe\nname: lab\ncomponents:\n  - component: hello-world\n    source: external\n",
+    )
+    .unwrap();
+    let mut app = fake_app();
+    app.splash = false;
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Integrity;
+    app.data_root = Some(root.to_str().unwrap().to_string());
+    app.run_integrity();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("全进配方"), "全绿给结论:{s}");
+    assert!(!s.contains("没进任何配方"), "没有孤儿行:{s}");
+    assert!(!s.contains("引用了不存在的组件"), "没有断链行:{s}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn 引用完整性_选中行明细列引用方_上下键与点行同路() {
+    let (mut app, root) = integrity_app("sel");
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("选中:断链 ghost"), "首行(断链)明细在右栏:{s}");
+    assert!(s.contains("引用方:lab、research-desk"), "断链的引用方:{s}");
+    // ↓ 到第一个孤儿行:右栏跟着选中行走
+    app.update(Message::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    )));
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("选中:extension dropped"), "选中行走动:{s}");
+    assert!(s.contains("引用方:无"), "孤儿没有引用方:{s}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn 引用完整性_常畅与紧凑两档快照_结论可读不溢出() {
+    let (app, root) = integrity_app("snap");
+    let comfy = crate::testutil::frame_display(&app, 110, 30);
+    for needle in [
+        "引用完整性",
+        "检查行",
+        "自读事实",
+        "ghost",
+        crate::screens::health::CheckSource::Panel.badge(),
+    ] {
+        assert!(comfy.contains(needle), "常畅 110×30 缺「{needle}」:{comfy}");
+    }
+    let compact = crate::testutil::frame_display(&app, 66, 50);
+    for needle in [
+        "引用完整性",
+        "检查行",
+        "ghost",
+        crate::screens::health::CheckSource::Panel.badge(),
+    ] {
+        assert!(
+            compact.contains(needle),
+            "紧凑 66×50 缺「{needle}」:{compact}"
+        );
+    }
+    for (w, frame) in [(110, comfy.as_str()), (66, compact.as_str())] {
+        for l in frame.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(l) <= w,
+                "{w} 宽行不溢出:{l}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // ---- #61 五域搜索过滤:纯本地筛选,空结果两态可区分指路 ----
 
 /// 五域各两条的夹具(#61):每域第二条都带独特可检索词,过滤后应只剩它一条。
@@ -2095,6 +2318,23 @@ fn key(app: &mut App, code: crossterm::event::KeyCode) {
         code,
         crossterm::event::KeyModifiers::NONE,
     )));
+}
+
+/// 在整帧真显示里定位某子串的 (行, 列)(列按显示宽累计——`frame_display`
+/// 已跳过宽字续格,字节偏移≠终端列;与命中区同一把尺,同 `layout::tests` 的
+/// `locate`)。鼠标测试据此把点击落到屏上看得见的那几个字上。
+fn locate(frame: &str, needle: &str) -> (u16, u16) {
+    use unicode_width::UnicodeWidthChar;
+    for (y, line) in frame.split('\n').enumerate() {
+        if let Some(byte) = line.find(needle) {
+            let col: u16 = line[..byte]
+                .chars()
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+                .sum();
+            return (y as u16, col);
+        }
+    }
+    panic!("整帧里找不到「{needle}」");
 }
 
 /// 敲一串字符(过滤词键入)。
@@ -2989,4 +3229,1054 @@ fn 落点浮层_外部源条目超上限_明说其余条数() {
     assert!(s.contains("skills/many/e5/"), "第 6 条在:{s}");
     assert!(!s.contains("skills/many/e6/"), "第 7 条不进浮层:{s}");
     assert!(s.contains("…其余 3 条"), "超出明说条数:{s}");
+}
+
+// ---- 组件打包器(spec #95 工单 #112):fixture 目录进、组件清单出 ----
+
+/// 打包夹具数据仓:一个本地 skill 目录 + 一个 extension 目录(带 node_modules
+/// 与 .git 脏树,验证排除表)。
+fn pack_fixture(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nwt-pack-fix-{}-{}", std::process::id(), tag));
+    let _ = std::fs::remove_dir_all(&dir);
+    let skill = dir.join("payloads/web-scout");
+    std::fs::create_dir_all(skill.join("references")).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: web-scout\ndescription: 检索\n---\n",
+    )
+    .unwrap();
+    std::fs::write(skill.join("references/triggers.md"), "查一下\n").unwrap();
+    std::fs::create_dir_all(skill.join("node_modules/zod")).unwrap();
+    std::fs::write(skill.join("node_modules/zod/index.js"), "x\n").unwrap();
+    std::fs::create_dir_all(skill.join(".git")).unwrap();
+    std::fs::write(skill.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    dir
+}
+
+/// 打包 App:数据仓根指夹具(写侧只认根,不认 NW_HOME)。
+fn pack_app(tag: &str) -> App {
+    let mut app = fake_app();
+    app.screen = Screen::Recipes;
+    app.splash = false;
+    app.data_root = Some(pack_fixture(tag).to_string_lossy().to_string());
+    app
+}
+
+/// 填三字段并 Enter(走到确认闸)。
+fn pack_fill(app: &mut App, source: &str, name: &str, version: &str) {
+    app.rc_domain = crate::app::Domain::Components;
+    if app.pack_open() {
+        key(app, crossterm::event::KeyCode::Esc); // 不重入:先返航再开新的
+    }
+    key(app, crossterm::event::KeyCode::Char('p'));
+    assert!(app.pack_open(), "组件域按 p 开打包表单");
+    type_str(app, source);
+    key(app, crossterm::event::KeyCode::Down);
+    type_str(app, name);
+    key(app, crossterm::event::KeyCode::Down);
+    type_str(app, version);
+    key(app, crossterm::event::KeyCode::Enter);
+}
+
+/// 夹具里那棵 skill 树的真校验和(与 `sha256sum` 同算法的目录摘要,含拟落盘的
+/// 清单)——由测试侧按上游 DirHash 同形独立算一遍,不当「面板自己说对」的证据。
+fn expected_digest(root: &std::path::Path) -> String {
+    let payload = root.join("payloads/web-scout");
+    let mut lines: Vec<String> = vec![
+        "SKILL.md".to_string(),
+        "references/triggers.md".to_string(),
+        "component.yaml".to_string(),
+    ]
+    .into_iter()
+    .map(|rel| {
+        let bytes = if rel == "component.yaml" {
+            crate::datarepo::pack::component_manifest("web-scout", "1.0.0").into_bytes()
+        } else {
+            std::fs::read(payload.join(&rel)).unwrap()
+        };
+        format!("{rel} {}", crate::datarepo::pack::sha256_hex(&bytes))
+    })
+    .collect();
+    lines.sort();
+    let mut text = String::new();
+    for l in &lines {
+        text.push_str(l);
+        text.push('\n');
+    }
+    crate::datarepo::pack::sha256_hex(text.as_bytes())
+}
+
+/// 规格验收 1 + 4:fixture 目录进、组件清单出,字节确定;清单键序与数据仓现有
+/// 组件样本一致(样本键一个不少)。
+#[test]
+fn 打包_表单进确认闸_字节确定且清单形状对齐样本() {
+    let mut app = pack_app("bytes");
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    pack_fill(&mut app, "payloads/web-scout", "web-scout", "1.0.0");
+    let plan = app
+        .pk_flow
+        .as_ref()
+        .and_then(|f| f.plan.clone())
+        .expect("Enter 后进确认闸,拟落账在场");
+    // 确认前一个字节都不落:清单还没写
+    assert!(
+        !root.join("payloads/web-scout/component.yaml").exists(),
+        "确认前不落盘(拟落账只算不写)"
+    );
+    // 清单形状:样本键序逐行对齐
+    let keys: Vec<&str> = plan
+        .manifest
+        .lines()
+        .map(|l| l.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "apiVersion",
+            "kind",
+            "name",
+            "version",
+            "pi",
+            "packages",
+            "vendored",
+            "depends",
+            "params",
+            "config",
+            "env",
+            "requires"
+        ],
+        "清单键序与样本(nw-journeys-and-docs component.yaml)一致"
+    );
+    assert!(plan.manifest.contains("apiVersion: nw/v1"));
+    assert!(plan.manifest.contains("kind: component"));
+    assert!(plan.manifest.contains("name: web-scout"));
+    assert!(plan.manifest.contains("version: 1.0.0"));
+    // 校验和:与测试侧按上游同算法独立算的一致(排除表生效:.git/node_modules
+    // 不进,3 个文件 = SKILL.md + references/triggers.md + 拟落盘的清单)
+    assert_eq!(plan.files, 2, "排除表生效:.git/ 与 node_modules/ 不算");
+    assert_eq!(plan.digest, expected_digest(&root), "校验和与独立重算一致");
+    assert_eq!(plan.target, "payloads/web-scout/component.yaml");
+}
+
+/// 规格验收 2:确认前不落盘 —— 表单 Enter 只出拟落账;Esc 返航连拟落账一起丢,
+/// 磁盘上仍然什么都没有。确认(Enter)之后才落,且只落那一个文件。
+#[test]
+fn 打包_确认前一个字节都不落_确认后原子落盘() {
+    let mut app = pack_app("gate");
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    pack_fill(&mut app, "payloads/web-scout", "web-scout", "1.0.0");
+    // 拟落账在手,磁盘干净
+    assert_eq!(
+        std::fs::read_dir(root.join("payloads/web-scout"))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != "node_modules")
+            .filter(|e| e.as_ref().unwrap().file_name() != ".git")
+            .count(),
+        2,
+        "确认前:源目录原样(SKILL.md + references),没有 component.yaml"
+    );
+    // Esc 返航:不落
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.pack_open(), "Esc 收起浮层");
+    assert!(
+        !root.join("payloads/web-scout/component.yaml").exists(),
+        "返航不落盘(拟落账随浮层一起丢)"
+    );
+    // 再来一次,这次确认
+    pack_fill(&mut app, "payloads/web-scout", "web-scout", "1.0.0");
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    let written = std::fs::read_to_string(root.join("payloads/web-scout/component.yaml")).unwrap();
+    let plan = app.pk_flow.as_ref().unwrap().plan.clone().unwrap();
+    assert_eq!(
+        written, plan.manifest,
+        "落盘字节 = 确认闸摊开过的拟生成清单(逐字节相同)"
+    );
+    // 幂等:再打一次,清单与校验和都不漂
+    let before = plan.digest.clone();
+    pack_fill(&mut app, "payloads/web-scout", "web-scout", "1.0.0");
+    let again = app.pk_flow.as_ref().unwrap().plan.clone().unwrap();
+    assert_eq!(again.digest, before, "同输入同校验和(可重复)");
+    assert_eq!(again.manifest, plan.manifest, "同输入同清单(可重复)");
+    // 源目录里没被顺手多写东西
+    assert!(!root.join("payloads/web-scout/SKILL.md.nwt-tmp").exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 规格验收 2 的鼠标一侧:点「Enter 落盘」段 = 落盘(与键盘同一条路),
+/// 点「Esc 返航」段 = 收起不落。
+#[test]
+fn 打包_确认闸键位行两段_点哪打哪() {
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let mut app = pack_app(&format!("mouse-{w}x{h}"));
+        let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+        pack_fill(&mut app, "payloads/web-scout", "web-scout", "1.0.0");
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("Enter 落盘"), "{w}×{h} 确认段左段在场:{f}");
+        assert!(f.contains("Esc 返航"), "{w}×{h} 确认段右段在场:{f}");
+        // 点左段:坐标取自布局模型的 Enter 命中区,并先断言屏上「Enter 落盘」
+        // 那几个字确落进该区(渲染与命中共源,ADR-0005)。
+        app.size = ratatui::layout::Rect::new(0, 0, w, h);
+        let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+        let act = hits
+            .iter()
+            .find(|(_, t)| *t == crate::layout::Target::Activate)
+            .map(|(r, _)| *r)
+            .expect("确认段产「Enter 落盘」命中区");
+        let (row, col) = locate(&f, "Enter 落盘");
+        assert!(
+            act.contains(ratatui::layout::Position::new(col, row)),
+            "{w}×{h} 渲染与命中共源:屏上「Enter 落盘」落进 Enter 命中区"
+        );
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }));
+        assert!(
+            root.join("payloads/web-scout/component.yaml").exists(),
+            "{w}×{h} 点左段 = 落盘(与键盘 Enter 同路)"
+        );
+        assert!(matches!(
+            app.pk_flow.as_ref().map(|f| f.phase),
+            Some(super::recipes::PackPhase::Done)
+        ));
+        // 结果屏点浮层内任意处 = 返航(坐标取自命中区)
+        let dismiss = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size))
+            .into_iter()
+            .find(|(_, t)| *t == crate::layout::Target::DismissPopup)
+            .map(|(r, _)| r)
+            .expect("结果屏整块是返航命中");
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: dismiss.x + dismiss.width / 2,
+            row: dismiss.y + dismiss.height / 2,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }));
+        assert!(!app.pack_open(), "{w}×{h} 结果屏点任意处返航");
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// 规格验收 5:常畅 / 紧凑两档快照 —— 校验和(64 hex 不截断)、拟生成清单、
+/// 将写文件、键位行都在阵;紧凑档明说只预览前几行(两档不同副面孔)。
+#[test]
+fn 打包_确认闸两档快照() {
+    let mut app = pack_app("snap");
+    pack_fill(&mut app, "payloads/web-scout", "web-scout", "1.0.0");
+    let digest = app
+        .pk_flow
+        .as_ref()
+        .unwrap()
+        .plan
+        .as_ref()
+        .unwrap()
+        .digest
+        .clone();
+    let comfy = crate::testutil::frame_display(&app, 80, 30);
+    assert!(comfy.contains("组件打包器"), "常畅标题:{comfy}");
+    assert!(comfy.contains("payloads/web-scout"), "常畅源目录:{comfy}");
+    assert!(
+        comfy.contains(&digest[..32]) && comfy.contains(&digest[32..]),
+        "常畅校验和完整 64 hex 不截断(放不下就折行):{comfy}"
+    );
+    assert!(
+        comfy.contains("apiVersion: nw/v1"),
+        "常畅摊开拟生成清单:{comfy}"
+    );
+    assert!(comfy.contains("requires: []"), "常畅清单末行在:{comfy}");
+    assert!(comfy.contains("将写"), "常畅将写文件行:{comfy}");
+    assert!(comfy.contains("2 个文件"), "常畅体量行:{comfy}");
+    let compact = crate::testutil::frame_display(&app, 66, 50);
+    assert!(compact.contains("组件打包器"), "紧凑标题:{compact}");
+    assert!(
+        compact.contains(&digest[..32]) && compact.contains(&digest[32..]),
+        "紧凑校验和也完整(折行不截断):{compact}"
+    );
+    assert!(
+        compact.contains("apiVersion: nw/v1"),
+        "紧凑也摊清单:{compact}"
+    );
+    assert!(compact.contains("…其余"), "紧凑明说只预览前几行:{compact}");
+    assert!(compact.contains("Enter 落盘"), "紧凑键位行:{compact}");
+    assert!(!compact.contains("panic"), "两档不炸:{compact}");
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+}
+
+/// 三道门收成一处(`App::author_side_gate`)后,三处入口的指路措辞仍逐字同调:
+/// 装配互斥说「<动作>与装配互斥」、根不就绪说「<动作>入口:…」。收拢不改语义。
+#[test]
+fn 作者侧三道门_三处入口措辞同调() {
+    // 装配互斥:三个入口同一句话形状(动作词各自)
+    let (mut app, _r) = recipe_app("gate-word", 0, VALIDATE_PASS);
+    app.assembling = true;
+    for (what, code, domain) in [
+        (
+            "脚手架",
+            crossterm::event::KeyCode::Char('n'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "打包",
+            crossterm::event::KeyCode::Char('p'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "配方编辑",
+            crossterm::event::KeyCode::Char('e'),
+            crate::app::Domain::Recipes,
+        ),
+    ] {
+        app.rc_domain = domain;
+        let before = app.log.len();
+        key(&mut app, code);
+        // 日志是新近在前(push_log 前插),取最新一行
+        assert_eq!(
+            app.log.first().map(|l| l.as_str()),
+            Some(format!("装配进行中:{what}与装配互斥,稍后再试").as_str()),
+            "{what} 入口的互斥措辞与另外两处同调"
+        );
+        assert!(app.log.len() > before, "{what} 要留一行指路");
+    }
+    // 根不就绪:三个入口同一句话形状
+    let (mut app2, _r2) = recipe_app("gate-root-word", 0, VALIDATE_PASS);
+    let app2_root = std::path::PathBuf::from(app2.data_root.clone().unwrap());
+    app2.data_root = None;
+    for (what, code, domain) in [
+        (
+            "脚手架",
+            crossterm::event::KeyCode::Char('n'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "打包",
+            crossterm::event::KeyCode::Char('p'),
+            crate::app::Domain::Components,
+        ),
+        (
+            "配方编辑",
+            crossterm::event::KeyCode::Char('e'),
+            crate::app::Domain::Recipes,
+        ),
+    ] {
+        app2.rc_domain = domain;
+        key(&mut app2, code);
+        let last = app2.log.first().cloned().unwrap_or_default();
+        assert!(last.starts_with(&format!("{what}入口:")), "{what}:{last}");
+        assert!(
+            last.contains("数据仓"),
+            "{what} 根不就绪的指路带数据仓词:{last}"
+        );
+    }
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+    std::fs::remove_dir_all(&app2_root).ok();
+}
+
+/// 三份字段枚举(skill / extension / 打包)走同一只字段光标(共用形状
+/// `FormField`):顺序即 `ALL`,↑/↓ 到顶 / 到底不越界、不绕回 —— 字段枚举各不同,
+/// 操作者的肌肉记忆不分叉。
+#[test]
+fn 字段光标_三份枚举同一条轮转习惯() {
+    use crate::screens::recipes::PackField;
+    use crate::screens::scaffold::{ExtensionField, SkillField};
+    use crate::screens::FormField;
+    /// 从起点一路向下(多走一格):末两份相同 = 到底不绕回。
+    fn down_walk<F: FormField>(start: F) -> Vec<&'static str> {
+        let mut cur = start;
+        let mut out = vec![cur.label()];
+        for _ in 0..F::ALL.len() {
+            cur = cur.moved(true);
+            out.push(cur.label());
+        }
+        out
+    }
+    /// 从起点一路向上(多走一格):末两份相同 = 回顶不越界。
+    fn up_walk<F: FormField>(start: F) -> Vec<&'static str> {
+        let mut cur = start;
+        let mut out = vec![cur.label()];
+        for _ in 0..F::ALL.len() {
+            cur = cur.moved(false);
+            out.push(cur.label());
+        }
+        out
+    }
+    assert_eq!(
+        down_walk(SkillField::Name),
+        vec!["名称", "描述", "触发词", "模板", "模板"],
+        "skill 四字段:到底停在模板不绕回"
+    );
+    assert_eq!(
+        down_walk(ExtensionField::Name),
+        vec!["名称", "描述", "入口文件", "模板", "模板"],
+        "extension 四字段:同一只习惯"
+    );
+    assert_eq!(
+        down_walk(PackField::Source),
+        vec!["源目录", "组件名", "版  本", "版  本"],
+        "pack 三字段:同一只习惯"
+    );
+    assert_eq!(
+        up_walk(SkillField::Template),
+        vec!["模板", "触发词", "描述", "名称", "名称"],
+        "回顶不越界"
+    );
+    assert_eq!(
+        up_walk(PackField::Version),
+        vec!["版  本", "组件名", "源目录", "源目录"],
+        "回顶不越界"
+    );
+    // index 与 ALL 自洽(下标 = 标签序)
+    for (i, f) in SkillField::ALL.iter().enumerate() {
+        assert_eq!(f.index(), i, "{} 的下标与 ALL 序一致", f.label());
+    }
+    for (i, f) in PackField::ALL.iter().enumerate() {
+        assert_eq!(f.index(), i, "{} 的下标与 ALL 序一致", f.label());
+    }
+}
+
+/// 规格验收 5(ADR-0011 §5):落盘失败是磁盘 / 权限问题,要在**确认闸**里看得见
+/// ——与脚手架同款(fail() + 预览态渲染),不是只写一行日志让操作者对浮层干瞪眼。
+#[test]
+fn 打包_落盘失败_确认闸里看得见_不冒充成功() {
+    let mut app = pack_app("commit-fail");
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    pack_fill(&mut app, "payloads/web-scout", "web-scout", "1.0.0");
+    assert_eq!(
+        app.pk_flow.as_ref().unwrap().phase,
+        crate::screens::recipes::PackPhase::Review,
+        "拟落账在手,进确认闸"
+    );
+    // 抢占落点:让 rename 必败(目标处是个目录)——磁盘 / 权限类失败
+    std::fs::create_dir_all(root.join("payloads/web-scout/component.yaml")).unwrap();
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    // 留在确认态(不回表单、不假装成功),err 在手
+    assert_eq!(
+        app.pk_flow.as_ref().unwrap().phase,
+        crate::screens::recipes::PackPhase::Review,
+        "落盘失败留在确认态,不冒充成功"
+    );
+    let err = app
+        .pk_flow
+        .as_ref()
+        .unwrap()
+        .err
+        .clone()
+        .expect("失败原因要留下来");
+    assert!(err.contains("落盘失败"), "人话点题:{err}");
+    assert!(
+        err.contains("payloads/web-scout/component.yaml"),
+        "带上相对路径:{err}"
+    );
+    // 浮层里渲染得见(常畅 / 紧凑两档)
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("落盘失败"), "{w}×{h} 确认闸渲染落盘失败:{f}");
+        assert!(
+            f.contains("payloads/web-scout/component.yaml"),
+            "{w}×{h} 带路径:{f}"
+        );
+    }
+    // 目标处原样(没写进去),也不留半文件
+    assert!(
+        root.join("payloads/web-scout/component.yaml").is_dir(),
+        "失败不覆盖目标"
+    );
+    assert!(
+        !root
+            .join("payloads/web-scout/.component.yaml.nwt-tmp")
+            .exists(),
+        "失败清 tmp"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 表单两档快照:三字段 + 当前字段块光标 + 键位提示。
+#[test]
+fn 打包_表单两档快照() {
+    let mut app = pack_app("form-snap");
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Char('p'));
+    type_str(&mut app, "payloads/web-scout");
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("源目录"), "{w}×{h} 源目录字段:{f}");
+        assert!(f.contains("组件名"), "{w}×{h} 组件名字段:{f}");
+        assert!(f.contains("payloads/web-scout"), "{w}×{h} 键入内容:{f}");
+        assert!(f.contains("Enter 算校验和"), "{w}×{h} 表单键位行:{f}");
+        assert!(!f.contains("panic"), "{w}×{h} 不炸:{f}");
+    }
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+}
+
+/// 面板侧就拒:坏形状的组件名 / 版本 / 不在的目录,留表单可改,一个字节都不落,
+/// 也不喂给写侧跑一趟(拒绝理由在表单上摊开)。
+#[test]
+fn 打包_形状不合_留表单可改且零字节() {
+    let mut app = pack_app("reject");
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    pack_fill(&mut app, "payloads/web-scout", "web/scout", "1.0.0");
+    assert!(
+        matches!(
+            app.pk_flow.as_ref().map(|f| f.phase),
+            Some(super::recipes::PackPhase::Form)
+        ),
+        "被拒留在表单,不进确认闸"
+    );
+    assert!(
+        app.pk_flow.as_ref().unwrap().err.is_some(),
+        "拒件人话摊在表单上"
+    );
+    assert!(
+        !root.join("payloads/web-scout/component.yaml").exists(),
+        "拒了不落"
+    );
+    // 版本形状也不合(同一处表单,改完就能再试)
+    pack_fill(&mut app, "payloads/web-scout", "web-scout", "latest");
+    assert!(app.pk_flow.as_ref().unwrap().err.is_some(), "版本也拒");
+    // 目录不在
+    pack_fill(&mut app, "payloads/nope", "web-scout", "1.0.0");
+    assert!(app.pk_flow.as_ref().unwrap().err.is_some(), "目录不在也拒");
+    assert!(
+        !root.join("payloads/web-scout/component.yaml").exists(),
+        "三种拒件都不落盘"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 三道门:数据仓根不就绪不摆(只留指路,不猜当前目录)、装配互斥、不重入。
+#[test]
+fn 打包_三道门_根不就绪与装配互斥都不开浮层() {
+    let mut app = pack_app("gates");
+    app.data_root = None;
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Char('p'));
+    assert!(!app.pack_open(), "数据仓根未设:指路,不开表单");
+    assert!(
+        app.log[0].contains("数据仓"),
+        "未设根只留指路,不开表单:{:?}",
+        app.log
+    );
+
+    let mut app2 = pack_app("gates2");
+    app2.assembling = true;
+    app2.rc_domain = crate::app::Domain::Components;
+    key(&mut app2, crossterm::event::KeyCode::Char('p'));
+    assert!(!app2.pack_open(), "装配互斥(写互斥,ADR-0011 §5)");
+    // 非组件域静默不摆(与 `r` 只外部源域同构)
+    let mut app3 = pack_app("gates3");
+    app3.rc_domain = crate::app::Domain::Recipes;
+    key(&mut app3, crossterm::event::KeyCode::Char('p'));
+    assert!(!app3.pack_open(), "非组件域不给打包入口");
+    for a in [&app, &app2, &app3] {
+        if let Some(root) = a.data_root.as_ref() {
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+}
+
+/// 浮层在场吞键:五域键位(切域 / 选行 / 过滤 / 落点 / 建议命令)一个都不受理,
+/// 配方屏原选中行原样不动。
+#[test]
+fn 打包_浮层吞键_五域键位不受理() {
+    let mut app = pack_app("swallow");
+    app.ls = Some(serde_json::from_str(LOCAL_LS).unwrap());
+    app.rc_domain = crate::app::Domain::Components;
+    key(&mut app, crossterm::event::KeyCode::Char('p'));
+    let before = (app.rc_domain, app.rc_sel, app.rc_filter.clone());
+    for code in [
+        crossterm::event::KeyCode::Char('h'),
+        crossterm::event::KeyCode::Char('l'),
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyCode::Char('/'),
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyCode::Enter,
+    ] {
+        key(&mut app, code);
+    }
+    assert_eq!(
+        (app.rc_domain, app.rc_sel, app.rc_filter.clone()),
+        before,
+        "浮层吞键:五域状态一个都不改(Enter 归表单段)"
+    );
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+}
+
+// ---- 配方编辑器(spec #95 工单 #113)----
+
+/// 夹具配方:带未知字段(顶层 metadata/labels、组件项 notes/tuning、env 项
+/// purpose)——往返保真的断言基准。
+const RECIPE_SAMPLE: &str = "apiVersion: nw/v1\n\
+kind: recipe\n\
+name: research-desk\n\
+version: 0.2.0\n\
+profile: desk\n\
+runtime:\n  node: 22\n  pi: 0.84\n  chezmoi: 2\n\
+components:\n  - component: scout\n    version: 1.0.0\n    notes: 主检索\n  - component: hello-world\n    source: external\n    tuning:\n      temperature: 0.3\n\
+models:\n  defaults:\n    id: base\n  providers: []\n\
+env:\n  - name: OPENAI_API_KEY\n    required: true\n    usedBy: [openai]\n    purpose: 调大模型\n  - name: OPTIONAL_FLAG\n    required: false\n\
+metadata:\n  owner: me\nlabels:\n  tier: prod\n";
+
+/// ls 回音的 **data 对象**(直接塞 `app.ls`,同 `LS_FULL` 先例):一条带 path
+/// 的配方行(配方编辑器要从数据仓读它)。
+const LS_RECIPE_EDIT: &str = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"0.2.0","path":"recipes/research-desk/recipe.yaml"}],"components":[],"sources":[],"profiles":[],"locks":[]}"#;
+
+/// 预跑 validate 的两态回音(四态里 fail=0 才放行写回)。
+const VALIDATE_PASS: &str = r#"{"schema":"nw/validate.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"target":"recipe.yaml","results":[{"id":"recipe.schema","status":"pass","message":"形状合"}],"summary":{"total":1,"pass":1,"warn":0,"fail":0,"skip":0}}}"#;
+const VALIDATE_FAIL: &str = r#"{"schema":"nw/validate.v1","nw":"0.1.0","ok":false,"errors":[{"code":"INPUT_INVALID","exitCode":3,"message":"组件引用不存在","hint":"补上组件或改引用","details":{}}],"warnings":[],"data":{"target":"recipe.yaml","results":[{"id":"recipe.components_exist","status":"fail","message":"组件不存在"}],"summary":{"total":1,"pass":0,"warn":0,"fail":1,"skip":0}}}"#;
+
+/// 夹具数据仓:recipes/research-desk/recipe.yaml(带未知字段)。
+fn recipe_fixture(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nwt-recipe-fix-{}-{}", std::process::id(), tag));
+    let _ = std::fs::remove_dir_all(&dir);
+    let recipe_dir = dir.join("recipes/research-desk");
+    std::fs::create_dir_all(&recipe_dir).unwrap();
+    std::fs::write(recipe_dir.join("recipe.yaml"), RECIPE_SAMPLE).unwrap();
+    dir
+}
+
+/// 编辑器 App:数据仓根指夹具、ls 带配方行、假引擎认 ls + validate 两态。
+fn recipe_app(tag: &str, validate_rc: i32, validate_json: &str) -> (App, Arc<FakeRunner>) {
+    let ls_env = format!(
+        r#"{{"schema":"nw/ls.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{LS_RECIPE_EDIT}}}"#
+    );
+    let runner = Arc::new(FakeRunner::new(&[
+        ("ls", 0, ls_env.as_str()),
+        ("validate", validate_rc, validate_json),
+    ]));
+    let mut app = App::with_runner(runner.clone());
+    app.screen = Screen::Recipes;
+    app.splash = false;
+    app.rc_domain = crate::app::Domain::Recipes;
+    app.rc_sel = 0;
+    app.data_root = Some(recipe_fixture(tag).to_string_lossy().to_string());
+    app.ls = Some(serde_json::from_str(LS_RECIPE_EDIT).unwrap());
+    (app, runner)
+}
+
+/// 开编辑器(配方域按 e)。
+fn open_editor(app: &mut App) {
+    key(app, crossterm::event::KeyCode::Char('e'));
+    assert!(app.recipe_edit_open(), "配方域按 e 开编辑器");
+}
+
+/// 驱动一组编辑:加组件 retention、删第一个组件 scout、把 OPTIONAL_FLAG 的
+/// required 打开并设默认 on。
+fn drive_edits(app: &mut App) {
+    // 加组件 retention(组件区,a → 键入 → Enter)
+    key(app, crossterm::event::KeyCode::Char('a'));
+    type_str(app, "retention");
+    key(app, crossterm::event::KeyCode::Enter);
+    // 光标回到第一个组件(scout)删掉
+    key(app, crossterm::event::KeyCode::Up);
+    key(app, crossterm::event::KeyCode::Up);
+    key(app, crossterm::event::KeyCode::Char('x'));
+    // 切到 env 区,选中 OPTIONAL_FLAG,开 required、设默认
+    key(app, crossterm::event::KeyCode::Tab);
+    key(app, crossterm::event::KeyCode::Down);
+    key(app, crossterm::event::KeyCode::Char(' '));
+    key(app, crossterm::event::KeyCode::Enter);
+    type_str(app, "on");
+    key(app, crossterm::event::KeyCode::Enter);
+}
+
+/// 喂一次预跑 validate 回音(走 app 的假引擎解析点,与生产同一条路)。
+async fn feed_validate(app: &mut App, runner: &FakeRunner) {
+    let argv = app.queue.last().expect("队尾有 validate argv").clone();
+    let o = runner.run(&argv).await;
+    app.update(Message::Engine(EngineEvent::Finished(Box::new(o))));
+}
+
+/// 规格验收 1:加/删组件槽、改 env 的编辑往返不丢未知字段(fixture 断言)。
+/// 全流程:编辑 → 拟落账+预跑(通过)→ 确认写回,落盘的 recipe.yaml 保留全部
+/// 未知字段(metadata/labels/notes/tuning/purpose),编辑确已生效。
+#[tokio::test]
+async fn 配方编辑_加删槽改env_往返不丢未知字段() {
+    let (mut app, runner) = recipe_app("roundtrip", 0, VALIDATE_PASS);
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    let recipe = root.join("recipes/research-desk/recipe.yaml");
+    let original = std::fs::read_to_string(&recipe).unwrap();
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    assert!(
+        matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::PreRun)
+        ),
+        "s 后进预跑在途"
+    );
+    // 预跑在途:recipe.yaml 仍未动,scratch 已暂存
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "预跑不碰 recipe.yaml"
+    );
+    feed_validate(&mut app, &runner).await;
+    assert!(
+        matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::Review)
+        ),
+        "回音落地进确认态"
+    );
+    // 确认前仍不落盘
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "确认前不落盘"
+    );
+    // Enter 写回
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(
+        matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::Done)
+        ),
+        "确认后写回进结论态"
+    );
+    let written = std::fs::read_to_string(&recipe).unwrap();
+    // 编辑生效
+    assert!(
+        written.contains("component: retention"),
+        "新组件槽在场:{written}"
+    );
+    assert!(!written.contains("component: scout"), "旧槽已删:{written}");
+    assert!(
+        written.contains("component: hello-world"),
+        "存活槽还在:{written}"
+    );
+    assert!(written.contains("default: on"), "env 默认已设:{written}");
+    // 未知字段一个不丢
+    assert!(written.contains("metadata:"), "顶层未知块不丢:{written}");
+    assert!(
+        written.contains("owner: me"),
+        "顶层未知子字段不丢:{written}"
+    );
+    assert!(written.contains("labels:"), "另一未知顶层块不丢:{written}");
+    assert!(
+        written.contains("tuning:"),
+        "存活项里的未知块不丢:{written}"
+    );
+    assert!(
+        written.contains("temperature: 0.3"),
+        "未知块子字段不丢:{written}"
+    );
+    assert!(
+        written.contains("purpose: 调大模型"),
+        "env 未知字段不丢:{written}"
+    );
+    // scratch 已清
+    assert!(
+        !root
+            .join("recipes/research-desk/.nwt-validate.yaml")
+            .exists(),
+        "预跑暂存已清"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 规格验收 2:写回前预跑 argv 与健康屏 validate 同源(同一 `commands::validate_recipe`
+/// 构造函数,即 `["validate","--recipe",<路径>]`;路径指向 scratch 编辑态,因 recipe.yaml
+/// 确认前不动)。
+#[tokio::test]
+async fn 配方编辑_预跑argv与健康屏validate同源() {
+    let (mut app, _runner) = recipe_app("argv", 0, VALIDATE_PASS);
+    let root = app.data_root.clone().unwrap();
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    let argv = app.queue.last().expect("s 入队了 validate").clone();
+    // 与健康屏同一构造函数:commands::validate_recipe(abs)。绝对路径由写侧
+    // 句柄的 abs_path 出(测试侧按同一形状独立拼一遍,不当「面板说对」的证据)。
+    let scratch_abs = format!(
+        "{}/{}",
+        root.trim_end_matches('/'),
+        crate::datarepo::recipe::scratch_rel("recipes/research-desk/recipe.yaml")
+            .expect("夹具配方路径是合法相对路径")
+            .as_str()
+    );
+    assert_eq!(
+        argv,
+        crate::engine::commands::validate_recipe(&scratch_abs),
+        "预跑 argv = commands::validate_recipe(scratch),与健康屏 validate 同源(同一构造函数)"
+    );
+    assert_eq!(argv[0], "validate", "命令族是 validate");
+    assert_eq!(
+        argv[1], "--recipe",
+        "子形状是 --recipe(非 --lock / 非面板自造检查)"
+    );
+}
+
+/// 窄准许面的第四条约束「换根也清」:暂存后操作者在设置屏换过数据仓根,
+/// 返航时残档必须从**旧根**消失(按暂存时那个根清,不按当前设置态)。
+#[tokio::test]
+async fn 配方编辑_换根返航_暂存档从旧根清掉() {
+    let (mut app, _runner) = recipe_app("swap-root", 0, VALIDATE_PASS);
+    let old_root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    // 另备一个新根(同一棵夹具树:换根后 editor 还能读得到配方)
+    let new_root = recipe_fixture("swap-root-new");
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    assert!(
+        app.rc_edit_flow
+            .as_ref()
+            .and_then(|f| f.scratch.as_ref())
+            .is_some(),
+        "s 后暂存档在场"
+    );
+    let scratch = old_root.join("recipes/research-desk/.nwt-validate.yaml");
+    assert!(scratch.exists(), "暂存落在旧根:{scratch:?}");
+    // 换根(设置态改指新根),然后返航
+    app.data_root = Some(new_root.to_string_lossy().to_string());
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.recipe_edit_open(), "Esc 收起浮层");
+    assert!(
+        !scratch.exists(),
+        "换根也清:残档不留在旧根(按暂存时那个根清)"
+    );
+    assert!(
+        !new_root
+            .join("recipes/research-desk/.nwt-validate.yaml")
+            .exists(),
+        "新根什么都没落"
+    );
+    std::fs::remove_dir_all(&old_root).ok();
+    std::fs::remove_dir_all(&new_root).ok();
+}
+
+/// 规格验收 3:预跑失败可放弃写回,数据仓状态不变(recipe.yaml 逐字节原样,scratch 已清)。
+#[tokio::test]
+async fn 配方编辑_预跑失败可放弃_数据仓不变() {
+    let (mut app, runner) = recipe_app("fail", 3, VALIDATE_FAIL);
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    let recipe = root.join("recipes/research-desk/recipe.yaml");
+    let original = std::fs::read_to_string(&recipe).unwrap();
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    feed_validate(&mut app, &runner).await;
+    // 预跑未过:写回闸关着
+    assert!(
+        matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::Review)
+        ),
+        "回音落地进确认态"
+    );
+    assert!(
+        !app.rc_edit_flow.as_ref().unwrap().validate_pass,
+        "预跑未过:validate_pass=false"
+    );
+    // Enter 不被受理(闸关着),Esc 放弃
+    key(&mut app, crossterm::event::KeyCode::Enter);
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "预跑未过时 Enter 不写回"
+    );
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.recipe_edit_open(), "Esc 收起浮层");
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "放弃写回:recipe.yaml 逐字节原样"
+    );
+    assert!(
+        !root
+            .join("recipes/research-desk/.nwt-validate.yaml")
+            .exists(),
+        "放弃也清 scratch"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 规格验收 4:确认前不落盘 —— 拟落账 + 预跑通过都不写;只有 Enter 确认后才写。
+#[tokio::test]
+async fn 配方编辑_确认前一个字节都不落() {
+    let (mut app, runner) = recipe_app("gate", 0, VALIDATE_PASS);
+    let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+    let recipe = root.join("recipes/research-desk/recipe.yaml");
+    let original = std::fs::read_to_string(&recipe).unwrap();
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    feed_validate(&mut app, &runner).await;
+    // 预跑通过、拟落账在手,但确认前一个字节都不落
+    assert!(
+        app.rc_edit_flow.as_ref().unwrap().plan.is_some(),
+        "拟落账在手"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "拟落账+预跑通过仍不落盘"
+    );
+    // Esc 返航(未确认):连拟落账一起丢,磁盘干净
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.recipe_edit_open(), "Esc 收起");
+    assert_eq!(
+        std::fs::read_to_string(&recipe).unwrap(),
+        original,
+        "返航不落盘"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 规格验收 5:常畅 / 紧凑两档快照 —— 表单(组件槽/env 清单 + 键位行)与确认闸
+/// (预跑四态 + 拟落账 + 写回闸)两档都在阵、不炸。
+#[tokio::test]
+async fn 配方编辑_两档快照() {
+    let (mut app, runner) = recipe_app("snap", 0, VALIDATE_PASS);
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    // 表单两档
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("配方编辑器"), "{w}×{h} 标题:{f}");
+        assert!(f.contains("组件槽"), "{w}×{h} 组件槽区:{f}");
+        assert!(f.contains("env 声明"), "{w}×{h} env 区:{f}");
+        assert!(f.contains("拟落账+预跑"), "{w}×{h} 表单键位行:{f}");
+        assert!(!f.contains("panic"), "{w}×{h} 不炸:{f}");
+    }
+    // 进确认闸(预跑通过)
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    feed_validate(&mut app, &runner).await;
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("配方编辑器"), "{w}×{h} 确认闸标题:{f}");
+        assert!(f.contains("预跑"), "{w}×{h} 预跑四态在场:{f}");
+        assert!(f.contains("recipe.yaml"), "{w}×{h} 将写文件在场:{f}");
+        assert!(f.contains("Enter 写回"), "{w}×{h} 写回键位行:{f}");
+        assert!(!f.contains("panic"), "{w}×{h} 不炸:{f}");
+    }
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+}
+
+/// 三道门:数据仓根不就绪 / 装配互斥 / 非配方域都不开浮层(只留指路)。
+#[test]
+fn 配方编辑_三道门_根不就绪装配互斥非配方域() {
+    // 数据仓根未设
+    let (mut app, _r) = recipe_app("gate-root", 0, VALIDATE_PASS);
+    app.data_root = None;
+    key(&mut app, crossterm::event::KeyCode::Char('e'));
+    assert!(!app.recipe_edit_open(), "根未设:指路,不开编辑器");
+    assert!(
+        app.log.iter().any(|l| l.contains("数据仓")),
+        "根未设只留指路:{:?}",
+        app.log
+    );
+    // 装配互斥
+    let (mut app2, _r2) = recipe_app("gate-asm", 0, VALIDATE_PASS);
+    app2.assembling = true;
+    key(&mut app2, crossterm::event::KeyCode::Char('e'));
+    assert!(!app2.recipe_edit_open(), "装配互斥");
+    // 非配方域静默不摆(与 r 只外部源域、p 只组件域同构)
+    let (mut app3, _r3) = recipe_app("gate-dom", 0, VALIDATE_PASS);
+    app3.rc_domain = crate::app::Domain::Components;
+    key(&mut app3, crossterm::event::KeyCode::Char('e'));
+    assert!(!app3.recipe_edit_open(), "非配方域不给编辑器入口");
+    for a in [&app, &app2, &app3] {
+        if let Some(root) = a.data_root.as_ref() {
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+}
+
+/// 浮层在场吞键:五域键位(切域/选行/过滤/建议命令/落点/打包)一个都不受理,
+/// 配方屏原选中行原样不动。
+#[test]
+fn 配方编辑_浮层吞键_五域键位不受理() {
+    let (mut app, _r) = recipe_app("swallow", 0, VALIDATE_PASS);
+    open_editor(&mut app);
+    let before = (app.rc_domain, app.rc_sel, app.rc_filter.clone());
+    for code in [
+        crossterm::event::KeyCode::Char('h'),
+        crossterm::event::KeyCode::Char('l'),
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyCode::Char('/'),
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyCode::Char('p'),
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyCode::Char('j'),
+        crossterm::event::KeyCode::Char('t'),
+    ] {
+        key(&mut app, code);
+    }
+    assert_eq!(
+        (app.rc_domain, app.rc_sel, app.rc_filter.clone()),
+        before,
+        "浮层吞键:五域与壳级切屏/主题状态一个都不改"
+    );
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+}
+
+/// 预跑在途直接返航:迟到的 validate 回音应丢弃,不污染健康屏 hl_result
+/// (按 argv 暂存标记分流,不是靠浮层在不在场)。
+#[tokio::test]
+async fn 配方编辑_预跑在途返航_迟到回音不污染健康屏() {
+    let (mut app, runner) = recipe_app("abandon-inflight", 0, VALIDATE_PASS);
+    open_editor(&mut app);
+    drive_edits(&mut app);
+    key(&mut app, crossterm::event::KeyCode::Char('s'));
+    // 预跑在途直接返航(scratch 随返航清)
+    key(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(!app.recipe_edit_open(), "返航收起编辑器");
+    assert!(app.hl_result.is_none(), "前置:健康屏无结论");
+    // 迟到回音到达:指向 scratch 暂存,应丢弃
+    feed_validate(&mut app, &runner).await;
+    assert!(
+        app.hl_result.is_none(),
+        "编辑器的迟到预跑回音不污染健康屏 hl_result"
+    );
+    std::fs::remove_dir_all(std::path::PathBuf::from(app.data_root.clone().unwrap())).ok();
+}
+
+/// 规格验收的鼠标一侧:确认段点「Enter 写回」段 = 写回(与键盘 Enter 同一条路),
+/// 渲染与命中共源(屏上「Enter 写回」那几个字落进 Activate 命中区,ADR-0005)。
+#[tokio::test]
+async fn 配方编辑_确认闸写回段_点哪打哪() {
+    use ratatui::layout::{Position, Rect};
+    for (w, h) in [(80u16, 30u16), (66, 50)] {
+        let (mut app, runner) = recipe_app(&format!("mouse-{w}x{h}"), 0, VALIDATE_PASS);
+        let root = std::path::PathBuf::from(app.data_root.clone().unwrap());
+        let recipe = root.join("recipes/research-desk/recipe.yaml");
+        let original = std::fs::read_to_string(&recipe).unwrap();
+        open_editor(&mut app);
+        drive_edits(&mut app);
+        key(&mut app, crossterm::event::KeyCode::Char('s'));
+        feed_validate(&mut app, &runner).await;
+        let f = crate::testutil::frame_display(&app, w, h);
+        assert!(f.contains("Enter 写回"), "{w}×{h} 写回段在场:{f}");
+        app.size = Rect::new(0, 0, w, h);
+        let hits = crate::layout::hitmap(app.size, &app, crate::layout::size_class(app.size));
+        let act = hits
+            .iter()
+            .find(|(_, t)| *t == crate::layout::Target::Activate)
+            .map(|(r, _)| *r)
+            .expect("确认段产「Enter 写回」命中区");
+        let (row, col) = locate(&f, "Enter 写回");
+        assert!(
+            act.contains(Position::new(col, row)),
+            "{w}×{h} 渲染与命中共源:屏上「Enter 写回」落进 Activate 命中区:{f}"
+        );
+        app.update(Message::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }));
+        assert_ne!(
+            std::fs::read_to_string(&recipe).unwrap(),
+            original,
+            "{w}×{h} 点写回段 = 落盘(与键盘 Enter 同路)"
+        );
+        assert!(matches!(
+            app.rc_edit_flow.as_ref().map(|f| f.phase),
+            Some(crate::screens::RecipeEditPhase::Done)
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
