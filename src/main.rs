@@ -17,6 +17,7 @@ mod term;
 mod testutil;
 mod theme;
 mod ui;
+mod upgrade;
 
 use anyhow::Result;
 use app::{App, Message};
@@ -100,6 +101,9 @@ async fn main() -> Result<()> {
     // 引擎版本对照(#108)的回音通道:与引擎通道并列而不同路——release 查询
     // 不是 `nw` 的进程输出,不借道 EngineEvent(见 `Message::Release`)。
     let (rtx, mut rrx) = mpsc::unbounded_channel::<release::ReleaseProbe>();
+    // 自升级事件通道(#121):与引擎 / 版本对照 / 扫描三条回音通道并列,主循环
+    // 在同一个 select 里一起收。install.sh 的逐行进度与终结结论都走这条。
+    let (utx, mut urx) = mpsc::unbounded_channel::<upgrade::UpgradeEvent>();
 
     let result = run_loop(
         &mut terminal,
@@ -111,6 +115,8 @@ async fn main() -> Result<()> {
         &mut rrx,
         &stx,
         &mut srx,
+        &utx,
+        &mut urx,
     )
     .await;
 
@@ -118,7 +124,7 @@ async fn main() -> Result<()> {
     result
 }
 
-#[allow(clippy::too_many_arguments)] // 两条回音通道(引擎/版本对照/扫描)并列,参数随接缝累加
+#[allow(clippy::too_many_arguments)] // 四条回音通道(引擎/版本对照/扫描/自升级)并列,参数随接缝累加
 async fn run_loop(
     terminal: &mut term::Term,
     app: &mut App,
@@ -129,6 +135,8 @@ async fn run_loop(
     rrx: &mut mpsc::UnboundedReceiver<release::ReleaseProbe>,
     stx: &mpsc::UnboundedSender<scan::ScanEvent>,
     srx: &mut mpsc::UnboundedReceiver<scan::ScanEvent>,
+    utx: &mpsc::UnboundedSender<upgrade::UpgradeEvent>,
+    urx: &mut mpsc::UnboundedReceiver<upgrade::UpgradeEvent>,
 ) -> Result<()> {
     let mut tick = interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -150,6 +158,24 @@ async fn run_loop(
         }
         if app.quit {
             break;
+        }
+        // 装配完成通知出匣(#117):bell / OSC 9 序列由主循环写进 stdout。
+        // 渲染保持无副作用(ADR-0004),所以「收尾时序列确实发出」走这里——
+        // 状态树只攒序列,不碰终端。OSC 9 在不支持的环境是静默 no-op,
+        // 所以照发不探测、不报错(规格 Further Notes)。
+        for seq in app.take_pending_notify() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(seq.as_bytes());
+            let _ = out.flush();
+        }
+        // 自升级队列(#121):与引擎命令同一个 drain 模式,但走 upgrade 模块
+        // 自己那条 async fn(它把 install.sh 的逐行原文当进度推回来)。
+        for req in std::mem::take(&mut app.upgrade_queue) {
+            let utx = utx.clone();
+            tokio::spawn(async move {
+                upgrade::run(&req, &upgrade::UpgradeEnv::from_env(), &utx).await;
+            });
         }
         // 键位处理器排队的引擎命令在这里统一执行(键位没有 tx)。
         for args in std::mem::take(&mut app.queue) {
@@ -184,6 +210,8 @@ async fn run_loop(
                 _ => {}
             },
             Some(ev) = erx.recv() => app.update(Message::Engine(ev)),
+            // 自升级推进(#121):install.sh 的逐行进度 + 终结结论。
+            Some(ev) = urx.recv() => app.update(Message::Upgrade(ev)),
             // 版本对照回音:与引擎回音并列收,不借道 EngineEvent
             Some(p) = rrx.recv() => app.update(Message::Release(p)),
             Some(ev) = srx.recv() => app.update(Message::Scan(ev)),

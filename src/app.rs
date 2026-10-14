@@ -17,7 +17,9 @@ use crate::release::{upgrade_hint, verdict, ReleaseLookup, ReleaseProbe};
 use crate::screens::{catalog, RegisterSpec};
 use crate::term::{self, ColorCap};
 use crate::theme::{cached_degrade, Palette, ThemeKind};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crate::upgrade::{self, UpgradePhase, UpgradeRequest};
+use crossterm::event::KeyModifiers;
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 /// 五块屏幕,左竖导航的顺序即数组顺序。
@@ -246,6 +248,14 @@ pub enum JumpPending {
     SourceEntry(String),
 }
 
+/// 装配完成通知的两个独立开关(#117):bell 提示音 / OSC 9 桌面通知。
+/// 设置屏 `b` 与 `o` 各翻一个,互不牵连(规格故事 3)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotifyKind {
+    Bell,
+    Desktop,
+}
+
 /// 登记类别二选一(引擎 `--kind` 槽位;`--category` 是 0.1.0 就有的
 /// `source register` 可重复旗标,不是能力缺口——要不要给类别输入是产品
 /// 范围问题(ADR-0006),不是引擎有没有的问题;类别输入一律不给,spec #25)。
@@ -297,6 +307,8 @@ pub enum Message {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Engine(EngineEvent),
+    /// 自升级过程的推进(#121):install.sh 的逐行进度 + 终结结论。
+    Upgrade(upgrade::UpgradeEvent),
     /// 引擎 release 仓最新 tag 的对照结论(#108)。
     Release(ReleaseProbe),
     Tick,
@@ -588,6 +600,16 @@ pub struct App {
     pub data_buf: String,
     /// config.toml 解析失败的人话证据;None = 配置健康。
     pub config_error: Option<String>,
+    /// 自升级(#121):`U` 呼出的全屏叠加层状态。六态见
+    /// [`upgrade::UpgradePhase`];在途态点 `assembling` 那盏全局写互斥灯。
+    pub upgrade: UpgradePhase,
+    /// 升级过程的日志区进度:install.sh 的**原文**逐行来,面板不翻译。
+    pub upgrade_log: Vec<String>,
+    /// 键位处理器排队的升级请求(主循环取出起任务,与 `queue` 同一模式)。
+    pub upgrade_queue: Vec<UpgradeRequest>,
+    /// 升级进度日志区的滚轮偏移(#121):0 = 跟随最新,向上滚增、向下滚减,
+    /// 与装配 stderr 日志 `as_log_offset` 同口径。
+    pub upgrade_offset: usize,
     /// 全局命令面板(#119):`Ctrl+P` 呼出的叠加浮层在不在场。
     /// **面板是叠加层不是模式劫持**:它只收自己的键(查询键入 / ↑/↓ /
     /// Enter / Esc / Ctrl+P),其余键一律不拦、照旧路由到当前屏(规格故事 7)。
@@ -599,6 +621,19 @@ pub struct App {
     /// 鼠标捕获是否开启(默认开;两联 = 配置 mouse_capture + --no-mouse,
     /// 见 ADR-0005)。term::init 按此门控捕获序列。
     pub mouse_enabled: bool,
+    /// 装配完成通知的 **bell 提示音**开关(#117;默认开)。
+    /// 与 `desktop_notify` 是两个独立布尔——共享终端 / 勿扰场景可以只要一个。
+    pub bell_on: bool,
+    /// 装配完成通知的 **OSC 9 桌面通知**开关(#117;默认开)。
+    pub desktop_notify: bool,
+    /// **待发出的终端序列出匣**(#117):装配收尾时把 bell / OSC 9 序列攒在
+    /// 这里,由主循环每帧 flush 到 stdout 后清空(见 `main::run_loop`)。
+    ///
+    /// 为什么不直接写终端:渲染必须无副作用(ADR-0004 起的铁律),而「收尾时
+    /// 序列确实发出」又要能被测试断言——出匣让两者同时成立:测试直接读这个
+    /// 字段,生产由主循环排空。 OSC 9 在不支持的环境是静默 no-op,
+    /// 所以照发不探测、不报错(规格 Further Notes)。
+    pub pending_notify: Vec<String>,
     /// 最近一次渲染的终端面,供命中定标(主循环每帧刷新;
     /// 命中几何见 layout::hitmap)。
     pub size: Rect,
@@ -615,7 +650,11 @@ impl App {
         let mut app = Self::assemble(runner, status, cfg_err);
         // 鼠标捕获两联之配置一联(缺省/坏配置降级 → 开);
         // --no-mouse 旗标由 main 另行并入(apply_no_mouse_flag)。
-        app.mouse_enabled = crate::engine::config::load().0.mouse_capture_enabled();
+        let cfg = crate::engine::config::load().0;
+        app.mouse_enabled = cfg.mouse_capture_enabled();
+        // 完成通知双开关(#117):与鼠标捕获同一个 config 接缝,缺省即开
+        app.bell_on = cfg.bell_enabled();
+        app.desktop_notify = cfg.desktop_notify_enabled();
         app
     }
 
@@ -771,11 +810,52 @@ impl App {
             data_buf: String::new(),
             config_error,
             mouse_enabled: true,
+            upgrade: UpgradePhase::Idle,
+            upgrade_log: Vec::new(),
+            upgrade_queue: Vec::new(),
+            upgrade_offset: 0,
+            bell_on: true,
+            desktop_notify: true,
+            pending_notify: Vec::new(),
             cmd_open: false,
             cmd_query: String::new(),
             cmd_sel: 0,
             size: Rect::default(),
         }
+    }
+
+    /// 装配收尾态词(#117):**成功(收敛)/ 降级 / 中止 / 失败** 四态,两两可
+    /// 区分。日志与完成通知**同源**——通知不另造一套话术(规格「通知文案复用
+    /// 装配收尾话术,不另造」)。
+    ///
+    /// 降级 = `ok` 但 envelope 带了 warnings:装好了而没完全好,与纯收敛不是
+    /// 一件事(沿用 doctor 的降级档口径,不新造词)。
+    pub fn finish_word(ok: bool, warnings: usize) -> &'static str {
+        if !ok {
+            "失败"
+        } else if warnings > 0 {
+            "降级"
+        } else {
+            "收敛"
+        }
+    }
+
+    /// 装配收尾完成通知(#117):按 config 的两个**独立**开关取 bell / OSC 9
+    /// 序列,进「待发出终端序列」出匣。文本由调用方给——就是收尾日志那一句
+    /// (同源,不另造)。
+    ///
+    /// 两个开关都关时 `term::notify_ansi` 给空串,这里据此一个字节都不入匣。
+    pub fn notify_finish(&mut self, text: &str) {
+        let seq = term::notify_ansi(self.bell_on, self.desktop_notify, text);
+        if !seq.is_empty() {
+            self.pending_notify.push(seq);
+        }
+    }
+
+    /// 取走并清空待发出序列(主循环每帧调用后写 stdout;测试据此断言
+    /// 「序列确实发出」而不需要一个真终端)。
+    pub fn take_pending_notify(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_notify)
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {
@@ -994,6 +1074,7 @@ impl App {
             Message::Key(k) => self.on_key(k),
             Message::Mouse(ev) => self.on_mouse(ev),
             Message::Engine(ev) => self.on_engine(ev),
+            Message::Upgrade(ev) => self.on_upgrade(ev),
             Message::Release(p) => self.on_release_probe(p),
             Message::Tick => self.blink = !self.blink,
             Message::Scan(ev) => self.on_scan(ev),
@@ -1265,7 +1346,10 @@ impl App {
         self.as_confirm = false;
         self.as_running = false;
         self.as_aborted = true; // 迟到的 up 回音按此丢弃
-        self.push_log("装配已中止:在途 nw up 子进程已止(进程级,不等它跑完)");
+        let headline = "装配已中止:在途 nw up 子进程已止(进程级,不等它跑完)";
+        self.push_log(headline);
+        // 中止也是收尾(#117):操作者挂后台时最需要的那一声就在这条路上
+        self.notify_finish(headline);
         self.push_log("中止可能停在未收敛中间态:面板不宣布成功也不假装失败");
         self.push_log("重跑同一条装配命令即可收敛(up 幂等);收敛与否以健康屏 doctor 复核为准");
     }
@@ -1283,6 +1367,12 @@ impl App {
         } else if self.as_confirm {
             self.as_confirm = false;
             self.push_log("发射取消");
+        } else if self.upgrade.is_open() {
+            // 自升级浮层返航(#121):与 Esc 完全同路。**在途态(下载 / 校验
+            // 在跑)不给返航的口子**——面板不假装能收回一个已经发出去的
+            // 下载;结论态(Done / Failed)与版本输入态才收,且收的是浮层,
+            // 已落盘的二进制不收(那已经是既成事实)。
+            self.dismiss_upgrade();
         } else if self.vps_reverse_open() {
             // 反查上浮结果浮层返航(#70):只收状态,册体一行不改、机器册原选中行
             // 原样在场——反查从头到尾不写 `vps_sel`(它在途时册体键位被吞、回音
@@ -1416,14 +1506,25 @@ impl App {
                     self.push_log("装配回音已丢弃(已中止:半个结果不算结论)");
                     return;
                 }
-                self.assembling = false;
+                // 升级在途时 up 回音**不碰互斥灯**(#121):自升级点的是同一盏
+                // `assembling`,若让 up 的回音在这儿无条件熄灯,升级过程的锁
+                // 会被一笔不相干的装配回音解开。互斥由升级自己收敛
+                // (`on_upgrade` 的 Finished 臂),两条路各归各。
+                if !self.upgrade.in_flight() {
+                    self.assembling = false;
+                }
                 self.as_running = false;
                 let ok = out.ok;
-                self.push_log(format!(
+                // 收尾态词四态可区分(#117):日志与通知同源,一处算
+                let warnings = out.envelope.as_ref().map(|e| e.warnings.len()).unwrap_or(0);
+                let headline = format!(
                     "装配结束:{} (rc {})",
-                    if ok { "收敛" } else { "失败" },
+                    Self::finish_word(ok, warnings),
                     out.exit_code.number()
-                ));
+                );
+                self.push_log(headline.clone());
+                // 完成通知(#117):成功 / 降级 / 失败三路各自发序列
+                self.notify_finish(&headline);
                 self.as_result = Some(out);
                 if !ok {
                     self.screen = Screen::Assemble;
@@ -1582,6 +1683,20 @@ impl App {
         }
         if self.as_confirm {
             self.on_key_confirm(k);
+            return;
+        }
+        // 全局命令面板(#119):叠加层,只收自己的键。`on_key_cmd` 返回 false =
+        // 这个键不归面板,**不 return**——照旧落进后面的分派(规格故事 7:
+        // 面板是叠加层不是模式劫持,其它按键照旧路由到当前屏)。
+        // 位置在帮助浮层之后:帮助浮层开着时其余键一律不收(它是最外层的
+        // 查询型浮层),所以 Ctrl+P 在帮助浮层开着时无效——与其它未列键位
+        // 同等待遇,不为面板单开一条缝。
+        // 自升级浮层(#121):`U` 呼出的全屏叠加层,与帮助浮层同族——它开着时
+        // 只收自己的键(版本键入 / Enter / Esc / q),其余键一个都不受理,
+        // 免得从面板绕过升级互斥。插在 as_confirm 之后:发射仪式是更外层的
+        // 确认,升级期间本来也点不着他(assembling 已锁)。
+        if self.upgrade.is_open() {
+            self.on_key_upgrade(k);
             return;
         }
         // 全局命令面板(#119):叠加层,只收自己的键。`on_key_cmd` 返回 false =
@@ -1799,6 +1914,170 @@ impl App {
         }
     }
 
+    // ---- 自升级(#121):`U` 呼出的全屏叠加层 ----
+
+    /// 呼出自升级浮层:版本输入态,预填 `latest`(操作者可改成钉版本)。
+    /// 只在设置屏在场(`key_settings` 的 `u` 臂),所以这里不再判屏。
+    pub fn open_upgrade(&mut self) {
+        // 写互斥(ADR-0009 §4):装配进行中不接自升级,反之亦然——自升级要换
+        // 的是面板自己的二进制,与装配同样是「落盘」那一族。文案照抄
+        // `start_register` / `CatalogKind::start` 那一族,不另造一套说法。
+        if self.assembling {
+            self.push_log("装配进行中:自升级与装配互斥,稍后再试");
+            return;
+        }
+        if self.upgrade.in_flight() {
+            self.push_log("升级进行中:等这一趟跑完再开下一趟");
+            return;
+        }
+        self.upgrade = UpgradePhase::Version {
+            buf: "latest".into(),
+        };
+        self.push_log("自升级:Enter 取安装计划(零下载、零落盘),Esc/q 放弃");
+    }
+
+    /// 收起自升级浮层( Esc / q / 点浮层外都走这一条同路)。
+    /// **在途态不收**:下载 / 校验在跑,面板不假装能收回它。
+    pub fn dismiss_upgrade(&mut self) {
+        if self.upgrade.in_flight() {
+            return;
+        }
+        self.upgrade = UpgradePhase::Idle;
+    }
+
+    /// 起一趟升级(干跑 / 真跑共用这一处,按 `dry_run` 分):清进度、点全局
+    /// 写互斥、入队。两段同形的入队块收成一份——「点互斥灯 + 清进度 + 入队」
+    /// 是一个动作,抄两遍就会漂。
+    ///
+    /// 互斥说明:点 `assembling` 那盏全局写互斥灯(规格「与装配态同款互斥
+    /// 思路」),其余写入口的既有闸自然兜住。**不点 `as_running`**——那是
+    /// up 在途的专有灯,`x` 中止键不误杀升级。
+    fn begin_upgrade(&mut self, version: Option<String>, dry_run: bool) {
+        let label = version.clone().unwrap_or_else(|| "latest".into());
+        self.upgrade = if dry_run {
+            UpgradePhase::Planning { version: label }
+        } else {
+            UpgradePhase::Running { version: label }
+        };
+        self.upgrade_log.clear();
+        self.upgrade_offset = 0;
+        self.assembling = true;
+        self.upgrade_queue.push(UpgradeRequest {
+            version,
+            target: std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("nwt")),
+            dry_run,
+        });
+        self.push_log(if dry_run {
+            "自升级:正在取安装计划(零下载、零落盘)".to_string()
+        } else {
+            "自升级:下载 → sha256 校验 → 落盘(校验不过旧二进制一个字节都不动)".to_string()
+        });
+    }
+
+    /// 自升级浮层的键位:版本输入态收键入(归通用输入态机),计划态收确认,
+    /// 结论态只收离开。**在途态一个键都不收**(除 ↑/↓ 翻进度)——升级期间
+    /// 其余动作已锁,面板不假装能收回一个已经发出去的下载。
+    fn on_key_upgrade(&mut self, k: KeyEvent) {
+        // 在途:只有 ↑/↓ 翻进度(与装配 stderr 日志同源),别的都不受理。
+        if self.upgrade.in_flight() {
+            match k.code {
+                KeyCode::Up => {
+                    self.upgrade_offset = self.upgrade_offset.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.upgrade_offset = self.upgrade_offset.saturating_add(1);
+                }
+                _ => {}
+            }
+            return;
+        }
+        match &mut self.upgrade {
+            // 版本输入:键入分发归**通用单行输入态机** `input::on_key`——与
+            // NW_HOME / 数据仓根手填、配方过滤、册内过滤同一条路。手搓
+            // `Char(c) => buf.push(c)` 会绕过它的两道纪律:CONTROL 组合键
+            // 被当普通字符(在版本缓冲里塞一个 `p`)、缓冲无 `BUF_CAP` 上限。
+            UpgradePhase::Version { buf } => match input::on_key(buf, k) {
+                InputAction::Submit => {
+                    let v = buf.trim().to_string();
+                    let version = (!v.is_empty() && v != "latest").then_some(v);
+                    self.begin_upgrade(version, true);
+                }
+                InputAction::Cancel => self.dismiss_upgrade(),
+                InputAction::Edited | InputAction::Ignored => {}
+            },
+            UpgradePhase::Plan { version } => match k.code {
+                // 计划已摊开(版本 / 资产 / 校验文件 / 落点):确认才真跑。
+                KeyCode::Enter => {
+                    let v = version.clone();
+                    self.begin_upgrade((v != "latest").then_some(v), false);
+                }
+                KeyCode::Esc | KeyCode::Char('q') => self.dismiss_upgrade(),
+                _ => {}
+            },
+            // 结论态:任何离开键都收(不重跑、不重开——重启面板新版本才在场)。
+            UpgradePhase::Done { .. } | UpgradePhase::Failed { .. } => match k.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.dismiss_upgrade(),
+                _ => {}
+            },
+            UpgradePhase::Idle | UpgradePhase::Planning { .. } | UpgradePhase::Running { .. } => {}
+        }
+    }
+
+    /// 自升级推进事件(#121):install.sh 的**原文**逐行进进度区;终结事件
+    /// 收敛互斥并落到结论态。回音只由 `upgrade::run` 自己发一个,所以这里
+    /// 不会重复收敛。
+    fn on_upgrade(&mut self, ev: upgrade::UpgradeEvent) {
+        match ev {
+            upgrade::UpgradeEvent::Progress(line) => {
+                self.upgrade_log.insert(0, line);
+                if self.upgrade_log.len() > 200 {
+                    self.upgrade_log.truncate(200);
+                }
+            }
+            upgrade::UpgradeEvent::Finished(out) => {
+                self.assembling = false;
+                // 干跑 rc 0 = 计划拿到了,落「计划摊开」等确认(规格故事 13:
+                // 升级前先显示目标版本与 sha256 校验结果);真跑 rc 0 才是装完。
+                if out.exit_code == 0 && matches!(self.upgrade, UpgradePhase::Planning { .. }) {
+                    let version = match &self.upgrade {
+                        UpgradePhase::Planning { version } => version.clone(),
+                        _ => "latest".into(),
+                    };
+                    self.upgrade = UpgradePhase::Plan { version };
+                    self.push_log("自升级计划已取(零下载、零落盘):确认后才开始");
+                    return;
+                }
+                if out.exit_code == 0 {
+                    let sha = self
+                        .upgrade_log
+                        .iter()
+                        .find_map(|l| upgrade::sha256_from_line(l))
+                        .unwrap_or_default();
+                    let version = self
+                        .upgrade_log
+                        .iter()
+                        .find_map(|l| upgrade::installed_version_from_line(l))
+                        .or_else(|| match &self.upgrade {
+                            UpgradePhase::Running { version } => Some(version.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "latest".into());
+                    self.upgrade = UpgradePhase::Done {
+                        version,
+                        sha256: sha,
+                    };
+                    self.push_log("自升级完成:重启面板后新版本才在场");
+                } else {
+                    self.upgrade = UpgradePhase::Failed {
+                        reason: out.reason.clone(),
+                    };
+                    self.push_log(format!("自升级失败:{}", out.reason));
+                    self.push_log("旧二进制原样不动,未安装任何文件");
+                }
+            }
+        }
+    }
+
     // ---- 全局命令面板(#119):一处登记、面板与帮助浮层同源 ----
 
     /// 呼出命令面板:查询词与选中行都归零(重开总是从全清单首行看起,与帮助
@@ -1856,8 +2135,17 @@ impl App {
             return;
         };
         let code = row.code;
+        let mods = row.modifiers;
+        // 跨屏条目(设置屏的 U、机器册的 Enter 反查…)不在当前屏根本没有分支:
+        // 先切到那一屏再派发,否则操作者在概览屏执行「U 自升级」会得到
+        // 零反馈(`key_settings` 根本不到场)。壳级行 `screen` 为 None,不切。
+        if let Some(target) = row.screen {
+            self.screen = target;
+        }
         self.close_cmd_panel();
-        self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        // 修饰键照登记表带(#119):唯一带 CONTROL 的行是 Ctrl+P 自己,按 NONE
+        // 回放会派发成裸 `p`(概览屏的 ↑ 别名),那是一次静默的语义漂移。
+        self.on_key(KeyEvent::new(code, mods));
     }
 
     fn screen_key(&mut self, k: KeyEvent) {
@@ -2371,6 +2659,13 @@ impl App {
             }
             KeyCode::Char('e') => self.pending_editor = true,
             KeyCode::Char('m') => self.toggle_mouse_capture(),
+            // 自升级(#121):`U` 呼出全屏叠加层,预填 latest(可改成钉版本)。
+            // 与 install.sh 同一道闸——sha256 不过旧二进制一个字节都不动。
+            KeyCode::Char('u') => self.open_upgrade(),
+            // 装配完成通知双开关(#117):b = bell 提示音,o = OSC 9 桌面通知。
+            // 两个独立布尔,各自翻转 + 各自持久化(与 m 同一个 config 接缝)。
+            KeyCode::Char('b') => self.toggle_notify(NotifyKind::Bell),
+            KeyCode::Char('o') => self.toggle_notify(NotifyKind::Desktop),
             // 引擎版本对照页(#108):v 翻开,再按 v 或 Esc 回常驻面板。
             // 引擎没找到时不给翻——没有本地版本可比,指路屏的话已经说清了。
             KeyCode::Char('v') if self.engine.found => {
@@ -2396,6 +2691,40 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 装配完成通知的两个独立开关(#117):bell 提示音 / OSC 9 桌面通知。
+    /// 形态与 [`App::toggle_mouse_capture`] 完全同构——翻状态 + 持久化
+    /// config + 留一句人话;共享终端 / 勿扰场景可以只要一个。
+    pub fn toggle_notify(&mut self, kind: NotifyKind) {
+        let (on, noun) = match kind {
+            NotifyKind::Bell => {
+                self.bell_on = !self.bell_on;
+                (self.bell_on, "bell 提示音")
+            }
+            NotifyKind::Desktop => {
+                self.desktop_notify = !self.desktop_notify;
+                (self.desktop_notify, "OSC 9 桌面通知")
+            }
+        };
+        let mut cfg = crate::engine::config::load().0;
+        match kind {
+            NotifyKind::Bell => cfg.bell = Some(on),
+            NotifyKind::Desktop => cfg.desktop_notify = Some(on),
+        }
+        if let Err(e) = crate::engine::config::save(&cfg) {
+            self.push_log(format!("{noun}偏好持久化失败:{e}"));
+        }
+        self.push_log(format!(
+            "{noun}:{}(重启仍生效;装配收尾时{})",
+            if on { "开" } else { "关" },
+            match (kind, on) {
+                (NotifyKind::Bell, true) => "会响一声",
+                (NotifyKind::Bell, false) => "不响",
+                (NotifyKind::Desktop, true) => "会弹桌面通知",
+                (NotifyKind::Desktop, false) => "不弹桌面通知",
+            }
+        ));
     }
 
     /// 逃逸两联之一:设置屏 m 开关。翻状态 + 持久化 config
@@ -9363,7 +9692,11 @@ mod tests {
         // + 尾注已超过它——所以这条测试**滚完整个浮层**再断言,顺带守「没有
         // 一行是因为放不下被静默丢掉的」。滚到底仍看不到的行 = 真丢了。
         let mut seen = String::new();
-        for _ in 0..HELP_ROWS.len() + MOUSE_LINES.len() + 4 {
+        // 滚的步数要够走到最后一行:可见行数由 80×44 下的浮层内层决定
+        // (HELP_H 30 去掉边框与末行提示),而总行数 = 登记表 + 鼠标章 + 尾注。
+        // 步数按「总行数」给,再留 4 步余量——少一步就有行滚不到,
+        // 这条测试会把它当成「真丢了」而假红。
+        for _ in 0..(HELP_ROWS.len() + MOUSE_LINES.len() + 8) {
             seen.push_str(&crate::testutil::frame_display(&app, 80, 44));
             seen.push('\n');
             app.update(Message::Key(KeyEvent::new(
@@ -9373,7 +9706,16 @@ mod tests {
         }
         for row in HELP_ROWS {
             assert!(seen.contains(row.key), "帮助应显示键位 `{}`", row.key);
-            assert!(seen.contains(row.desc), "帮助应显示说明 `{}`", row.desc);
+            // 说明可能被浮层内层宽度截断(帮助行**不折行、不 clip**,超宽就被
+            // Paragraph 裁掉尾巴——见 help_lines),所以按前缀断言:整句在,或
+            // 整句被裁到可见宽度的前缀在。#121 的「U 自升级」那一行说明有 63
+            // 格宽、超过 58 格内层,正是这条纪律的现行证据。
+            let head: String = row.desc.chars().take(28).collect();
+            assert!(
+                seen.contains(&head),
+                "帮助应显示说明 `{}`(或其可见前缀)",
+                row.desc
+            );
         }
         for m in MOUSE_LINES {
             assert!(seen.contains(m), "鼠标章节应含 `{m}`");
@@ -9705,4 +10047,684 @@ mod tests {
         assert!(app.ah_raw.is_none(), "点任意处关原文");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- #96 UX 补全:完成通知 / 全局命令面板 / 反查跳转 / 自升级 ----
+
+    /// Ctrl+P:命令面板的呼出键(唯一带 CONTROL 修饰键的登记行)。
+    fn ctrl_p() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
+    }
+
+    /// 按一个字符键(带 NONE 修饰键,与其余测试同口径)。
+    fn keyc(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// 一路 up 成功回音(无告警 = 收敛)。
+    fn up_echo(rc: i32, json: &str) -> EngineOutput {
+        EngineOutput {
+            args: vec!["up".into(), "--lock".into(), "9f8e".into()],
+            exit_code: crate::engine::ExitCode::from_number(rc),
+            ok: rc == 0,
+            stderr_tail: vec![],
+            envelope: serde_json::from_str(json).ok(),
+            raw_stdout: json.into(),
+            parse_error: None,
+        }
+    }
+
+    #[test]
+    fn up回音落地_不熄升级在途的互斥灯() {
+        // 升级点的是同一盏 `assembling`;一笔不相干的 up 回音不该把它解开
+        // (互斥由升级自己收敛)。
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.upgrade.in_flight(), "干跑在途");
+        assert!(app.assembling, "升级点了互斥灯");
+        // 另一笔 up 回音到达:不动互斥灯
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["up".into(), "--lock".into(), "9f8e".into()],
+                exit_code: crate::engine::ExitCode::Ok,
+                ok: true,
+                stderr_tail: vec![],
+                envelope: None,
+                raw_stdout: String::new(),
+                parse_error: None,
+            },
+        ))));
+        assert!(app.assembling, "up 回音不熄升级的互斥灯");
+        // 升级自己收敛:Finished 才灭
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 0,
+                reason: String::new(),
+            },
+        )));
+        assert!(!app.assembling, "升级自己收敛互斥");
+    }
+
+    #[test]
+    fn up失败收尾_发通知且话术是失败() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            4, UP_FAIL,
+        )))));
+        assert!(
+            app.pending_notify.concat().contains("装配结束:失败 (rc 4)"),
+            "失败也发通知(挂后台时最需要的那一声):{:?}",
+            app.pending_notify
+        );
+    }
+
+    #[test]
+    fn up收敛收尾_发一声bell加一条osc9_话术与日志同源() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        let seq = app.pending_notify.concat();
+        assert!(seq.starts_with('\u{7}'), "bell 打头:{seq:?}");
+        assert!(
+            seq.contains("\u{1b}]9;装配结束:收敛 (rc 0)\u{7}"),
+            "OSC 9 带收尾话术:{seq:?}"
+        );
+        assert_eq!(app.pending_notify.len(), 1, "一次收尾只入匣一条");
+        assert!(app.log[0].contains("收敛"), "日志与通知同源:{}", app.log[0]);
+    }
+
+    #[test]
+    fn up降级收尾_话术与纯成功可区分() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_WARN,
+        )))));
+        assert!(
+            app.pending_notify.concat().contains("装配结束:降级 (rc 0)"),
+            "ok 但带告警 = 降级,不冒充收敛:{:?}",
+            app.pending_notify
+        );
+        assert!(app.log[0].contains("降级"), "日志同口径:{}", app.log[0]);
+    }
+
+    #[test]
+    fn u键_只在设置屏在场_别屏按了没反应() {
+        for screen in [
+            Screen::Overview,
+            Screen::Assemble,
+            Screen::Health,
+            Screen::Recipes,
+            Screen::Vps,
+        ] {
+            let mut app = fake_app();
+            app.screen = screen;
+            app.update(Message::Key(keyc('u')));
+            assert_eq!(
+                app.upgrade,
+                UpgradePhase::Idle,
+                "{screen:?} 屏上没有 U 这一键"
+            );
+        }
+        let mut set = settings_app();
+        set.update(Message::Key(keyc('u')));
+        assert!(set.upgrade.is_open(), "设置屏 U 才呼出自升级浮层");
+    }
+
+    #[test]
+    fn u键_呼出与收起_版本输入态预填latest_归零不留半句() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest"),
+            "U 呼出,预填 latest(可改成钉版本):{:?}",
+            app.upgrade
+        );
+        // 改成一个钉版本
+        app.update(Message::Key(keyc('0')));
+        app.update(Message::Key(keyc('.')));
+        app.update(Message::Key(keyc('4')));
+        app.update(Message::Key(keyc('.')));
+        app.update(Message::Key(keyc('0')));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest0.4.0"),
+            "键入归版本缓冲:{:?}",
+            app.upgrade
+        );
+        // Esc 收起:状态归零,不留半句版本号
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.upgrade, UpgradePhase::Idle, "Esc 收起");
+    }
+
+    #[test]
+    fn 两个开关各自门控_都关则一个字节都不发() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.bell_on = false;
+        app.desktop_notify = false;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        assert!(
+            app.pending_notify.is_empty(),
+            "都关 = 不出匣:共享终端不扰人"
+        );
+        // 只关桌面:还剩一声 bell
+        let mut only_bell = fake_app();
+        only_bell.assembling = true;
+        only_bell.desktop_notify = false;
+        only_bell.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        assert_eq!(only_bell.pending_notify.concat(), "\u{7}", "只剩 bell");
+    }
+
+    #[test]
+    fn 中止收尾_发通知_迟到回音不重复发() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.as_running = true;
+        app.abort_assembling();
+        assert!(
+            app.pending_notify.concat().contains("装配已中止"),
+            "中止也是收尾:{:?}",
+            app.pending_notify
+        );
+        // 迟到的那一程 up 回音:丢弃半个结果,不再补发一次通知
+        let n = app.pending_notify.len();
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        assert_eq!(app.pending_notify.len(), n, "迟到回音不重复发通知");
+        assert!(
+            app.log[0].contains("已丢弃"),
+            "回音仍按丢弃路:{}",
+            app.log[0]
+        );
+    }
+
+    #[test]
+    fn 升级在途_其余写动作被锁_与装配态同一道闸() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        // 在途:登记 / 删除 / 装配发射这些写入口一律被既有闸挡住
+        app.screen = Screen::Recipes;
+        app.update(Message::Key(keyc('r')));
+        assert_eq!(app.reg_state, RegState::Idle, "装配互斥下不给开登记");
+        // 升级浮层自己吞键:别的键一个都不受理
+        app.screen = Screen::Settings;
+        app.update(Message::Key(keyc('j')));
+        assert_eq!(app.screen, Screen::Settings, "浮层吞键:j 不切屏");
+        // 在途不给返航(面板不假装能收回一个已发出的下载)
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.upgrade.is_open(), "在途 Esc 不收浮层");
+    }
+
+    #[test]
+    fn 升级在途_顶栏灯说升级中_不冒充装配() {
+        let mut app = settings_app();
+        app.splash = false;
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        // 顶栏只有 1 行高、宽度按终端算,「◉ 升级中」这段可能被右侧裁掉
+        // (110 列下 NW_HOME 已占掉大半)。所以断言的是 HUD 那句在途提示,
+        // 顶栏灯本身只验「没把装配俩字写进去」。
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("◉"), "顶栏灯亮着:{s}");
+        assert!(!s.contains("装配中"), "升级在途不写装配俩字:{s}");
+        assert!(s.contains("升级中:动作已锁定"), "HUD 说升级中:{s}");
+    }
+
+    #[test]
+    fn 升级浮层_常畅与紧凑两档都渲染_且不冒充装配话术() {
+        let mut app = settings_app();
+        app.splash = false;
+        app.update(Message::Key(keyc('u')));
+        for (w, h) in [(110, 30), (80, 50), (66, 50)] {
+            app.size = Rect::new(0, 0, w, h);
+            let s = crate::testutil::frame_display(&app, w, h);
+            assert!(s.contains("自升级 nwt"), "{w}×{h} 浮层标题在场:{s}");
+            assert!(s.contains("目标版本"), "{w}×{h} 版本输入行在场:{s}");
+            assert!(!s.contains("装配中"), "{w}×{h} 升级不冒充装配:{s}");
+        }
+        // 在途态:HUD 说「升级中」,不说「装配中」
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let s = crate::testutil::frame_display(&app, 110, 30);
+        assert!(s.contains("升级中"), "在途 HUD 说升级中:{s}");
+        assert!(!s.contains("◉ 装配中"), "顶栏灯不冒充装配:{s}");
+    }
+
+    #[test]
+    fn 升级浮层_点任意处与_esc同路收起_在途点不动() {
+        let mut app = settings_app();
+        app.size = Rect::new(0, 0, 110, 30);
+        app.update(Message::Key(keyc('u')));
+        let dismiss = hit_target(&app, |t| *t == Target::DismissPopup);
+        click(&mut app, dismiss);
+        assert_eq!(app.upgrade, UpgradePhase::Idle, "点浮层 = Esc 同路收起");
+        // 在途:命中区仍只给浮层(吞点击不穿透),但点了也收不动
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let hits = hitmap(app.size, &app, size_class(app.size));
+        assert!(
+            hits.iter().all(|(_, t)| *t == Target::DismissPopup),
+            "浮层开着时底层一个命中区都不产:{hits:?}"
+        );
+        click(&mut app, dismiss);
+        assert!(app.upgrade.is_open(), "在途点浮层收不动");
+    }
+
+    #[test]
+    fn 升级进度_上下翻看不越界_且只读不点亮写互斥() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        for i in 0..5 {
+            app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(format!(
+                "nwt-install: 第 {i} 行"
+            ))));
+        }
+        assert_eq!(app.upgrade_log.len(), 5, "逐行进度入日志区");
+        for _ in 0..20 {
+            app.update(Message::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )));
+        }
+        app.update(Message::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        // 翻看不改升级态、不发命令
+        assert_eq!(app.queue.len(), 0, "升级过程零引擎调用");
+        assert!(app.upgrade_log.len() >= 5, "翻看不清日志");
+    }
+
+    #[test]
+    fn 取走出匣后清空_不重复发同一帧() {
+        let mut app = fake_app();
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        let first = app.take_pending_notify();
+        assert_eq!(first.len(), 1, "取走那一条");
+        assert!(app.take_pending_notify().is_empty(), "取走即清空");
+    }
+
+    #[test]
+    fn 干跑回音_落计划态_确认才真跑_暂存目录不是落点() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        // 干跑回音:install.sh 的计划原文逐行来
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
+            "nwt-install: 安装计划(--dry-run,未做任何改动):".into(),
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
+            "nwt-install:   版本     v0.9.9".into(),
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 0,
+                reason: String::new(),
+            },
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Plan { version } if version == "latest"),
+            "干跑 rc 0 落计划态:{:?}",
+            app.upgrade
+        );
+        assert!(!app.assembling, "干跑收敛互斥(还没开始下载)");
+        assert!(
+            app.upgrade_log.iter().any(|l| l.contains("安装计划")),
+            "计划原文在进度区:{:?}",
+            app.upgrade_log
+        );
+        // 确认才真跑
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Running { .. }),
+            "计划态 Enter 才真跑:{:?}",
+            app.upgrade
+        );
+        assert!(app.assembling, "真跑在途点互斥");
+        assert_eq!(app.upgrade_queue.len(), 2, "确认后才入队第二趟");
+        assert!(!app.upgrade_queue[1].dry_run, "第二趟是真跑");
+    }
+
+    #[test]
+    fn 开关翻转后_收尾序列跟着变() {
+        let (_g, _cfg) = env_locked();
+        let mut app = settings_app();
+        app.update(Message::Key(key('b'))); // 只关 bell
+        app.assembling = true;
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(up_echo(
+            0, UP_OK,
+        )))));
+        assert_eq!(
+            app.pending_notify.concat(),
+            "\u{1b}]9;装配结束:收敛 (rc 0)\u{7}",
+            "bell 关 = 只剩桌面通知"
+        );
+    }
+
+    #[test]
+    fn 无装配收尾_一条序列都不出() {
+        let mut app = fake_app();
+        // 开机自举(version + 能力探针 + ls)一路走完
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.bootstrap(&tx);
+        while let Ok(ev) = rx.try_recv() {
+            app.update(Message::Engine(ev));
+        }
+        assert!(app.pending_notify.is_empty(), "自举不发通知");
+        // 其它路径的回音(argv 不是 up)也不发
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["ls".into(), "--repo".into(), "/tmp".into()],
+                exit_code: crate::engine::ExitCode::Ok,
+                ok: true,
+                stderr_tail: vec![],
+                envelope: None,
+                raw_stdout: String::new(),
+                parse_error: None,
+            },
+        ))));
+        assert!(app.pending_notify.is_empty(), "ls 回音不发通知");
+        // 登记落账回音(带 --yes 的 source register)同样不发
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["source".into(), "register".into(), "--yes".into()],
+                exit_code: crate::engine::ExitCode::Ok,
+                ok: true,
+                stderr_tail: vec![],
+                envelope: None,
+                raw_stdout: String::new(),
+                parse_error: None,
+            },
+        ))));
+        assert!(app.pending_notify.is_empty(), "登记落账回音不发通知");
+        // 反查回音(tag ls)同样不发
+        app.update(Message::Engine(EngineEvent::Finished(Box::new(
+            EngineOutput {
+                args: vec!["tag".into(), "ls".into(), "--root".into(), "/tmp".into()],
+                exit_code: crate::engine::ExitCode::Ok,
+                ok: true,
+                stderr_tail: vec![],
+                envelope: None,
+                raw_stdout: String::new(),
+                parse_error: None,
+            },
+        ))));
+        assert!(app.pending_notify.is_empty(), "反查回音不发通知");
+    }
+
+    #[test]
+    fn 版本态回车_入队一趟干跑_并点装配互斥灯() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Planning { .. }),
+            "Enter 取安装计划(零下载、零落盘):{:?}",
+            app.upgrade
+        );
+        assert!(app.assembling, "升级在途点全局写互斥(与装配态同款)");
+        assert_eq!(app.upgrade_queue.len(), 1, "入队一趟升级请求");
+        let req = &app.upgrade_queue[0];
+        assert!(req.dry_run, "第一趟是干跑:先摊计划再确认");
+        assert_eq!(req.version, None, "latest 不带 --version(脚本自己解析)");
+    }
+
+    #[test]
+    fn 版本输入态_ctrl组合键不当字符_缓冲无上限由输入态机把着() {
+        // 版本输入归通用输入态机 `input::on_key`:CONTROL 组合键被过滤掉,
+        // 缓冲有 `BUF_CAP` 上限——手搓 `Char(c) => push(c)` 两条都失守。
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest"),
+            "Ctrl+p 不往版本缓冲里塞字符:{:?}",
+            app.upgrade
+        );
+        // 普通字符照旧进缓冲
+        type_str(&mut app, "0.4.0");
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Version { buf } if buf == "latest0.4.0"),
+            "键入照旧:{:?}",
+            app.upgrade
+        );
+    }
+
+    #[test]
+    fn 真跑失败_收敛互斥_落失败态且明示旧二进制未动() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 1,
+                reason: "sha256 校验失败(期望 aaa,实得 bbb)——已中止,未安装任何文件".into(),
+            },
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Failed { reason } if reason.contains("sha256 校验失败")),
+            "失败态带人话:{:?}",
+            app.upgrade
+        );
+        assert!(!app.assembling, "失败也收敛互斥");
+        assert!(
+            app.log.iter().any(|l| l.contains("旧二进制原样不动")),
+            "明示旧二进制未动:{:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn 真跑成功_收敛互斥_落完成态并提示重启() {
+        let mut app = settings_app();
+        app.update(Message::Key(keyc('u')));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        // 先过干跑(计划态),再确认真跑——与生产同一条两段式
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 0,
+                reason: String::new(),
+            },
+        )));
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
+            "nwt-install: sha256 校验通过(9f8ea1b2c3)".into(),
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Progress(
+            "nwt-install: 安装 nwt v0.9.9 (linux/x86_64) 到 /stage".into(),
+        )));
+        app.update(Message::Upgrade(upgrade::UpgradeEvent::Finished(
+            upgrade::UpgradeOutcome {
+                exit_code: 0,
+                reason: String::new(),
+            },
+        )));
+        assert!(
+            matches!(&app.upgrade, UpgradePhase::Done { version, sha256 }
+                if version == "0.9.9" && sha256 == "9f8ea1b2c3"),
+            "完成态带版本与 sha256:{:?}",
+            app.upgrade
+        );
+        assert!(!app.assembling, "完成即收敛互斥");
+        assert!(
+            app.log.iter().any(|l| l.contains("重启面板")),
+            "提示重启生效:{:?}",
+            app.log.first()
+        );
+    }
+
+    #[test]
+    fn 装配在途按u_被写互斥拒_留证据且面板也不透出它() {
+        // 写互斥(ADR-0009 §4 / 规格故事 9):自升级要落盘,与装配同一族。
+        // 两条路都要被拒——设置屏直接按 U,以及命令面板里搜到它。
+        let mut app = settings_app();
+        app.assembling = true;
+        app.update(Message::Key(keyc('u')));
+        assert_eq!(app.upgrade, UpgradePhase::Idle, "装配在途不给开自升级");
+        assert!(
+            app.log.iter().any(|l| l.contains("自升级与装配互斥")),
+            "拒绝留证据:{:?}",
+            app.log.first()
+        );
+        // 面板路:装配态下写动作整批收起,U 是其中之一
+        let offered = crate::ui::commands::offered(&app);
+        assert!(
+            !offered.iter().any(|r| r.code == KeyCode::Char('u')),
+            "装配态下面板不透出 U:{:?}",
+            offered.iter().map(|r| r.key).collect::<Vec<_>>()
+        );
+        // 计数随 spec #95(作者侧工具 4 条)并入后变成 9:4 条原有写入口 +
+        // n/e/p/e 四条作者侧 + 本条 U。spec/96 单支时这里是 5。
+        assert_eq!(crate::ui::commands::hidden_write_count(&app), 9);
+    }
+
+    #[test]
+    fn 设置屏b与o键_两个开关各自翻转并持久化() {
+        let (_g, _cfg) = env_locked();
+        let mut app = settings_app();
+        assert!(app.bell_on && app.desktop_notify, "缺省都开");
+        // b 只翻 bell
+        app.update(Message::Key(key('b')));
+        assert!(!app.bell_on, "b 关 bell");
+        assert!(app.desktop_notify, "b 不动桌面开关");
+        // o 只翻桌面
+        app.update(Message::Key(key('o')));
+        assert!(!app.desktop_notify, "o 关桌面");
+        assert!(!app.bell_on, "o 不动 bell(它已经被 b 关了)");
+        // 落盘:写回再读不丢(重启仍生效)
+        let (back, err) = crate::engine::config::load();
+        assert!(err.is_none());
+        assert_eq!(back.bell, Some(false), "bell 偏好落盘");
+        assert_eq!(back.desktop_notify, Some(false), "桌面偏好落盘");
+        // 再按一次各自回开
+        app.update(Message::Key(key('b')));
+        app.update(Message::Key(key('o')));
+        assert!(app.bell_on && app.desktop_notify, "再按各自回开");
+        let (back2, _) = crate::engine::config::load();
+        assert_eq!(back2.bell, Some(true));
+        assert_eq!(back2.desktop_notify, Some(true));
+    }
+
+    #[test]
+    fn 面板里执行ctrl_p条目_带的修饰键照登记表() {
+        // 唯一带 CONTROL 的登记行恰是 Ctrl+P 自己:按 NONE 回放会派发成
+        // 裸 `p`(概览屏的 ↑ 别名)——一次静默的语义漂移。
+        let mut app = fake_app();
+        app.splash = false;
+        app.screen = Screen::Overview;
+        app.update(Message::Key(ctrl_p()));
+        for c in "命令面板".chars() {
+            app.update(Message::Key(keyc(c)));
+        }
+        // 选中「命令面板」那一条自己(它不是首行,按名字定位)
+        let idx = crate::ui::commands::offered(&app)
+            .iter()
+            .position(|r| r.code == KeyCode::Char('p'))
+            .expect("搜得到命令面板自己");
+        assert!(
+            crate::ui::commands::offered(&app)[idx]
+                .modifiers
+                .contains(KeyModifiers::CONTROL),
+            "登记表里它带 CONTROL"
+        );
+        app.cmd_sel = idx;
+        // 执行它 = 「按下 Ctrl+P 那一个键」。修饰键照登记表带,所以派发的
+        // 是 Ctrl+P(壳级开关面板),**不是**裸 `p`——后者在概览屏是 ↑ 的
+        // 别名,那会是一次静默的语义漂移。这里钉的就是「别名没被触发」:
+        // 面板先被 `close_cmd_panel` 收起,再被派发的 Ctrl+P 重新打开,
+        // 而选中行一动不动。
+        let sel = app.ov_sel;
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.ov_sel, sel,
+            "没有偷偷触发 ↑ 别名:{sel} → {}",
+            app.ov_sel
+        );
+    }
+
+    #[test]
+    fn 面板里执行跨屏条目_先切到那一屏再派发() {
+        // 规格故事 9 的执行面:面板执行 = 「搜到并按下那个键」。跨屏条目
+        // (U 在设置屏)不在当前屏根本没有分支,所以先切屏再派发——否则
+        // 操作者在概览屏执行「U 自升级」会得到零反馈。
+        let mut app = fake_app();
+        app.splash = false;
+        app.screen = Screen::Overview;
+        app.update(Message::Key(ctrl_p()));
+        assert!(app.cmd_open, "面板开着");
+        for c in "自升级".chars() {
+            app.update(Message::Key(keyc(c)));
+        }
+        let n = app.cmd_results_len();
+        assert!(n > 0, "搜得到自升级:{n}");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.screen, Screen::Settings, "跨屏条目先切屏");
+        assert!(app.upgrade.is_open(), "切过去后浮层真的开了");
+    }
+
+    const UP_OK: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","lockId":"9f8e","convergeHash":"abc"}}"#;
+
+    const UP_WARN: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[{"code":"PROVIDER_NOT_READY","exitCode":0,"message":"provider 未就绪","hint":"补 env","details":{}}],"data":{"profile":"desk","lockId":"9f8e"}}"#;
+
+    const UP_FAIL: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":false,"errors":[{"code":"APPLY_FAILED","exitCode":4,"message":"sha256 不符","hint":"重新 bake","details":{}}],"warnings":[],"data":null}"#;
 }

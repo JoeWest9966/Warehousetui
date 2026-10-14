@@ -33,6 +33,14 @@ pub struct Config {
     /// 逃逸两联之另一联是 --no-mouse 旗标(见 ADR-0005)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse_capture: Option<bool>,
+    /// 装配完成通知的 **bell 提示音**开关(#117;默认 true)。
+    /// None = 缺省或坏配置降级,与 `mouse_capture` 同口径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bell: Option<bool>,
+    /// 装配完成通知的 **OSC 9 桌面通知**开关(#117;默认 true)。
+    /// 与 `bell` 是两个独立布尔——共享终端 / 勿扰场景可以只要一个。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_notify: Option<bool>,
     /// 用户自加的键:原样保留,写回时不丢。
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
@@ -42,6 +50,16 @@ impl Config {
     /// 鼠标捕获解析值:None(缺省)与坏配置降级后的默认皆为开。
     pub fn mouse_capture_enabled(&self) -> bool {
         self.mouse_capture.unwrap_or(true)
+    }
+
+    /// bell 提示音解析值(#117):None(缺省)与坏配置降级后的默认皆为开。
+    pub fn bell_enabled(&self) -> bool {
+        self.bell.unwrap_or(true)
+    }
+
+    /// OSC 9 桌面通知解析值(#117):同上,缺省即开。与 bell 各自独立。
+    pub fn desktop_notify_enabled(&self) -> bool {
+        self.desktop_notify.unwrap_or(true)
     }
 }
 
@@ -146,6 +164,47 @@ mod tests {
         assert!(err.is_some(), "坏 TOML 必须给证据");
         assert_eq!(cfg.mouse_capture, None, "降级到默认");
         assert!(cfg.mouse_capture_enabled(), "解析失败按默认 true 降级");
+    }
+
+    #[test]
+    fn 完成通知两个开关_缺省都开_显式关保留() {
+        let (cfg, err) = parse("");
+        assert!(err.is_none());
+        assert_eq!(cfg.bell, None);
+        assert!(cfg.bell_enabled(), "bell 缺省即开");
+        assert_eq!(cfg.desktop_notify, None);
+        assert!(cfg.desktop_notify_enabled(), "桌面通知缺省即开");
+        let (off, _) = parse("bell = false\ndesktop_notify = false");
+        assert_eq!(off.bell, Some(false));
+        assert_eq!(off.desktop_notify, Some(false));
+        assert!(!off.bell_enabled());
+        assert!(!off.desktop_notify_enabled());
+        // 显式值写回再读,偏好不失忆(重启仍生效的落盘语义)
+        let text = toml::to_string_pretty(&off).unwrap();
+        let (back, err2) = parse(&text);
+        assert!(err2.is_none());
+        assert_eq!(back.bell, Some(false));
+        assert_eq!(back.desktop_notify, Some(false));
+    }
+
+    #[test]
+    fn 完成通知两个开关_各自独立_关一个不关另一个() {
+        let (only_bell, _) = parse("desktop_notify = false");
+        assert!(only_bell.bell_enabled(), "关桌面不动 bell");
+        assert!(!only_bell.desktop_notify_enabled());
+        let (only_desktop, _) = parse("bell = false");
+        assert!(!only_desktop.bell_enabled(), "关 bell 不动桌面");
+        assert!(only_desktop.desktop_notify_enabled());
+    }
+
+    #[test]
+    fn 完成通知开关_坏配置降级为开() {
+        let (cfg, err) = parse("bell = \ndesktop_notify = ");
+        assert!(err.is_some(), "坏 TOML 必须给证据");
+        assert_eq!(cfg.bell, None, "bell 降级到默认");
+        assert_eq!(cfg.desktop_notify, None, "桌面降级到默认");
+        assert!(cfg.bell_enabled(), "解析失败按默认 true 降级");
+        assert!(cfg.desktop_notify_enabled());
     }
 
     #[test]
