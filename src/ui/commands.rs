@@ -383,10 +383,12 @@ mod tests {
         // Enter=打开发射仪式;r=外部源登记;r=编目册登记;d=删除。作者侧工具
         // (spec #95)再添四条写入口:n=skill 脚手架、e=extension 脚手架、
         // p=组件打包、e=配方编辑器写回——都是「拟落账+确认闸」的写流,
-        // 装配态下一并收起,口径与上面四条一致。
+        // 装配态下一并收起,口径与上面四条一致。spec #96 的自升级 U 同属
+        // 写动作(换面板自己的二进制),也一并收起——不许从命令面板绕过
+        // 装配互斥(规格故事 9)。
         assert_eq!(
             writes,
-            vec!["Enter", "r", "p", "e", "n", "e", "r", "d"],
+            vec!["Enter", "r", "p", "e", "n", "e", "r", "d", "U"],
             "登记表里的写动作:{writes:?}"
         );
 
@@ -403,13 +405,13 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(gated.len() < all.len(), "收起了写动作,条数该变少");
-        // 4 条原有写入口 + 作者侧工具 4 条(n/e/p/e)= 8
-        assert_eq!(hidden_write_count(&app), 8, "该说清收起了几条");
+        // 4 条原有写入口 + 作者侧工具 4 条(n/e/p/e)+ 自升级 U = 9
+        assert_eq!(hidden_write_count(&app), 9, "该说清收起了几条");
 
         // 屏上给得出说明,不是静默消失
         let s = crate::testutil::frame_display(&app, 80, 30);
         assert!(
-            s.contains("装配中收起 8 个写动作"),
+            s.contains("装配中收起 9 个写动作"),
             "提示行说明收起原因:{s}"
         );
         // 收敛后写动作回来(互斥是装配态专属,不是永久过滤)

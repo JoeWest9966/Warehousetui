@@ -116,6 +116,28 @@ sha256sum -c checksums.txt        # 每一项都要 OK
 
 install.sh 装前做同一件事;对不上就非零退出、不留半个二进制。手动下载等价于 `gh release download v0.2.0`(公开仓免凭证)。
 
+## 双出口:install.sh 与面板 `U` 自升级共享同一套校验纪律
+
+面板的设置屏有一个 `U` 键可以自升级 nwt。它**不是在 Rust 里另写一遍**「下载 → 校验 → 落盘」,而是把本文约束的同一份 install.sh 嵌进二进制(`src/upgrade.rs` 的 `INSTALL_SH = include_str!("../install.sh")`),运行时写进临时文件以 `sh` 跑起来——**脚本出口与面板出口走的是同一份字节、同一道闸**。所以下面这些纪律改一处,两个出口一起变,不存在「面板一份、脚本一份」各自漂移的两套口径。
+
+| 维度 | install.sh(终端出口) | 面板 `U`(设置屏出口) |
+|---|---|---|
+| 版本解析 | `latest` 走 API,钉版本带 / 不带 `v` 都收 | 同左(`U` 呼出的浮层预填 `latest`,可改) |
+| 资产命名 | `nwt_<版本>_<os>_<arch>.tar.gz` | 同一份脚本推导,面板不自己拼名 |
+| 校验 | `checksums.txt` 的 sha256 双列格式,**先校验后安装** | 同一份脚本、同一道闸 |
+| 凭证 | `GH_TOKEN` / `GITHUB_TOKEN` 任选其一,有 token 走 API 资产面 | 同一份脚本读;面板只负责把进程环境透传给子进程 |
+| 落盘 | `--prefix` 下 `cp` | 面板自己多做一步 **tmp + rename**(脚本的 `cp` 覆盖不是原子的) |
+| 失败语义 | 非零退出、不留半个二进制 | 同左 + 面板明示「旧二进制原样不动」 |
+
+面板比脚本只多两件事,都是脚本刻意不做的:
+
+1. **tmp + rename 原子替换**:install.sh 把验证过的那一份装进暂存目录,面板随后把它写进目标同目录的 `.new` 再 rename 盖上去。新二进制整个写完才 rename,所以下载失败 / 校验不过 / 写盘失败 / rename 失败,旧二进制统统原样在场。
+2. **过程呈现在日志区**:install.sh 的 stdout 逐行原文进进度区,面板不翻译、不改写。
+
+**铁律不变**:落盘前必须校验;sha256 对不上 = 一个字节都不碰旧二进制;凭证只作为子进程环境变量透传,绝不进日志 / 配置 / 回音。
+
+**测试纪律**:面板侧用 fixture 假 release(带对 / 错 sha256 两个资产)驱动完整三路,`NWT_DOWNLOAD_BASE` / `NWT_API_BASE` 指到本地目录(curl 吃 `file://`),所以这条链在测试里零网络、零真实 release。闸不过时断言旧文件**逐字节**不变,不是长度不变。
+
 ## 本地复现(交叉构建细节)
 
 linux aarch64 / windows x86_64 的交叉编译前提(全部免费):
@@ -134,6 +156,8 @@ apt install gcc-aarch64-linux-gnu mingw-w64 zip
 - Windows:编译运行级(spec #10 的 R3 决定),无 installer、无自动安装;手动 zip。**v0.2.0 起产物是 gnu 目标**(交叉工具链所限),与 v0.1.0 的 msvc 产物功能等价、无外部 DLL 依赖。
 - **macOS 预编译暂缺(v0.2.0 起)**:无 Apple 设备,两个 mac 包产不出来;install.sh 对 Darwin 直接给出「请源码构建」的明路(不撞 404)。等有 Mac 再补,命名契约不变。
 - 无代码签名/公证(macOS notarization、Windows Authenticode):V1 不做,靠 sha256 校验兜底。
+- 无 `nwt self-update` **引擎命令**:ADR-0003「面板不代跑引擎命令」的边界不变。但面板自身二进制由设置屏 `U` 经 install.sh 同一道 sha256 闸替换(见上文「双出口」)——自改走的是脚本同一道闸,不是面板自己另造一套。
+- **仓库私有时匿名安装必然 404**:release 资产与 `raw.githubusercontent.com` 的 install.sh 对匿名请求都返回 404(私有仓库行为)。`curl | sh` 一行装的前提是**仓库公开**;保持私有则用 `gh release download`(带凭证),或给 install.sh 加 token 认证通道(未实现)。
 - 无自更新命令(`nwt self-update`):保持 ADR-0003 精神,面板不自改。
 - **公开仓匿名安装即用**:`curl | sh` 一行装开箱即用;未认证 API 有 60 次/小时限流,install.sh 带 `GH_TOKEN`/`GITHUB_TOKEN` 时自动改走 API 资产面(既避限流、也兼容私有仓场景)。
 - **glibc 基线 2.41(v0.2.0 linux 包)**:v0.1.0 的 linux 包构建于 ubuntu-24.04(glibc 2.39);v0.2.0 起在本机(Debian 13)构建,基线升到 2.41,老发行版运行会报 `GLIBC_2.41 not found`。需要更宽兼容时用更老的构建机重打这两个 linux 包(命名不变)。
