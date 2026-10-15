@@ -72,7 +72,6 @@ const RESERVED_FILES: [&str; 5] = [
 ];
 
 /// 拟落账的一条:相对路径 + 将写内容(字节级确定)。
-/// 单文件(#112 / #113)与多文件(#110 / #111)同一种形状。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedWrite {
     pub path: RepoRelPath,
@@ -80,7 +79,7 @@ pub struct PlannedWrite {
 }
 
 impl PlannedWrite {
-    /// 文本内容的便捷构造(骨架 / 清单 / 配方都是文本;字节面仍在)。
+    /// 文本内容的便捷构造(配方是文本;字节面仍在)。
     pub fn text(path: RepoRelPath, text: &str) -> Self {
         Self {
             path,
@@ -130,10 +129,10 @@ impl DataRepo {
         }
     }
 
-    /// 数据仓根的路径:**只给同模块族的 [`pack`](super::pack) 用**(列目录
-    /// 树、算目录校验和)。`pub(super)` = 数据仓访问层内部的事,屏幕层拿不到
-    /// ——它们只消费 `RepoRelPath` 与拟落账形状,「屏幕层零路径拼接」
-    /// (#101 已有测试先例)自然覆盖写侧。
+    /// 数据仓根的路径:**只给同模块族的 [`recipe`](super::recipe) 用**
+    /// (读配方原文、预跑暂存落点)。`pub(super)` = 数据仓访问层内部的事,
+    /// 屏幕层拿不到 ——它们只消费 `RepoRelPath` 与拟落账形状,「屏幕层零
+    /// 路径拼接」(#101 已有测试先例)自然覆盖写侧。
     pub(super) fn root_path(&self) -> &Path {
         &self.root
     }
@@ -317,7 +316,7 @@ mod tests {
             "~/.nous-warehouse/x",
             "../../../etc/passwd",
             "..",
-            "skills/../../nw-home",
+            "recipes/../../nw-home",
             "a//b",
             "a/./b",
             "a\\b",
@@ -330,8 +329,10 @@ mod tests {
         }
         // 合法相对路径照常收
         assert_eq!(
-            RepoRelPath::new("skills/hello/SKILL.md").unwrap().as_str(),
-            "skills/hello/SKILL.md"
+            RepoRelPath::new("recipes/research-desk/recipe.yaml")
+                .unwrap()
+                .as_str(),
+            "recipes/research-desk/recipe.yaml"
         );
     }
 
@@ -360,15 +361,12 @@ mod tests {
             );
         }
         // 同名的**目录**不挡:编目册是文件,目录叫什么都不写这几个文件
-        assert!(RepoRelPath::new("catalog.json/component.yaml").is_ok());
-        // 现有四个消费方写的都不是这些名字(#110 / #111 / #112 / #113)
+        assert!(RepoRelPath::new("catalog.json/notes.md").is_ok());
+        // 数据仓里合法可写的相对路径照常收(现消费方只写配方一脉,#113)
         for ok in [
-            "skills/hello/SKILL.md",
-            "extensions/ribbon/package.json",
-            "extensions/ribbon/index.ts",
-            "payloads/web-scout/component.yaml",
             "recipes/research-desk/recipe.yaml",
             "recipes/research-desk/.nwt-validate.yaml",
+            "recipes/night-shift/recipe.yaml",
         ] {
             assert!(RepoRelPath::new(ok).is_ok(), "{ok} 照常收");
         }
@@ -382,15 +380,15 @@ mod tests {
         let r = repo(&root);
         let plan = r
             .plan(vec![PlannedWrite::text(
-                RepoRelPath::new("skills/hello/SKILL.md").unwrap(),
-                "# hello\n",
+                RepoRelPath::new("recipes/research-desk/recipe.yaml").unwrap(),
+                "apiVersion: nw/v1\n",
             )])
             .unwrap();
         r.commit(&plan).unwrap();
         // 落的精确落在根之下
         assert_eq!(
-            fs::read_to_string(root.join("skills/hello/SKILL.md")).unwrap(),
-            "# hello\n"
+            fs::read_to_string(root.join("recipes/research-desk/recipe.yaml")).unwrap(),
+            "apiVersion: nw/v1\n"
         );
         // 根外哨兵原样;根之外没有任何新文件(除测试自己建的)
         assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
@@ -407,22 +405,25 @@ mod tests {
         let plan = r
             .plan(vec![
                 PlannedWrite::text(
-                    RepoRelPath::new("skills/hello/SKILL.md").unwrap(),
-                    "# hello\n",
+                    RepoRelPath::new("recipes/research-desk/recipe.yaml").unwrap(),
+                    "apiVersion: nw/v1\n",
                 ),
                 PlannedWrite::text(
-                    RepoRelPath::new("skills/hello/notes.md").unwrap(),
-                    "触发词:hi\n",
+                    RepoRelPath::new("recipes/research-desk/.nwt-validate.yaml").unwrap(),
+                    "apiVersion: nw/v1\n",
                 ),
             ])
             .unwrap();
         // 确认闸直接呈现的三样:清单、逐条内容、体量
         assert_eq!(
             plan.paths(),
-            vec!["skills/hello/SKILL.md", "skills/hello/notes.md"]
+            vec![
+                "recipes/research-desk/recipe.yaml",
+                "recipes/research-desk/.nwt-validate.yaml"
+            ]
         );
-        assert_eq!(plan.writes[0].content, b"# hello\n".to_vec());
-        assert_eq!(plan.total_bytes(), b"# hello\n".len() + "触发词:hi\n".len());
+        assert_eq!(plan.writes[0].content, b"apiVersion: nw/v1\n".to_vec());
+        assert_eq!(plan.total_bytes(), 2 * "apiVersion: nw/v1\n".len());
         // 一个字节都没落:根还是空的
         assert!(fs::read_dir(&root).unwrap().next().is_none(), "plan 不落盘");
         fs::remove_dir_all(&root).ok();
@@ -444,7 +445,7 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    // ---- 落盘:确定字节 + 三种消费方形状 ----
+    // ---- 落盘:确定字节 + 单文件 / 多文件两种形状 ----
 
     #[test]
     fn 确认后落盘_确定字节() {
@@ -452,41 +453,46 @@ mod tests {
         let r = repo(&root);
         let plan = r
             .plan(vec![PlannedWrite::text(
-                RepoRelPath::new("skills/hello/SKILL.md").unwrap(),
-                "---\nname: hello\ndescription: 打招呼\n---\n",
+                RepoRelPath::new("recipes/research-desk/recipe.yaml").unwrap(),
+                "apiVersion: nw/v1\nkind: recipe\n",
             )])
             .unwrap();
         let receipt = r.commit(&plan).unwrap();
-        assert_eq!(receipt.written, vec!["skills/hello/SKILL.md"]);
+        assert_eq!(receipt.written, vec!["recipes/research-desk/recipe.yaml"]);
         assert_eq!(
-            fs::read(root.join("skills/hello/SKILL.md")).unwrap(),
+            fs::read(root.join("recipes/research-desk/recipe.yaml")).unwrap(),
             plan.writes[0].content,
             "fixture 进、确定字节出"
         );
         fs::remove_dir_all(&root).ok();
     }
 
+    /// 多文件 plan 的接缝能力(§4:逐文件原子,非跨文件事务)。工单 #118 后
+    /// 没有消费方一次写多文件,能力留在接缝上、测试钉住,不是现行义务。
     #[test]
-    fn 多文件骨架_一次拟落账_逐个原子落() {
-        let root = fixture("skeleton");
+    fn 多文件拟落账_逐文件原子落() {
+        let root = fixture("multi-file");
         let r = repo(&root);
         let plan = r
             .plan(vec![
-                PlannedWrite::text(RepoRelPath::new("skills/hello/SKILL.md").unwrap(), "# hi\n"),
                 PlannedWrite::text(
-                    RepoRelPath::new("skills/hello/references/triggers.md").unwrap(),
-                    "hi\n",
+                    RepoRelPath::new("recipes/research-desk/recipe.yaml").unwrap(),
+                    "apiVersion: nw/v1\n",
+                ),
+                PlannedWrite::text(
+                    RepoRelPath::new("recipes/night-shift/recipe.yaml").unwrap(),
+                    "apiVersion: nw/v1\n",
                 ),
             ])
             .unwrap();
         r.commit(&plan).unwrap();
         assert_eq!(
-            fs::read_to_string(root.join("skills/hello/SKILL.md")).unwrap(),
-            "# hi\n"
+            fs::read_to_string(root.join("recipes/research-desk/recipe.yaml")).unwrap(),
+            "apiVersion: nw/v1\n"
         );
         assert_eq!(
-            fs::read_to_string(root.join("skills/hello/references/triggers.md")).unwrap(),
-            "hi\n"
+            fs::read_to_string(root.join("recipes/night-shift/recipe.yaml")).unwrap(),
+            "apiVersion: nw/v1\n"
         );
         fs::remove_dir_all(&root).ok();
     }
@@ -521,21 +527,21 @@ mod tests {
     #[test]
     fn 写tmp阶段中断_目标不留半文件() {
         let root = fixture("half-tmp");
-        fs::create_dir_all(root.join("skills/hello")).unwrap();
-        // 抢占(tmp 名确定:`.SKILL.md.nwt-tmp`),让 fs::write 落在目录上必败
-        fs::create_dir_all(root.join("skills/hello/.SKILL.md.nwt-tmp")).unwrap();
+        fs::create_dir_all(root.join("recipes/research-desk")).unwrap();
+        // 抢占(tmp 名确定:`.recipe.yaml.nwt-tmp`),让 fs::write 落在目录上必败
+        fs::create_dir_all(root.join("recipes/research-desk/.recipe.yaml.nwt-tmp")).unwrap();
         let r = repo(&root);
         let plan = r
             .plan(vec![PlannedWrite::text(
-                RepoRelPath::new("skills/hello/SKILL.md").unwrap(),
+                RepoRelPath::new("recipes/research-desk/recipe.yaml").unwrap(),
                 "# 半个文件?\n",
             )])
             .unwrap();
         let err = r.commit(&plan).unwrap_err();
-        assert_eq!(err.path, "skills/hello/SKILL.md");
+        assert_eq!(err.path, "recipes/research-desk/recipe.yaml");
         assert!(err.why().contains("落盘失败"), "人话点题:{}", err.why());
         assert!(
-            !root.join("skills/hello/SKILL.md").exists(),
+            !root.join("recipes/research-desk/recipe.yaml").exists(),
             "写 tmp 就败 = 目标不存在,没有半文件"
         );
         fs::remove_dir_all(&root).ok();
