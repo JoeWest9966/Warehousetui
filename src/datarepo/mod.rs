@@ -7,18 +7,16 @@
 //! 「屏幕层零路径拼接」由 [`tests::屏幕层零路径_api`] 钉死。
 //!
 //! 读侧两面:装配历史(清单存档,#101)+ 配方×组件目录引用图(#116)。
-//! 写侧(spec #95:脚手架/组件清单/配方写回)已随工单 #109 落地([`write`]
-//! 模块),方法清单在 ADR-0011 里随接缝契约一并钉死。
+//! 写侧(spec #95)只剩配方写回一条面:方法收在 [`write`] 模块,准许面 /
+//! 禁止面 / 方法清单由 ADR-0011 钉死。
 //! 已知消费方:#116 引用完整性扫数据仓的配方×组件目录(读侧);
-//! #110/#111 脚手架、#112 组件清单、#113 配方写回(写侧)。
+//! #113 配方写回(写侧)。
 //!
 //! 只读铁律:读侧方法一个字节都不写(`reference_scan` 由
 //! [`tests::引用扫描_零写动作_文件树一个字节都不动`] 钉死);写动作全部
 //! 收在 [`write`](ADR-0011),面板永不写 NW_HOME。
 
-pub mod pack;
 pub mod recipe;
-pub mod scaffold;
 pub mod write;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -212,13 +210,10 @@ pub fn archive_lamp(state: &ArchiveState) -> State {
 
 // ---- 引用图(spec #95 工单 #116):配方×组件目录的只读扫描 ----
 
-/// 数据仓根的三个组件家(上游事实 + spec #95 作者侧脚手架落点):本地组件住
-/// `components/`,作者侧脚手架的 skill / extension 落 `skills/` 与
-/// `extensions/`。路径知识只在本模块,模块外不出现第二处。
+/// 数据仓根的三个组件家(上游事实):本地组件住 `components/`,参考源条目
+/// 住 `skills/` 与 `extensions/`。路径知识只在本模块,模块外不出现第二处。
 ///
-/// 写侧的脚手架落点计算在[`scaffold`] 子模块(同族:它只借这里的家目录名,
-/// 不另立第二处);读侧 `reference_scan` 与写侧 `scaffold::skill_write` /
-/// `scaffold::ext_writes` 因此认同一批家——读写对称,不断链。
+/// 读侧 `reference_scan` 认这三个家(同名解析见 [`resolves`])。
 pub(crate) const SKILLS_DIR: &str = "skills";
 pub(crate) const EXTENSIONS_DIR: &str = "extensions";
 const COMPONENTS_DIR: &str = "components";
@@ -1127,20 +1122,19 @@ components:
         }
     }
 
-    /// 同一条接缝纪律的**写侧**半边(code-review H1):脚手架屏与配方屏只消费
-    /// 意图级形状——数据仓的组件家与配方文件名是 datarepo 才有的路径知识,
-    /// 屏幕层自己拼不出一个路径。禁字面量与 [`tests::健康屏零路径_api`] 同款。
+    /// 同一条接缝纪律的**写侧**半边(code-review H1):配方屏只消费意图级
+    /// 形状——数据仓的组件家与配方文件名是 datarepo 才有的路径知识,屏幕层
+    /// 自己拼不出一个路径。禁字面量与 [`tests::健康屏零路径_api`] 同款。
     ///
     /// 只扫生产码(`#[cfg(test)]` 之前):测试夹具要造 fixture 数据仓,免不了
     /// `std::fs` 与落点字面量——那是测试自己的事,不是屏幕层的事。
     ///
-    /// 脚手架屏另禁两条**路径形状**的家目录字面量(`\"skills/` / `\"extensions/`):
-    /// 落点下沉之后,屏幕层连 `skills/` 这个词都不该出现。配方屏不禁这两条 ——
+    /// 配方屏不禁两条**路径形状**的家目录字面量(`\"skills/` / `\"extensions/`):
     /// 它身上的 `skills/<仓库>/<条目>/` 是 #115 **派内**落点的只读呈现
     /// (上游 external-sources.md 的口径,与数据仓组件家不是一回事,也不归
     /// datarepo 管);禁它会逼着把只读知识也搬进接缝,那是扩范围。
     #[test]
-    fn 写侧两屏零路径_api() {
+    fn 写侧零路径_api() {
         let common: &[&str] = &[
             "PathBuf",
             "Path::new",
@@ -1153,12 +1147,10 @@ components:
             "\"recipes\"",
             "\"recipe.yaml\"",
         ];
-        let scaffold_src = include_str!("../screens/scaffold.rs")
+        let recipes_src = include_str!("../screens/recipes.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        禁字面量("脚手架屏", scaffold_src, common);
-        禁字面量("配方屏", include_str!("../screens/recipes.rs"), common);
-        禁字面量("脚手架屏", scaffold_src, &["\"skills/", "\"extensions/"]);
+        禁字面量("配方屏", recipes_src, common);
     }
 }
