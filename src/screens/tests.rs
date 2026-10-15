@@ -978,7 +978,7 @@ fn 装配中七步一律未决_明示粗粒度_不按stderr措辞打勾() {
     }
 }
 
-const UP_FULL: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","profileDir":"/d","runtimeKey":"rk-1","components":["retention"],"skeletonFiles":["settings.json"],"configKeys":["models.json"],"envPresent":[],"envMissing":[],"convergeHash":"abc123","lockId":"9f8e","upgraded":false,"installedAt":"2026-10-01"}}"#;
+const UP_FULL: &str = r#"{"schema":"nw/up.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"profile":"desk","profileDir":"/d","runtimeKey":"rk-1","components":["retention"],"skeletonFiles":["settings.json"],"configKeys":["models.json"],"envPresent":2,"envMissing":[],"convergeHash":"abc123","lockId":"9f8e","upgraded":false,"installedAt":"2026-10-01"}}"#;
 
 /// 跑完后:七步结论只认 `nw/up.v1` data 的冻结字段在场。六面有结论;
 /// 自检在 up 面恒无字段(上游由 CLI 层另起 doctor 复核),明示归 doctor。

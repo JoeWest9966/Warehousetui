@@ -213,7 +213,7 @@ pub struct UpData {
     #[serde(default, rename = "configKeys")]
     pub config_keys: Vec<String>,
     #[serde(default, rename = "envPresent")]
-    pub env_present: Vec<String>,
+    pub env_present: u32,
     #[serde(default, rename = "envMissing")]
     pub env_missing: Vec<String>,
     #[serde(default, rename = "convergeHash")]
@@ -1330,7 +1330,7 @@ mod tests {
         let d: UpData = e.data_as().unwrap();
         assert_eq!(d.env_missing, vec!["OPENAI_API_KEY".to_string()]);
         assert_eq!(d.lock_id.as_deref(), Some("a1b2c3"));
-        assert!(d.env_present.is_empty());
+        assert_eq!(d.env_present, 0);
     }
 
     #[test]
