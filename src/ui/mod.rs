@@ -308,7 +308,12 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
             "装配中:动作已锁定"
         };
         spans.push(Span::styled(hint, p.dim()));
-    } else if app.home_input || app.data_input || app.rc_filter_on || app.ah_filter_on {
+    } else if app.home_input
+        || app.data_input
+        || app.slot_input.is_some()
+        || app.rc_filter_on
+        || app.ah_filter_on
+    {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
     } else if app.reg_state == crate::app::RegState::RepoInput {
@@ -324,6 +329,13 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记中:Esc 返航", p.accent()));
     } else {
+        // 健康屏 validate 档(#98):三档校验范围的切档键位进 HUD(壳级提示栏
+        // 唯一的屏内分支)。三档名字摊在健康屏正文顶行,HUD 只给键位——
+        // 常畅态与紧凑态都放得下这一段(66 列仍余量),两档都给。
+        if app.screen == Screen::Health && app.hl_mode == HealthMode::Validate {
+            spans.push(Span::styled(" s", p.accent()));
+            spans.push(Span::raw(" 切档 "));
+        }
         spans.push(Span::styled("  q", p.accent()));
         spans.push(Span::raw(" 退出"));
     }
@@ -544,6 +556,22 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         modifiers: KeyModifiers::NONE,
         write: false,
     },
+    // validate 档的三档校验范围(#98):`s` 在 单侧配方 / 单侧锁定集 / 双侧同给
+    // 之间轮转。mode 钉在 Validate —— 其余三个模式没有可切的维度(doctor 按派
+    // 跑,recheck 与引用完整性不读这两侧),屏上不摆这一条。
+    HelpRow {
+        key: "s",
+        desc: "健康:切档(单侧配方/单侧锁定集/双侧同给)",
+        screen: Some(Screen::Health),
+        domain: None,
+        mode: Some(HealthMode::Validate),
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('s'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
     // 引用完整性(#116):同一个 r 键在第四种模式下是「重扫数据仓」——
     // 面板自有检查,与引擎三项的复核分开写,免得读成同一件事。
     HelpRow {
@@ -717,7 +745,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
     },
     HelpRow {
         key: "g",
-        desc: "编目:取回链接(订阅册;g 段可点,只给建议)",
+        desc: "编目:取回链接(订阅册;g 段可点,确认后揭示)",
         screen: Some(Screen::Vps),
         domain: None,
         mode: None,
@@ -730,7 +758,7 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
     },
     HelpRow {
         key: "g",
-        desc: "编目:取回钥匙(钥匙册;g 段可点,只给建议)",
+        desc: "编目:取回钥匙(钥匙册;g 段可点,确认后揭示)",
         screen: Some(Screen::Vps),
         domain: None,
         mode: None,
@@ -803,6 +831,32 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('d'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "a",
+        desc: "设置:手填烘焙资产目录(可选槽位 --assets-dir,未设不落)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('a'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "r",
+        desc: "设置:手填 bundle 取货仓(可选槽位 --bundle-repo,未设不落)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('r'),
         modifiers: KeyModifiers::NONE,
         write: false,
     },
@@ -954,7 +1008,7 @@ pub(crate) const MOUSE_LINES: &[&str] = &[
     "发射仪式「发射/返航」两段可点;浮层吞点击不穿透",
     "装配运行中「x 中止」段可点 = 按 x 进程级真止",
     "编目册键位行可点段:换册 / 过滤 / 反查(点它 = 按对应键)",
-    "取回段只订阅/钥匙册:点它 = 按 g(只收建议命令,不代跑)",
+    "取回段只订阅/钥匙册:点它 = 按 g(两册都是确认后揭示)",
     "删除段四本册可点 = 按 d(先确认;标签册是「d 摘/删」)",
     "自升级浮层点任意处关 = 按 Esc(在途点不动,其余动作已锁)",
     "概览警示带点名到期订阅,点那一条 = 跳到订阅册并选中它",
@@ -1248,6 +1302,16 @@ mod tests {
         assert!(s.contains("Enter 确认"));
     }
 
+    /// 烘焙两槽位手填(#93)与另两份手填同一条 HUD 提示。
+    #[test]
+    fn 烘焙槽位输入态_hud_给键位提示() {
+        let mut app = ui_app();
+        app.slot_input = Some(crate::app::BakeSlot::BundleRepo);
+        let s = render_to_string(&app, 100, 30);
+        assert!(s.contains("输入中"), "槽位手填共用输入态提示");
+        assert!(s.contains("Enter 确认"));
+    }
+
     #[test]
     fn 帮助浮层可开关() {
         let mut app = ui_app();
@@ -1304,6 +1368,26 @@ mod tests {
         assert!(hud.contains("切屏") && hud.contains("确认"));
         assert!(hud.contains("帮助") && hud.contains("退出"));
         assert!(!hud.contains("主题"), "紧凑态 HUD 少给提示、无主题标注");
+    }
+
+    /// #98:健康屏 validate 档的三档校验范围切档键位 `s` 进 HUD(与帮助浮层
+    /// 同写)。两档都放得下这一段(常畅 80 列加了它右侧主题标注仍完整;
+    /// 紧凑 66 列也有余量);doctor 档没有可切的维度,不摆。
+    #[test]
+    fn 健康validate档_hud给切档键位_doctor不给() {
+        let mut app = ui_app();
+        app.screen = Screen::Health;
+        app.hl_mode = HealthMode::Validate;
+        let comfy = render_to_string(&app, 80, 30);
+        assert!(comfy.contains("s 切档"), "常畅态 HUD 给切档键位:{comfy}");
+        // 加了这一段不把右侧主题标注挤出屏(常畅态行尾仍完整)
+        assert!(comfy.contains("主题:"), "右侧主题标注不被挤掉:{comfy}");
+        let compact = render_to_string(&app, 66, 50);
+        assert!(compact.contains("s 切档"), "紧凑态也放得下这一段:{compact}");
+        // doctor 档没有可切的维度:HUD 不摆这一段
+        app.hl_mode = HealthMode::Doctor;
+        let doctor = render_to_string(&app, 80, 30);
+        assert!(!doctor.contains("s 切档"), "doctor 档不给切档键位:{doctor}");
     }
 
     /// 命令面板键位(#119)在 HUD 里的两档纪律(#67:放不下整段不收):

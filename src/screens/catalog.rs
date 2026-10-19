@@ -3,7 +3,9 @@
 //! 「无确认闸的写路径」上也站得住;#56 加第三本(订阅册),验证骨架在
 //! 「本体只经 stdin 进」的机密路径上也站得住(到期三态按 UTC 现算);#57 加第四本
 //! (钥匙册),机密纪律最严的一本——本体只经 stdin 进、投影无本体槽也不印指纹、
-//! get 一律只给建议命令(连「这像是哪把钥匙」都不该让人推断出来)。
+//! `get` 一律只给建议命令(连「这像是哪把钥匙」都不该让人推断出来);#97 / #99
+//! 修订这一条:两册的 `g` 各自**代跑** `key get` / `subscription get`(确认浮层
+//! + 揭示区),两册共用同一份浮层 / 揭示区 / 清空时机。
 //!
 //! 三件骨架(ADR-0009 Consequences):
 //! 1. envelope 投影类型(条目 + 编目路径 + 闸结论,字段恒在不为 null)——
@@ -28,10 +30,14 @@
 //!
 //! 机密纪律(ADR-0009 §3):`logins[].ref` 是**指针不是密钥**,原样呈现安全;
 //! 摘要行不印 ref 与 addr(照引擎 stderr 摘要的口径)。订阅册与钥匙册有「本体」:
-//! 链接 / 钥匙本体都**只经 stdin 进**,面板侧只以 [`SecretBody`] 这一
+//! 链接 / 钥匙本体**喂入路径**只经 stdin 进,面板侧只以 [`SecretBody`] 这一
 //! 「在途内存、不打印内容的外包类型」存在——喂入框渲染成掩码、日志只记
 //! 字节数、Debug 不打印内容、不进 config,流程结束即 drop。钥匙册更严:投影
-//! 无本体槽也不印指纹,`get` 一律只给建议命令。vps 组 argv 面无密码参数
+//! 无本体槽也不印指纹。#97 起钥匙册多一条**回显路径**(`g` 代跑 `key get`):
+//! 本体从引擎 stdout envelope 的 `data.key` 出来,只进 [`RevealedBody`]、只在
+//! 确认后的**揭示区**读一次,切条目 / 翻册 / 切屏 / 返航 / 退出立即清空
+//! (spec #89 修订 ADR-0009 §1 的「get 一律只给建议命令」那一裁;ADR 与
+//! CONTEXT.md 的成文归 #100)。vps 组 argv 面无密码参数
 //! (误粘 PEM 由引擎第⑤道闸拦);tag 组连指针槽都没有(`--ref` 走 argv 不走 stdin)。
 
 use ratatui::layout::Rect;
@@ -241,7 +247,7 @@ pub enum CatalogKind {
     /// 订阅册:`<root>/subscriptions.json`(工单 #56;本票主价值是到期三态)。
     Subscription,
     /// 钥匙册:`<root>/keys.json`(工单 #57;机密纪律最严的一本:本体只经 stdin
-    /// 进,投影无本体槽也不印指纹,get 只给建议命令)。
+    /// 进,投影无本体槽也不印指纹;#97 起 `g` 代跑 get,本体只在确认后的揭示区)。
     Key,
 }
 
@@ -526,7 +532,6 @@ impl CatalogKind {
                         let counts = d.status_counts();
                         app.sub_ls = Some(d);
                         app.catalog_clamp();
-                        app.sub_get_logged = false;
                         app.push_log(format!(
                             "订阅册已刷新:{n} 条(active {} · expiring {} · expired {},只读)",
                             counts.active, counts.expiring, counts.expired
@@ -545,7 +550,6 @@ impl CatalogKind {
                         let n = d.keys.len();
                         app.key_ls = Some(d);
                         app.catalog_clamp();
-                        app.key_get_logged = false;
                         app.push_log(format!("钥匙册已刷新:{n} 条(只读,无本体槽、不印指纹)"));
                     }
                     None => app.push_log(format!("key ls 结果不可用:{}", out.headline())),
@@ -1292,7 +1296,8 @@ impl CatalogKind {
     }
 
     /// 册体清单之外、**只属于某一本**的附述行(订阅册的到期三态汇总与
-    /// 取回链接建议;钥匙册的取回钥匙建议)。机器册与标签册没有这一族
+    /// 取回链接建议;钥匙册的取回钥匙退路 + **揭示区**——#97 起本体只在确认
+    /// 之后在这里现身一次)。机器册与标签册没有这一族
     /// 关切,给空——所以渲染侧不再有 `if kind == Subscription` /
     /// `if kind == Key` 两段。
     pub fn extra_lines(self, app: &App, w: usize, p: &Palette) -> Vec<Line<'static>> {
@@ -1388,7 +1393,7 @@ impl CatalogKind {
     /// `CatalogKind::action` 里也没有 `g` 这一行)。
     /// 于是「这一段可不可点」与「这个键在这一本上有没有动作」是同一张表的同一
     /// 行,`catalog_key_parts` 不为本票加 `if kind ==` 分叉(#66 查表纪律);点下去
-    /// 走 [`App::log_sub_get_suggest`] / [`App::log_key_get_suggest`],与按 `g`
+    /// 走 [`App::open_sub_get_reveal`] / [`App::open_key_get_reveal`],与按 `g`
     /// 逐字节同一条路。
     ///
     /// **`d 删除` 段也挂在本表里**(#78,兑 #75 裁决 A):四本册各一行,命中目标
@@ -1444,12 +1449,23 @@ impl CatalogKind {
     /// 嵌套在表单流里(表单 Enter 才出现),`on_key` 的受理次序是更里层
     /// 的先收;订阅 / 钥匙册同形。这一条的次序与 `on_key` 逐字对齐,
     /// 否则会出现「键被 A 收、屏上画的是 B」。
+    ///
+    /// #97 起多出第三种形态([`OverlayForm::GetReveal`] 取回本体的确认浮层):
+    /// 它与登记 / 删除两道**互斥**(`g` 只在册体态受理,登记流与删除确认
+    /// 在场时册体键位整个被吞),所以排在第几都不改变事实;排在最末只是
+    /// 「万一同时在场也让它垫底」的兜底,不靠它成立。
     pub fn overlay(self, app: &App) -> Option<OverlayForm> {
         let order = match self {
-            CatalogKind::Vps => [OverlayForm::Register, OverlayForm::RmConfirm],
-            CatalogKind::Tag | CatalogKind::Subscription | CatalogKind::Key => {
-                [OverlayForm::RmConfirm, OverlayForm::Register]
-            }
+            CatalogKind::Vps => [
+                OverlayForm::Register,
+                OverlayForm::RmConfirm,
+                OverlayForm::GetReveal,
+            ],
+            CatalogKind::Tag | CatalogKind::Subscription | CatalogKind::Key => [
+                OverlayForm::RmConfirm,
+                OverlayForm::Register,
+                OverlayForm::GetReveal,
+            ],
         };
         order.into_iter().find(|f| self.overlay_on(*f, app))
     }
@@ -1459,6 +1475,11 @@ impl CatalogKind {
         match form {
             OverlayForm::Register => self.flow(app).phase != RegPhase::Idle,
             OverlayForm::RmConfirm => self.rm_confirm(app),
+            // 取回确认浮层:**册无关**(#97 把它做成两册共用的一份)。此刻在不在
+            // 场只看 `App::get_reveal` 那一条状态,不分是哪一本——订阅册(#99)
+            // 打开的是同一条状态、同一个画法。揭示区那一段不归浮层:本体已落
+            // 进册体的揭示区行,浮层只覆盖「确认前 / 在途」两态。
+            OverlayForm::GetReveal => app.get_reveal.overlay_on(),
         }
     }
 
@@ -1478,6 +1499,10 @@ impl CatalogKind {
             }
             (CatalogKind::Key, OverlayForm::Register) => render_key_overlay(frame, area, app),
             (CatalogKind::Key, OverlayForm::RmConfirm) => render_key_rm_confirm(frame, area, app),
+            // 取回确认(#97):**四本册同一个画法**——画法只看
+            // `App::get_reveal` 里那条 argv 与退路,不分是哪一本、也不分取的是
+            // 钥匙还是订阅链接(#99 一行都不改)。
+            (_, OverlayForm::GetReveal) => render_get_reveal_overlay(frame, area, app),
         }
     }
 
@@ -1513,10 +1538,17 @@ impl CatalogKind {
             (CatalogKind::Tag, KeyCode::Char('l')) => Some(Act(App::run_tag_ls_all)),
             (CatalogKind::Subscription, KeyCode::Char('l')) => Some(Act(App::run_sub_ls)),
             (CatalogKind::Key, KeyCode::Char('l')) => Some(Act(App::run_key_ls)),
-            // g 取回本体的建议命令:只订阅册与钥匙册有(投影里有本体槽的
-            // 两本;ADR-0009 §1 面板不代跑 get)。机器册 / 标签册没有这一行
-            (CatalogKind::Subscription, KeyCode::Char('g')) => Some(Act(App::log_sub_get_suggest)),
-            (CatalogKind::Key, KeyCode::Char('g')) => Some(Act(App::log_key_get_suggest)),
+            // g 取回本体:只订阅册与钥匙册有(投影里有本体槽的
+            // 两本)。机器册 / 标签册没有这一行
+            //
+            // #97 立钥匙册、#99 补订阅册:两本的 `g` 都**代跑** get —— 先开
+            // 标注「即将揭示机密本体」的确认浮层,确认后才经
+            // `App::spawn_engine` 唯一入口下发,本体只在确认后的揭示区显示
+            // (spec #89 修订 ADR-0009 §1「get 一律只给建议命令」那一裁)。
+            // 分岔落在表里的**不同方法**(各自的 argv 与本体槽),浮层 / 揭示
+            // 区 / 清空时机是同一份实现(见 [`GetReveal`])。
+            (CatalogKind::Subscription, KeyCode::Char('g')) => Some(Act(App::open_sub_get_reveal)),
+            (CatalogKind::Key, KeyCode::Char('g')) => Some(Act(App::open_key_get_reveal)),
             // Enter 反查选中的这一条:标签册反查选中的那条标签(#54 旧态);
             // 机器册反查「什么标签引用了这一条」(#70 上浮——只机器册的条目可打
             // 标签,见 TAG_REF_KINDS;订阅 / 钥匙册的条目不在其内,不提供)。
@@ -1771,14 +1803,19 @@ impl TagJump {
     }
 }
 
-/// 册内浮层的两种形态(登记流 / rm 确认;弹层优先级高于册体)。
-/// 渲染与命中区都只认这两个形态,不认「哪一本」。
+/// 册内浮层的三种形态(登记流 / rm 确认 / 取回确认;弹层优先级高于册体)。
+/// 渲染与命中区都只认这三个形态,不认「哪一本」。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OverlayForm {
     /// 两段式登记流(表单 / 预审在途 / 摊开闸结论 / 落账在途 / 结论)。
     Register,
     /// 删除前的图形确认(ADR-0009 §2:面板加一道,不改引擎语义)。
     RmConfirm,
+    /// 取回本体的确认(工单 #97:标注「即将揭示机密本体」+ shell 退路)。
+    /// **两册共用一份实现**(#99 订阅册薄适配):画法只看
+    /// [`App::get_reveal`](crate::app::App::get_reveal) 里那条 argv 与退路,
+    /// 不分册。
+    GetReveal,
 }
 
 /// 册内登记 / 删除入口的模式(#76:四本册的 `start_*` 八份收成一份后,由
@@ -2095,6 +2132,207 @@ impl std::fmt::Debug for SecretBody {
     /// 也不会漏本体(ADR-0009 §3 的「不打印内容的外包类型」)。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SecretBody(<在途 {} 字节,不打印内容>)", self.0.len())
+    }
+}
+
+// ---- 取回本体的确认浮层与揭示区(工单 #97 立项,#99 订阅册薄适配;两册共用一份) ----
+
+/// 揭示区里的**本体**(工单 #97 立、#99 两册同用):从引擎 stdout envelope 的
+/// 本体槽(`nw/key-get.v1` 的 `data.key` / `nw/subscription-get.v1` 的
+/// `data.url`)出来、只进这一个类型。
+///
+/// 纪律与 [`SecretBody`] **逐条同源**,因为包的就是它:
+/// - **不进任何第二个面**:日志行 / config / 崩溃上报 / `{:?}` 都碰不到内容
+///   ——[`std::fmt::Debug`] 委给 [`SecretBody`] 那份「只报字节数」的实现;
+/// - **流程结束即擦字节**:随本类型 drop,内层 [`SecretBody`] 的 `Drop`
+///   `fill(0)`(ADR-0009 §3 两句可判定纪律的第二次落地);
+/// - **唯一读者是揭示区渲染**( [`GetReveal`] 的 `Revealed` 态那一行):
+///   [`Self::text`] 的文档就是这一句,别处不许调。
+///
+/// 与 [`SecretBody`] 分成两个类型(而不是给 `SecretBody` 加一个读内容的
+/// 方法)是刻意的:喂入路径的本体**永远不该被读出来**(登记两段式只报字节
+/// 数),回显路径的本体**只该在揭示区被读一次**。两种许可不是一件事,
+/// 两个类型各自说清自己那一种。
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RevealedBody(SecretBody);
+
+impl RevealedBody {
+    /// 从引擎回音的本体槽立起来(**唯一产地**:只有两册 `get` 的回音能造它,见
+    /// [`key_get_body`] / [`sub_get_body`])。
+    pub fn new(text: String) -> Self {
+        Self(SecretBody(text.into_bytes()))
+    }
+
+    /// 本体正文——**揭示区渲染是唯一读者**。
+    ///
+    /// 任何别的面都不许碰这个返回值:日志行、config、崩溃上报、测试快照
+    /// 帧以外的持久化路径,一个都不行(ADR-0009 §3;`Debug` 与 `Drop` 已把
+    /// 另外几条路焊死,这一条只能靠纪律 + 评审)。
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0 .0).into_owned()
+    }
+}
+
+impl std::fmt::Debug for RevealedBody {
+    /// **刻意不打印内容**:委给内层 [`SecretBody`](它只报字节数)。
+    /// 于是 `GetReveal` derive 的 `Debug` 也漏不出一个字符。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RevealedBody({:?})", self.0)
+    }
+}
+
+/// 取回本体的流程态(工单 #97;spec #89 修订 ADR-0009 的「`key get` /
+/// `subscription get` 一律只给建议命令」为新口径——两册的 `g` 代跑 get,
+/// 但带机密揭示浮层)。
+///
+/// # 四态两两可区分
+///
+/// - [`Idle`](GetReveal::Idle):什么都不在场(常态 / 已清空);
+/// - [`Confirm`](GetReveal::Confirm):**确认浮层在场**——标注「即将揭示机密
+///   本体」+ 可复制的 shell 退路。此刻**一个字节的 argv 都没下发**,执行权
+///   还在操作者手里(误触 `g` 不会当场把本体拍在屏幕上);
+/// - [`InFlight`](GetReveal::InFlight):已确认、已下发,等回音。此刻屏上
+///   照样没有本体;
+/// - [`Revealed`](GetReveal::Revealed):本体已在**揭示区**(只在确认之后
+///   才可能到达这一态)。
+///
+/// 「取不到」**不单列一态**:rc≠0 / 契约守卫 / data 不可定型一律回
+/// [`Idle`](GetReveal::Idle) 并走既有指路(日志),不画空揭示区、不按旧形状
+/// 降级解析、不猜。
+///
+/// # 清空时机(工单 #97 验收第 4 条)
+///
+/// 切条目(↑/↓)、翻册(`m`)、切屏(`j`/`k`)、返航、退出**立即清空**——五条
+/// 路都调 [`GetReveal::clear`],屏幕无残留、内存里也不留(本体随类型 drop
+/// 被擦掉)。
+///
+/// # 两册共用一份
+///
+/// 状态里不带「哪一本」:册内维度由屏上的当前册决定,翻册即清空,所以一本
+/// 实例就够。订阅册(工单 #99)加的只有「`g` 落在订阅册上时开这一个浮层」
+/// 与「data 里取 `url` 那一格」([`sub_get_body`])——浮层画法、揭示区、清空
+/// 时机、键位受理全在这里,#99 一行都没改。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum GetReveal {
+    /// 闲置:没有取回动作在场。
+    #[default]
+    Idle,
+    /// 确认浮层在场。`argv` 是确认后要下发的那一条(此刻**还没**下发),
+    /// `fallback` 是给人复制的 shell 退路(带 `| jq -r .data.key` 管道段)。
+    Confirm {
+        /// 取回哪一条(册里选中的名字;只印名字,不印本体)。
+        name: String,
+        /// 确认后才下发的 argv(与 shell 退路同源同层)。
+        argv: Vec<String>,
+        /// 可复制的 shell 退路文案。
+        fallback: String,
+    },
+    /// 已确认并下发,等回音。此刻屏上没有本体。`fallback` 跟着走——在途
+    /// 浮层照样给终端退路(操作者等不及可以自己去敲),与确认浮层同一份
+    /// 文案,不另拼一套。
+    InFlight {
+        /// 取回哪一条(对账用)。
+        name: String,
+        /// 可复制的 shell 退路文案(与确认浮层同源同层)。
+        fallback: String,
+    },
+    /// 本体已揭示(只在揭示区)。
+    Revealed {
+        /// 取回哪一条。
+        name: String,
+        /// 本体(不打印内容、随 drop 擦字节)。
+        body: RevealedBody,
+    },
+}
+
+impl GetReveal {
+    /// `g` 落在有本体可取的一本上:进确认浮层。**只把要下发的那一条算出来
+    /// 带着,一个字节都不下发**——浮层开着 = 执行权还在操作者手里。
+    pub fn open(&mut self, name: String, argv: Vec<String>, fallback: String) {
+        *self = GetReveal::Confirm {
+            name,
+            argv,
+            fallback,
+        };
+    }
+
+    /// 确认浮层在不在场(渲染与键位受理共用这一判据)。
+    pub fn is_open(&self) -> bool {
+        matches!(self, GetReveal::Confirm { .. })
+    }
+
+    /// 在途(已下发、等回音)。
+    pub fn in_flight(&self) -> bool {
+        matches!(self, GetReveal::InFlight { .. })
+    }
+
+    /// 浮层此刻在不在场(确认 / 在途两态画浮层,揭示区与闲置不画)。
+    /// 渲染(`CatalogKind::overlay_on`)与命中区共用这一判据。
+    pub fn overlay_on(&self) -> bool {
+        self.is_open() || self.in_flight()
+    }
+
+    /// 揭示区里的本体与它的名字(`None` = 此刻没有本体在场)。
+    pub fn revealed(&self) -> Option<(&str, &RevealedBody)> {
+        match self {
+            GetReveal::Revealed { name, body } => Some((name.as_str(), body)),
+            _ => None,
+        }
+    }
+
+    /// 当前在取回哪一条(确认浮层 / 在途 / 已揭示三态都说得出;闲置 = None)。
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            GetReveal::Idle => None,
+            GetReveal::Confirm { name, .. }
+            | GetReveal::InFlight { name, .. }
+            | GetReveal::Revealed { name, .. } => Some(name.as_str()),
+        }
+    }
+
+    /// 确认揭示:拿走浮层上那条 argv,进等回音态。**只有确认浮层在场才拿得到**
+    /// ——`Confirm` 之外的一切态返回 `None`,「没确认就下发」在类型上不成立。
+    pub fn confirm(&mut self) -> Option<Vec<String>> {
+        match std::mem::replace(self, GetReveal::Idle) {
+            GetReveal::Confirm {
+                name,
+                argv,
+                fallback,
+            } => {
+                *self = GetReveal::InFlight { name, fallback };
+                Some(argv)
+            }
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    /// 回音落账。`Ok(())` = 本体已进揭示区;`Err(理由)` = 取不到(回
+    /// [`Idle`](GetReveal::Idle),调用方走既有指路:日志)。
+    ///
+    /// **只在等回音态收账**:操作者已返航 / 已清空的迟到回音不落任何状态
+    /// (不幽灵重开),回报一句「已丢弃」。
+    pub fn absorb(&mut self, body: Option<RevealedBody>) -> Result<(), String> {
+        if !self.in_flight() {
+            return Err("回音已丢弃(取回已返航,本体一个字节都没进面板)".to_string());
+        }
+        let name = self.name().unwrap_or_default().to_string();
+        let Some(body) = body else {
+            *self = GetReveal::Idle;
+            return Err(format!(
+                "{name} 的本体没取到(回音不可定型:契约守卫 / rc≠0 / data 缺本体槽,不猜)"
+            ));
+        };
+        *self = GetReveal::Revealed { name, body };
+        Ok(())
+    }
+
+    /// 立即清空(切条目 / 翻册 / 切屏 / 返航 / 退出五条路共用这一句)。
+    /// 本体随旧值 drop 被擦字节(见 [`RevealedBody`])。
+    pub fn clear(&mut self) {
+        *self = GetReveal::Idle;
     }
 }
 
@@ -2975,10 +3213,10 @@ pub(crate) fn catalog_body_lines(app: &App, w: usize) -> Vec<Line<'static>> {
                 }
             }
         }
-        // 只属于某一本的附述行(订阅册的到期三态汇总 + 取回链接建议;
-        // 钥匙册的取回钥匙建议)。机器册 / 标签册没有这一族关切,
+        // 只属于某一本的附述行(订阅册的到期三态汇总 + 取回链接退路 + 揭示区;
+        // 钥匙册的取回钥匙退路 + 揭示区)。机器册 / 标签册没有这一族关切,
         // `CatalogKind::extra_lines` 给空——渲染侧不再有两段 `if kind ==`。
-        // ADR-0009 §1:面板不代跑 get;两本的投影都没有本体槽。
+        // 两本的投影都没有本体槽:本体只进确认后的揭示区(ADR-0009 §1)。
         lines.extend(kind.extra_lines(app, w, p));
         // 边界表述(ADR-0009 §5):编目条目绝不进配方 / 锁定集 / bundle /
         // 装配命令,面板侧不提供任何把它烤进去的入口(各本一句,同一条
@@ -3020,8 +3258,8 @@ pub(crate) const CATALOG_REVERSE: &str = "Enter 反查";
 pub(crate) const CATALOG_FILTER: &str = "/ 过滤";
 
 /// 键位行「g 取回」可点文案(#73):点它 = 按 `g`——当前选中订阅 / 钥匙的
-/// **建议命令**收进日志,执行权留给操作者(ADR-0009 §1:面板不代跑 get,
-/// 上游才是唯一回显本体的出口)。渲染画这个串、命中测这个串的宽,同一份
+/// **取回本体确认浮层**(#97 立、#99 两册同口径:确认前一个字节都不下发,
+/// 确认后才代跑 get,本体只进揭示区)。渲染画这个串、命中测这个串的宽,同一份
 /// 字符串——点哪打哪(ADR-0005)。
 ///
 /// 与 [`CATALOG_SWITCH`] / [`CATALOG_REVERSE`] / [`CATALOG_FILTER`] 不同的
@@ -4140,34 +4378,43 @@ fn sub_summary_lines(c: &SubStatusCounts, w: usize, p: &Palette) -> Vec<Line<'st
     ]
 }
 
-/// 取回链接本体的**建议命令**那一行(ADR-0009 §1 裁定:面板不代跑
-/// `subscription get`——`data.url` 是上游唯一回显本体的出口,屏显铺一条活
-/// 订阅链接的扩散面面板兜不住)。执行权留给操作者,面板只给命令文案。
+/// 取回链接本体的那一族行(#99,与 [`key_get_lines`] **逐条同构**):**shell
+/// 退路常驻** + 确认揭示之后才在场的**揭示区**。
+///
+/// 分工(spec #89 修订 ADR-0009 §1 后的新口径)与钥匙册那一本一字不差,只换
+/// 文案里的「链接」二字与本体槽(`data.url`):
+/// - 退路那一行**永远在场**(有选中行就有)——不想代跑时终端永远有路可走,
+///   且它与面板代跑的那一条 argv 同源同层(`engine::commands::subscription_get_suggest`
+///   一份真相);
+/// - 揭示区**只在确认之后**才可能出现本体,且只有这里读得到它
+///   ([`RevealedBody::text`] 的唯一读者);取不到 / 已清空时一行都不画。
 fn sub_get_lines(app: &App, w: usize, p: &Palette) -> Vec<Line<'static>> {
-    match app.sub_get_suggest() {
-        Some(s) => vec![
-            Line::from(Span::styled(
-                if app.sub_get_logged {
-                    "  取回链接(面板不代跑,已按 g 收进日志):"
-                } else {
-                    "  取回链接(面板不代跑,按 g 收进日志):"
-                },
-                p.dim(),
-            )),
-            Line::from(Span::styled(clip(&s.display, w), p.accent().bold())),
-            Line::from(Span::styled(
-                clip(
-                    "  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照帧,执行权留给操作者。",
-                    w,
-                ),
-                p.dim(),
-            )),
-        ],
-        None => vec![Line::from(Span::styled(
-            "  取回链接:先选中一条订阅(↑/↓ 或鼠标点行);面板只给建议命令,不代跑 get。",
+    let mut out = Vec::new();
+    if let Some(s) = app.sub_get_suggest() {
+        out.push(Line::from(Span::styled(
+            "  取回链接(按 g 代跑;不想代跑就复制这一条去终端):",
             p.dim(),
-        ))],
+        )));
+        out.push(Line::from(Span::styled(
+            clip(&s.display, w),
+            p.accent().bold(),
+        )));
+        out.push(Line::from(Span::styled(
+            clip(
+                "  与面板确认后下发的是同一条命令;确认前一个字节都不下发。",
+                w,
+            ),
+            p.dim(),
+        )));
+    } else {
+        out.push(Line::from(Span::styled(
+            "  取回链接:先选中一条订阅(↑/↓ 或鼠标点行);按 g 开确认浮层,本体只在确认后的揭示区。",
+            p.dim(),
+        )));
     }
+    // 揭示区:与钥匙册共用 [`reveal_area_lines`] 那一份(#97 立,#99 两册同用)。
+    out.extend(reveal_area_lines(app, w, p));
+    out
 }
 
 /// 订阅册的边界表述(ADR-0009 §5,工单 #56 验收第 7 条):订阅链接随续费轮换,
@@ -4180,35 +4427,82 @@ pub const SUB_BOUNDARY: &str =
 pub const KEY_BOUNDARY: &str =
     "  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供烤进去的入口)";
 
-/// 取回钥匙本体的**建议命令**那一行(ADR-0009 §1 裁定:面板不代跑 `key get`——
-/// `data.key` 是上游唯一回显本体的出口,屏显铺一把活钥匙的扩散面面板兜不住)。
-/// 执行权留给操作者,面板只给命令文案(与 bake / recipe new / subscription get
-/// 同源同层,纯函数层产、永不带写旗标)。
+/// 取回钥匙本体的那一族行(#97):**shell 退路常驻** + 确认揭示之后才在场的
+/// **揭示区**。
+///
+/// 分工(spec #89 修订 ADR-0009 §1 后的新口径):
+/// - 退路那一行**永远在场**(有选中行就有)——不想代跑时终端永远有路可走,
+///   且它与面板代跑的那一条 argv 同源同层(`engine::commands::key_get_suggest`
+///   一份真相);
+/// - 揭示区**只在确认之后**才可能出现本体,且只有这里读得到它
+///   ([`RevealedBody::text`] 的唯一读者);取不到 / 已清空时一行都不画。
+///
+/// 与订阅册([`sub_get_lines`])**逐条同构**(#99 那一票已把订阅册接到同一份
+/// 实现上):差别只在「取的是 `data.key` 还是 `data.url`」,不在这两段画法,
+/// 也不在浮层 / 揭示区 / 清空时机。
 fn key_get_lines(app: &App, w: usize, p: &Palette) -> Vec<Line<'static>> {
-    match app.key_get_suggest() {
-        Some(s) => vec![
-            Line::from(Span::styled(
-                if app.key_get_logged {
-                    "  取回钥匙(面板不代跑,已按 g 收进日志):"
-                } else {
-                    "  取回钥匙(面板不代跑,按 g 收进日志):"
-                },
-                p.dim(),
-            )),
-            Line::from(Span::styled(clip(&s.display, w), p.accent().bold())),
-            Line::from(Span::styled(
-                clip(
-                    "  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照帧,执行权留给操作者。",
-                    w,
-                ),
-                p.dim(),
-            )),
-        ],
-        None => vec![Line::from(Span::styled(
-            "  取回钥匙:先选中一把(↑/↓ 或鼠标点行);面板只给建议命令,不代跑 get。",
+    let mut out = Vec::new();
+    if let Some(s) = app.key_get_suggest() {
+        out.push(Line::from(Span::styled(
+            "  取回钥匙(按 g 代跑;不想代跑就复制这一条去终端):",
             p.dim(),
-        ))],
+        )));
+        out.push(Line::from(Span::styled(
+            clip(&s.display, w),
+            p.accent().bold(),
+        )));
+        out.push(Line::from(Span::styled(
+            clip(
+                "  与面板确认后下发的是同一条命令;确认前一个字节都不下发。",
+                w,
+            ),
+            p.dim(),
+        )));
+    } else {
+        out.push(Line::from(Span::styled(
+            "  取回钥匙:先选中一把(↑/↓ 或鼠标点行);按 g 开确认浮层,本体只在确认后的揭示区。",
+            p.dim(),
+        )));
     }
+    // 揭示区:本体已确认取回才在场。清空时机见 [`GetReveal::clear`](切条目 /
+    // 翻册 / 切屏 / 返航 / 退出五条路)。
+    out.extend(reveal_area_lines(app, w, p));
+    out
+}
+
+/// **揭示区**(#97,两册共用的一份):本体在场的唯一一处屏面。
+///
+/// 三件事写在这几行里,都是为了「操作者知道自己在看什么、以及它什么时候
+/// 消失」:① 这是揭示区(不是册体投影,册体结构上没有本体槽);② 本体只读
+/// 一次、只在这里读;③ 清空时机——切条目 / 翻册 / 切屏 / 返航 / 退出立即擦。
+///
+/// 本体经 [`RevealedBody::text`] 取出,`clip` 截断(册体行同一条纪律:截断
+/// 不折行,折行会多占一行、末行几何即失真)。**没有任何别的面读它**——
+/// 日志行 / config / 崩溃上报都拿不到(`Debug` 与 `Drop` 已把另外几条路焊死)。
+pub(crate) fn reveal_area_lines(app: &App, w: usize, p: &Palette) -> Vec<Line<'static>> {
+    let Some((name, body)) = app.get_reveal.revealed() else {
+        return Vec::new();
+    };
+    vec![
+        Line::from(Span::styled(
+            clip("  揭示区(本体只在这里、只在这一次;↑/↓ m j/k Esc q 即清)", w),
+            p.warn().bold(),
+        )),
+        Line::from(vec![
+            Span::styled(format!("  {name} "), p.text().bold()),
+            Span::styled(
+                clip(&body.text(), w.saturating_sub(4 + name.len())),
+                p.text(),
+            ),
+        ]),
+        Line::from(Span::styled(
+            clip(
+                "  本体不落盘、不进日志、不进配置;离开这一屏/这一条即从内存里擦掉。",
+                w,
+            ),
+            p.dim(),
+        )),
+    ]
 }
 
 // ---- 订阅册浮层(工单 #56:两段式登记 + rm 图形确认;本体只经 stdin) ----
@@ -5029,6 +5323,182 @@ fn render_key_rm_confirm(frame: &mut Frame, area: Rect, app: &App) {
                 Block::bordered()
                     .border_style(p.accent())
                     .title(Span::styled(" 删除钥匙 · 确认 ", p.accent().bold())),
+            )
+            .style(p.surface()),
+        popup,
+    );
+}
+
+// ---- 取回本体的确认浮层与揭示区(工单 #97;两册共用一份,#99 只写薄适配器) ----
+
+/// 取回确认浮层的尺寸:渲染与命中区同一组常量(几何零分歧,与登记 / 删除
+/// 两道浮层同一条纪律)。高 9 = 上下边框 2 + 内 7 行(标注 / 取回哪一条 /
+/// shell 退路 / 两句纪律注 / 空行 / 键位行)。
+pub const GET_REVEAL_W: u16 = 72;
+pub const GET_REVEAL_H: u16 = 9;
+
+/// 键位行两段文案(与命中区 `two_key_segments` 同一份字符串:点哪打哪)。
+pub const GET_REVEAL_KEY_CONFIRM: &str = "  Enter 确认揭示 ";
+
+/// 从 `key get` 的回音里取出**本体槽**(`nw/key-get.v1` 的 `data.key`)——
+/// 本体进入面板的**唯一入口**,出来就是 [`RevealedBody`]。
+///
+/// 三道拒收,一道都不猜:① rc≠0 或 envelope 说 not ok;② 契约守卫挡下
+/// (schema 不认识,`data_as` 直接 None);③ data 不可定型(形状不匹配)。
+/// 三种都回 `None`,由调用方走既有指路(日志),**不按旧形状降级解析**、
+/// 不画空揭示区。
+///
+/// 订阅册那一格由同形状的 [`sub_get_body`] 取(`data.url`),两册经 [`get_body`]
+/// 共用 [`reveal_area_lines`] / [`render_get_reveal_overlay`] 一份画法。
+pub(crate) fn key_get_body(out: &EngineOutput) -> Option<RevealedBody> {
+    if !out.ok {
+        return None;
+    }
+    let d = out
+        .envelope
+        .as_ref()
+        .and_then(|e| e.data_as::<crate::engine::KeyGetData>())?;
+    if d.key.is_empty() {
+        // 上游带了这一格但空串:按「没取到」处理,不当成本体揭示
+        return None;
+    }
+    Some(RevealedBody::new(d.key))
+}
+
+/// 从 `subscription get` 的回音里取出**本体槽**(`nw/subscription-get.v1` 的
+/// `data.url`)——订阅册那一格的本体进入面板的**唯一入口**,出来也是
+/// [`RevealedBody`]。
+///
+/// 三道拒收与 [`key_get_body`] 逐条同源(一道都不猜):rc≠0 或 envelope 说 not
+/// ok / 契约守卫挡下 / data 不可定型。订阅册与钥匙册只差「取 data 里哪一格」,
+/// 与「本体怎么进揭示区」无关——后者两册共用 [`reveal_area_lines`] 一份。
+pub(crate) fn sub_get_body(out: &EngineOutput) -> Option<RevealedBody> {
+    if !out.ok {
+        return None;
+    }
+    let d = out
+        .envelope
+        .as_ref()
+        .and_then(|e| e.data_as::<crate::engine::SubGetData>())?;
+    if d.url.is_empty() {
+        // 上游带了这一格但空串:按「没取到」处理,不当成本体揭示
+        return None;
+    }
+    Some(RevealedBody::new(d.url))
+}
+
+/// 取回回音 → 本体(**两册共用的一个入口**,工单 #99)。
+///
+/// 取 data 里哪一格由**回音自己的命令组**决定(`argv[0]` 是 `key` 还是
+/// `subscription`),不靠「屏上此刻是哪一本」——状态里不带册别(见
+/// [`GetReveal`]),回音才是这件事的真相源。两册落到的 [`RevealedBody`] 与揭示
+/// 区是同一份,这一处只分「取哪一格」。
+pub(crate) fn get_body(out: &EngineOutput) -> Option<RevealedBody> {
+    match out.args.first().map(String::as_str) {
+        Some("key") => key_get_body(out),
+        Some("subscription") => sub_get_body(out),
+        _ => None,
+    }
+}
+
+/// 取回本体的确认浮层(#97):**两态共一个画法**——确认前(`Confirm`)与
+/// 已下发等回音(`InFlight`)。本体一字节都不在这里:确认前它还在引擎那边,
+/// 在途时它还在管道里,只有回音落地后才进揭示区(册体那一族行)。
+///
+/// 三件必说的:① 「即将揭示机密本体」标注(误触 `g` 不会当场把本体拍在
+/// 屏幕上,操作者明确知道自己要按下去的是什么);② 可复制的 shell 退路
+/// (不想代跑时终端永远有路,且与确认后下发的那一条同源同层);③ 确认前
+/// 一个字节都没下发。
+///
+/// **不分册**:画法只读 `App::get_reveal` 里那条 argv 与退路,#99 的订阅册
+/// 打开的是同一条状态、同一个浮层。
+fn render_get_reveal_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let p = &app.palette;
+    let popup = popup_rect(area, GET_REVEAL_W, GET_REVEAL_H);
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    match &app.get_reveal {
+        GetReveal::Confirm {
+            name,
+            argv: _,
+            fallback,
+        } => {
+            lines.push(Line::from(Span::styled(
+                "  ⚠ 即将揭示机密本体",
+                p.warn().bold(),
+            )));
+            lines.push(Line::from(vec![
+                Span::raw("  取回 "),
+                Span::styled(name.clone(), p.text().bold()),
+                Span::styled("(只印名字,本体还在引擎那边)", p.dim()),
+            ]));
+            // 退路单独一行:命令文案一个字符都不裁(裁掉的命令复制出去是废的)。
+            // 与确认后下发的那一条同源同层——都是 `commands` 那一份 `Suggest`。
+            lines.push(Line::from(Span::styled(
+                "  退路(可复制,不想代跑就敲这一条):",
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                clip(&format!("  {fallback}"), inner_w),
+                p.accent().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                clip("  确认前一个字节都没下发:执行权还在你手里。", inner_w),
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                clip(
+                    "  本体只进确认后的揭示区,不落盘/不进日志/不进配置。",
+                    inner_w,
+                ),
+                p.dim(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                clip(&format!("  {GET_REVEAL_KEY_CONFIRM} · Esc/q 返航"), inner_w),
+                p.accent().bold(),
+            )));
+        }
+        GetReveal::InFlight { name, fallback } => {
+            lines.push(Line::from(Span::styled(
+                format!("  正在取回 {name} 的本体…"),
+                p.text().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  已确认并下发;等引擎回音,此刻屏上没有本体。",
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  退路(可复制,不想等就敲这一条):",
+                p.dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                clip(&format!("  {fallback}"), inner_w),
+                p.accent().bold(),
+            )));
+            lines.push(Line::from(Span::styled(
+                clip("  返航收不回已下发的那一次:回音到达即丢弃。", inner_w),
+                p.dim(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Esc/q 返航", p.accent().bold())));
+        }
+        // 本体已进揭示区 / 闲置:没有浮层可画(`overlay_on` 已拦掉这两态,
+        // 这里是穷尽匹配不是可达分支)。
+        GetReveal::Idle | GetReveal::Revealed { .. } => {}
+    }
+    let budget = popup.height.saturating_sub(2) as usize;
+    lines.truncate(budget);
+    while lines.len() < budget {
+        lines.push(Line::from(""));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(p.accent())
+                    .title(Span::styled(" 取回本体 · 确认 ", p.accent().bold())),
             )
             .style(p.surface()),
         popup,
@@ -7213,12 +7683,199 @@ mod tests {
         assert!(!app.assembling, "钥匙册 rm 回音灭灯");
     }
 
-    /// 取回链接本体:**只给建议命令**。面板不代跑 `subscription get`——队列里
-    /// 永远不会出现它;建议命令与 bake / recipe new 同源同层(commands.rs 纯函数层),
-    /// 永不带写旗标。
+    // ---- 工单 #99:订阅册 `g` 代跑 `subscription get`(薄适配器) ----
+    //
+    // 与 #97 钥匙册那一组**逐条同构**,只换 fixture 与断言槽(`data.url` 而不是
+    // `data.key`):① 确认前一个字节的 argv 都不下发;② 本体只在确认后的揭示
+    // 区;③ 揭示区在切条目 / 翻册 / 切屏 / 返航 / 退出时立即清空;④ 本体不进
+    // 日志 / 不落盘 / Debug 不打印内容。两册共用同一份浮层 / 揭示区 / 清空时机,
+    // 本票只补「订阅册这一侧的入口」与「取哪一格」。
+
+    /// 取回订阅本体的回音(工单 #99):`nw/subscription-get.v1` 的 `data.url` 就是
+    /// 上游唯一回显本体的那一格。测试里的本体取一个**看得出的假串**——断言
+    /// 「它在揭示区、不在日志」都要能逐字符对得上。
+    const SUB_BODY: &str = "https://airport.example/subscribe?token=SUBSECRET99";
+
+    const SUB_GET_OK: &str = r#"{"schema":"nw/subscription-get.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"name":"airport","url":"https://airport.example/subscribe?token=SUBSECRET99"}}"#;
+
+    /// `g` 开的是**确认浮层**(工单 #99):明确标注「即将揭示机密本体」,同时给足
+    /// 可复制的 shell 退路(`nw subscription get … | jq -r .data.url`)——不想代跑
+    /// 时永远有终端退路。确认前**一个字节的 argv 都没下发**:执行权还在操作者
+    /// 手里,误触 `g` 不会当场把本体拍在屏幕上。
     #[test]
-    fn 取回链接_只给建议命令_面板无任何路径会下发它() {
+    fn 取回订阅_g开确认浮层标注即将揭示机密本体_确认前不发任何argv() {
+        let (mut app, runner) = sub_app(&[
+            ("subscription ls", 0, SUB_LS_ALL),
+            ("subscription get", 0, SUB_GET_OK),
+        ]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        assert_eq!(
+            app.selected_sub_name().as_deref(),
+            Some("airport"),
+            "选中首行"
+        );
+        let before = runner.call_argvs();
+        tap(&mut app, KeyCode::Char('g'));
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("即将揭示机密本体"), "浮层明确标注:{s}");
+        // 退路是订阅自己那条(不是钥匙册的 `nw key get`),命令头不裁——浮层
+        // 宽度只够到管道段,断言落在「哪一族命令 + 取哪一格」上。
+        assert!(
+            s.contains(&format!(
+                "nw subscription get --name airport --root {}",
+                app.usable_data_root().unwrap_or_default()
+            )),
+            "浮层给足订阅自己那条可复制的 shell 退路:{s}"
+        );
+        assert!(!s.contains("nw key get"), "两册退路不串味:{s}");
+        assert!(!s.contains(SUB_BODY), "确认前本体不在屏上:{s}");
+        assert!(app.queue.is_empty(), "确认前不入队:{:?}", app.queue);
+        assert_eq!(runner.call_argvs(), before, "确认前运行器零调用");
+        assert_eq!(runner.stdin_feed_count(), 0, "没有真实子进程被拉起喂入");
+        // 返航:浮层收起来,还是一个字节都没下发
+        tap(&mut app, KeyCode::Esc);
+        assert!(
+            !crate::testutil::frame_display(&app, 80, 30).contains("即将揭示机密本体"),
+            "Esc 收浮层"
+        );
+        assert_eq!(runner.call_argvs(), before, "返航后仍然零调用");
+    }
+
+    /// 确认后才下发——经 `App::spawn_engine` 这唯一入口;本体从引擎 stdout
+    /// envelope(`nw/subscription-get.v1` 的 `data.url`)进面板,**只在确认后的
+    /// 揭示区**显示。
+    #[test]
+    fn 取回订阅_确认后才经唯一入口下发subscription_get_本体只在确认后的揭示区显示() {
+        let (mut app, runner) = sub_app(&[
+            ("subscription ls", 0, SUB_LS_ALL),
+            ("subscription get", 0, SUB_GET_OK),
+        ]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        tap(&mut app, KeyCode::Enter);
+        let argv = app.queue.last().cloned().expect("确认后入队");
+        assert_eq!(
+            argv,
+            vec![
+                "subscription".to_string(),
+                "get".to_string(),
+                "--name".to_string(),
+                "airport".to_string(),
+                "--root".to_string(),
+                app.usable_data_root().unwrap_or_default(),
+            ],
+            "下发的就是浮层上看的那一条(同源同层)"
+        );
+        feed(&mut app); // 回音落地
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("揭示区"), "说清这是揭示区:{s}");
+        assert!(s.contains(SUB_BODY), "本体只在确认后的揭示区:{s}");
+        assert!(
+            app.log.iter().all(|l| !l.contains(SUB_BODY)),
+            "本体不进日志行:{:?}",
+            app.log.first()
+        );
+        assert!(
+            runner
+                .call_argvs()
+                .iter()
+                .all(|a| !a.iter().any(|x| x == SUB_BODY)),
+            "argv 面无明文本体"
+        );
+    }
+
+    /// 揭示区**立即清空**:切条目(↑/↓)、翻册(m)、切屏(j/k)、返航(Esc)、
+    /// 退出(q)五条路,屏幕无残留,状态也不留。
+    #[test]
+    fn 取回订阅_揭示区在切条目翻册切屏返航退出时立即清空() {
+        for (label, key) in [
+            ("切条目", KeyCode::Down),
+            ("翻册", KeyCode::Char('m')),
+            ("切屏", KeyCode::Char('j')),
+            ("返航", KeyCode::Esc),
+            ("退出", KeyCode::Char('q')),
+        ] {
+            let (mut app, _r) = sub_app(&[
+                ("subscription ls", 0, SUB_LS_ALL),
+                ("subscription get", 0, SUB_GET_OK),
+            ]);
+            tap(&mut app, KeyCode::Char('l'));
+            feed(&mut app);
+            tap(&mut app, KeyCode::Char('g'));
+            tap(&mut app, KeyCode::Enter);
+            feed(&mut app);
+            assert!(
+                crate::testutil::frame_display(&app, 80, 30).contains(SUB_BODY),
+                "{label} 前本体在揭示区"
+            );
+            tap(&mut app, key);
+            let s = crate::testutil::frame_display(&app, 80, 30);
+            assert!(!s.contains(SUB_BODY), "{label} 后屏幕无残留:{s}");
+            assert!(
+                app.get_reveal.revealed().is_none(),
+                "{label} 后揭示区状态也清空(本体不在内存里留)"
+            );
+        }
+    }
+
+    /// 引擎缺 subscription 组能力时 `g` 走既有指路(升级 nw):不报错、不猜、
+    /// 不落半条命令——确认浮层都不开。
+    #[test]
+    fn 取回订阅_引擎缺subscription组能力时走升级指路_不落半条命令() {
         let (mut app, runner) = sub_app(&[("subscription ls", 0, SUB_LS_ALL)]);
+        app.capabilities.record(
+            crate::engine::Capability::Subscription,
+            crate::engine::Probe::Unavailable,
+            None,
+        );
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        assert!(
+            !crate::testutil::frame_display(&app, 80, 30).contains("即将揭示机密本体"),
+            "门不过:连浮层都不开"
+        );
+        assert!(app.queue.is_empty(), "门不过:一个字节都不下发");
+        assert_eq!(runner.stdin_feed_count(), 0, "没有真实子进程被拉起喂入");
+        assert!(
+            app.log.iter().any(|l| l.contains("升级所配 nw")),
+            "走既有能力指路:{:?}",
+            app.log.first()
+        );
+    }
+
+    /// 本体**不进日志行、不进 config、不进崩溃上报**:承载它的类型 `Debug`
+    /// 派生不打印内容(同 `SecretBody` 纪律),`{:?}` 进任何字符串都漏不出
+    /// 一个字符。
+    #[test]
+    fn 取回订阅_本体不进日志不落盘_承载类型不打印内容() {
+        let (mut app, _r) = sub_app(&[
+            ("subscription ls", 0, SUB_LS_ALL),
+            ("subscription get", 0, SUB_GET_OK),
+        ]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        tap(&mut app, KeyCode::Enter);
+        feed(&mut app);
+        let dbg = format!("{:?}", app.get_reveal);
+        assert!(!dbg.contains(SUB_BODY), "Debug 不打印本体:{dbg}");
+        assert!(dbg.contains("不打印内容"), "Debug 只说字节数:{dbg}");
+        assert!(
+            app.log.iter().all(|l| !l.contains(SUB_BODY)),
+            "日志不现本体:{:?}",
+            app.log.first()
+        );
+    }
+
+    /// 命令层仍是纯函数层产 argv + 展示串(#99 起与钥匙册**同源同层**:面板
+    /// 代跑的那条 argv 与给人复制的 shell 退路是同一份真相,不另拼一套)。
+    /// `get` 是只读出口,永不带写旗标、上游不开 `--raw` 面板也不造。
+    #[test]
+    fn 取回订阅_命令层仍产同源argv与shell退路_永不带写旗标() {
+        let (mut app, _r) = sub_app(&[("subscription ls", 0, SUB_LS_ALL)]);
         tap(&mut app, KeyCode::Char('l'));
         feed(&mut app);
         let suggest = app.sub_get_suggest().expect("选中一条就能算出建议命令");
@@ -7238,40 +7895,21 @@ mod tests {
             !suggest.display.contains("--raw"),
             "上游不开 --raw,面板也不造"
         );
-        // 册体把建议命令与理由都摊开给人看(取回链接那一行给足宽度)
+        assert_eq!(
+            suggest.argv,
+            vec![
+                "subscription".to_string(),
+                "get".to_string(),
+                "--name".to_string(),
+                "airport".to_string(),
+                "--root".to_string(),
+                app.usable_data_root().unwrap_or_default(),
+            ],
+            "argv 与展示串同源同层(面板代跑的那条就是这一条)"
+        );
         let s = crate::testutil::frame_display(&app, 80, 30);
-        assert!(s.contains("面板不代跑"), "{s}");
-        assert!(
-            s.contains("jq -r .data.url"),
-            "建议命令完整在场(不被标签挤掉):{s}"
-        );
-        assert!(!s.contains("https://"), "册体不出现链接:{s}");
-        // 按 g 收进日志(可取用),但队列里一个字节都不多
-        assert!(!app.sub_get_logged);
-        tap(&mut app, KeyCode::Char('g'));
-        assert!(app.sub_get_logged, "g 把建议命令收进日志");
-        assert!(
-            app.log.iter().any(|l| l.contains("jq -r .data.url")),
-            "建议命令收进日志可取用:{:?}",
-            app.log.first()
-        );
-        assert!(app.queue.is_empty(), "面板不代跑 get:队列里没有它");
-        assert_eq!(runner.stdin_feed_count(), 0, "没有真实子进程被拉起喂入");
-        // 键位扫一遍:没有任何一条路径会把 subscription get 入队
-        for c in ['g', 'l', 'm', 'k', 'j'] {
-            tap(&mut app, KeyCode::Char(c));
-        }
-        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Esc] {
-            tap(&mut app, code);
-        }
-        assert!(
-            app.queue
-                .iter()
-                .chain(app.fed_queue.iter().map(|(a, _)| a))
-                .all(|a| a.get(1).map(String::as_str) != Some("get")),
-            "任何路径都不会下发 subscription get:{:?}",
-            app.queue
-        );
+        assert!(s.contains("jq -r .data.url"), "册体常驻 shell 退路:{s}");
+        assert!(!s.contains(SUB_BODY), "册体不出现本体:{s}");
     }
 
     /// 复用 #53 的骨架:三本册共用同一个列表件(`catalog_sheet_lines`),订阅册
@@ -7423,7 +8061,14 @@ mod tests {
         assert!(s.contains("缺的是引擎能力"), "{s}");
     }
 
-    // ---- 工单 #57:钥匙册(本体只经 stdin / 投影无本体槽不印指纹 / get 只给建议) ----
+    // ---- 工单 #97:钥匙册(本体只经 stdin / 投影无本体槽不印指纹 / g 代跑 key get) ----
+
+    /// 取回钥匙本体的回音(工单 #97):`nw/key-get.v1` 的 `data.key` 就是上游
+    /// 唯一回显本体的那一格。测试里的本体取一个**看得出的假串**——断言
+    /// 「它在揭示区、不在日志」都要能逐字符对得上。
+    const KEY_BODY: &str = "ghp_fakeCIToken000000000000000000";
+
+    const KEY_GET_OK: &str = r#"{"schema":"nw/key-get.v1","nw":"0.1.0","ok":true,"errors":[],"warnings":[],"data":{"name":"ci","key":"ghp_fakeCIToken000000000000000000"}}"#;
 
     /// 钥匙 ls 回音:两把钥匙,一把声明了作用域、一把没有;`kind` / `host` /
     /// `scopes[]` / `rotatedAt` 五键冻结——**没有 secret 槽、也没有指纹字段**。
@@ -7751,12 +8396,234 @@ mod tests {
         assert!(s.contains("keys.json"), "说清是哪一本:{s}");
     }
 
-    /// 取回钥匙本体:**只给建议命令**。面板不代跑 `key get`——队列里永远不会
-    /// 出现它;建议命令与 bake / recipe new / subscription get 同源同层
-    /// (commands.rs 纯函数层),永不带写旗标。
+    // ---- 工单 #97:钥匙册 `g` 代跑 `key get`(确认浮层 + 揭示区) ----
+    //
+    // spec #89 修订 ADR-0009 的 get 裁决:`g` 从「只给建议命令」升级为
+    // 「面板代跑 + 确认浮层揭示本体」。四条硬边界由这一组测试钉着——
+    // ① 确认前一个字节的 argv 都不下发;② 本体只在确认后的揭示区;
+    // ③ 揭示区在切条目 / 翻册 / 切屏 / 返航 / 退出时立即清空;
+    // ④ 本体不进日志 / 不落盘 / Debug 不打印内容。
+
+    /// `g` 开的是**确认浮层**(工单 #97):明确标注「即将揭示机密本体」,同时
+    /// 给足可复制的 shell 退路(`nw key get … | jq -r .data.key`)——不想代跑
+    /// 时永远有终端退路。确认前**一个字节的 argv 都没下发**:执行权还在
+    /// 操作者手里,误触 `g` 不会当场把本体拍在屏幕上。
     #[test]
-    fn 取回钥匙_只给建议命令_面板无任何路径会下发它() {
+    fn 取回钥匙_g开确认浮层标注即将揭示机密本体_确认前不发任何argv() {
+        let (mut app, runner) = key_app(&[("key ls", 0, KEY_LS_ALL), ("key get", 0, KEY_GET_OK)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        assert_eq!(app.selected_key_name().as_deref(), Some("ci"), "选中首行");
+        let before = runner.call_argvs();
+        tap(&mut app, KeyCode::Char('g'));
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("即将揭示机密本体"), "浮层明确标注:{s}");
+        assert!(
+            s.contains(&format!(
+                "nw key get --name ci --root {} | jq -r .data.key",
+                app.usable_data_root().unwrap_or_default()
+            )),
+            "浮层给足可复制的 shell 退路:{s}"
+        );
+        assert!(!s.contains(KEY_BODY), "确认前本体不在屏上:{s}");
+        assert!(app.queue.is_empty(), "确认前不入队:{:?}", app.queue);
+        assert_eq!(runner.call_argvs(), before, "确认前运行器零调用");
+        assert_eq!(runner.stdin_feed_count(), 0, "没有真实子进程被拉起喂入");
+        // 返航:浮层收起来,还是一个字节都没下发
+        tap(&mut app, KeyCode::Esc);
+        assert!(
+            !crate::testutil::frame_display(&app, 80, 30).contains("即将揭示机密本体"),
+            "Esc 收浮层"
+        );
+        assert_eq!(runner.call_argvs(), before, "返航后仍然零调用");
+    }
+
+    /// 确认后才下发——经 `App::spawn_engine` 这唯一入口(键位没有 tx,排队
+    /// 由主循环取出后走同一入口);本体从引擎 stdout envelope
+    /// (`nw/key-get.v1` 的 `data.key`)进面板,**只在确认后的揭示区**显示。
+    #[test]
+    fn 取回钥匙_确认后才经唯一入口下发key_get_本体只在确认后的揭示区显示() {
+        let (mut app, runner) = key_app(&[("key ls", 0, KEY_LS_ALL), ("key get", 0, KEY_GET_OK)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        tap(&mut app, KeyCode::Enter);
+        let argv = app.queue.last().cloned().expect("确认后入队");
+        assert_eq!(
+            argv,
+            vec![
+                "key".to_string(),
+                "get".to_string(),
+                "--name".to_string(),
+                "ci".to_string(),
+                "--root".to_string(),
+                app.usable_data_root().unwrap_or_default(),
+            ],
+            "下发的就是浮层上看的那一条(同源同层)"
+        );
+        feed(&mut app); // 回音落地
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(s.contains("揭示区"), "说清这是揭示区:{s}");
+        assert!(s.contains(KEY_BODY), "本体只在确认后的揭示区:{s}");
+        assert!(
+            app.log.iter().all(|l| !l.contains(KEY_BODY)),
+            "本体不进日志行:{:?}",
+            app.log.first()
+        );
+        assert!(
+            runner
+                .call_argvs()
+                .iter()
+                .all(|a| !a.iter().any(|x| x == KEY_BODY)),
+            "argv 面无明文本体"
+        );
+    }
+
+    /// 浮层两段可点(#73 / #78 那条「点哪打哪」纪律的延续):点「Enter 确认
+    /// 揭示」段 = 按 Enter(确认后才入队),点「Esc/q 返航」段 = 按 Esc(一个
+    /// 字节都没下发,浮层收起)。两条路与键盘逐字同后果,不许漂移。
+    #[test]
+    fn 取回钥匙_浮层两段可点_点确认才入队点返航零下发() {
+        let (mut app, runner) = key_app(&[("key ls", 0, KEY_LS_ALL), ("key get", 0, KEY_GET_OK)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        let before = runner.call_argvs();
+        // 点「Esc/q 返航」段:一个字节都没下发,浮层收起
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::DismissPopup)
+        });
+        assert_eq!(runner.call_argvs(), before, "点返航零下发");
+        assert!(app.queue.is_empty(), "点返航不入队");
+        assert!(
+            !crate::testutil::frame_display(&app, 80, 30).contains("即将揭示机密本体"),
+            "点返航即收浮层"
+        );
+        // 再开一次,点「Enter 确认揭示」段:经唯一入口入队,回音落地才进揭示区
+        tap(&mut app, KeyCode::Char('g'));
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::Activate)
+        });
+        assert_eq!(app.queue.len(), 1, "点确认即入队(只有一条)");
+        assert_eq!(app.queue[0].get(1).map(String::as_str), Some("get"));
+        feed(&mut app);
+        assert!(
+            crate::testutil::frame_display(&app, 80, 30).contains(KEY_BODY),
+            "点确认与按 Enter 同后果:本体进揭示区"
+        );
+    }
+    /// 揭示区**立即清空**:切条目(↑/↓)、翻册(m)、切屏(j/k)、返航(Esc)、
+    /// 退出(q)五条路,屏幕无残留,状态也不留。
+    #[test]
+    fn 取回钥匙_揭示区在切条目翻册切屏返航退出时立即清空() {
+        for (label, key) in [
+            ("切条目", KeyCode::Down),
+            ("翻册", KeyCode::Char('m')),
+            ("切屏", KeyCode::Char('j')),
+            ("返航", KeyCode::Esc),
+            ("退出", KeyCode::Char('q')),
+        ] {
+            let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL), ("key get", 0, KEY_GET_OK)]);
+            tap(&mut app, KeyCode::Char('l'));
+            feed(&mut app);
+            tap(&mut app, KeyCode::Char('g'));
+            tap(&mut app, KeyCode::Enter);
+            feed(&mut app);
+            assert!(
+                crate::testutil::frame_display(&app, 80, 30).contains(KEY_BODY),
+                "{label} 前本体在揭示区"
+            );
+            tap(&mut app, key);
+            let s = crate::testutil::frame_display(&app, 80, 30);
+            assert!(!s.contains(KEY_BODY), "{label} 后屏幕无残留:{s}");
+            assert!(
+                app.get_reveal.revealed().is_none(),
+                "{label} 后揭示区状态也清空(本体不在内存里留)"
+            );
+        }
+    }
+
+    /// 切屏**不止 `j/k` 一条路**:点导航(常畅)/ 屏 Tab(紧凑)与 `j/k` 同语义
+    /// (#62 起两条路同一个 `Target::NavTo`),揭示区照样立即清空——换屏后本体
+    /// 不跟着走,回到编目册时也不旧事重提。清空点只有
+    /// [`crate::app::App::set_screen`] 一处,切屏的路再加几条也不会漏。
+    #[test]
+    fn 取回钥匙_点导航切屏同样立即清空揭示区() {
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL), ("key get", 0, KEY_GET_OK)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        tap(&mut app, KeyCode::Enter);
+        feed(&mut app);
+        assert!(
+            crate::testutil::frame_display(&app, 80, 30).contains(KEY_BODY),
+            "点导航前本体在揭示区"
+        );
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::NavTo(crate::app::Screen::Health))
+        });
+        assert_eq!(app.screen, crate::app::Screen::Health, "点导航即切屏");
+        assert!(
+            app.get_reveal.revealed().is_none(),
+            "切屏即擦:本体不跟着换屏走"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains(KEY_BODY), "换屏后屏幕无残留:{s}");
+    }
+
+    /// 引擎缺 key 组能力时 `g` 走既有指路(升级 nw):不报错、不猜、不落半条
+    /// 命令——确认浮层都不开。
+    #[test]
+    fn 取回钥匙_引擎缺key组能力时走升级指路_不落半条命令() {
         let (mut app, runner) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
+        app.capabilities.record(
+            crate::engine::Capability::Key,
+            crate::engine::Probe::Unavailable,
+            None,
+        );
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        assert!(
+            !crate::testutil::frame_display(&app, 80, 30).contains("即将揭示机密本体"),
+            "门不过:连浮层都不开"
+        );
+        assert!(app.queue.is_empty(), "门不过:一个字节都不下发");
+        assert_eq!(runner.stdin_feed_count(), 0, "没有真实子进程被拉起喂入");
+        assert!(
+            app.log.iter().any(|l| l.contains("升级所配 nw")),
+            "走既有能力指路:{:?}",
+            app.log.first()
+        );
+    }
+
+    /// 本体**不进日志行、不进 config、不进崩溃上报**:承载它的类型 `Debug`
+    /// 派生不打印内容(同 `SecretBody` 纪律),`{:?}` 进任何字符串都漏不出
+    /// 一个字符。
+    #[test]
+    fn 取回钥匙_本体不进日志不落盘_承载类型不打印内容() {
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL), ("key get", 0, KEY_GET_OK)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        tap(&mut app, KeyCode::Enter);
+        feed(&mut app);
+        let dbg = format!("{:?}", app.get_reveal);
+        assert!(!dbg.contains(KEY_BODY), "Debug 不打印本体:{dbg}");
+        assert!(dbg.contains("不打印内容"), "Debug 只说字节数:{dbg}");
+        assert!(
+            app.log.iter().all(|l| !l.contains(KEY_BODY)),
+            "日志不现本体:{:?}",
+            app.log.first()
+        );
+    }
+
+    /// 命令层仍是纯函数层产 argv + 展示串(工单 #97 起**同源同层**:面板
+    /// 代跑的那条 argv 与给人复制的 shell 退路是同一份真相,不另拼一套)。
+    /// `get` 是只读出口,永不带写旗标、上游不开 `--raw` 面板也不造。
+    #[test]
+    fn 取回钥匙_命令层仍产同源argv与shell退路_永不带写旗标() {
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
         tap(&mut app, KeyCode::Char('l'));
         feed(&mut app);
         let suggest = app.key_get_suggest().expect("选中一条就能算出建议命令");
@@ -7776,35 +8643,21 @@ mod tests {
             !suggest.display.contains("--raw"),
             "上游不开 --raw,面板也不造"
         );
+        assert_eq!(
+            suggest.argv,
+            vec![
+                "key".to_string(),
+                "get".to_string(),
+                "--name".to_string(),
+                "ci".to_string(),
+                "--root".to_string(),
+                app.usable_data_root().unwrap_or_default(),
+            ],
+            "argv 与展示串同源同层(面板代跑的那条就是这一条)"
+        );
         let s = crate::testutil::frame_display(&app, 80, 30);
-        assert!(s.contains("面板不代跑"), "{s}");
-        assert!(s.contains("jq -r .data.key"), "建议命令完整在场:{s}");
-        assert!(!s.contains("ghp_"), "册体不出现本体:{s}");
-        assert!(!app.key_get_logged);
-        tap(&mut app, KeyCode::Char('g'));
-        assert!(app.key_get_logged, "g 把建议命令收进日志");
-        assert!(
-            app.log.iter().any(|l| l.contains("jq -r .data.key")),
-            "建议命令收进日志可取用:{:?}",
-            app.log.first()
-        );
-        assert!(app.queue.is_empty(), "面板不代跑 get:队列里没有它");
-        assert_eq!(runner.stdin_feed_count(), 0, "没有真实子进程被拉起喂入");
-        // 键位扫一遍:没有任何一条路径会把 key get 入队
-        for c in ['g', 'l', 'm', 'k', 'j'] {
-            tap(&mut app, KeyCode::Char(c));
-        }
-        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Esc] {
-            tap(&mut app, code);
-        }
-        assert!(
-            app.queue
-                .iter()
-                .chain(app.fed_queue.iter().map(|(a, _)| a))
-                .all(|a| a.get(1).map(String::as_str) != Some("get")),
-            "任何路径都不会下发 key get:{:?}",
-            app.queue
-        );
+        assert!(s.contains("jq -r .data.key"), "册体常驻 shell 退路:{s}");
+        assert!(!s.contains(KEY_BODY), "册体不出现本体:{s}");
     }
 
     /// 复用 #53 的骨架:四本册共用同一个列表件(`catalog_sheet_lines`),钥匙册
@@ -9605,9 +10458,9 @@ mod tests {
 │          ││    到期 2099-03-04  警 expiring  剩 3 天                         │
 │          ││  汇总 2 active · 1 expiring · 1 expired                          │
 │          ││  三态按 UTC 在读取时算、永不写进文件;只标记不治理(过期不改退出   │
-│          ││  取回链接(面板不代跑,按 g 收进日志):                             │
+│          ││  取回链接(按 g 代跑;不想代跑就复制这一条去终端):                 │
 │          ││nw subscription get --name airport --root /tmp | jq -r .data.url  │
-│          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
+│          ││  与面板确认后下发的是同一条命令;确认前一个字节都不下发。         │
 │          ││  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发重   │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -9637,9 +10490,9 @@ mod tests {
 │    到期 2099-03-04  警 expiring  剩 3 天                       │
 │  汇总 2 active · 1 expiring · 1 expired                        │
 │  三态按 UTC 在读取时算、永不写进文件;只标记不治理(过期不改退   │
-│  取回链接(面板不代跑,按 g 收进日志):                           │
+│  取回链接(按 g 代跑;不想代跑就复制这一条去终端):               │
 │nw subscription get --name airport --root /tmp | jq -r .data.u  │
-│  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
+│  与面板确认后下发的是同一条命令;确认前一个字节都不下发。       │
 │  边界:订阅链接绝不进配方/锁定集/bundle/装配(续费换链接不触发   │
 │                                                                │
 │                                                                │
@@ -9673,8 +10526,10 @@ mod tests {
 │  ↑/↓ 选订阅 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤    │
 └────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 ? 帮助   q 退出                              "####;
-    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66,此后一个字节未动;
-    /// #106 轮换日那一行加了账龄列——本轮唯二变动,来历记在这里)。
+    /// 钥匙册 80×30 整帧 golden(基线 `bb19d70` + #66;#106 轮换日那一行加了账龄列;
+    /// **#97 取回本体那一族行改口径**——`g` 从「只把建议命令收进日志」升级为
+    /// 「代跑 + 确认浮层揭示本体」,册体常驻的 shell 退路三行跟着改写。差的只有
+    /// 这三行,逐字节对过;帧上其余部分与上一次刷新逐字节相同)。
     const KEY_80X30: &str = r####" Warehousetui · Nous Warehouse 驾驶舱   nwt v0.3 · nw 探测中 · 测试注入  │  NW_H
 ┌ 导航 ────┐┌ 编目 ───────────────────────────────────────────机器写 · 永不手改┐
 │  ▸ 概览  ││  当前册 钥匙 · 全部钥匙 · 编目 /r/keys.json                      │
@@ -9686,9 +10541,9 @@ mod tests {
 │          ││    主机 github.com                                               │
 │          ││    作用域 repo · read:org                                        │
 │          ││    轮换日 2026-01-15  账龄 271 天                                │
-│          ││  取回钥匙(面板不代跑,按 g 收进日志):                             │
+│          ││  取回钥匙(按 g 代跑;不想代跑就复制这一条去终端):                 │
 │          ││nw key get --name ci --root /tmp | jq -r .data.key                │
-│          ││  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快照   │
+│          ││  与面板确认后下发的是同一条命令;确认前一个字节都不下发。         │
 │          ││  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供烤  │
 │          ││                                                                  │
 │          ││                                                                  │
@@ -9705,7 +10560,7 @@ mod tests {
 │          ││  ↑/↓ 选钥匙 ·r 登记 ·g 取回 ·d 删除 ·l 重读 ·m 换册 ·/ 过滤      │
 └──────────┘└──────────────────────────────────────────────────────────────────┘
  j/k 切屏 Enter 确认 t 主题 ? 帮助 Ctrl+P 命令   q 退出主题:暗色仓库            "####;
-    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档;#106 同因加账龄列)。
+    /// 钥匙册 66×50 整帧 golden(同 80×30 的来历,紧凑档;#106 账龄列、#97 取回行)。
     const KEY_66X50: &str = r####"NW_HOME: /nw  ○ 空闲                                              
   ▸ 概览   ⚙ 装配   ✚ 健康   ▤ 配方 ▸ ▩ 编目   ✦ 设置             
 ┌ 编目 ─────────────────────────────────────────机器写 · 永不手改┐
@@ -9718,9 +10573,9 @@ mod tests {
 │    主机 github.com                                             │
 │    作用域 repo · read:org                                      │
 │    轮换日 2026-01-15  账龄 271 天                              │
-│  取回钥匙(面板不代跑,按 g 收进日志):                           │
+│  取回钥匙(按 g 代跑;不想代跑就复制这一条去终端):               │
 │nw key get --name ci --root /tmp | jq -r .data.key              │
-│  get 是上游唯一回显本体的出口:铺在屏显上会进滚动历史/截图/快   │
+│  与面板确认后下发的是同一条命令;确认前一个字节都不下发。       │
 │  边界:钥匙绝不进配方/锁定集/bundle/装配(凭据不随派分发,不提供  │
 │                                                                │
 │                                                                │
@@ -10020,8 +10875,9 @@ mod tests {
 
     /// 「一条只在一本册上成立的关切,落在查表成员上即生效」(#66 验收第 5 条)。
     ///
-    /// 钉两件真事,不靠口头约定:`g`(取回本体的建议命令)只属于订阅册与
-    /// 钥匙册——投影里有本体槽的两本(ADR-0009 §1 面板不代跑 get);
+    /// 钉两件真事,不靠口头约定:`g`(取回本体)只属于订阅册与
+    /// 钥匙册——投影里有本体槽的两本(#97 起两本分岔:钥匙册代跑 + 确认浮层,
+    /// 订阅册仍只把建议命令收进日志);
     /// `Enter`(反查)属于标签册与机器册——标签册带参反查选中的那条(#54)、
     /// 机器册无参列全部再本地精确匹配「什么标签引用了这一条」(#70;`vps`
     /// 在 `TAG_REF_KINDS` 里,机器条目可打标签)。订阅 / 钥匙册的条目不在
@@ -10038,24 +10894,27 @@ mod tests {
             // g:只有订阅册 / 钥匙册有这一条关切
             tap(&mut app, KeyCode::Char('g'));
             let has_g = matches!(label, "订阅" | "钥匙");
+            // 这一本的 `g` 一共留下几行日志(下面 Enter 那一轮按同一个数对账):
+            // 订阅 / 钥匙两册**同口径**(#97 立、#99 两册同用),一行「待确认」;
+            // 命令只在浮层与册体退路上摊,不重复进日志。
+            let mut g_lines = 1;
             if has_g {
-                // 两行:建议命令 + 「get 是上游唯一回显本体的出口」那句纪律注
-                assert_eq!(app.log.len(), log_before + 2, "{label}册 g 留两行");
-                // 日志最新在前:先入队的是建议命令那一行,纪律注压在它上面
-                let line = app.log.get(1).cloned().unwrap_or_default();
-                assert!(
-                    line.starts_with(if label == "订阅" {
-                        "取回链接"
-                    } else {
-                        "取回钥匙"
-                    }),
-                    "{label}册 g 给的是自己那一本的取回建议:{line}"
+                // 日志最新在前:这一行就是刚入的那句「待确认」
+                let line = app.log.first().cloned().unwrap_or_default();
+                assert_eq!(
+                    app.log.len(),
+                    log_before + 1,
+                    "{label}册 g 只留一行待确认(不重复摊命令)"
                 );
                 assert!(
-                    app.log[0].contains("上游唯一回显本体的出口"),
-                    "{label}册 g 同时留一句纪律注:{s}",
-                    s = app.log[0]
+                    line.starts_with("取回本体待确认:"),
+                    "{label}册 g 说的是待确认哪一条:{line}"
                 );
+                assert!(
+                    app.get_reveal.is_open(),
+                    "{label}册 g 开确认浮层(确认前一个字节都不下发)"
+                );
+                assert!(app.queue.is_empty(), "确认前不入队");
             } else {
                 assert_eq!(
                     app.log.len(),
@@ -10067,6 +10926,15 @@ mod tests {
             // g 是纯读关切:册体与选中一个字节都不动(四本同一口径)
             assert_eq!(app.catalog_len(), sheet_before, "{label}册 g 不改册体");
             assert_eq!(app.catalog_sel(), sel_before, "{label}册 g 不改选中");
+            // 钥匙册(#97):`g` 开的是确认浮层,它会把紧随其后的 Enter 当成
+            // 「确认揭示」收走——那是浮层该做的事(专测钉),这里先把浮层收起来,
+            // 好让下面 Enter 那一轮量的仍是「这一本有没有 Enter 反查」。
+            if app.get_reveal.is_open() {
+                tap(&mut app, KeyCode::Esc);
+                assert!(!app.get_reveal.is_open(), "Esc 收回确认浮层");
+                assert!(app.queue.is_empty(), "收回浮层仍一个字节都没下发");
+                g_lines += 1;
+            }
             // Enter 反查:标签册(#54 旧态)与机器册(#70 上浮)都有这一关切,
             // 但两本读法不同——标签册带参反查选中的那条,机器册无参列全部再
             // 本地按 `<kind>/<条目>` 精确匹配。订阅 / 钥匙册的条目不在
@@ -10106,7 +10974,7 @@ mod tests {
                 );
                 assert_eq!(
                     app.log.len(),
-                    log_before + 2 * usize::from(has_g),
+                    log_before + usize::from(has_g) * g_lines,
                     "{label}册 Enter 无声"
                 );
                 assert_eq!(app.catalog_len(), sheet_before, "{label}册册体原样");
@@ -10778,12 +11646,12 @@ mod tests {
         out
     }
 
-    /// 日志里**最新**一条「取回链接」行(按一次 `g` 收两行:命令 + 一句纪律;
-    /// `push_log` 是头插,最新在前,所以取第一个命中)。
+    /// 日志里**最新**一条带取回命令的行(#99 起按一次 `g` 收一行「待确认」,
+    /// 退路文案就在这行里;`push_log` 是头插,最新在前,所以取第一个命中)。
     fn 最后一条取回日志(app: &crate::app::App) -> String {
         app.log
             .iter()
-            .find(|l| l.contains("取回链接"))
+            .find(|l| l.contains("nw subscription get"))
             .cloned()
             .unwrap_or_default()
     }
@@ -10800,9 +11668,12 @@ mod tests {
             });
             tap(&mut keyed, KeyCode::Char('g'));
             assert_eq!(clicked.log, keyed.log, "{w}×{h} 点 g 段与按 g 日志逐条相同");
-            assert!(clicked.sub_get_logged, "{w}×{h} 屏上该翻成已收进日志");
+            assert!(
+                clicked.get_reveal.is_open(),
+                "{w}×{h} 点 g 段与按 g 同后果:开的是取回确认浮层"
+            );
             let f = crate::testutil::frame_display(&clicked, w, h);
-            assert!(f.contains("已按 g 收进日志"), "{w}×{h} 屏上文案翻转:{f}");
+            assert!(f.contains("即将揭示机密本体"), "{w}×{h} 浮层在场:{f}");
             assert!(
                 clicked.queue.is_empty() && clicked.fed_queue.is_empty(),
                 "{w}×{h} 不入队、不下发"
@@ -10817,6 +11688,8 @@ mod tests {
     }
 
     /// 规格验收 2 / 故事 17:再点一次 = 再按一次——日志再收,不报错、不静默。
+    /// 浮层在场时键位行整行让位(点不到 `g` 段、`g` 也归浮层),所以「再点
+    /// 一次」要走完「收浮层 → 再点」这一轮——这正是两册同一条后果链。
     #[test]
     fn 再点一次g段_等于再按一次g() {
         let (mut clicked, _r) = sub_book();
@@ -10826,7 +11699,12 @@ mod tests {
             *t == crate::layout::Target::CatalogGet
         });
         tap(&mut keyed, KeyCode::Char('g'));
+        assert!(clicked.get_reveal.is_open() && keyed.get_reveal.is_open());
         let once = clicked.log.len();
+        // 收浮层(Esc),再点 / 再按:再开一次浮层、日志再收
+        tap(&mut clicked, KeyCode::Esc);
+        tap(&mut keyed, KeyCode::Esc);
+        assert!(!clicked.get_reveal.is_open(), "Esc 收浮层");
         点中(&mut clicked, 80, 30, |t| {
             *t == crate::layout::Target::CatalogGet
         });
@@ -10834,8 +11712,9 @@ mod tests {
         assert_eq!(
             clicked.log.len(),
             once + 2,
-            "再点一次再收两行(命令 + 一句纪律),不是静默无后果"
+            "再点一次再收两行(收回浮层一行 + 再待确认一行),不是静默无后果"
         );
+        assert!(clicked.get_reveal.is_open(), "再点一次再开浮层");
         assert_eq!(clicked.log, keyed.log, "连点与连按逐条相同");
     }
 
@@ -10915,7 +11794,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert_eq!(app.log.len(), before_log, "点段间空白不新增日志");
-        assert!(!app.sub_get_logged, "点段间空白不翻状态");
+        assert!(!app.get_reveal.is_open(), "点段间空白不开浮层");
     }
 
     /// 规格验收 5 / 故事 25:边缘态(册已读到、数据仓根随后被撤)——段仍在场,点击
@@ -10942,7 +11821,7 @@ mod tests {
             "既有指路复现:{:?}",
             clicked.log.last()
         );
-        assert!(!clicked.sub_get_logged, "命令没给出就不标记已收");
+        assert!(!clicked.get_reveal.is_open(), "命令没给出就不开浮层");
         assert!(clicked.queue.is_empty(), "仍是一个字节都不下发");
         assert!(g.width > 0, "段有宽度(不是空壳)");
     }
@@ -10962,6 +11841,8 @@ mod tests {
             "默认选中第一条:{:?}",
             最后一条取回日志(&app)
         );
+        // 浮层在场时 ↑/↓ 归浮层(键盘让位)、g 段也让位:先收回浮层再换行
+        tap(&mut app, KeyCode::Esc);
         tap(&mut app, KeyCode::Down);
         点中(&mut app, 80, 30, |t| {
             *t == crate::layout::Target::CatalogGet
@@ -11072,7 +11953,7 @@ mod tests {
                 "{w}×{h} 段整段在场(不是半个命中):{row}"
             );
             点中(&mut app, w, h, |t| *t == crate::layout::Target::CatalogGet);
-            assert!(app.sub_get_logged, "{w}×{h} 点得中");
+            assert!(app.get_reveal.is_open(), "{w}×{h} 点得中(开确认浮层)");
             assert!(
                 最后一条取回日志(&app).contains("nw subscription get --name airport"),
                 "{w}×{h} 拿到当前选中那条的建议命令:{:?}",
@@ -11096,7 +11977,7 @@ mod tests {
         });
         tap(&mut keyed, KeyCode::Char('g'));
         assert_eq!(clicked.log, keyed.log, "装配态下两条路逐条相同");
-        assert!(clicked.sub_get_logged, "装配态下照旧收进日志");
+        assert!(clicked.get_reveal.is_open(), "装配态下照旧开确认浮层");
         assert!(
             clicked.queue.is_empty(),
             "装配态也不入队(只读,不碰装配互斥)"
@@ -11104,10 +11985,11 @@ mod tests {
         assert_eq!(r1.call_argvs(), before, "装配态点击仍然零调用");
     }
 
-    /// 故事 19:钥匙册各在各的键位行、各取各的命令——点「g 取回」拿到的是
-    /// `nw key get …`,与按 `g` 同路;屏显上永不出现钥匙本体。
+    /// 故事 19:钥匙册各在各的键位行、各取各的命令——点「g 取回」与按 `g`
+    /// 同路:开的是**取回本体的确认浮层**(#97),标注「即将揭示机密本体」+
+    /// 可复制的 shell 退路;确认前一个字节都不下发,屏显上永不出现钥匙本体。
     #[test]
-    fn 钥匙册点g段_拿到key_get建议命令且不现本体() {
+    fn 钥匙册点g段_开取回确认浮层且不现本体() {
         let (mut app, runner) = key_app(&[("key ls", 0, KEY_LS_ALL)]);
         tap(&mut app, KeyCode::Char('l'));
         feed(&mut app);
@@ -11116,7 +11998,15 @@ mod tests {
         点中(&mut app, 80, 30, |t| {
             *t == crate::layout::Target::CatalogGet
         });
-        assert!(app.key_get_logged, "g 把钥匙建议命令收进日志");
+        let f = crate::testutil::frame_display(&app, 80, 30);
+        assert!(f.contains("即将揭示机密本体"), "点 g 段开确认浮层:{f}");
+        assert!(
+            f.contains(&format!(
+                "nw key get --name ci --root {} | jq -r .data.key",
+                app.usable_data_root().unwrap_or_default()
+            )),
+            "浮层给足可复制的 shell 退路:{f}"
+        );
         assert!(
             app.log
                 .iter()
@@ -11124,9 +12014,8 @@ mod tests {
             "建议命令收进日志可取用:{:?}",
             app.log.last()
         );
-        assert!(app.queue.is_empty(), "队列里没有 key get");
+        assert!(app.queue.is_empty(), "确认前队列里没有 key get");
         assert_eq!(runner.call_argvs(), before, "点击路径零引擎调用");
-        let f = crate::testutil::frame_display(&app, 80, 30);
         assert!(!f.contains("ghp_"), "屏显永不出现钥匙本体:{f}");
     }
 
