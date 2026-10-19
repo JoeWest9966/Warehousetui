@@ -81,7 +81,7 @@ _Avoid_: 响应、输出
 _Avoid_: 客户端（暗示另一套契约面）、GUI
 
 **代跑（run on behalf）**：
-面板自己把引擎命令跑完。准许清单（ADR-0009 新口径，**六类**）：只读三类 `ls` / `doctor` + `validate` / `source recheck`；写动作三类 `up` / `source register` / **编目册写动作**（`vps` / `key` / `subscription` 的 register 两段式 + rm，`tag` 的 add + rm）。`key get` / `subscription get` 一律只给建议命令——上游唯一回显本体的两个出口，面板不接。
+面板自己把引擎命令跑完。准许清单（ADR-0009 新口径、spec #89 再修订，**六类**）：只读三类 `ls` / `doctor` + `validate` / `source recheck`、**编目册两本册的 `get`**（`key get` / `subscription get`，按键 `g`，只读）;写动作三类 `up` / `source register` / **编目册写动作**（`vps` / `key` / `subscription` 的 register 两段式 + rm，`tag` 的 add + rm）。两册的 `g` 虽由面板代跑这一族命令,但它过的闸比写动作更严:`g` 先开一道「即将揭示机密本体」的确认浮层(只印名字、附一条同源同层的 shell 退路、确认前一个字节都不下发),确认后才代跑,本体只从引擎 stdout envelope 进内存(`data.key` / `data.url`)、只显示在确认后的**揭示区**(唯一读者),不落盘、不进会话日志、argv 面无明文,`--raw` 不开、剪贴板不集成;切条目 / 翻册 / 切屏 / 返航 / 退出五条路**立即清空**(屏幕与内存都不留)。机器册与标签册没有 `get`,这两本上 `g` 不是这个动作。
 _Avoid_: 自动执行、一键执行
 
 **建议命令（suggested command）**：
