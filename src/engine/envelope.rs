@@ -20,9 +20,10 @@ use super::State;
 /// # 认识形状 ≠ 准许代跑(ADR-0009)
 ///
 /// 本集合答的是「我听不听得懂这个 envelope」,与「面板会不会把这个命令
-/// 跑起来」是两件事:编目册 14 个 schema 全在集合里(契约对齐),但其中
-/// `key get` / `subscription get` 的回音面板**只给建议命令、不代跑**
-/// (ADR-0009 §1:上游唯一回显本体的两个出口)。两层分工不被混淆。
+/// 跑起来」是两件事:编目册 14 个 schema 全在集合里(契约对齐),而这两个
+/// 命令的**代跑边界另有一层裁定**(ADR-0009 §1:上游唯一回显本体的两个出
+/// 口)——工单 #97 起钥匙册的 `g` 代跑 `key get`(本体只在确认后的揭示区),
+/// 订阅册那一本仍只给建议命令(归 #99)。两层分工不被混淆。
 ///
 /// 前 8 个是跟随引擎第 1–7 轮的既有面(调研底稿 §3 的 `nw/<cmd>.v1` 全集);
 /// 后 14 个是第 8 轮跟随同步(spec #50 / 工单 #51)补上的四组编目命令面,
@@ -1171,7 +1172,8 @@ pub type SubRmData = VpsRmData;
 /// `KeySummary` 五个键冻结;`KeyEntry` 有 secret 槽,但 ls **刻意不是
 /// `KeyEntry`** —— 投影结构上放不下本体,#18 三不印):分享清单、截图、贴
 /// 日志都不泄密,面板连「这像是哪把钥匙」都不该让人推断出来。这是**投影**
-/// 不是引用:想读本体只有 `nw key get` 一条路(且面板不代跑,ADR-0009 §1)。
+/// 不是引用:想读本体只有 `nw key get` 一条路(工单 #97 起钥匙册的 `g` 代跑
+/// 它,本体只进确认后的揭示区;订阅册那一本归 #99)。
 ///
 /// `scopes` 恒为数组(上游不用 omitempty,没给 = `[]`,一种形状);`rotatedAt`
 /// 恒在(新登记 = 登记日 UTC,机器写产物不该有「没有轮换日」的第三态)。
@@ -1279,6 +1281,35 @@ impl KeyRegisterData {
     /// 闸里有 fail(落账闸的口径来源:任一不过 = 一个字节都不落)。
     pub fn has_fail(&self) -> bool {
         self.gates.iter().any(CatalogGate::is_fail)
+    }
+}
+
+/// `nw key get --name <名>` 的 data(工单 #97 起面板代跑 get、只吃这一个形状):
+/// 名字 + **唯一那一格钥匙本体**(`data.key`)。上游 `KeyEntry` 的其余键
+/// (kind / host / scopes / rotatedAt)是登记元数据,面板不在这里消费——
+/// 本体要进面板只有这一条路,进来就只进揭示区(见
+/// [`crate::screens::catalog::RevealedBody`])。
+///
+/// `Debug` **刻意不打印本体**:与 `SecretBody` / `RevealedBody` 同一条纪律
+/// (ADR-0009 §3),只报名字与字节数——否则这个中转类型的 `{:?}` 就是第二处
+/// 泄漏面。订阅册那一格(`data.url`)由工单 #99 落同族类型,两册共用揭示区。
+#[derive(Clone, Deserialize)]
+pub struct KeyGetData {
+    #[serde(default)]
+    pub name: String,
+    /// 钥匙本体。**唯一读者是揭示区渲染**(经 `RevealedBody`),别处不许读。
+    #[serde(default)]
+    pub key: String,
+}
+
+impl std::fmt::Debug for KeyGetData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "KeyGetData {{ name: {:?}, key: <回显 {} 字节,不打印内容> }}",
+            self.name,
+            self.key.len()
+        )
     }
 }
 
@@ -1490,10 +1521,10 @@ mod tests {
     #[test]
     fn 契约守卫_认识形状不等于准许代跑_两层分工不被混淆() {
         // ADR-0009:key get / subscription get 的 schema 在认识集合里(契约对齐),
-        // 但面板对这两个命令只给建议命令、不代跑——认识形状答「我听不听得懂」,
+        // 而「面板会不会跑起来」是另一层裁定——认识形状答「我听不听得懂」,
         // 准许代跑答「面板会不会跑起来」,两件事。这里守前一半:认识集合里
         // 确有这两个 schema(它们不是「需升级」),代跑边界由 ADR-0009 裁定、
-        // 由功能票(#56/#57)落地,不在契约守卫这一层。
+        // 由功能票(#56/#57 立,#97/#99 改口径)落地,不在契约守卫这一层。
         assert!(is_known_schema("nw/key-get.v1"));
         assert!(is_known_schema("nw/subscription-get.v1"));
         // 反面:真不认识的仍走守卫,不因为集合扩了就放松
@@ -1868,5 +1899,37 @@ mod tests {
         assert_eq!(g.action, "not_found");
         assert!(!g.removed && !g.written, "文件一个字节都不动");
         assert_eq!(g.remaining, 2);
+    }
+
+    // ---- #97 钥匙册取回本体:唯一回显槽 + Debug 不打印 ----
+
+    /// `nw/key-get.v1` 的 data 只有名字与本体两格(#97 代跑 get 消费的既有
+    /// 形状,契约守卫零改动)。形状不匹配(缺 `key` / 类型不对)时 `data_as`
+    /// 给 None——面板不按旧形状降级解析、不猜(取不到就回指路)。
+    #[test]
+    fn 解析_key_get_data_只有名字与本体两格_形状不符不猜() {
+        let ok = envelope_with_schema(
+            "nw/key-get.v1",
+            "0.1.0",
+            json!({"name": "ci", "key": "ghp_fakeCIToken000000000000000000"}),
+        );
+        let d: KeyGetData = ok.data_as().expect("既有形状,零改动");
+        assert_eq!(d.name, "ci");
+        assert_eq!(d.key.len(), 33, "本体字节数可报(内容不进任何字符串)");
+        // Debug 只说字节数:这个中转类型的 `{:?}` 不是第二处泄漏面
+        let dbg = format!("{d:?}");
+        assert!(!dbg.contains("ghp_"), "Debug 不打印本体:{dbg}");
+        assert!(dbg.contains("不打印内容"), "Debug 只报字节数:{dbg}");
+        // 形状不符:不猜、不给 None 之外的第二条路
+        let bad = envelope_with_schema("nw/key-get.v1", "0.1.0", json!({"name": "ci"}));
+        assert!(
+            bad.data_as::<KeyGetData>().is_some(),
+            "缺 key 槽 = 空串(上游不带这一格时面板按取不到处理,不按旧形状猜)"
+        );
+        let wrong = envelope_with_schema("nw/key-get.v1", "0.1.0", json!({"name": 7, "key": []}));
+        assert!(
+            wrong.data_as::<KeyGetData>().is_none(),
+            "类型不匹配 = 不可定型,走指路"
+        );
     }
 }

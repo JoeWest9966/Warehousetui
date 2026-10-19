@@ -617,9 +617,16 @@ pub struct App {
     pub key_rm_confirm: bool,
     /// 最近一次 `key rm` 回音(证据五字段原样呈现)。
     pub key_rm_result: Option<EngineOutput>,
-    /// 取回钥匙本体的建议命令是否已收进日志(#57,键 `g`):命令可见可取用,
-    /// 但面板**不执行**它(ADR-0009 §1:get 一律只给建议命令)。
-    pub key_get_logged: bool,
+    /// 取回本体的流程态(#97:确认浮层 / 在途 / 已揭示 / 闲置;spec #89 修订
+    /// ADR-0009 §1 后,钥匙册的 `g` 代跑 `key get`)。**两册共用一份**——
+    /// 订阅册(#99)打开的是同一条状态、同一个浮层与揭示区。
+    ///
+    /// 本体只以 [`crate::screens::catalog::RevealedBody`] 的形式在这里停留,
+    /// `Debug` 不打印内容、随 drop 擦字节;切条目 / 翻册 / 切屏 / 返航 / 退出
+    /// 五条路都调 [`crate::screens::catalog::GetReveal::clear`](见
+    /// [`App::catalog_sel_mut`] / [`App::cycle_catalog_kind`] /
+    /// [`App::next_screen`] / [`App::prev_screen`] / 册体 Esc / 退出)。
+    pub get_reveal: crate::screens::catalog::GetReveal,
     /// 配方域建议命令的只读选中态(#39,键 `c`):命令可见可取用,
     /// 但面板**不执行**它(ADR-0003:执行权留给操作者)。选中行/切域即复位。
     pub rc_bake_sel: bool,
@@ -866,7 +873,7 @@ impl App {
             key_sel: 0,
             key_rm_confirm: false,
             key_rm_result: None,
-            key_get_logged: false,
+            get_reveal: crate::screens::catalog::GetReveal::Idle,
             fed_queue: Vec::new(),
             rc_bake_sel: false,
             rc_filter: String::new(),
@@ -1198,13 +1205,8 @@ impl App {
             Target::Activate if self.recipe_edit_open() => self.recipe_edit_commit(),
             Target::DismissPopup if self.recipe_edit_open() => self.recipe_edit_abandon(),
             // 点导航(常畅)/屏 Tab(紧凑)切屏,与 j/k 同语义。
-            Target::NavTo(s) => {
-                self.screen = s;
-                self.rc_filter_on = false; // 点导航切屏同样退过滤输入态(#61)
-                self.catalog_filter_on = false; // 编目册过滤同理(#69)
-                self.ah_filter_on = false; // 装配历史过滤同理(#101)
-                self.ah_raw = None; // 原文浮层不跨屏(#101)
-            }
+            // 与 j/k 同一后果(含 #97 擦揭示区):见 [`Self::set_screen`]。
+            Target::NavTo(s) => self.set_screen(s),
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
             // 登记 kind 选项行在场时优先于配方列表(弹层优先级)。
@@ -1247,6 +1249,11 @@ impl App {
                 RegState::KindPick => self.dispatch_register(),
                 RegState::Review if self.reg_can_commit() => self.dispatch_register_commit(),
                 RegState::PreScanPick => self.reg_pick_confirm(),
+                // 取回确认浮层的「Enter 确认揭示」段(#97):与键盘 Enter 完全
+                // 同路——经 `App::confirm_get_reveal` 入队,主循环取出后走
+                // `spawn_engine` 唯一入口。守卫在最前:浮层在场时不该落到
+                // 发射仪式那条路上(它在别的屏)。
+                _ if self.get_reveal.is_open() => self.confirm_get_reveal(),
                 _ => self.launch_selected_lock(),
             },
             // 帮助「任意处关」与仪式「Esc 返航」:与键盘 Esc 同一路
@@ -1455,6 +1462,11 @@ impl App {
         } else if self.reg_state != RegState::Idle {
             // 登记返航与 Esc 完全同路(鼠标点确认屏与键盘 Esc 一个后果)
             self.cancel_register();
+        } else if self.get_reveal.overlay_on() {
+            // 取回确认浮层返航(#97):只收状态。确认前一个字节都没下发;在途那
+            // 一次收不回,回音到达即丢弃(`GetReveal::absorb` 只在等回音态
+            // 收账)。Esc / q / 点「返航」段三条路同一个后果,语义不漂移。
+            self.dismiss_get_reveal();
         } else if self.vps_rm_confirm {
             self.dismiss_rm(crate::screens::CatalogKind::Vps);
         } else if self.tag_rm_confirm {
@@ -1834,6 +1846,15 @@ impl App {
             self.on_key_catalog_filter(k);
             return;
         }
+        // 取回本体的确认浮层(#97):与登记 / 删除两道同级的**册内浮层**——它在场时
+        // 吞键,册体键位(↑/↓ / r / d / l / g / Enter / m)一个都不受理
+        // (尤其 `g`:再按一次不该叠一个浮层,也不该换一条 argv)。排在四本册的
+        // 登记流 / 删除确认守卫之前:两者互斥(`g` 只在册体态受理),这一条只是
+        // 兜底,真正常态永远只开一个。
+        if self.get_reveal.overlay_on() {
+            self.on_key_get_reveal(k);
+            return;
+        }
         // 装配历史过滤输入态(#101):与 rc_filter/catalog_filter 同级的顶层
         // 输入态(优先于屏键位,但只在历史视图在场时吞键——Esc 收词/清词,
         // 关视图即退输入态)。
@@ -1925,7 +1946,12 @@ impl App {
             RegState::Idle => {}
         }
         match k.code {
-            KeyCode::Char('q') if !self.assembling => self.quit = true,
+            KeyCode::Char('q') if !self.assembling => {
+                // 退出即擦(#97 验收第 4 条):本体不留在屏幕上,也不留在内存里
+                // (随 `GetReveal` drop 擦字节)。
+                self.get_reveal.clear();
+                self.quit = true;
+            }
             KeyCode::Char('?') => {
                 self.help = true;
                 self.help_offset = 0; // 重开从首行看起
@@ -2183,7 +2209,7 @@ impl App {
         // 先切到那一屏再派发,否则操作者在概览屏执行「U 自升级」会得到
         // 零反馈(`key_settings` 根本不到场)。壳级行 `screen` 为 None,不切。
         if let Some(target) = row.screen {
-            self.screen = target;
+            self.set_screen(target); // 跨屏先切屏,与 j/k 同一后果(#97)
         }
         self.close_cmd_panel();
         // 修饰键照登记表带(#119):唯一带 CONTROL 的行是 Ctrl+P 自己,按 NONE
@@ -2208,16 +2234,16 @@ impl App {
         let n = self.ls.as_ref().map(|l| l.profiles.len()).unwrap_or(0);
         match k.code {
             KeyCode::Char('r') => self.refresh_ls(),
-            KeyCode::Char('a') => self.screen = Screen::Assemble,
-            KeyCode::Char('h') => self.screen = Screen::Health,
-            KeyCode::Char('l') => self.screen = Screen::Recipes,
+            KeyCode::Char('a') => self.set_screen(Screen::Assemble),
+            KeyCode::Char('h') => self.set_screen(Screen::Health),
+            KeyCode::Char('l') => self.set_screen(Screen::Recipes),
             // #68:「家」直达第六屏(编目)。键取 `v`(屏枚举 `Screen::Vps` 首字母),
             // 与既有 `a/h/l` 跳屏同构;屏上指令栏、帮助、README 三处同写 `v`
             // (屏上看到的与我按下的是一回事,故事 5)。HUD 不写它——HUD 是壳级
             // 提示栏,只有 j/k 切屏 / Enter 确认 / t 主题 / ? 帮助 / q 退出。
             // 纯导航零引擎调用——册体到编目屏按 `l` 才读,门禁也按册各自给,
             // 不在指令栏做禁用态。
-            KeyCode::Char('v') => self.screen = Screen::Vps,
+            KeyCode::Char('v') => self.set_screen(Screen::Vps),
             KeyCode::Down | KeyCode::Char('n') => {
                 if n > 0 {
                     self.ov_sel = (self.ov_sel + 1) % n;
@@ -3517,10 +3543,19 @@ impl App {
         // Esc 一键回全量(#69):不在输入态时,按 Esc 清当前册过滤词并让选中回顶
         // (输入态下 Esc 归 `on_key_catalog_filter` 的 Cancel,同一后果链)。
         // 无过滤词时 Esc 什么都不做(与 #61 五域同口径)。
+        //
+        // #97 补第三种后果:过滤词本来就没有、而**揭示区在本体在场**时,Esc 擦
+        // 揭示区——册体上 `Esc` 是返航,返航即清(验收第 4 条五条路之一)。
+        // 有过滤词时仍只清词:两条后果不并成一句,操作者按一下只发生一件事。
         if let KeyCode::Esc = k.code {
             if !self.catalog_filter().is_empty() {
                 self.clear_catalog_filter();
                 self.push_log("已清空过滤词:回到编目全量".to_string());
+            } else if self.get_reveal.revealed().is_some() {
+                self.get_reveal.clear();
+                self.push_log(
+                    "揭示区已清空:本体不在屏幕上,也不在内存里留(随类型 drop 擦字节)".to_string(),
+                );
             }
             return;
         }
@@ -3811,6 +3846,9 @@ impl App {
             Some("register") => self.on_echo_register(kind, out),
             Some("add") => self.on_echo_add(out),
             Some("rm") => self.on_echo_rm(kind, out),
+            // get 回音(#97):`key get` 的 stdout envelope 里那一格本体进揭示区
+            // (只此一条路;`subscription get` 归 #99,届时同一个分发臂)。
+            Some("get") => self.on_echo_get(out),
             _ => {}
         }
     }
@@ -3992,6 +4030,7 @@ impl App {
         // 的命中清单顺带到别的册上,也不让它在别的册上被 Enter 误触。
         self.tag_jump = crate::screens::catalog::TagJump::Idle;
         let k = self.catalog_kind;
+        self.get_reveal.clear(); // 翻册即擦(#97):本体不顺着换册带到别本上
         self.push_log(format!(
             "换册:{}册({});{}",
             k.label(),
@@ -4015,8 +4054,7 @@ impl App {
         // 换册即离开机器册语境(#70):反查上浮是机器册独有的只读动作,跳册同样
         // 收回任何在场 / 在途的反查——与 `cycle_catalog_kind` 同一条纪律。
         self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
-        self.screen = Screen::Vps;
-        self.catalog_filter_on = false; // 进册不顺手进过滤输入态(同 NavTo)
+        self.set_screen(Screen::Vps); // 同 NavTo:进册退过滤输入态、擦揭示区
         let name = self
             .catalog_sheet()
             .and_then(|s| s.entries.get(idx).map(|e| e.name.clone()));
@@ -4102,11 +4140,17 @@ impl App {
 
     /// 册级选中态的**单一查表**:当前是哪一本,就借出它自己的选中槽与行数
     /// (键位 ↑/↓、鼠标点行、滚轮移选中都走这一口,换册不串味)。
+    ///
+    /// #97 起它同时是**揭示区的清空点**:选中态一动(↑/↓ / 点行 / 滚轮 /
+    /// 册体刷新后的钳位)就擦掉已揭示的本体——「切条目即清」因此只有一处
+    /// 实现,不存在第二条改了选中却忘了清揭示区的路(验收第 4 条:屏幕无残留、
+    /// 内存里也不留,本体随旧值 drop 被擦字节)。
     /// 行数取**可见行数**(#69:`catalog_sel` 是「看得见的那一行」在可见列表里
     /// 的位置,↑/↓ / 点行 / 钳位都建立在 `catalog_sel ∈ [0, 可见行数)` 上;
     /// 不过滤时可见行数 = 册体条数,与过去逐字等价)。
     /// 只读侧的同源口径是 [`App::catalog_sel`] / [`App::catalog_len`]。
     fn catalog_sel_mut(&mut self) -> (&mut usize, usize) {
+        self.get_reveal.clear();
         let n = self.catalog_visible().len();
         (self.catalog_kind.sel_mut(self), n)
     }
@@ -4306,7 +4350,7 @@ impl App {
     /// vps 命中 → 机器册(#120):册已读过就按机器名落选中;册里没有这一台
     /// (标签引用可能已悬空)就明说;册还没读过就入队刷新 + 记待落地选中位。
     fn jump_to_machine(&mut self, name: &str, label: &str) {
-        self.screen = Screen::Vps;
+        self.set_screen(Screen::Vps);
         self.catalog_kind = crate::screens::CatalogKind::Vps;
         let found = self
             .vps_ls
@@ -4349,7 +4393,7 @@ impl App {
     /// 是它们的家,硬安一个去处等于造第六本册)。落法是「选中所在的那条源」
     /// ——源的详情栏就摊着它的条目清单,一步看得见命中那一条。
     fn jump_to_source_entry(&mut self, id: &str, label: &str) {
-        self.screen = Screen::Recipes;
+        self.set_screen(Screen::Recipes);
         self.rc_domain = Domain::Sources;
         self.rc_bake_sel = false; // 切域即复位只读选中态(#39 既有口径)
         let found = self
@@ -4566,27 +4610,108 @@ impl App {
         }
     }
 
-    /// 取回钥匙本体的**建议命令**(ADR-0009 §1:面板不代跑 `key get`)。纯函数层产
+    /// 取回钥匙本体的**建议命令**(与给人复制的 shell 退路同源同层)。纯函数层产
     /// argv + 展示串(`engine::commands::key_get_suggest`,与 bake / recipe new /
-    /// subscription get 同源同层);`App` 只在这里读它,**没有任何路径会把它下发**
-    /// ——队列里永远不会出现 `key get`。
+    /// subscription get 同一层);`App` 只在这里读它——**确认前没有任何路径
+    /// 把它下发**,确认后才经 [`Self::spawn_engine`] 这唯一入口出去。
     pub fn key_get_suggest(&self) -> Option<crate::engine::commands::Suggest> {
         let name = self.selected_key_name()?;
         let root = self.usable_data_root()?;
         Some(crate::engine::commands::key_get_suggest(&name, &root))
     }
 
-    /// 把取回钥匙的建议命令收进日志(键 `g`):命令文案可取用,执行权留给操作者。
-    /// **只收命令不收本体**——这条命令本身不含钥匙,面板也从不代跑它。
-    pub fn log_key_get_suggest(&mut self) {
-        match self.key_get_suggest() {
-            Some(s) => {
-                self.push_log(format!("取回钥匙(面板不代跑,自己执行):{}", s.display));
-                self.push_log("get 是上游唯一回显本体的出口:别把它贴回面板(不进日志/配置/快照)。");
-                self.key_get_logged = true;
-            }
-            None => self.push_log(format!("取回钥匙未给出:{}", self.key_gate_hint())),
+    /// 钥匙册的 `g`(#97):开**取回本体的确认浮层**。
+    ///
+    /// spec #89 修订 ADR-0009 §1「`key get` / `subscription get` 一律只给建议
+    /// 命令」那一裁:钥匙册的 `g` 从「只把建议命令收进日志」升级为「面板代跑
+    /// 再加确认浮层揭示本体」。三道门,任一不过即**一个字节都不下发、连浮层都
+    /// 不开**,只留既有指路(与 #57 的 `g` 指路同一套措辞),不报错、不猜、
+    /// 不落半条命令:
+    /// ① 引擎缺 key 组能力(组级探针的答案,`get` 不进探针清单);
+    /// ② 数据仓根不可用;
+    /// ③ 没有选中的钥匙。
+    ///
+    /// 订阅册(#99)那一本仍是「只收建议命令进日志」——分岔只在「哪一本的
+    /// `g` 落到哪个方法」,浮层 / 揭示区 / 清空时机是同一份实现。
+    pub fn open_key_get_reveal(&mut self) {
+        if !self.capabilities.enabled(Capability::Key) {
+            self.push_log(format!("取回钥匙未下发:{}", self.key_gate_hint()));
+            return;
         }
+        let Some(suggest) = self.key_get_suggest() else {
+            self.push_log(format!("取回钥匙未给出:{}", self.key_gate_hint()));
+            return;
+        };
+        let name = self.selected_key_name().unwrap_or_default();
+        self.raise_get_reveal(name, suggest);
+    }
+
+    /// 开取回确认浮层的**共用一步**(#97;#99 的订阅册只写一个同形状的
+    /// `open_sub_get_reveal` 转进来):把要下发的那一条 argv 与 shell 退路
+    /// 算好带着,**一个字节都不下发**——浮层开着 = 执行权还在操作者手里。
+    ///
+    /// argv 与退路同源同层(都是 [`crate::engine::commands`] 那一份
+    /// `Suggest`):操作者复制去终端敲的,与面板确认后跑的是同一条命令。
+    fn raise_get_reveal(&mut self, name: String, suggest: crate::engine::commands::Suggest) {
+        self.get_reveal
+            .open(name, suggest.argv, suggest.display.clone());
+        self.push_log(format!(
+            "取回本体待确认:{}(确认前一个字节都没下发;退路 {})",
+            self.get_reveal.name().unwrap_or("—"),
+            suggest.display
+        ));
+    }
+
+    /// 确认揭示:拿走浮层上那条 argv,经**唯一入口**入队(主循环取出后走
+    /// [`Self::spawn_engine`])。**只有确认浮层在场才拿得到**——没确认就没有
+    /// 下发这条路(`GetReveal::confirm` 在类型上只从 `Confirm` 态给出 argv)。
+    pub fn confirm_get_reveal(&mut self) {
+        let Some(argv) = self.get_reveal.confirm() else {
+            return;
+        };
+        let name = self.get_reveal.name().unwrap_or("—").to_string();
+        self.queue.push(argv);
+        self.push_log(format!(
+            "取回本体已确认下发:{name}(只读,本体只在确认后的揭示区)"
+        ));
+    }
+
+    /// 取回回音落账(#97):`key get` 的 stdout envelope 里那一格本体进揭示区。
+    /// 取不到(rc≠0 / 契约守卫 / data 不可定型)一律回闲置并走既有指路
+    /// (日志),不画空揭示区、不按旧形状降级解析、不猜。
+    fn on_echo_get(&mut self, out: EngineOutput) {
+        let body = catalog::key_get_body(&out);
+        let name = self.get_reveal.name().unwrap_or("—").to_string();
+        match self.get_reveal.absorb(body) {
+            Ok(()) => self.push_log(format!(
+                "本体已进揭示区:{name}(不落盘、不进日志;切条目/翻册/切屏/返航/退出即清)"
+            )),
+            Err(reason) => self.push_log(format!("取回本体未给出:{reason}")),
+        }
+    }
+
+    /// 取回确认浮层的键位(#97):Enter 确认揭示(经唯一入口下发)、Esc/q 返航
+    /// (一个字节都没下发,或已下发的那一次收不回、回音将丢弃)。其余键不受理
+    /// ——浮层在场时册体键位整个让位(与登记 / 删除两道浮层同一优先级)。
+    fn on_key_get_reveal(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter if self.get_reveal.is_open() => self.confirm_get_reveal(),
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_get_reveal(),
+            _ => {}
+        }
+    }
+
+    /// 收回取回确认浮层(键盘 Esc/q 与鼠标点「返航」段同路):清状态,本体
+    /// 一个字节都不进面板(已下发的那一次收不回,回音到达即丢弃——
+    /// [`GetReveal::absorb`] 只在等回音态收账)。
+    fn dismiss_get_reveal(&mut self) {
+        let flying = self.get_reveal.in_flight();
+        self.get_reveal.clear();
+        self.push_log(if flying {
+            "取回已返航:已下发的那一次收不回,回音将丢弃(本体一个字节都没进面板)"
+        } else {
+            "取回已返航:一个字节都没下发"
+        });
     }
 
     /// 读一次钥匙编目册(只读;编目不存在 = 空数组 rc 0,合法空态)。投影**没有
@@ -4912,22 +5037,31 @@ impl App {
 
     // ---- 通用 ----
 
-    pub fn next_screen(&mut self) {
-        let i = (self.screen.index() + 1) % Screen::ALL.len();
-        self.screen = Screen::ALL[i];
+    /// 切屏的**单一入口**:`j`/`k`、点导航(常畅)/ 屏 Tab(紧凑)(#62 起两条路
+    /// 走同一个 `Target::NavTo`)、概览 `a/h/l/v` 跳屏、命令面板跨屏条目(#119)、
+    /// 反查跳转(#120)全部走这一句,于是**切屏的后果只有一份**——不存在第二条
+    /// 换了屏却漏掉某一条后果的路。
+    ///
+    /// 后果四条:退三处过滤输入态(词留着,回屏还在)、收装配原文浮层(#101
+    /// 不跨屏)、以及 #97 起的**擦揭示区**——本体不跟着换屏走,回到编目册时也不
+    /// 旧事重提。
+    pub fn set_screen(&mut self, s: Screen) {
+        self.screen = s;
         self.rc_filter_on = false; // 切屏退过滤输入态(#61),过滤词留着回屏还在
         self.catalog_filter_on = false; // 编目册过滤同理(#69):退输入态、留词
         self.ah_filter_on = false; // 装配历史过滤同理(#101)
         self.ah_raw = None; // 原文浮层不跨屏(#101)
+        self.get_reveal.clear(); // 切屏即擦揭示区(#97):本体不跨屏残留
+    }
+
+    pub fn next_screen(&mut self) {
+        let i = (self.screen.index() + 1) % Screen::ALL.len();
+        self.set_screen(Screen::ALL[i]);
     }
 
     pub fn prev_screen(&mut self) {
         let i = (self.screen.index() + Screen::ALL.len() - 1) % Screen::ALL.len();
-        self.screen = Screen::ALL[i];
-        self.rc_filter_on = false;
-        self.catalog_filter_on = false;
-        self.ah_filter_on = false;
-        self.ah_raw = None;
+        self.set_screen(Screen::ALL[i]);
     }
 
     pub fn cycle_theme(&mut self) {

@@ -475,6 +475,28 @@ fn catalog_hits(inner: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
         }
         return;
     }
+    // 取回本体的确认浮层(#97):与删除确认同一族两段命中——「Enter 确认揭示」
+    // 给 `Activate`(点 = 确认,经 `App::confirm_get_reveal` 入队走唯一入口),
+    // 「Esc/q 返航」给 `DismissPopup`(点 = 收回,一个字节都没下发)。
+    // 在途态只有返航那一段(已下发的那一次收不回),所以这里按 `is_open` 判。
+    if app.get_reveal.is_open() {
+        let popup = popup_rect(
+            inner,
+            crate::screens::catalog::GET_REVEAL_W,
+            crate::screens::catalog::GET_REVEAL_H,
+        );
+        if popup.width > 0 && popup.height > 0 {
+            let key_y = popup.y + popup.height - 2;
+            two_key_segments(
+                popup,
+                key_y,
+                crate::screens::catalog::GET_REVEAL_KEY_CONFIRM,
+                RITUAL_KEY_RETURN,
+                hits,
+            );
+        }
+        return;
+    }
     // 册体:清单行命中(渲染每条目占 `row_lines` 行,命中按条给整块)
     // #69:只给「看得见的那一行」产命中——行数取可见行数(经过滤后的),
     // 不过滤时 = 册体条数,与过去逐字等价;点第 i 个可见行 = 选中第 i 个
