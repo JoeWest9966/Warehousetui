@@ -728,6 +728,19 @@ pub(crate) fn integrity_cols(area: Rect) -> (Rect, Rect) {
     )
 }
 
+/// 健康屏 validate 档的正文分区(#98):顶部两行「校验范围」条(三档 + 两侧
+/// 现状)+ 其余。渲染侧 `screens::health::render_health` 与命中侧
+/// [`health_hits`] 共用这一处,几何零分歧(ADR-0005)——条子多高,27 项清单
+/// 就下移多高,鼠标点行才不会错位。
+pub(crate) fn health_validate_rows(area: Rect) -> (Rect, Rect) {
+    let rows = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(2),
+        ratatui::layout::Constraint::Min(1),
+    ])
+    .split(area);
+    (rows[0], rows[1])
+}
+
 /// 健康屏:validate 模式下「27 项」列表在 55% 左栏、带边框、首行即数据
 /// (doctor 模式是只读七面卡,无选中目标);外部源漂移模式(#40)的左栏是
 /// 「结论横幅 + 已登记外部源清单」,清单行在横幅之下,几何见
@@ -772,7 +785,10 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     if !matches!(app.hl_mode, crate::app::HealthMode::Validate) {
         return;
     }
-    let (cols, _) = h_split2(area, 55, 45);
+    // 校验范围条(#98)占掉顶部两行:清单几何随之下移,与渲染同一个
+    // `health_validate_rows`
+    let (_, rest) = health_validate_rows(area);
+    let (cols, _) = h_split2(rest, 55, 45);
     let lst = shrink_border(cols);
     let n = app
         .hl_result

@@ -60,11 +60,24 @@ pub fn validate_lock(lock: &str, repo: &str, quiet: bool) -> Vec<String> {
     validate_argv(&[("--lock", lock)], repo, quiet)
 }
 
+/// 校验:两侧同给(spec #89 工单 #98 的第三态)。
+///
+/// 一次跑全 27 项里的**跨文件检查项**(1–19):单侧 `--lock` 在命令路径推导
+/// 不出数据仓根时发现不全配方与组件清单,配方与锁定集同给就不靠发现兜底
+/// (spec #89 用户故事 2)。`--repo` 恒落,纪律同两个单侧态——不假设引擎拿
+/// 当前目录兜底。`quiet` 留位槽位同两个单侧态,缺省不落。
+///
+/// 旗标顺序冻结:`validate` → `--recipe` → `--lock` → `--repo` → (`--quiet`)。
+pub fn validate_both(recipe: &str, lock: &str, repo: &str, quiet: bool) -> Vec<String> {
+    validate_argv(&[("--recipe", recipe), ("--lock", lock)], repo, quiet)
+}
+
 /// validate argv 的**唯一拼装处**(spec #89 工单 #92):两侧槽位按序落,
 /// `--repo` 恒落,`quiet` 留位**缺省不落**。
 ///
-/// 双侧同给(`--recipe` + `--lock`)归工单 #98 —— 到那时在本函数上多传一组
-/// 槽位即可,**不另立第二条拼装路径**(旗标一处真相,与 `ls` / `up` 同层)。
+/// 三态(单侧配方 / 单侧锁定集 / 双侧同给)都从本函数出,**不另立第二条
+/// 拼装路径**:旗标一处真相,与 `ls` / `up` 同层(工单 #98 在两侧槽位上多
+/// 传一组即得双侧同给,见 [`validate_both`])。
 ///
 /// `quiet` 是**留位槽位**:上游 `--quiet` 今天是压 stderr 进度行的 no-op
 /// (进度阶段没启用,警告永不被压),语义以上游激活为准;面板不摆 UI 入口,
@@ -1500,6 +1513,43 @@ mod tests {
         ] {
             assert!(a.contains(&"--repo".to_string()), "{a:?} 必须带 --repo");
         }
+    }
+
+    #[test]
+    fn validate_双侧同给_配方与锁定集一次跑全_旗标顺序稳定可断言() {
+        // spec #89 工单 #98 的第三态:`--recipe` + `--lock` 同给,27 项里的
+        // 跨文件项(1–19)一次跑全,不靠单侧模式的发现兜底。旗标顺序冻结:
+        // validate → --recipe → --lock → --repo(quiet 留位仍在最末)。
+        assert_eq!(
+            validate_both(
+                "recipes/research-desk/recipe.yaml",
+                "/root/.nous-warehouse/locks/9f8e.nwlock",
+                "/data/repo",
+                false
+            ),
+            vec![
+                "validate",
+                "--recipe",
+                "recipes/research-desk/recipe.yaml",
+                "--lock",
+                "/root/.nous-warehouse/locks/9f8e.nwlock",
+                "--repo",
+                "/data/repo"
+            ]
+        );
+        // 顺序不是「恰好这七个元素」而已:--recipe 必在 --lock 之前、
+        // --repo 必在两侧之后(上游 usage 的形状,可断言所以不变)
+        let a = validate_both("r.yaml", "x.nwlock", "/r", false);
+        let i = |f: &str| a.iter().position(|s| s == f).expect("旗标在场");
+        assert!(i("--recipe") < i("--lock"), "配方侧在前:{a:?}");
+        assert!(i("--lock") < i("--repo"), "锁定集侧在数据仓根之前:{a:?}");
+        assert_eq!(a.len(), 7, "双侧七元素,quiet 留位缺省不落:{a:?}");
+        // quiet 留位槽位(#92)在双侧同给上同一纪律:缺省不落、给了才落,
+        // 落点仍在 --repo 之后(argv 末位)
+        assert!(!a.iter().any(|s| s == "--quiet"), "{a:?} 缺省不落 quiet");
+        let q = validate_both("r.yaml", "x.nwlock", "/r", true);
+        assert_eq!(q.last().map(String::as_str), Some("--quiet"), "{q:?}");
+        assert_eq!(q.len(), 8, "双侧给了 quiet 才多一枚:{q:?}");
     }
 
     #[test]
