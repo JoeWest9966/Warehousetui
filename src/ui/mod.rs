@@ -308,7 +308,12 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
             "装配中:动作已锁定"
         };
         spans.push(Span::styled(hint, p.dim()));
-    } else if app.home_input || app.data_input || app.rc_filter_on || app.ah_filter_on {
+    } else if app.home_input
+        || app.data_input
+        || app.slot_input.is_some()
+        || app.rc_filter_on
+        || app.ah_filter_on
+    {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("输入中:Enter 确认 · Esc/q 放弃", p.accent()));
     } else if app.reg_state == crate::app::RegState::RepoInput {
@@ -830,6 +835,32 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         write: false,
     },
     HelpRow {
+        key: "a",
+        desc: "设置:手填烘焙资产目录(可选槽位 --assets-dir,未设不落)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('a'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
+        key: "r",
+        desc: "设置:手填 bundle 取货仓(可选槽位 --bundle-repo,未设不落)",
+        screen: Some(Screen::Settings),
+        domain: None,
+        mode: None,
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    HelpRow {
         key: "e",
         desc: "设置:拉起 $EDITOR",
         screen: Some(Screen::Settings),
@@ -1268,6 +1299,16 @@ mod tests {
         app.data_input = true;
         let s = render_to_string(&app, 100, 30);
         assert!(s.contains("输入中"), "数据仓根手填共用输入态提示");
+        assert!(s.contains("Enter 确认"));
+    }
+
+    /// 烘焙两槽位手填(#93)与另两份手填同一条 HUD 提示。
+    #[test]
+    fn 烘焙槽位输入态_hud_给键位提示() {
+        let mut app = ui_app();
+        app.slot_input = Some(crate::app::BakeSlot::BundleRepo);
+        let s = render_to_string(&app, 100, 30);
+        assert!(s.contains("输入中"), "槽位手填共用输入态提示");
         assert!(s.contains("Enter 确认"));
     }
 

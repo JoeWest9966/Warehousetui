@@ -290,10 +290,10 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         ritual_hits(body, class, &mut hits);
         return hits;
     }
-    // 手填浮层(NW_HOME / 数据仓根)对鼠标惰性:打字仍走键盘;浮层打开
-    // 期间鼠标不分派任何命中区——点击只作用于浮层,不误触底层
-    // (spec #15 故事 14/16;数据仓根手填沿用同一条)。
-    if app.home_input || app.data_input {
+    // 手填浮层(NW_HOME / 数据仓根 / 烘焙两槽位)对鼠标惰性:打字仍走键盘;
+    // 浮层打开期间鼠标不分派任何命中区——点击只作用于浮层,不误触底层
+    // (spec #15 故事 14/16;数据仓根手填沿用同一条,#93 两槽位同族)。
+    if app.home_input || app.data_input || app.slot_input.is_some() {
         return hits;
     }
     // 全局命令面板(#119):叠加浮层,与帮助浮层同级的吞点击纪律——底层
@@ -1646,6 +1646,11 @@ mod tests {
             hits.is_empty(),
             "手填浮层对鼠标惰性:零命中区(#20 不分派,故事 16)"
         );
+        // 烘焙两槽位手填(#93):同一级浮层,同一条惰性纪律
+        app.home_input = false;
+        app.slot_input = Some(crate::app::BakeSlot::AssetsDir);
+        let hits = hitmap(a, &app, size_class(a));
+        assert!(hits.is_empty(), "槽位手填浮层同样对鼠标惰性:零命中区");
     }
 
     #[test]
