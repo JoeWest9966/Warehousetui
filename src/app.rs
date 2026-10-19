@@ -174,6 +174,46 @@ impl DataRootCause {
     }
 }
 
+/// 烘焙的两个**可选槽位**(spec #89 工单 #93):资产目录 / bundle 取货仓。
+///
+/// 与数据仓根一样是操作者设置的一等设置(设置屏可见可改、缺省未设、持久化),
+/// 但**不是前提闸**:未设时 bake 建议命令照旧给得出,只是这两个旗标不落
+/// (让引擎自己算)。两者共用一套手填输入态与持久化链,只差旗标、标签与键位。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BakeSlot {
+    /// 资产目录(`--assets-dir`):真机首跑时 sha256 逐个按真资产算。
+    AssetsDir,
+    /// bundle 取货仓(`--bundle-repo`):数据仓没有 git origin 可推导时钉死取货仓。
+    BundleRepo,
+}
+
+impl BakeSlot {
+    /// 上游旗标名:argv 面唯一拼法(与 `commands::recipe_bake` 同一处口径,
+    /// 设置屏的指路也照它说,不另写一串)。
+    pub fn flag(self) -> &'static str {
+        match self {
+            BakeSlot::AssetsDir => crate::engine::commands::ASSETS_DIR_FLAG,
+            BakeSlot::BundleRepo => crate::engine::commands::BUNDLE_REPO_FLAG,
+        }
+    }
+
+    /// 设置屏行标签(领域词,照工单 #93 的「资产目录」/「bundle 取货仓」)。
+    pub fn label(self) -> &'static str {
+        match self {
+            BakeSlot::AssetsDir => "资产目录",
+            BakeSlot::BundleRepo => "bundle 取货仓",
+        }
+    }
+
+    /// 设置屏手填键位(取设置屏未占用的 a / r;与 d = 数据仓根同一族)。
+    pub fn key(self) -> char {
+        match self {
+            BakeSlot::AssetsDir => 'a',
+            BakeSlot::BundleRepo => 'r',
+        }
+    }
+}
+
 /// 复核门三(清单为空)的两种可区分原因(spec #34 / 工单 #40):
 /// **五域还没读到** 与 **编目真为空** 是两件事,话不许互相冒充——
 /// `ls` 还没回音时不能对操作者断言「没有记录」。
@@ -332,6 +372,13 @@ pub struct App {
     /// 数据仓根(spec #24,票 #27):与 NW_HOME 并列的一等设置,
     /// 持久化进 config;None = 未设——五域入口走指路,不兑当前目录。
     pub data_root: Option<String>,
+    /// 烘焙的**可选**资产目录槽位(spec #89 工单 #93):一等设置,持久化进
+    /// config;None = 未设——槽位不落,让引擎按 release 预设自己算。
+    /// 它不是前提闸:未设也照旧给得出 bake 建议命令。
+    pub assets_dir: Option<String>,
+    /// 烘焙的**可选** bundle 取货仓槽位(同上):None = 未设——槽位不落,
+    /// 取货仓由引擎从数据仓 git origin 推导(面板不复制这个推导)。
+    pub bundle_repo: Option<String>,
     pub engine: EngineStatus,
     pub engine_version: String,
     /// 能力探测门(#29):问引擎自己所得的三态结论,入口可用性唯一事实源。
@@ -578,6 +625,11 @@ pub struct App {
     pub data_input: bool,
     /// 数据仓根手填缓冲区(同款上限与拒绝语义)。
     pub data_buf: String,
+    /// 烘焙两槽位手填输入模式(#93,设置屏 a / r 进入):两个槽位共用一份
+    /// 输入态,`Some(哪一个)` 记正在填的是资产目录还是 bundle 取货仓。
+    pub slot_input: Option<BakeSlot>,
+    /// 槽位手填缓冲区(与 NW_HOME / 数据仓根手填同款上限与拒绝语义)。
+    pub slot_buf: String,
     /// config.toml 解析失败的人话证据;None = 配置健康。
     pub config_error: Option<String>,
     /// 自升级(#121):`U` 呼出的全屏叠加层状态。六态见
@@ -675,6 +727,7 @@ impl App {
                     .map(|h| format!("{h}/.nous-warehouse"))
             })
             .unwrap_or_else(|| "~/.nous-warehouse".into());
+        let cfg = crate::engine::config::load().0;
         Self {
             quit: false,
             help: false,
@@ -685,7 +738,9 @@ impl App {
             assembling: false,
             blink: false,
             nw_home,
-            data_root: crate::engine::config::load().0.data_root,
+            data_root: cfg.data_root,
+            assets_dir: cfg.assets_dir,
+            bundle_repo: cfg.bundle_repo,
             engine,
             engine_version: "探测中".into(),
             capabilities: Gate::default(),
@@ -782,6 +837,8 @@ impl App {
             home_buf: String::new(),
             data_input: false,
             data_buf: String::new(),
+            slot_input: None,
+            slot_buf: String::new(),
             config_error,
             mouse_enabled: true,
             upgrade: UpgradePhase::Idle,
@@ -1712,6 +1769,12 @@ impl App {
             self.on_key_data_input(k);
             return;
         }
+        // 烘焙两槽位手填(#93):与 NW_HOME / 数据仓根手填同一级顶层输入态
+        // (浮层优先级见上),两个槽位共用一份输入态。
+        if self.slot_input.is_some() {
+            self.on_key_slot_input(k);
+            return;
+        }
         // 配方屏搜索过滤输入态(#61):与两份手填同一级(输入态优先于屏键位),
         // 但只在本屏在场时吞键——切屏即退输入态,过滤词保留可预期。
         if self.rc_filter_on && self.screen == Screen::Recipes {
@@ -2524,6 +2587,8 @@ impl App {
             recipe,
             self.usable_data_root().as_deref(),
             self.capabilities.enabled(Capability::RecipeBake),
+            self.assets_dir.as_deref(),
+            self.bundle_repo.as_deref(),
         )
         .map(|_| ())
     }
@@ -2578,6 +2643,13 @@ impl App {
                 self.data_input = true;
                 self.data_buf = self.data_root.clone().unwrap_or_default();
                 self.push_log("手填数据仓根:Enter 确认,Esc/q 放弃");
+            }
+            // 烘焙两槽位(#93):a = 资产目录,r = bundle 取货仓。两个槽位共用
+            // 一套输入态(`slot_input` 记在填哪一个),键位与旗标名同族。
+            // r 在版本对照页是「重查」,所以这一支只归常驻面板。
+            KeyCode::Char('a') => self.open_slot_input(BakeSlot::AssetsDir),
+            KeyCode::Char('r') if self.settings_page == SettingsPage::Panel => {
+                self.open_slot_input(BakeSlot::BundleRepo)
             }
             KeyCode::Char('e') => self.pending_editor = true,
             KeyCode::Char('m') => self.toggle_mouse_capture(),
@@ -2802,6 +2874,80 @@ impl App {
         self.data_input = false;
         self.data_buf.clear();
         self.apply_data_root(expanded);
+    }
+
+    /// 烘焙槽位手填键位:与 NW_HOME / 数据仓根手填同一条通用态机
+    /// ([`input::on_key`]),本函数只接这两个可选槽位的后果链。两个槽位
+    /// 共用一份输入态,后果链也共用一条(只差槽位与说法)。
+    fn on_key_slot_input(&mut self, k: KeyEvent) {
+        let Some(slot) = self.slot_input else { return };
+        match input::on_key(&mut self.slot_buf, k) {
+            InputAction::Submit => self.apply_slot_input(slot),
+            InputAction::Cancel => {
+                self.slot_input = None;
+                self.slot_buf.clear();
+                self.push_log(format!("取消手填{}", slot.label()));
+            }
+            InputAction::Edited | InputAction::Ignored => {}
+        }
+    }
+
+    /// 进入烘焙槽位手填:预填当前值(未设则空),进输入态。
+    pub fn open_slot_input(&mut self, slot: BakeSlot) {
+        self.slot_input = Some(slot);
+        self.slot_buf = self.bake_slot(slot).clone().unwrap_or_default();
+        self.push_log(format!(
+            "手填{}:Enter 确认,Esc/q 放弃;不填则 {} 不落槽",
+            slot.label(),
+            slot.flag()
+        ));
+    }
+
+    /// 槽位当前值(未设 = `None`)。两个槽位各是各的值,互不顶替。
+    fn bake_slot(&self, slot: BakeSlot) -> &Option<String> {
+        match slot {
+            BakeSlot::AssetsDir => &self.assets_dir,
+            BakeSlot::BundleRepo => &self.bundle_repo,
+        }
+    }
+
+    /// 槽位手填生效:去空白 + `~` 展开;空值拒绝并留驻可改(与数据仓根手填
+    /// 同口径——原值保持不变,不退输入态)。路径不存在**接受入状态**:这两个
+    /// 槽位由引擎自己判,面板不替引擎预检,也不在输入层拦。
+    pub fn apply_slot_input(&mut self, slot: BakeSlot) {
+        let Some(trimmed) = input::normalize(&self.slot_buf) else {
+            self.push_log(format!("{}手填被拒:空值,原值保持不变", slot.label()));
+            return;
+        };
+        let expanded = crate::engine::discover::expand_tilde(&trimmed)
+            .display()
+            .to_string();
+        self.slot_input = None;
+        self.slot_buf.clear();
+        self.apply_bake_slot(slot, expanded);
+    }
+
+    /// 槽位生效链(与 [`Self::apply_data_root`] 同形,但**不下发任何引擎命令**
+    /// —— bake 是建议命令,槽位只改下一次算出来的 argv):写状态 → 持久化
+    /// config → 留一句人话。
+    pub fn apply_bake_slot(&mut self, slot: BakeSlot, next: String) {
+        match slot {
+            BakeSlot::AssetsDir => self.assets_dir = Some(next.clone()),
+            BakeSlot::BundleRepo => self.bundle_repo = Some(next.clone()),
+        }
+        let mut cfg = crate::engine::config::load().0;
+        match slot {
+            BakeSlot::AssetsDir => cfg.assets_dir = Some(next.clone()),
+            BakeSlot::BundleRepo => cfg.bundle_repo = Some(next.clone()),
+        }
+        if let Err(e) = crate::engine::config::save(&cfg) {
+            self.push_log(format!("{}持久化失败:{e}", slot.label()));
+        }
+        self.push_log(format!(
+            "{}已设为 {next}({} 落槽;bake 建议命令随之更新)",
+            slot.label(),
+            slot.flag()
+        ));
     }
 
     /// 数据仓根生效链(手填与将来其他入口共用):写状态 → 持久化 config →
@@ -6219,6 +6365,106 @@ mod tests {
             app.log.iter().any(|l| l.contains("数据仓根切换")),
             "日志留证据"
         );
+    }
+
+    // ---- #93 烘焙两槽位(可选增强,一等设置) ----
+
+    #[test]
+    fn 烘焙两槽位_手填生效同链_持久化且两个槽位互不顶替() {
+        let (_g, _cfg) = env_locked();
+        let mut app = settings_app();
+        // 缺省未设:不落槽,也不拿当前目录兜底
+        assert_eq!(app.assets_dir, None, "资产目录缺省未设");
+        assert_eq!(app.bundle_repo, None, "bundle 取货仓缺省未设");
+        // a = 资产目录
+        app.update(Message::Key(key('a')));
+        assert_eq!(
+            app.slot_input,
+            Some(crate::app::BakeSlot::AssetsDir),
+            "a 进资产目录手填"
+        );
+        type_str(&mut app, "/data/assets");
+        assert_eq!(app.slot_buf, "/data/assets", "缓冲区回显");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.assets_dir.as_deref(),
+            Some("/data/assets"),
+            "新值落状态树"
+        );
+        assert!(
+            app.slot_input.is_none() && app.slot_buf.is_empty(),
+            "用完即退"
+        );
+        let (cfg, err) = crate::engine::config::load();
+        assert!(err.is_none());
+        assert_eq!(
+            cfg.assets_dir.as_deref(),
+            Some("/data/assets"),
+            "持久化进 config,重启(重读)仍生效"
+        );
+        // r = bundle 取货仓(与 a 同一套输入态,只差槽位)
+        app.update(Message::Key(key('r')));
+        assert_eq!(
+            app.slot_input,
+            Some(crate::app::BakeSlot::BundleRepo),
+            "r 进 bundle 取货仓手填"
+        );
+        type_str(&mut app, "git@github.com:me/bundles.git");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.bundle_repo.as_deref(),
+            Some("git@github.com:me/bundles.git"),
+            "第二个槽位落状态树"
+        );
+        let (cfg2, _) = crate::engine::config::load();
+        assert_eq!(
+            cfg2.bundle_repo.as_deref(),
+            Some("git@github.com:me/bundles.git"),
+            "第二个槽位也持久化"
+        );
+        assert_eq!(
+            cfg2.assets_dir.as_deref(),
+            Some("/data/assets"),
+            "设一个不顶掉另一个"
+        );
+        // 这两个槽位不入队任何引擎命令:bake 是建议命令,面板不代跑(ADR-0003)
+        assert!(
+            !app.queue
+                .iter()
+                .any(|a| a.first().is_some_and(|s| s == "recipe")),
+            "槽位生效不下发引擎命令:{:?}",
+            app.queue
+        );
+    }
+
+    #[test]
+    fn 烘焙槽位_空值拒绝留驻_esc_放弃不改状态() {
+        let mut app = settings_app();
+        app.assets_dir = Some("/data/assets".into());
+        app.update(Message::Key(key('a')));
+        app.slot_buf = "   ".into();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.assets_dir.as_deref(),
+            Some("/data/assets"),
+            "空值拒绝,原值保持不变(与数据仓根手填同口径)"
+        );
+        assert!(app.slot_input.is_some(), "拒绝后留输入态可改");
+        // Esc 放弃:不退面板、不改状态
+        app.update(Message::Key(key('q')));
+        assert!(!app.quit, "输入态 q = 放弃,不是退出");
+        assert!(app.slot_input.is_none(), "放弃退输入态");
+        assert_eq!(app.assets_dir.as_deref(), Some("/data/assets"));
+        assert!(app.slot_buf.is_empty());
     }
 
     #[test]

@@ -23,6 +23,16 @@ pub struct Config {
     /// None = 未设——面板不猜、不拿当前目录兜底,五域走指路(#27)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_root: Option<String>,
+    /// 烘焙的**可选**资产目录槽位(`--assets-dir`;spec #89 工单 #93)。
+    /// None = 未设——槽位不落,让引擎按 release 预设自己算 sha256。
+    /// 与 `data_root` 一样是操作者设置的一等设置:设置屏可见可改、持久化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets_dir: Option<String>,
+    /// 烘焙的**可选** bundle 取货仓槽位(`--bundle-repo`;spec #89 工单 #93)。
+    /// None = 未设——槽位不落,取货仓由引擎从数据仓 git origin 推导
+    /// (面板**不复制**这个推导)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_repo: Option<String>,
     /// 主题 warehouse | high_contrast。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
@@ -140,6 +150,42 @@ mod tests {
             Some("/data/repo"),
             "重启仍生效的落盘语义"
         );
+    }
+
+    #[test]
+    fn 烘焙两槽位_缺省未设_写回再读不丢() {
+        let (cfg, err) = parse("");
+        assert!(err.is_none());
+        assert_eq!(cfg.assets_dir, None, "资产目录缺省未设:一个字节都不落槽");
+        assert_eq!(cfg.bundle_repo, None, "bundle 取货仓缺省未设");
+        // 缺省态不往 config 里写键(与 data_root 同口径:未设即不存在)
+        let off = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!off.contains("assets_dir"), "未设不落键:{off}");
+        assert!(!off.contains("bundle_repo"), "未设不落键:{off}");
+        // 设了:写回再读不丢(重启仍生效的落盘语义)
+        let (mut on, _) = parse("");
+        on.assets_dir = Some("/data/assets".into());
+        on.bundle_repo = Some("git@github.com:me/bundles.git".into());
+        let text = toml::to_string_pretty(&on).unwrap();
+        assert!(
+            text.contains("assets_dir = \"/data/assets\""),
+            "键值落盘:{text}"
+        );
+        assert!(
+            text.contains("bundle_repo = \"git@github.com:me/bundles.git\""),
+            "键值落盘:{text}"
+        );
+        let (back, err2) = parse(&text);
+        assert!(err2.is_none());
+        assert_eq!(back.assets_dir.as_deref(), Some("/data/assets"));
+        assert_eq!(
+            back.bundle_repo.as_deref(),
+            Some("git@github.com:me/bundles.git")
+        );
+        // 只设一个:另一个照旧未设(两个槽位各自独立)
+        let (one, _) = parse("assets_dir = \"/data/assets\"");
+        assert_eq!(one.assets_dir.as_deref(), Some("/data/assets"));
+        assert_eq!(one.bundle_repo, None);
     }
 
     #[test]

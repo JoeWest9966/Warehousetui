@@ -27,6 +27,23 @@ fn draw(app: &App, w: u16, h: u16) -> String {
     term.backend().to_string()
 }
 
+/// 整帧的**去掉空白与边框字符**的内容(#93):建议命令按内层宽折行是真的,
+/// 列断点随宽度变;跨词断言一律在扁平串上做,测的是操作者读到的内容而不是
+/// 某一行的断点。边框字符也要去掉——否则折行处夹着一串 `│`,跨行片段
+/// 就对不上了。
+fn flat_frame(app: &App, w: u16, h: u16) -> String {
+    crate::testutil::frame_display(app, w, h)
+        .chars()
+        .filter(|c| {
+            !c.is_whitespace()
+                && !matches!(
+                    c,
+                    '│' | '─' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼'
+                )
+        })
+        .collect()
+}
+
 fn feed(app: &mut App, out: EngineOutput) {
     app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
 }
@@ -733,6 +750,96 @@ fn 设置屏_数据仓根手填浮层渲染() {
     assert!(s.contains("/data/repo"), "缓冲区回显");
     assert!(s.contains("█"), "块光标可见");
     assert!(s.contains("Enter 确认"), "键位提示");
+}
+
+// ---- #93 烘焙两槽位:一等设置(可见 / 可改 / 缺省未设 / 持久化) ----
+
+#[test]
+fn 设置屏_烘焙两槽位_缺省未设显式标出_设了就显示原值() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    // 缺省未设:显式标「未设置」,不说成空、也不拿当前目录兜底
+    let unset = draw(&app, 110, 30);
+    assert!(unset.contains("资产目录"), "行在场:{unset}");
+    assert!(unset.contains("bundle 取货仓"), "行在场:{unset}");
+    assert!(unset.contains("(a 手填)"), "键位提示:{unset}");
+    assert!(unset.contains("(r 手填)"), "键位提示:{unset}");
+    assert_eq!(
+        unset.matches("未设置").count(),
+        2,
+        "两个槽位都显式标未设:{unset}"
+    );
+    // 设了就显示原值(可见 = 操作者知道现在 bake 会带上什么)
+    app.assets_dir = Some("/data/assets".into());
+    app.bundle_repo = Some("git@github.com:me/bundles.git".into());
+    let set = draw(&app, 110, 30);
+    assert!(set.contains("资产目录  /data/assets"), "原值在场:{set}");
+    assert!(
+        set.contains("bundle 取货仓  git@github.com:me/bundles.git"),
+        "原值在场:{set}"
+    );
+    // config 状态仍在屏内(竖向预算:新行不许把末行挤出去)
+    assert!(set.contains("config 状态"), "末行没被挤出去:{set}");
+}
+
+#[test]
+fn 设置屏_烘焙槽位手填浮层渲染_点名旗标() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.slot_input = Some(crate::app::BakeSlot::AssetsDir);
+    app.slot_buf = "/data/assets".into();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("手填资产目录"), "浮层标题:{s}");
+    assert!(s.contains("/data/assets"), "缓冲区回显:{s}");
+    assert!(s.contains("█"), "块光标可见:{s}");
+    assert!(s.contains("Enter 确认"), "键位提示:{s}");
+    assert!(s.contains("--assets-dir 落槽"), "末行点名 argv 旗标:{s}");
+    // bundle 取货仓:同一渲染件,只差标题与旗标
+    app.slot_input = Some(crate::app::BakeSlot::BundleRepo);
+    app.slot_buf = "git@github.com:me/bundles.git".into();
+    let s2 = draw(&app, 110, 30);
+    assert!(s2.contains("手填bundle 取货仓"), "另一个槽位同构:{s2}");
+    assert!(s2.contains("--bundle-repo 落槽"), "旗标各自点名:{s2}");
+}
+
+#[test]
+fn 配方域建议命令_两槽位设了才落_未设时与现状逐字节相同() {
+    let mut app = bake_app();
+    app.data_root = Some("/tmp".into());
+    // 未设:命令与 #93 之前逐字节相同(不多一个字节)。命令按内层宽折行,
+    // 所以断言在**去掉空白的扁平串**上做——测的是操作者读到的内容,
+    // 不是某一行的列断点。
+    let plain = flat_frame(&app, 110, 30);
+    assert!(
+        plain.contains("nwrecipebakeresearch-desk@1.0.0--outresearch-desk.sh--repo/tmp"),
+        "未设时命令原样:{plain}"
+    );
+    assert!(!plain.contains("--assets-dir"), "未设不落槽:{plain}");
+    assert!(!plain.contains("--bundle-repo"), "未设不落槽:{plain}");
+    // 设了:两槽位接在 --repo 之后,展示串仍由 argv 拼出(同源同层)
+    app.assets_dir = Some("/data/assets".into());
+    app.bundle_repo = Some("git@github.com:me/bundles.git".into());
+    let s = flat_frame(&app, 110, 30);
+    assert!(s.contains("--assets-dir/data/assets"), "资产目录落槽:{s}");
+    assert!(
+        s.contains("--bundle-repogit@github.com:me/bundles.git"),
+        "取货仓落槽:{s}"
+    );
+    // 落点顺序:两个可选槽位都在 --repo 之后
+    let repo_at = s.find("--repo/tmp").expect("--repo 在场");
+    let assets_at = s.find("--assets-dir").expect("资产目录在场");
+    let bundle_at = s.find("--bundle-repo").expect("取货仓在场");
+    assert!(repo_at < assets_at && assets_at < bundle_at, "顺序:{s}");
+    // 只设一个:另一个照样不落
+    let mut one = bake_app();
+    one.data_root = Some("/tmp".into());
+    one.assets_dir = Some("/data/assets".into());
+    let one_s = flat_frame(&one, 110, 30);
+    assert!(
+        one_s.contains("--assets-dir/data/assets"),
+        "设了的落:{one_s}"
+    );
+    assert!(!one_s.contains("--bundle-repo"), "没设的不落:{one_s}");
 }
 
 // ---- #22 纵向密度:50 行富余用满(常畅/紧凑两档共用同一 render_*) ----
