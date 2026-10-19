@@ -7,6 +7,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
+use crate::app::BakeSlot;
 use crate::engine::capability;
 use crate::engine::config;
 use crate::engine::{Capability, Probe, GATE_HINT};
@@ -39,6 +40,10 @@ pub fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     }
     if app.data_input {
         render_data_input(frame, area, app);
+    }
+    // 烘焙两槽位手填(#93):与两份手填同级的浮层,同一渲染件、同一优先级。
+    if let Some(slot) = app.slot_input {
+        render_slot_input(frame, area, app, slot);
     }
 }
 
@@ -183,6 +188,19 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
             "  数据仓根  {}  (d 手填)",
             app.data_root.as_deref().unwrap_or("未设置")
         )),
+        // 烘焙的两个可选槽位(#93):与数据仓根同族的一等设置——可见、可改、
+        // 缺省未设。**不并进上一行**:两槽位各是各的值,合成一行会把
+        // 「谁设了谁没设」读成一句含糊话。未设显式标「未设置」,不说成空。
+        Line::from(format!(
+            "  资产目录  {}  ({} 手填)",
+            app.assets_dir.as_deref().unwrap_or("未设置"),
+            BakeSlot::AssetsDir.key()
+        )),
+        Line::from(format!(
+            "  bundle 取货仓  {}  ({} 手填)",
+            app.bundle_repo.as_deref().unwrap_or("未设置"),
+            BakeSlot::BundleRepo.key()
+        )),
         // 三态指路与五域入口同源(标题+说法,互不冒充);健康时给一行安心
         match app.data_root_cause() {
             Some(cause) => {
@@ -230,17 +248,19 @@ fn render_panel(frame: &mut Frame, inner: Rect, app: &App) {
             "  只读展示;按 e 用 $EDITOR 打开 · 按 U 自升级 nwt(sha256 同款闸)",
             p.dim(),
         )),
-        Line::from(""),
+        // #93:竖向预算被 110×30 内层 26 行钉死,烘焙两槽位各占一行之后,
+        // 尾部这几条次要说明之间的空行让出来——「铁律」「发现优先级」
+        // 「config 状态」连成一束收尾,不再各空一行。空行是装饰,让出来
+        // 不丢任何信息;反过来说,把 config 状态挤出手屏才会丢信息。
         Line::from(Span::styled(
             "  铁律:配置永不存密钥;env 只显示 present 布尔",
             p.dim(),
         )),
+        Line::from(Span::styled(
+            "  发现优先级:--nw-bin > 配置 > PATH > $NW_HOME/nw",
+            p.dim(),
+        )),
     ]);
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  发现优先级:--nw-bin > 配置 > PATH > $NW_HOME/nw",
-        p.dim(),
-    )));
     // config 解析失败告警:人话一句 + 路径 + e 修复指引;健康时给一行安心
     match app.config_error.as_deref() {
         Some(err) => {
@@ -390,6 +410,22 @@ fn render_data_input(frame: &mut Frame, area: Rect, app: &App) {
         &app.data_buf,
         " 手填数据仓根 ",
         "  生效后写配置并立即刷新五域;坏路径会得到指路",
+    );
+}
+
+/// 烘焙槽位手填浮层(#93):与数据仓根手填同一渲染件,只差标题与末行提示。
+/// 提示里点名旗标——操作者看得到自己设的是 argv 上哪一槽。
+fn render_slot_input(frame: &mut Frame, area: Rect, app: &App, slot: BakeSlot) {
+    render_text_input(
+        frame,
+        area,
+        app,
+        &app.slot_buf,
+        &format!(" 手填{} ", slot.label()),
+        &format!(
+            "  生效后写配置并进 bake 建议命令({} 落槽);留空即不落槽",
+            slot.flag()
+        ),
     );
 }
 
