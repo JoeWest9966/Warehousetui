@@ -21,8 +21,8 @@ pub use envelope::{
     CheckResult, CheckedSource, ComponentRow, DoctorData, DoctorResult, Drift, Envelope, Evidence,
     KeyGetData, KeyLsData, KeyRegisterData, KeyRmData, KeySummary, LockRow, LsData, ManifestBrief,
     ProfileRow, RecheckData, RecipeRow, RegisterAcceptance, RegisterData, RegisterEntry, SourceRow,
-    SubLsData, SubRegisterData, SubRmData, SubStatusCounts, SubSummary, TagAddData, TagEntry,
-    TagLsData, TagRmData, UpData, ValidateData, ValidateSummary, VpsEntry, VpsLsData,
+    SubGetData, SubLsData, SubRegisterData, SubRmData, SubStatusCounts, SubSummary, TagAddData,
+    TagEntry, TagLsData, TagRmData, UpData, ValidateData, ValidateSummary, VpsEntry, VpsLsData,
     VpsRegisterData, VpsRmData,
 };
 #[allow(unused_imports)]
