@@ -1282,6 +1282,35 @@ impl KeyRegisterData {
     }
 }
 
+/// `nw key get --name <名>` 的 data(工单 #97 起面板代跑 get、只吃这一个形状):
+/// 名字 + **唯一那一格钥匙本体**(`data.key`)。上游 `KeyEntry` 的其余键
+/// (kind / host / scopes / rotatedAt)是登记元数据,面板不在这里消费——
+/// 本体要进面板只有这一条路,进来就只进揭示区(见
+/// [`crate::screens::catalog::RevealedBody`])。
+///
+/// `Debug` **刻意不打印本体**:与 `SecretBody` / `RevealedBody` 同一条纪律
+/// (ADR-0009 §3),只报名字与字节数——否则这个中转类型的 `{:?}` 就是第二处
+/// 泄漏面。订阅册那一格(`data.url`)由工单 #99 落同族类型,两册共用揭示区。
+#[derive(Clone, Deserialize)]
+pub struct KeyGetData {
+    #[serde(default)]
+    pub name: String,
+    /// 钥匙本体。**唯一读者是揭示区渲染**(经 `RevealedBody`),别处不许读。
+    #[serde(default)]
+    pub key: String,
+}
+
+impl std::fmt::Debug for KeyGetData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "KeyGetData {{ name: {:?}, key: <回显 {} 字节,不打印内容> }}",
+            self.name,
+            self.key.len()
+        )
+    }
+}
+
 /// `nw key rm <名>` 的 data 与 `nw vps rm` **逐字相同**——上游 `entry.RmOutcome`
 /// 是四组共用的同一个类型。删不存在的名 → rc 3 且 `keys.json` 一个字节都不动;
 /// 删光最后一条留空 `entries` 数组的文件,不删文件。
@@ -1868,5 +1897,37 @@ mod tests {
         assert_eq!(g.action, "not_found");
         assert!(!g.removed && !g.written, "文件一个字节都不动");
         assert_eq!(g.remaining, 2);
+    }
+
+    // ---- #97 钥匙册取回本体:唯一回显槽 + Debug 不打印 ----
+
+    /// `nw/key-get.v1` 的 data 只有名字与本体两格(#97 代跑 get 消费的既有
+    /// 形状,契约守卫零改动)。形状不匹配(缺 `key` / 类型不对)时 `data_as`
+    /// 给 None——面板不按旧形状降级解析、不猜(取不到就回指路)。
+    #[test]
+    fn 解析_key_get_data_只有名字与本体两格_形状不符不猜() {
+        let ok = envelope_with_schema(
+            "nw/key-get.v1",
+            "0.1.0",
+            json!({"name": "ci", "key": "ghp_fakeCIToken000000000000000000"}),
+        );
+        let d: KeyGetData = ok.data_as().expect("既有形状,零改动");
+        assert_eq!(d.name, "ci");
+        assert_eq!(d.key.len(), 33, "本体字节数可报(内容不进任何字符串)");
+        // Debug 只说字节数:这个中转类型的 `{:?}` 不是第二处泄漏面
+        let dbg = format!("{d:?}");
+        assert!(!dbg.contains("ghp_"), "Debug 不打印本体:{dbg}");
+        assert!(dbg.contains("不打印内容"), "Debug 只报字节数:{dbg}");
+        // 形状不符:不猜、不给 None 之外的第二条路
+        let bad = envelope_with_schema("nw/key-get.v1", "0.1.0", json!({"name": "ci"}));
+        assert!(
+            bad.data_as::<KeyGetData>().is_some(),
+            "缺 key 槽 = 空串(上游不带这一格时面板按取不到处理,不按旧形状猜)"
+        );
+        let wrong = envelope_with_schema("nw/key-get.v1", "0.1.0", json!({"name": 7, "key": []}));
+        assert!(
+            wrong.data_as::<KeyGetData>().is_none(),
+            "类型不匹配 = 不可定型,走指路"
+        );
     }
 }
