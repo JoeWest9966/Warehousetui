@@ -4538,10 +4538,13 @@ impl App {
     /// 健康屏 validate 档:27 项冻结检查按**配方文件**跑。引擎没有
     /// 「按派名 validate」这个形状(`--recipe` 收配方路径),而派名 = 配方名
     /// 是 #5 命名决策(引擎 up 的缺省同款)—— 据此在 ls 的配方域找行,
-    /// 用行自带的 path 拼数据仓根下的配方文件。引擎从配方路径自己推导
-    /// 仓根(`<root>/recipes/<名>/recipe.yaml` → root),不必另带 --repo。
-    /// 缺前提(根没设 / 配方不在仓里 / 引擎没给 path)→ 日志说清、不下发
-    /// 一条必败的命令(与 bake 建议同纪律:不给半条命令)。
+    /// 用行自带的 path 拼数据仓根下的配方文件。
+    ///
+    /// 数据仓根**显式携带**(`--repo`,与 `ls --repo` / `bake --repo` 同源同
+    /// 纪律,spec #89 工单 #92):不假设引擎拿当前目录兜底,锁定集放在引擎
+    /// 推导不出的目录布局时跨文件检查项也跑得全。
+    /// 缺前提(根没设 / 不可用 / 配方不在仓里 / 引擎没给 path)→ 日志说清、
+    /// 不下发一条必败的命令(与 bake 建议同纪律:不给半条命令)。
     fn queue_validate(&mut self, profile: &str) {
         let Some(root) = self.usable_data_root() else {
             self.push_log("validate 要读配方文件:数据仓根未设,去设置屏按 d 录入");
@@ -4556,7 +4559,9 @@ impl App {
         match rel {
             Some(rel) => {
                 let abs = format!("{}/{rel}", root.trim_end_matches('/'));
-                self.queue.push(commands::validate_recipe(&abs));
+                // quiet 留位槽(#92):面板本票不摆 UI 入口,缺省不落——
+                // 与加这个槽位之前的 argv 逐字节一致
+                self.queue.push(commands::validate_recipe(&abs, &root, false));
             }
             None => self.push_log(format!(
                 "派 {profile} 的配方不在当前数据仓(或引擎 ls 没给配方路径):validate 无从拼装,先 ls 刷新或换数据仓根"
@@ -4991,8 +4996,11 @@ impl App {
             };
         // 预跑 argv:与健康屏 validate 同源(同一 `commands::validate_recipe`
         // 构造函数),只是路径指向 scratch(编辑态)——recipe.yaml 仍未动。
-        // 绝对路径由写侧句柄出(壳层不拼字符串)。
-        self.queue.push(commands::validate_recipe(&slot.abs()));
+        // 绝对路径由写侧句柄出(壳层不拼字符串);数据仓根照单侧配方的同一
+        // 纪律显式给(#92),scratch 落在配方同目录,根槽与健康屏一字不差。
+        // quiet 留位同样缺省不落(面板没有入口)。
+        self.queue
+            .push(commands::validate_recipe(&slot.abs(), &root, false));
         if let Some(f) = self.rc_edit_flow.as_mut() {
             f.plan = Some(plan);
             f.scratch = Some(slot);
@@ -5404,17 +5412,58 @@ mod tests {
         );
         app.hl_mode = HealthMode::Validate;
         app.run_health();
+        let argv = app.queue.last().expect("validate 已入队").clone();
         assert_eq!(
-            app.queue.last().unwrap(),
-            &vec![
+            argv,
+            vec![
                 "validate".to_string(),
                 "--recipe".into(),
                 // 引擎 --recipe 收配方路径(裸派名实测 rc 3 INPUT_INVALID);
-                // 派名 = 配方名(#5),path 取自 ls 行,仓根由引擎从路径自推导
-                format!("{}/recipes/research-desk/recipe.yaml", root.display())
-            ]
+                // 派名 = 配方名(#5),path 取自 ls 行
+                format!("{}/recipes/research-desk/recipe.yaml", root.display()),
+                // 数据仓根显式携带(#92):与 ls --repo / bake --repo 同源同纪律,
+                // 不假设引擎拿当前目录兜底
+                "--repo".into(),
+                root.display().to_string(),
+            ],
+            "单侧配方两槽位:--recipe + --repo,quiet 留位缺省不落"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--quiet"),
+            "quiet 缺省不落:与加这个留位槽之前的 argv 逐字节同形(只多 --repo):{argv:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 健康validate档_数据仓根未设或不可用_不入队_指路话术一字不改() {
+        // 门只有一道:usable_data_root 拿不到根(未设 / 设了但目录不可用)
+        // 就一条命令都不下发,日志只说清缺什么——**绝不给半条命令**。
+        for (root, why) in [
+            (None, "未设"),
+            (
+                Some("/nonexistent-nwt-validate-root-xyz".to_string()),
+                "不可用",
+            ),
+        ] {
+            let mut app = fake_app();
+            app.data_root = root;
+            app.ls = Some(
+                serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[{"name":"desk","version":"1.0.0","path":"recipes/desk/recipe.yaml"}],"components":[],"sources":[],"profiles":[{"name":"desk","state":"ok"}],"locks":[]}"#)
+                    .unwrap(),
+            );
+            app.hl_mode = HealthMode::Validate;
+            let before = app.queue.len();
+            app.run_health();
+            assert_eq!(app.queue.len(), before, "数据仓根{why}:validate 不入队");
+            assert!(
+                app.log
+                    .iter()
+                    .any(|l| l.contains("validate 要读配方文件:数据仓根未设,去设置屏按 d 录入")),
+                "数据仓根{why}:日志只有既有那句指路(一字不改),实际 {:?}",
+                app.log
+            );
+        }
     }
 
     #[test]

@@ -606,10 +606,16 @@ pub fn scratch_rel(recipe_rel: &str) -> Result<RepoRelPath, write::RepoRelPathEr
 /// 配方编辑器的预跑 validate argv 指向它,据此与健康屏的 validate 回音分开。
 pub const SCRATCH_FILE: &str = ".nwt-validate.yaml";
 
-/// 这条引擎 argv 是不是配方编辑器的预跑 validate(argv 末位指向 scratch 暂存文件)。
-/// 健康屏的 validate 指向真实配方路径,不含本标记,于是两者回音不混。
+/// 这条引擎 argv 是不是配方编辑器的预跑 validate(argv 里**有** scratch
+/// 暂存文件的路径)。健康屏的 validate 指向真实配方路径,不含本标记,于是
+/// 两者回音不混。
+///
+/// 判据扫**整条 argv**、不钉末位:预跑 argv 与健康屏同源,而 #92 起两态都
+/// 显式带 `--repo`——scratch 路径后面还跟着 `--repo <数据仓根>` 两元素。
+/// 若仍按「末位」判,预跑回音会被误路由到健康屏:编辑器停在「预跑中」
+/// 永远等不到回音,而健康屏的 hl_result 被scratch 回音污染。
 pub fn is_prerun_argv(args: &[String]) -> bool {
-    args.last().is_some_and(|p| p.contains(SCRATCH_FILE))
+    args.iter().any(|p| p.contains(SCRATCH_FILE))
 }
 
 /// 把编辑态序列化,经写侧 `plan`+`commit` 原子暂存到 scratch(走同一条缝,
@@ -839,6 +845,37 @@ metadata:\n  owner: me\nlabels:\n  tier: prod\n";
         slot.clear();
         assert!(!at.exists(), "validate 完即清");
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// 回音路由判据(#92):预跑 argv 与健康屏同源(同一构造函数),scratch
+    /// 路径后面还跟着 `--repo <数据仓根>`——判据必须扫整条 argv,按「末位」
+    /// 判会把预跑回音误路由到健康屏(编辑器永远停在「预跑中」)。
+    #[test]
+    fn 预跑argv判据_扫整条argv_带repo也不误路由() {
+        let scratch = "/data/repo/recipes/research-desk/.nwt-validate.yaml";
+        // 带 --repo 的单侧配方 argv(#92 起的形状):scratch 不在末位
+        let with_repo = vec![
+            "validate".to_string(),
+            "--recipe".to_string(),
+            scratch.to_string(),
+            "--repo".to_string(),
+            "/data/repo".to_string(),
+        ];
+        assert!(
+            is_prerun_argv(&with_repo),
+            "带了 --repo 仍是预跑 argv:{with_repo:?}"
+        );
+        // 健康屏的 validate 指向真实配方路径,不含暂存标记
+        let health = vec![
+            "validate".to_string(),
+            "--recipe".to_string(),
+            "/data/repo/recipes/research-desk/recipe.yaml".to_string(),
+            "--repo".to_string(),
+            "/data/repo".to_string(),
+        ];
+        assert!(!is_prerun_argv(&health), "健康屏 argv 不是预跑:{health:?}");
+        // 空 argv 不炸
+        assert!(!is_prerun_argv(&[]));
     }
 
     /// 窄准许面的四条约束之一「跑完即清」的三条径:正常回音落地、预跑未过
