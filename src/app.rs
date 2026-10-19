@@ -1205,13 +1205,8 @@ impl App {
             Target::Activate if self.recipe_edit_open() => self.recipe_edit_commit(),
             Target::DismissPopup if self.recipe_edit_open() => self.recipe_edit_abandon(),
             // 点导航(常畅)/屏 Tab(紧凑)切屏,与 j/k 同语义。
-            Target::NavTo(s) => {
-                self.screen = s;
-                self.rc_filter_on = false; // 点导航切屏同样退过滤输入态(#61)
-                self.catalog_filter_on = false; // 编目册过滤同理(#69)
-                self.ah_filter_on = false; // 装配历史过滤同理(#101)
-                self.ah_raw = None; // 原文浮层不跨屏(#101)
-            }
+            // 与 j/k 同一后果(含 #97 擦揭示区):见 [`Self::set_screen`]。
+            Target::NavTo(s) => self.set_screen(s),
             // 点行=选中(与 ↑/↓ 同语义),只选中、不触发破坏性动作;
             // 命中区只产自当前屏,按 self.screen 路由对应选中态。
             // 登记 kind 选项行在场时优先于配方列表(弹层优先级)。
@@ -2214,7 +2209,7 @@ impl App {
         // 先切到那一屏再派发,否则操作者在概览屏执行「U 自升级」会得到
         // 零反馈(`key_settings` 根本不到场)。壳级行 `screen` 为 None,不切。
         if let Some(target) = row.screen {
-            self.screen = target;
+            self.set_screen(target); // 跨屏先切屏,与 j/k 同一后果(#97)
         }
         self.close_cmd_panel();
         // 修饰键照登记表带(#119):唯一带 CONTROL 的行是 Ctrl+P 自己,按 NONE
@@ -2239,16 +2234,16 @@ impl App {
         let n = self.ls.as_ref().map(|l| l.profiles.len()).unwrap_or(0);
         match k.code {
             KeyCode::Char('r') => self.refresh_ls(),
-            KeyCode::Char('a') => self.screen = Screen::Assemble,
-            KeyCode::Char('h') => self.screen = Screen::Health,
-            KeyCode::Char('l') => self.screen = Screen::Recipes,
+            KeyCode::Char('a') => self.set_screen(Screen::Assemble),
+            KeyCode::Char('h') => self.set_screen(Screen::Health),
+            KeyCode::Char('l') => self.set_screen(Screen::Recipes),
             // #68:「家」直达第六屏(编目)。键取 `v`(屏枚举 `Screen::Vps` 首字母),
             // 与既有 `a/h/l` 跳屏同构;屏上指令栏、帮助、README 三处同写 `v`
             // (屏上看到的与我按下的是一回事,故事 5)。HUD 不写它——HUD 是壳级
             // 提示栏,只有 j/k 切屏 / Enter 确认 / t 主题 / ? 帮助 / q 退出。
             // 纯导航零引擎调用——册体到编目屏按 `l` 才读,门禁也按册各自给,
             // 不在指令栏做禁用态。
-            KeyCode::Char('v') => self.screen = Screen::Vps,
+            KeyCode::Char('v') => self.set_screen(Screen::Vps),
             KeyCode::Down | KeyCode::Char('n') => {
                 if n > 0 {
                     self.ov_sel = (self.ov_sel + 1) % n;
@@ -4059,8 +4054,7 @@ impl App {
         // 换册即离开机器册语境(#70):反查上浮是机器册独有的只读动作,跳册同样
         // 收回任何在场 / 在途的反查——与 `cycle_catalog_kind` 同一条纪律。
         self.vps_reverse = crate::screens::catalog::VpsReverse::Idle;
-        self.screen = Screen::Vps;
-        self.catalog_filter_on = false; // 进册不顺手进过滤输入态(同 NavTo)
+        self.set_screen(Screen::Vps); // 同 NavTo:进册退过滤输入态、擦揭示区
         let name = self
             .catalog_sheet()
             .and_then(|s| s.entries.get(idx).map(|e| e.name.clone()));
@@ -4356,7 +4350,7 @@ impl App {
     /// vps 命中 → 机器册(#120):册已读过就按机器名落选中;册里没有这一台
     /// (标签引用可能已悬空)就明说;册还没读过就入队刷新 + 记待落地选中位。
     fn jump_to_machine(&mut self, name: &str, label: &str) {
-        self.screen = Screen::Vps;
+        self.set_screen(Screen::Vps);
         self.catalog_kind = crate::screens::CatalogKind::Vps;
         let found = self
             .vps_ls
@@ -4399,7 +4393,7 @@ impl App {
     /// 是它们的家,硬安一个去处等于造第六本册)。落法是「选中所在的那条源」
     /// ——源的详情栏就摊着它的条目清单,一步看得见命中那一条。
     fn jump_to_source_entry(&mut self, id: &str, label: &str) {
-        self.screen = Screen::Recipes;
+        self.set_screen(Screen::Recipes);
         self.rc_domain = Domain::Sources;
         self.rc_bake_sel = false; // 切域即复位只读选中态(#39 既有口径)
         let found = self
@@ -4630,10 +4624,12 @@ impl App {
     ///
     /// spec #89 修订 ADR-0009 §1「`key get` / `subscription get` 一律只给建议
     /// 命令」那一裁:钥匙册的 `g` 从「只把建议命令收进日志」升级为「面板代跑
-    /// + 确认浮层揭示本体」。三道门,任一不过即**一个字节都不下发、连浮层都
-    /// 不开**,只留既有指路(与 #57 的 `g` 指路同一套措辞):① 引擎缺 key 组
-    /// 能力(组级探针的答案,`get` 不进探针清单);② 数据仓根不可用;③ 没有
-    /// 选中的钥匙。不报错、不猜、不落半条命令。
+    /// 再加确认浮层揭示本体」。三道门,任一不过即**一个字节都不下发、连浮层都
+    /// 不开**,只留既有指路(与 #57 的 `g` 指路同一套措辞),不报错、不猜、
+    /// 不落半条命令:
+    /// ① 引擎缺 key 组能力(组级探针的答案,`get` 不进探针清单);
+    /// ② 数据仓根不可用;
+    /// ③ 没有选中的钥匙。
     ///
     /// 订阅册(#99)那一本仍是「只收建议命令进日志」——分岔只在「哪一本的
     /// `g` 落到哪个方法」,浮层 / 揭示区 / 清空时机是同一份实现。
@@ -5041,9 +5037,16 @@ impl App {
 
     // ---- 通用 ----
 
-    pub fn next_screen(&mut self) {
-        let i = (self.screen.index() + 1) % Screen::ALL.len();
-        self.screen = Screen::ALL[i];
+    /// 切屏的**单一入口**:`j`/`k`、点导航(常畅)/ 屏 Tab(紧凑)(#62 起两条路
+    /// 走同一个 `Target::NavTo`)、概览 `a/h/l/v` 跳屏、命令面板跨屏条目(#119)、
+    /// 反查跳转(#120)全部走这一句,于是**切屏的后果只有一份**——不存在第二条
+    /// 换了屏却漏掉某一条后果的路。
+    ///
+    /// 后果四条:退三处过滤输入态(词留着,回屏还在)、收装配原文浮层(#101
+    /// 不跨屏)、以及 #97 起的**擦揭示区**——本体不跟着换屏走,回到编目册时也不
+    /// 旧事重提。
+    pub fn set_screen(&mut self, s: Screen) {
+        self.screen = s;
         self.rc_filter_on = false; // 切屏退过滤输入态(#61),过滤词留着回屏还在
         self.catalog_filter_on = false; // 编目册过滤同理(#69):退输入态、留词
         self.ah_filter_on = false; // 装配历史过滤同理(#101)
@@ -5051,14 +5054,14 @@ impl App {
         self.get_reveal.clear(); // 切屏即擦揭示区(#97):本体不跨屏残留
     }
 
+    pub fn next_screen(&mut self) {
+        let i = (self.screen.index() + 1) % Screen::ALL.len();
+        self.set_screen(Screen::ALL[i]);
+    }
+
     pub fn prev_screen(&mut self) {
         let i = (self.screen.index() + Screen::ALL.len() - 1) % Screen::ALL.len();
-        self.screen = Screen::ALL[i];
-        self.rc_filter_on = false;
-        self.catalog_filter_on = false;
-        self.ah_filter_on = false;
-        self.ah_raw = None;
-        self.get_reveal.clear(); // 切屏即擦揭示区(#97):本体不跨屏残留
+        self.set_screen(Screen::ALL[i]);
     }
 
     pub fn cycle_theme(&mut self) {

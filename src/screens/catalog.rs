@@ -1297,7 +1297,8 @@ impl CatalogKind {
     }
 
     /// 册体清单之外、**只属于某一本**的附述行(订阅册的到期三态汇总与
-    /// 取回链接建议;钥匙册的取回钥匙建议)。机器册与标签册没有这一族
+    /// 取回链接建议;钥匙册的取回钥匙退路 + **揭示区**——#97 起本体只在确认
+    /// 之后在这里现身一次)。机器册与标签册没有这一族
     /// 关切,给空——所以渲染侧不再有 `if kind == Subscription` /
     /// `if kind == Key` 两段。
     pub fn extra_lines(self, app: &App, w: usize, p: &Palette) -> Vec<Line<'static>> {
@@ -8263,6 +8264,39 @@ mod tests {
         );
     }
 
+    /// 浮层两段可点(#73 / #78 那条「点哪打哪」纪律的延续):点「Enter 确认
+    /// 揭示」段 = 按 Enter(确认后才入队),点「Esc/q 返航」段 = 按 Esc(一个
+    /// 字节都没下发,浮层收起)。两条路与键盘逐字同后果,不许漂移。
+    #[test]
+    fn 取回钥匙_浮层两段可点_点确认才入队点返航零下发() {
+        let (mut app, runner) = key_app(&[("key ls", 0, KEY_LS_ALL), ("key get", 0, KEY_GET_OK)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        let before = runner.call_argvs();
+        // 点「Esc/q 返航」段:一个字节都没下发,浮层收起
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::DismissPopup)
+        });
+        assert_eq!(runner.call_argvs(), before, "点返航零下发");
+        assert!(app.queue.is_empty(), "点返航不入队");
+        assert!(
+            !crate::testutil::frame_display(&app, 80, 30).contains("即将揭示机密本体"),
+            "点返航即收浮层"
+        );
+        // 再开一次,点「Enter 确认揭示」段:经唯一入口入队,回音落地才进揭示区
+        tap(&mut app, KeyCode::Char('g'));
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::Activate)
+        });
+        assert_eq!(app.queue.len(), 1, "点确认即入队(只有一条)");
+        assert_eq!(app.queue[0].get(1).map(String::as_str), Some("get"));
+        feed(&mut app);
+        assert!(
+            crate::testutil::frame_display(&app, 80, 30).contains(KEY_BODY),
+            "点确认与按 Enter 同后果:本体进揭示区"
+        );
+    }
     /// 揭示区**立即清空**:切条目(↑/↓)、翻册(m)、切屏(j/k)、返航(Esc)、
     /// 退出(q)五条路,屏幕无残留,状态也不留。
     #[test]
@@ -8292,6 +8326,34 @@ mod tests {
                 "{label} 后揭示区状态也清空(本体不在内存里留)"
             );
         }
+    }
+
+    /// 切屏**不止 `j/k` 一条路**:点导航(常畅)/ 屏 Tab(紧凑)与 `j/k` 同语义
+    /// (#62 起两条路同一个 `Target::NavTo`),揭示区照样立即清空——换屏后本体
+    /// 不跟着走,回到编目册时也不旧事重提。清空点只有
+    /// [`crate::app::App::set_screen`] 一处,切屏的路再加几条也不会漏。
+    #[test]
+    fn 取回钥匙_点导航切屏同样立即清空揭示区() {
+        let (mut app, _r) = key_app(&[("key ls", 0, KEY_LS_ALL), ("key get", 0, KEY_GET_OK)]);
+        tap(&mut app, KeyCode::Char('l'));
+        feed(&mut app);
+        tap(&mut app, KeyCode::Char('g'));
+        tap(&mut app, KeyCode::Enter);
+        feed(&mut app);
+        assert!(
+            crate::testutil::frame_display(&app, 80, 30).contains(KEY_BODY),
+            "点导航前本体在揭示区"
+        );
+        点中(&mut app, 80, 30, |t| {
+            matches!(t, crate::layout::Target::NavTo(crate::app::Screen::Health))
+        });
+        assert_eq!(app.screen, crate::app::Screen::Health, "点导航即切屏");
+        assert!(
+            app.get_reveal.revealed().is_none(),
+            "切屏即擦:本体不跟着换屏走"
+        );
+        let s = crate::testutil::frame_display(&app, 80, 30);
+        assert!(!s.contains(KEY_BODY), "换屏后屏幕无残留:{s}");
     }
 
     /// 引擎缺 key 组能力时 `g` 走既有指路(升级 nw):不报错、不猜、不落半条
