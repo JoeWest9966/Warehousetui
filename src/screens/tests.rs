@@ -247,6 +247,75 @@ fn 健康屏_validate_清单四态() {
     assert!(s.contains("缺字段"));
 }
 
+/// 三档校验范围说得出、看得见(#98):屏顶那一行把三档名字都摊开,当前档带
+/// `▸`;切档键位 `s` 只在这一行与 HUD / 帮助浮层里出现,不另造一套选择。
+#[test]
+fn 健康屏_validate三档校验范围_摊开给操作者看() {
+    use crate::app::ValidateScope;
+    let mut app = fake_app();
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Validate;
+    app.data_root = Some(std::env::temp_dir().display().to_string());
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    // 有结论与无结论两种场都要看得见三档(切档不依赖上一次回音)
+    feed(
+        &mut app,
+        out(
+            &["validate", "--recipe", "x"],
+            3,
+            r#"{"schema":"nw/validate.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[],"data":{"target":"recipe.yaml","results":[{"id":"1","status":"pass","message":"schema 认"}],"summary":{"total":27,"pass":20,"warn":5,"fail":1,"skip":1}}}"#,
+        ),
+    );
+    for (scope, mark) in [
+        (ValidateScope::Recipe, "▸ 单侧配方"),
+        (ValidateScope::Lock, "▸ 单侧锁定集"),
+        (ValidateScope::Both, "▸ 双侧同给"),
+    ] {
+        app.hl_scope = scope;
+        let s = draw(&app, 110, 30);
+        // 三档名字一个都不少:操作者说得出自己在哪一档、还有哪两档
+        for name in ["单侧配方", "单侧锁定集", "双侧同给"] {
+            assert!(s.contains(name), "{scope:?} 三档都应上屏:{s}");
+        }
+        assert!(s.contains(mark), "{scope:?} 当前档带标记:{s}");
+        assert!(s.contains("s 切档"), "{scope:?} 切档键位在正文里:{s}");
+        // 27 项清单 + 证据五字段照旧呈现(不因新加一行而丢)
+        assert!(s.contains("27 项"), "{scope:?} 27 项清单在场:{s}");
+        assert!(s.contains("证据"), "{scope:?} 证据五字段在场:{s}");
+    }
+    // 紧凑态(66×50 保证最小)也不丢三档、不溢出行
+    app.splash = false; // frame_display 走整帧壳:splash 在场会画 logo,先交棒
+    app.hl_scope = ValidateScope::Both;
+    let f = crate::testutil::frame_display(&app, 66, 50);
+    for name in ["单侧配方", "单侧锁定集", "双侧同给"] {
+        assert!(f.contains(name), "66×50 三档仍在场:{f}");
+    }
+    for ln in f.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(ln) <= 66,
+            "66×50 有行超宽:{ln}"
+        );
+    }
+    // 第二行说清两侧各自指向谁;缺哪一侧就只说那一侧(LS_FULL 里选中派 desk
+    // 的配方不在仓 → 配方侧说不在仓,锁定集侧报选中的那条)
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("配方侧:派 desk 的配方不在当前数据仓"),
+        "配方侧按真因说话:{s}"
+    );
+    assert!(
+        s.contains("锁定集侧:装配屏选中的 9f8e"),
+        "锁定集侧报装配屏选中的那条:{s}"
+    );
+    // 缺锁定集那一侧:装配屏没选中任何一行 → 只说清缺锁定集侧
+    app.as_sel = 9; // 越界 = 没选中任何一行
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("锁定集侧:缺选中的锁定集(装配屏 ↑/↓ 选一条)"),
+        "缺哪一侧就说哪一侧:{s}"
+    );
+}
+
 #[test]
 fn 配方屏五域与详情() {
     let mut app = fake_app();

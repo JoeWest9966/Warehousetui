@@ -5,13 +5,96 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, HealthMode};
+use crate::app::{App, HealthMode, ValidateScope};
 use crate::engine::State;
 use crate::screens::body;
 
 const SURFACES: [&str; 7] = [
     "manifest", "consist", "converge", "config", "env", "runtime", "provider",
 ];
+
+/// validate 档的三档校验范围(#98),顺序即 `s` 切档的轮转次序。
+const SCOPES: [ValidateScope; 3] = [
+    ValidateScope::Recipe,
+    ValidateScope::Lock,
+    ValidateScope::Both,
+];
+
+/// validate 档顶部的「校验范围」条(#98):**说得出、看得见**的三档。
+///
+/// 第一行把三档名字都摊开、当前档带 `▸`(操作者说得出自己在哪一档、还有
+/// 哪两档);第二行说清两侧各自现在指向谁、缺哪一侧——判据与下发门同一处
+/// 出([`App::validate_recipe_target`] / [`App::validate_lock_target`]),屏上
+/// 说齐了,`r` 才真入队,不摆「屏上说能跑、一跑就缺前提」的假象。
+/// 切档键位 `s` 只在这里与 HUD / 帮助浮层里出现,不另造一套选择机制。
+fn validate_scope_lines(app: &App) -> Vec<Line<'static>> {
+    let p = &app.palette;
+    let mut head: Vec<Span<'static>> = vec![
+        Span::styled(" 校验范围", p.accent()),
+        Span::styled("(s 切档)", p.dim()),
+        Span::raw(":"),
+    ];
+    for (i, sc) in SCOPES.iter().enumerate() {
+        if i > 0 {
+            head.push(Span::styled(" · ", p.dim()));
+        }
+        let cur = *sc == app.hl_scope;
+        let text = if cur {
+            format!("▸ {}", sc.label())
+        } else {
+            sc.label().to_string()
+        };
+        head.push(Span::styled(
+            text,
+            if cur { p.accent().bold() } else { p.dim() },
+        ));
+    }
+    vec![
+        Line::from(head),
+        Line::from(Span::styled(scope_detail(app), p.dim())),
+    ]
+}
+
+/// 第二行:当前档要看的那一侧(或两侧)现在指向谁 / 缺哪一侧。
+fn scope_detail(app: &App) -> String {
+    let recipe = match app.hl_scope {
+        ValidateScope::Lock => None,
+        _ => Some(recipe_side_text(app)),
+    };
+    let lock = match app.hl_scope {
+        ValidateScope::Recipe => None,
+        _ => Some(lock_side_text(app)),
+    };
+    match (recipe, lock) {
+        (Some(r), Some(l)) => format!(" {r} · {l}"),
+        (Some(r), None) | (None, Some(r)) => format!(" {r}"),
+        (None, None) => String::new(),
+    }
+}
+
+/// 配方侧的一句:就绪报选中的派(派名 = 配方名,#5),缺失按真因说清
+/// (派没选 / 数据仓根未设 / 配方不在仓)——不拿另一句话顶替。
+fn recipe_side_text(app: &App) -> String {
+    let Some(profile) = app.selected_profile() else {
+        return "配方侧:缺选中的派(概览屏 ↑/↓ 选一个)".to_string();
+    };
+    if app.data_root_cause().is_some() {
+        return "配方侧:缺数据仓根(设置屏按 d 录入)".to_string();
+    }
+    match app.validate_recipe_target() {
+        Some(_) => format!("配方侧:选中的派 {profile} → 仓内配方文件"),
+        None => format!("配方侧:派 {profile} 的配方不在当前数据仓(先 ls 刷新)"),
+    }
+}
+
+/// 锁定集侧的一句:就绪报装配屏选中的那条,缺失说清去哪选(既有翻页 / 选行
+/// 交互,不新造一套)。
+fn lock_side_text(app: &App) -> String {
+    match app.selected_lock_id() {
+        Some(id) => format!("锁定集侧:装配屏选中的 {id}"),
+        None => "锁定集侧:缺选中的锁定集(装配屏 ↑/↓ 选一条)".to_string(),
+    }
+}
 
 /// 检查项来源(spec #95 工单 #116):「面板自有检查 vs 引擎检查」的**最小**
 /// 区分机制。
@@ -48,8 +131,19 @@ pub fn render_health(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let cols =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(inner);
+    // validate 档(#98):顶部两行「校验范围」条(三档 + 两侧现状),其余高度
+    // 才分左右两栏。doctor 档没有这一条,几何与 #98 之前一字不差。
+    let body_area = match app.hl_mode {
+        HealthMode::Validate => {
+            let (scope_row, rest) = crate::layout::health_validate_rows(inner);
+            frame.render_widget(Paragraph::new(validate_scope_lines(app)), scope_row);
+            rest
+        }
+        _ => inner,
+    };
+
+    let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(body_area);
 
     // 外部源漂移复核(#40):与 doctor / validate 并列的第三种模式,只读。
     // 结论按结果四态呈现,与 doctor 的降级/漂移/破损三档并列但不合并。
@@ -71,7 +165,7 @@ pub fn render_health(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             "按 r 对选中的派跑 doctor;m 切 validate。".to_string()
         };
-        frame.render_widget(Paragraph::new(hint).style(app.palette.dim()), inner);
+        frame.render_widget(Paragraph::new(hint).style(app.palette.dim()), cols[0]);
         return;
     };
 

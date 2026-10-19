@@ -329,6 +329,13 @@ fn render_hud(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("登记中:Esc 返航", p.accent()));
     } else {
+        // 健康屏 validate 档(#98):三档校验范围的切档键位进 HUD(壳级提示栏
+        // 唯一的屏内分支)。三档名字摊在健康屏正文顶行,HUD 只给键位——
+        // 常畅态与紧凑态都放得下这一段(66 列仍余量),两档都给。
+        if app.screen == Screen::Health && app.hl_mode == HealthMode::Validate {
+            spans.push(Span::styled(" s", p.accent()));
+            spans.push(Span::raw(" 切档 "));
+        }
         spans.push(Span::styled("  q", p.accent()));
         spans.push(Span::raw(" 退出"));
     }
@@ -546,6 +553,22 @@ pub(crate) const HELP_ROWS: &[HelpRow] = &[
         running: false,
         prep: Prep::Shell,
         code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        write: false,
+    },
+    // validate 档的三档校验范围(#98):`s` 在 单侧配方 / 单侧锁定集 / 双侧同给
+    // 之间轮转。mode 钉在 Validate —— 其余三个模式没有可切的维度(doctor 按派
+    // 跑,recheck 与引用完整性不读这两侧),屏上不摆这一条。
+    HelpRow {
+        key: "s",
+        desc: "健康:切档(单侧配方/单侧锁定集/双侧同给)",
+        screen: Some(Screen::Health),
+        domain: None,
+        mode: Some(HealthMode::Validate),
+        book: None,
+        running: false,
+        prep: Prep::Shell,
+        code: KeyCode::Char('s'),
         modifiers: KeyModifiers::NONE,
         write: false,
     },
@@ -1345,6 +1368,26 @@ mod tests {
         assert!(hud.contains("切屏") && hud.contains("确认"));
         assert!(hud.contains("帮助") && hud.contains("退出"));
         assert!(!hud.contains("主题"), "紧凑态 HUD 少给提示、无主题标注");
+    }
+
+    /// #98:健康屏 validate 档的三档校验范围切档键位 `s` 进 HUD(与帮助浮层
+    /// 同写)。两档都放得下这一段(常畅 80 列加了它右侧主题标注仍完整;
+    /// 紧凑 66 列也有余量);doctor 档没有可切的维度,不摆。
+    #[test]
+    fn 健康validate档_hud给切档键位_doctor不给() {
+        let mut app = ui_app();
+        app.screen = Screen::Health;
+        app.hl_mode = HealthMode::Validate;
+        let comfy = render_to_string(&app, 80, 30);
+        assert!(comfy.contains("s 切档"), "常畅态 HUD 给切档键位:{comfy}");
+        // 加了这一段不把右侧主题标注挤出屏(常畅态行尾仍完整)
+        assert!(comfy.contains("主题:"), "右侧主题标注不被挤掉:{comfy}");
+        let compact = render_to_string(&app, 66, 50);
+        assert!(compact.contains("s 切档"), "紧凑态也放得下这一段:{compact}");
+        // doctor 档没有可切的维度:HUD 不摆这一段
+        app.hl_mode = HealthMode::Doctor;
+        let doctor = render_to_string(&app, 80, 30);
+        assert!(!doctor.contains("s 切档"), "doctor 档不给切档键位:{doctor}");
     }
 
     /// 命令面板键位(#119)在 HUD 里的两档纪律(#67:放不下整段不收):
