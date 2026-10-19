@@ -119,6 +119,45 @@ pub enum HealthMode {
     Integrity,
 }
 
+/// 健康屏 validate 档的**三档校验范围**(spec #89 工单 #98):单侧配方 /
+/// 单侧锁定集 / 双侧同给。三档说得出、看得见(`s` 切档,HUD 与帮助浮层
+/// 同写),默认落在单侧配方——#92 之前只有这一档,切档前的 argv 与它
+/// 逐字节一致。
+///
+/// 三档共用同一个 argv 构造函数族(`commands::validate_recipe` /
+/// [`commands::validate_lock`](crate::engine::commands::validate_lock) /
+/// [`commands::validate_both`](crate::engine::commands::validate_both)),
+/// 不另立第二条拼装路径。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ValidateScope {
+    /// 单侧配方:选中的派 → 仓内配方文件(#92 的既定形态)。
+    Recipe,
+    /// 单侧锁定集:装配屏里选中的那条锁定集的载体文件。
+    Lock,
+    /// 双侧同给:配方侧 + 锁定集侧一次跑全跨文件检查项(1–19)。
+    Both,
+}
+
+impl ValidateScope {
+    /// 三档的屏上说名(一字一档,顺序即 `s` 切档的轮转次序)。
+    pub fn label(self) -> &'static str {
+        match self {
+            ValidateScope::Recipe => "单侧配方",
+            ValidateScope::Lock => "单侧锁定集",
+            ValidateScope::Both => "双侧同给",
+        }
+    }
+
+    /// `s` 切档的下一档(单侧配方 → 单侧锁定集 → 双侧同给 → 回单侧配方)。
+    pub fn next(self) -> ValidateScope {
+        match self {
+            ValidateScope::Recipe => ValidateScope::Lock,
+            ValidateScope::Lock => ValidateScope::Both,
+            ValidateScope::Both => ValidateScope::Recipe,
+        }
+    }
+}
+
 /// 设置屏的屏内页(spec #94 工单 #108,照 [`HealthMode`] 的屏内多模样板)。
 ///
 /// 为什么不把版本对照并进常驻面板的那棵扁平行向量:设置屏的竖向预算已被
@@ -170,6 +209,46 @@ impl DataRootCause {
             DataRootCause::EngineCapability => {
                 "引擎缺少所需能力——不是面板坏了。升级 nw 后能力探测门自然开启。".into()
             }
+        }
+    }
+}
+
+/// 烘焙的两个**可选槽位**(spec #89 工单 #93):资产目录 / bundle 取货仓。
+///
+/// 与数据仓根一样是操作者设置的一等设置(设置屏可见可改、缺省未设、持久化),
+/// 但**不是前提闸**:未设时 bake 建议命令照旧给得出,只是这两个旗标不落
+/// (让引擎自己算)。两者共用一套手填输入态与持久化链,只差旗标、标签与键位。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BakeSlot {
+    /// 资产目录(`--assets-dir`):真机首跑时 sha256 逐个按真资产算。
+    AssetsDir,
+    /// bundle 取货仓(`--bundle-repo`):数据仓没有 git origin 可推导时钉死取货仓。
+    BundleRepo,
+}
+
+impl BakeSlot {
+    /// 上游旗标名:argv 面唯一拼法(与 `commands::recipe_bake` 同一处口径,
+    /// 设置屏的指路也照它说,不另写一串)。
+    pub fn flag(self) -> &'static str {
+        match self {
+            BakeSlot::AssetsDir => crate::engine::commands::ASSETS_DIR_FLAG,
+            BakeSlot::BundleRepo => crate::engine::commands::BUNDLE_REPO_FLAG,
+        }
+    }
+
+    /// 设置屏行标签(领域词,照工单 #93 的「资产目录」/「bundle 取货仓」)。
+    pub fn label(self) -> &'static str {
+        match self {
+            BakeSlot::AssetsDir => "资产目录",
+            BakeSlot::BundleRepo => "bundle 取货仓",
+        }
+    }
+
+    /// 设置屏手填键位(取设置屏未占用的 a / r;与 d = 数据仓根同一族)。
+    pub fn key(self) -> char {
+        match self {
+            BakeSlot::AssetsDir => 'a',
+            BakeSlot::BundleRepo => 'r',
         }
     }
 }
@@ -332,6 +411,13 @@ pub struct App {
     /// 数据仓根(spec #24,票 #27):与 NW_HOME 并列的一等设置,
     /// 持久化进 config;None = 未设——五域入口走指路,不兑当前目录。
     pub data_root: Option<String>,
+    /// 烘焙的**可选**资产目录槽位(spec #89 工单 #93):一等设置,持久化进
+    /// config;None = 未设——槽位不落,让引擎按 release 预设自己算。
+    /// 它不是前提闸:未设也照旧给得出 bake 建议命令。
+    pub assets_dir: Option<String>,
+    /// 烘焙的**可选** bundle 取货仓槽位(同上):None = 未设——槽位不落,
+    /// 取货仓由引擎从数据仓 git origin 推导(面板不复制这个推导)。
+    pub bundle_repo: Option<String>,
     pub engine: EngineStatus,
     pub engine_version: String,
     /// 能力探测门(#29):问引擎自己所得的三态结论,入口可用性唯一事实源。
@@ -386,6 +472,10 @@ pub struct App {
 
     // ---- 健康 ----
     pub hl_mode: HealthMode,
+    /// validate 档的三档校验范围(spec #89 工单 #98):`s` 切档,默认单侧
+    /// 配方(#92 之前只有这一档,切档前 argv 与它逐字节一致)。只在 validate
+    /// 档有意义——其余三个模式不看它。
+    pub hl_scope: ValidateScope,
     pub hl_sel: usize,
     pub hl_result: Option<EngineOutput>,
     pub hl_loading: bool,
@@ -585,6 +675,11 @@ pub struct App {
     pub data_input: bool,
     /// 数据仓根手填缓冲区(同款上限与拒绝语义)。
     pub data_buf: String,
+    /// 烘焙两槽位手填输入模式(#93,设置屏 a / r 进入):两个槽位共用一份
+    /// 输入态,`Some(哪一个)` 记正在填的是资产目录还是 bundle 取货仓。
+    pub slot_input: Option<BakeSlot>,
+    /// 槽位手填缓冲区(与 NW_HOME / 数据仓根手填同款上限与拒绝语义)。
+    pub slot_buf: String,
     /// config.toml 解析失败的人话证据;None = 配置健康。
     pub config_error: Option<String>,
     /// 自升级(#121):`U` 呼出的全屏叠加层状态。六态见
@@ -682,6 +777,7 @@ impl App {
                     .map(|h| format!("{h}/.nous-warehouse"))
             })
             .unwrap_or_else(|| "~/.nous-warehouse".into());
+        let cfg = crate::engine::config::load().0;
         Self {
             quit: false,
             help: false,
@@ -692,7 +788,9 @@ impl App {
             assembling: false,
             blink: false,
             nw_home,
-            data_root: crate::engine::config::load().0.data_root,
+            data_root: cfg.data_root,
+            assets_dir: cfg.assets_dir,
+            bundle_repo: cfg.bundle_repo,
             engine,
             engine_version: "探测中".into(),
             capabilities: Gate::default(),
@@ -717,6 +815,8 @@ impl App {
             ah_filter: String::new(),
             ah_raw: None,
             hl_mode: HealthMode::Doctor,
+            // validate 三档校验范围(#98):默认单侧配方,与 #92 的 argv 同形
+            hl_scope: ValidateScope::Recipe,
             hl_sel: 0,
             hl_result: None,
             hl_loading: false,
@@ -789,6 +889,8 @@ impl App {
             home_buf: String::new(),
             data_input: false,
             data_buf: String::new(),
+            slot_input: None,
+            slot_buf: String::new(),
             config_error,
             mouse_enabled: true,
             upgrade: UpgradePhase::Idle,
@@ -1729,6 +1831,12 @@ impl App {
             self.on_key_data_input(k);
             return;
         }
+        // 烘焙两槽位手填(#93):与 NW_HOME / 数据仓根手填同一级顶层输入态
+        // (浮层优先级见上),两个槽位共用一份输入态。
+        if self.slot_input.is_some() {
+            self.on_key_slot_input(k);
+            return;
+        }
         // 配方屏搜索过滤输入态(#61):与两份手填同一级(输入态优先于屏键位),
         // 但只在本屏在场时吞键——切屏即退输入态,过滤词保留可预期。
         if self.rc_filter_on && self.screen == Screen::Recipes {
@@ -2370,6 +2478,24 @@ impl App {
                     _ => {}
                 }
             }
+            // validate 档(spec #89 工单 #98):三档校验范围,`s` 切档 ——
+            // 单侧配方 → 单侧锁定集 → 双侧同给 → 回单侧配方。键位进 HUD
+            // 与帮助浮层(屏顶那一行把三档都摊开给操作者看)。
+            HealthMode::Validate => {
+                let n = self
+                    .hl_result
+                    .as_ref()
+                    .map(|r| r.evidence().len())
+                    .unwrap_or(0);
+                match k.code {
+                    KeyCode::Char('r') => self.run_health(),
+                    KeyCode::Char('s') => self.cycle_validate_scope(),
+                    KeyCode::Down if n > 0 => self.hl_sel = (self.hl_sel + 1) % n,
+                    KeyCode::Up if n > 0 => self.hl_sel = (self.hl_sel + n - 1) % n,
+                    _ => {}
+                }
+            }
+            // doctor 七面:没有可切档的维度(它按派跑),沿用 r / ↑/↓。
             _ => {
                 let n = self
                     .hl_result
@@ -2384,6 +2510,14 @@ impl App {
                 }
             }
         }
+    }
+
+    /// `s` 切档(spec #89 工单 #98):validate 档的三档校验范围轮转一档,
+    /// 并把「现在按哪一档跑」说清——切档只改范围,不动在途的结论
+    /// (上一次的回音仍在上屏,直到下一次 r 覆盖它)。
+    pub fn cycle_validate_scope(&mut self) {
+        self.hl_scope = self.hl_scope.next();
+        self.push_log(format!("校验范围切到:{}", self.hl_scope.label()));
     }
 
     /// 外部源漂移复核的可选行数(#40):已登记的外部源记录数。
@@ -2555,6 +2689,8 @@ impl App {
             recipe,
             self.usable_data_root().as_deref(),
             self.capabilities.enabled(Capability::RecipeBake),
+            self.assets_dir.as_deref(),
+            self.bundle_repo.as_deref(),
         )
         .map(|_| ())
     }
@@ -2609,6 +2745,13 @@ impl App {
                 self.data_input = true;
                 self.data_buf = self.data_root.clone().unwrap_or_default();
                 self.push_log("手填数据仓根:Enter 确认,Esc/q 放弃");
+            }
+            // 烘焙两槽位(#93):a = 资产目录,r = bundle 取货仓。两个槽位共用
+            // 一套输入态(`slot_input` 记在填哪一个),键位与旗标名同族。
+            // r 在版本对照页是「重查」,所以这一支只归常驻面板。
+            KeyCode::Char('a') => self.open_slot_input(BakeSlot::AssetsDir),
+            KeyCode::Char('r') if self.settings_page == SettingsPage::Panel => {
+                self.open_slot_input(BakeSlot::BundleRepo)
             }
             KeyCode::Char('e') => self.pending_editor = true,
             KeyCode::Char('m') => self.toggle_mouse_capture(),
@@ -2833,6 +2976,80 @@ impl App {
         self.data_input = false;
         self.data_buf.clear();
         self.apply_data_root(expanded);
+    }
+
+    /// 烘焙槽位手填键位:与 NW_HOME / 数据仓根手填同一条通用态机
+    /// ([`input::on_key`]),本函数只接这两个可选槽位的后果链。两个槽位
+    /// 共用一份输入态,后果链也共用一条(只差槽位与说法)。
+    fn on_key_slot_input(&mut self, k: KeyEvent) {
+        let Some(slot) = self.slot_input else { return };
+        match input::on_key(&mut self.slot_buf, k) {
+            InputAction::Submit => self.apply_slot_input(slot),
+            InputAction::Cancel => {
+                self.slot_input = None;
+                self.slot_buf.clear();
+                self.push_log(format!("取消手填{}", slot.label()));
+            }
+            InputAction::Edited | InputAction::Ignored => {}
+        }
+    }
+
+    /// 进入烘焙槽位手填:预填当前值(未设则空),进输入态。
+    pub fn open_slot_input(&mut self, slot: BakeSlot) {
+        self.slot_input = Some(slot);
+        self.slot_buf = self.bake_slot(slot).clone().unwrap_or_default();
+        self.push_log(format!(
+            "手填{}:Enter 确认,Esc/q 放弃;不填则 {} 不落槽",
+            slot.label(),
+            slot.flag()
+        ));
+    }
+
+    /// 槽位当前值(未设 = `None`)。两个槽位各是各的值,互不顶替。
+    fn bake_slot(&self, slot: BakeSlot) -> &Option<String> {
+        match slot {
+            BakeSlot::AssetsDir => &self.assets_dir,
+            BakeSlot::BundleRepo => &self.bundle_repo,
+        }
+    }
+
+    /// 槽位手填生效:去空白 + `~` 展开;空值拒绝并留驻可改(与数据仓根手填
+    /// 同口径——原值保持不变,不退输入态)。路径不存在**接受入状态**:这两个
+    /// 槽位由引擎自己判,面板不替引擎预检,也不在输入层拦。
+    pub fn apply_slot_input(&mut self, slot: BakeSlot) {
+        let Some(trimmed) = input::normalize(&self.slot_buf) else {
+            self.push_log(format!("{}手填被拒:空值,原值保持不变", slot.label()));
+            return;
+        };
+        let expanded = crate::engine::discover::expand_tilde(&trimmed)
+            .display()
+            .to_string();
+        self.slot_input = None;
+        self.slot_buf.clear();
+        self.apply_bake_slot(slot, expanded);
+    }
+
+    /// 槽位生效链(与 [`Self::apply_data_root`] 同形,但**不下发任何引擎命令**
+    /// —— bake 是建议命令,槽位只改下一次算出来的 argv):写状态 → 持久化
+    /// config → 留一句人话。
+    pub fn apply_bake_slot(&mut self, slot: BakeSlot, next: String) {
+        match slot {
+            BakeSlot::AssetsDir => self.assets_dir = Some(next.clone()),
+            BakeSlot::BundleRepo => self.bundle_repo = Some(next.clone()),
+        }
+        let mut cfg = crate::engine::config::load().0;
+        match slot {
+            BakeSlot::AssetsDir => cfg.assets_dir = Some(next.clone()),
+            BakeSlot::BundleRepo => cfg.bundle_repo = Some(next.clone()),
+        }
+        if let Err(e) = crate::engine::config::save(&cfg) {
+            self.push_log(format!("{}持久化失败:{e}", slot.label()));
+        }
+        self.push_log(format!(
+            "{}已设为 {next}({} 落槽;bake 建议命令随之更新)",
+            slot.label(),
+            slot.flag()
+        ));
     }
 
     /// 数据仓根生效链(手填与将来其他入口共用):写状态 → 持久化 config →
@@ -4638,16 +4855,11 @@ impl App {
             self.run_integrity();
             return;
         }
-        let profile = self
-            .ls
-            .as_ref()
-            .and_then(|l| {
-                l.profiles
-                    .get(self.ov_sel.min(l.profiles.len().saturating_sub(1)))
-            })
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
-        if profile.is_empty() {
+        let profile = self.selected_profile().unwrap_or_default();
+        // 配方侧要不要「选中的派」:doctor 与 validate 的配方侧要;validate
+        // 单侧锁定集**不要**(#98)——那一档只读锁定集,派跟它无关,拿派当
+        // 前提就是把操作者摁在一道没有意义的门上。
+        if profile.is_empty() && self.validate_needs_recipe_side() {
             self.push_log("没有选中的派,先 ls");
             return;
         }
@@ -4664,32 +4876,133 @@ impl App {
         }
     }
 
-    /// 健康屏 validate 档:27 项冻结检查按**配方文件**跑。引擎没有
-    /// 「按派名 validate」这个形状(`--recipe` 收配方路径),而派名 = 配方名
-    /// 是 #5 命名决策(引擎 up 的缺省同款)—— 据此在 ls 的配方域找行,
-    /// 用行自带的 path 拼数据仓根下的配方文件。引擎从配方路径自己推导
-    /// 仓根(`<root>/recipes/<名>/recipe.yaml` → root),不必另带 --repo。
-    /// 缺前提(根没设 / 配方不在仓里 / 引擎没给 path)→ 日志说清、不下发
-    /// 一条必败的命令(与 bake 建议同纪律:不给半条命令)。
+    /// 这一趟 validate 要不要配方侧(#98):单侧配方与双侧同给要(配方侧沿用
+    /// 「选中的派 → 仓内配方文件」的既有派生),单侧锁定集不要。
+    /// 非 validate 档恒 `true`(doctor 永远按派跑)。
+    fn validate_needs_recipe_side(&self) -> bool {
+        !matches!(
+            (self.hl_mode, self.hl_scope),
+            (HealthMode::Validate, ValidateScope::Lock)
+        )
+    }
+
+    /// 健康屏 validate 档(#98 三档校验范围的唯一下发口):27 项冻结检查按
+    /// **配方文件** / **锁定集载体文件** / 两侧同给跑。
+    ///
+    /// 引擎没有「按派名 validate」这个形状(`--recipe` 收配方路径),而派名 =
+    /// 配方名是 #5 命名决策(引擎 up 的缺省同款)—— 据此在 ls 的配方域找行,
+    /// 用行自带的 path 拼数据仓根下的配方文件。
+    ///
+    /// 数据仓根**显式携带**(`--repo`,与 `ls --repo` / `bake --repo` 同源同
+    /// 纪律,spec #89 工单 #92):不假设引擎拿当前目录兜底,锁定集放在引擎
+    /// 推导不出的目录布局时跨文件检查项也跑得全。
+    /// 缺前提(根没设 / 不可用 / 配方侧没派或配方不在仓里 / 锁定集侧没选)
+    /// → 日志只说清缺哪一侧、不下发一条必败的命令(与 bake 建议同纪律:
+    /// 不给半条命令)。
+    ///
+    /// 锁定集侧沿用**既有**的选行交互:装配屏 `↑/↓`(与鼠标点行同义)选中的
+    /// 那条锁定集(`as_sel`),不另造第二套选择机制;配方侧沿用概览屏选中的
+    /// 派(`ov_sel`)。
     fn queue_validate(&mut self, profile: &str) {
+        // 门一:数据仓根。既有指路话术一字不改(#92 冻结),只在句首点明这一
+        // 档要读哪几侧——三档各说自己缺的那一侧,不合成一句万能缺前提。
         let Some(root) = self.usable_data_root() else {
-            self.push_log("validate 要读配方文件:数据仓根未设,去设置屏按 d 录入");
+            self.push_log(format!(
+                "{}:数据仓根未设,去设置屏按 d 录入",
+                self.validate_gate_head()
+            ));
             return;
         };
+        // 门二:配方侧(单侧配方 / 双侧同给)。单侧锁定集不看这一侧,门根本不设。
+        let recipe = match self.hl_scope {
+            ValidateScope::Lock => None,
+            _ => match self.validate_recipe_target() {
+                Some(abs) => Some(abs),
+                None => {
+                    self.push_log(format!(
+                        "派 {profile} 的配方不在当前数据仓(或引擎 ls 没给配方路径):validate 无从拼装,先 ls 刷新或换数据仓根"
+                    ));
+                    return;
+                }
+            },
+        };
+        // 门三:锁定集侧(单侧锁定集 / 双侧同给)。选中态就是装配屏选定的
+        // 那一条(与发射同源),载体落点同 `launch_selected_lock` 的推导。
+        let lock = match self.hl_scope {
+            ValidateScope::Recipe => None,
+            _ => match self.validate_lock_target() {
+                Some(carrier) => Some(carrier),
+                None => {
+                    self.push_log(format!(
+                        "{}:装配屏里没选中锁定集(↑/↓ 选一条再跑)",
+                        self.validate_gate_head()
+                    ));
+                    return;
+                }
+            },
+        };
+        // 拼装:三档都走同一个构造函数族,旗标顺序一处真相(#98)。quiet 留位
+        // 槽(#92):面板本票不摆 UI 入口,缺省不落——单侧两态的 argv 与 #92
+        // 逐字节一致。
+        let argv = match (recipe, lock) {
+            (Some(recipe), None) => commands::validate_recipe(&recipe, &root, false),
+            (None, Some(lock)) => commands::validate_lock(&lock, &root, false),
+            // 双侧同给:配方侧 + 锁定集侧一次跑全跨文件检查项(1–19)
+            (Some(recipe), Some(lock)) => commands::validate_both(&recipe, &lock, &root, false),
+            // 死臂:上面三道门已保证「该在的侧都在」,到这儿不可达
+            (None, None) => return,
+        };
+        self.queue.push(argv);
+    }
+
+    /// 选中的派(#98 起屏上与下发门同一处算):概览屏 `↑/↓`(与鼠标点行
+    /// 同义)选中的那一条。一个派都没有 → `None`。
+    pub fn selected_profile(&self) -> Option<String> {
+        self.ls.as_ref().and_then(|l| {
+            l.profiles
+                .get(self.ov_sel.min(l.profiles.len().saturating_sub(1)))
+                .map(|p| p.name.clone())
+        })
+    }
+
+    /// 装配屏选中的那条锁定集的 lockId(`↑/↓` 与鼠标点行同一份选中态,
+    /// 不另造第二套选择机制):没有选中的行 / 行上没有 lockId → `None`。
+    pub fn selected_lock_id(&self) -> Option<String> {
+        self.ls
+            .as_ref()
+            .and_then(|l| l.locks.get(self.as_sel))
+            .and_then(|l| l.lock_id.clone())
+    }
+
+    /// 配方侧现在指向的配方文件(#98):「选中的派 → 仓内配方文件」的既有派生
+    /// (派名 = 配方名,#5;path 取自 ls 配方行)。屏上那一行与下发门共用这一
+    /// 份事实——屏上说齐了,下发才真入队。派没选 / 配方不在仓里 → `None`。
+    pub fn validate_recipe_target(&self) -> Option<String> {
+        let root = self.usable_data_root()?;
+        let profile = self.selected_profile()?;
         let rel = self.ls.as_ref().and_then(|l| {
             l.recipes
                 .iter()
                 .find(|r| r.name == profile)
                 .and_then(|r| r.path.clone())
-        });
-        match rel {
-            Some(rel) => {
-                let abs = format!("{}/{rel}", root.trim_end_matches('/'));
-                self.queue.push(commands::validate_recipe(&abs));
-            }
-            None => self.push_log(format!(
-                "派 {profile} 的配方不在当前数据仓(或引擎 ls 没给配方路径):validate 无从拼装,先 ls 刷新或换数据仓根"
-            )),
+        })?;
+        Some(format!("{}/{rel}", root.trim_end_matches('/')))
+    }
+
+    /// 锁定集侧现在指向的载体文件(#98):引擎 ls 的 locks 域与装配命令交锁段
+    /// 的同一落点(`$NW_HOME/locks/<lockId>.nwlock`)。没选中 → `None`。
+    pub fn validate_lock_target(&self) -> Option<String> {
+        self.selected_lock_id().map(|id| self.lock_carrier(&id))
+    }
+
+    /// 缺前提那句话的句首(#98):三档各说清自己要读哪几侧——同一句
+    /// 「数据仓根未设」在三个档上不冒充成同一件事。单侧配方那一措辞与
+    /// #92 冻结的逐字节一致。
+    fn validate_gate_head(&self) -> &'static str {
+        match self.hl_scope {
+            ValidateScope::Recipe => "validate 要读配方文件",
+            ValidateScope::Lock => "validate 要读锁定集",
+            ValidateScope::Both => "validate 要同时读配方与锁定集",
         }
     }
 
@@ -5122,8 +5435,11 @@ impl App {
             };
         // 预跑 argv:与健康屏 validate 同源(同一 `commands::validate_recipe`
         // 构造函数),只是路径指向 scratch(编辑态)——recipe.yaml 仍未动。
-        // 绝对路径由写侧句柄出(壳层不拼字符串)。
-        self.queue.push(commands::validate_recipe(&slot.abs()));
+        // 绝对路径由写侧句柄出(壳层不拼字符串);数据仓根照单侧配方的同一
+        // 纪律显式给(#92),scratch 落在配方同目录,根槽与健康屏一字不差。
+        // quiet 留位同样缺省不落(面板没有入口)。
+        self.queue
+            .push(commands::validate_recipe(&slot.abs(), &root, false));
         if let Some(f) = self.rc_edit_flow.as_mut() {
             f.plan = Some(plan);
             f.scratch = Some(slot);
@@ -5535,17 +5851,58 @@ mod tests {
         );
         app.hl_mode = HealthMode::Validate;
         app.run_health();
+        let argv = app.queue.last().expect("validate 已入队").clone();
         assert_eq!(
-            app.queue.last().unwrap(),
-            &vec![
+            argv,
+            vec![
                 "validate".to_string(),
                 "--recipe".into(),
                 // 引擎 --recipe 收配方路径(裸派名实测 rc 3 INPUT_INVALID);
-                // 派名 = 配方名(#5),path 取自 ls 行,仓根由引擎从路径自推导
-                format!("{}/recipes/research-desk/recipe.yaml", root.display())
-            ]
+                // 派名 = 配方名(#5),path 取自 ls 行
+                format!("{}/recipes/research-desk/recipe.yaml", root.display()),
+                // 数据仓根显式携带(#92):与 ls --repo / bake --repo 同源同纪律,
+                // 不假设引擎拿当前目录兜底
+                "--repo".into(),
+                root.display().to_string(),
+            ],
+            "单侧配方两槽位:--recipe + --repo,quiet 留位缺省不落"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--quiet"),
+            "quiet 缺省不落:与加这个留位槽之前的 argv 逐字节同形(只多 --repo):{argv:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 健康validate档_数据仓根未设或不可用_不入队_指路话术一字不改() {
+        // 门只有一道:usable_data_root 拿不到根(未设 / 设了但目录不可用)
+        // 就一条命令都不下发,日志只说清缺什么——**绝不给半条命令**。
+        for (root, why) in [
+            (None, "未设"),
+            (
+                Some("/nonexistent-nwt-validate-root-xyz".to_string()),
+                "不可用",
+            ),
+        ] {
+            let mut app = fake_app();
+            app.data_root = root;
+            app.ls = Some(
+                serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[{"name":"desk","version":"1.0.0","path":"recipes/desk/recipe.yaml"}],"components":[],"sources":[],"profiles":[{"name":"desk","state":"ok"}],"locks":[]}"#)
+                    .unwrap(),
+            );
+            app.hl_mode = HealthMode::Validate;
+            let before = app.queue.len();
+            app.run_health();
+            assert_eq!(app.queue.len(), before, "数据仓根{why}:validate 不入队");
+            assert!(
+                app.log
+                    .iter()
+                    .any(|l| l.contains("validate 要读配方文件:数据仓根未设,去设置屏按 d 录入")),
+                "数据仓根{why}:日志只有既有那句指路(一字不改),实际 {:?}",
+                app.log
+            );
+        }
     }
 
     #[test]
@@ -5566,6 +5923,200 @@ mod tests {
             app.log.iter().any(|l| l.contains("配方不在当前数据仓")),
             "日志说清为什么没跑:{:?}",
             app.log
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- 工单 #98:validate 三档校验范围(单侧配方 / 单侧锁定集 / 双侧同给) ----
+
+    /// 三档各自的入队 argv:期望值按字面量钉死(旗标顺序 = 上游 usage 形状),
+    /// 不按实现的计算方式再算一遍。
+    #[test]
+    fn 健康validate档_三档各自的入队argv() {
+        let mut app = fake_app();
+        let root = std::env::temp_dir().join("nwt-validate-scope-3");
+        let _ = std::fs::create_dir_all(&root);
+        app.data_root = Some(root.display().to_string());
+        app.nw_home = "/nw-home".into(); // 钉定:载体落点不随进程环境漂
+        app.ls = Some(
+            serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[{"name":"research-desk","version":"1.0.0","path":"recipes/research-desk/recipe.yaml"}],"components":[],"sources":[],"profiles":[{"name":"research-desk","state":"ok","lockId":"9f8e"}],"locks":[{"lockId":"9f8e","recipe":"research-desk"},{"lockId":"a1b2","recipe":"lab-desk"}]}"#)
+                .unwrap(),
+        );
+        app.hl_mode = HealthMode::Validate;
+
+        // 档一:单侧配方 —— 与 #92 逐字节一致(含新带的 --repo)
+        app.hl_scope = ValidateScope::Recipe;
+        app.as_sel = 1; // 装配屏选中第二条锁定集:单侧配方不看这一侧
+        app.run_health();
+        assert_eq!(
+            app.queue.last().unwrap(),
+            &vec![
+                "validate".to_string(),
+                "--recipe".into(),
+                format!("{}/recipes/research-desk/recipe.yaml", root.display()),
+                "--repo".into(),
+                root.display().to_string(),
+            ],
+            "单侧配方:--recipe + --repo,与 #92 的输出逐字节一致"
+        );
+
+        // 档二:单侧锁定集 —— --lock + --repo,配方侧整个不出现
+        app.hl_scope = ValidateScope::Lock;
+        app.as_sel = 1;
+        app.run_health();
+        assert_eq!(
+            app.queue.last().unwrap(),
+            &vec![
+                "validate".to_string(),
+                "--lock".into(),
+                // 载体落点同发射那条路:引擎 ls 的 locks 域与交锁段同一处
+                "/nw-home/locks/a1b2.nwlock".to_string(),
+                "--repo".into(),
+                root.display().to_string(),
+            ],
+            "单侧锁定集:--lock + --repo(上游在这一态用 --repo 发现配方与组件清单)"
+        );
+
+        // 档三:双侧同给 —— 一次跑全跨文件检查项(1–19)
+        app.hl_scope = ValidateScope::Both;
+        app.as_sel = 1;
+        app.run_health();
+        assert_eq!(
+            app.queue.last().unwrap(),
+            &vec![
+                "validate".to_string(),
+                "--recipe".into(),
+                format!("{}/recipes/research-desk/recipe.yaml", root.display()),
+                "--lock".into(),
+                "/nw-home/locks/a1b2.nwlock".to_string(),
+                "--repo".into(),
+                root.display().to_string(),
+            ],
+            "双侧同给:--recipe + --lock + --repo,旗标顺序稳定可断言"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 缺前提三态各自只说清自己:派没选 / 锁定集没选 / 数据仓根未设 ——
+    /// 一条命令都不入队,三句话互不冒充。
+    #[test]
+    fn 健康validate档_缺前提三态各自只说清自己_绝不给半条命令() {
+        let ls_both = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"1.0.0","path":"recipes/research-desk/recipe.yaml"}],"components":[],"sources":[],"profiles":[{"name":"research-desk","state":"ok"}],"locks":[{"lockId":"9f8e","recipe":"research-desk"}]}"#;
+        let root = std::env::temp_dir().join("nwt-validate-scope-gate");
+        let _ = std::fs::create_dir_all(&root);
+
+        // 态一:双侧同给却一个锁定集都没选(ls 的 locks 域空)
+        let mut app = fake_app();
+        app.data_root = Some(root.display().to_string());
+        app.nw_home = "/nw-home".into();
+        app.ls = Some(serde_json::from_str::<LsData>(ls_both).unwrap());
+        app.hl_mode = HealthMode::Validate;
+        app.hl_scope = ValidateScope::Both;
+        app.as_sel = 7; // 越界 = 没选中任何一行
+        let before = app.queue.len();
+        app.run_health();
+        assert_eq!(app.queue.len(), before, "缺锁定集:不入队");
+        assert!(
+            app.log.iter().any(|l| l.contains("装配屏里没选中锁定集")),
+            "缺锁定集:只说清缺锁定集这一侧,实际 {:?}",
+            app.log
+        );
+        assert!(
+            !app.log.iter().any(|l| l.contains("配方不在当前数据仓")),
+            "配方侧是齐的:不许拿另一侧的话顶替,实际 {:?}",
+            app.log
+        );
+
+        // 态二:双侧同给却没选派(概览屏一个派都没选中)
+        let no_profile = r#"{"domain":"all","recipes":[{"name":"research-desk","version":"1.0.0","path":"recipes/research-desk/recipe.yaml"}],"components":[],"sources":[],"profiles":[],"locks":[{"lockId":"9f8e","recipe":"research-desk"}]}"#;
+        let mut app = fake_app();
+        app.data_root = Some(root.display().to_string());
+        app.nw_home = "/nw-home".into();
+        app.ls = Some(serde_json::from_str::<LsData>(no_profile).unwrap());
+        app.hl_mode = HealthMode::Validate;
+        app.hl_scope = ValidateScope::Both;
+        let before = app.queue.len();
+        app.run_health();
+        assert_eq!(app.queue.len(), before, "缺派:不入队");
+        assert!(
+            app.log.iter().any(|l| l.contains("没有选中的派")),
+            "缺派:只说清缺派这一侧,实际 {:?}",
+            app.log
+        );
+        assert!(
+            !app.log.iter().any(|l| l.contains("没选中锁定集")),
+            "锁定集侧是齐的:不许拿另一侧的话顶替,实际 {:?}",
+            app.log
+        );
+
+        // 态三:数据仓根未设(三档都不入队,句首各点明自己要读哪几侧)
+        for (scope, head) in [
+            (
+                ValidateScope::Recipe,
+                "validate 要读配方文件:数据仓根未设,去设置屏按 d 录入",
+            ),
+            (
+                ValidateScope::Lock,
+                "validate 要读锁定集:数据仓根未设,去设置屏按 d 录入",
+            ),
+            (
+                ValidateScope::Both,
+                "validate 要同时读配方与锁定集:数据仓根未设,去设置屏按 d 录入",
+            ),
+        ] {
+            let mut app = fake_app();
+            app.data_root = None;
+            app.nw_home = "/nw-home".into();
+            app.ls = Some(serde_json::from_str::<LsData>(ls_both).unwrap());
+            app.hl_mode = HealthMode::Validate;
+            app.hl_scope = scope;
+            let before = app.queue.len();
+            app.run_health();
+            assert_eq!(app.queue.len(), before, "{scope:?} 数据仓根未设:不入队");
+            assert!(
+                app.log.iter().any(|l| l.contains(head)),
+                "{scope:?} 数据仓根未设:只说清自己缺数据仓根,实际 {:?}",
+                app.log
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 切档再切回单侧配方:argv 与 #92 逐字节一致(切档不污染单侧形态),
+    /// 且 `s` 是这三个档之间唯一的轮转键。
+    #[test]
+    fn 健康validate档_切回单侧配方_argv不变() {
+        let mut app = fake_app();
+        let root = std::env::temp_dir().join("nwt-validate-scope-back");
+        let _ = std::fs::create_dir_all(&root);
+        app.data_root = Some(root.display().to_string());
+        app.nw_home = "/nw-home".into();
+        app.ls = Some(
+            serde_json::from_str::<LsData>(r#"{"domain":"all","recipes":[{"name":"research-desk","version":"1.0.0","path":"recipes/research-desk/recipe.yaml"}],"components":[],"sources":[],"profiles":[{"name":"research-desk","state":"ok"}],"locks":[{"lockId":"9f8e","recipe":"research-desk"}]}"#)
+                .unwrap(),
+        );
+        app.hl_mode = HealthMode::Validate;
+        app.screen = Screen::Health; // s 是健康屏的键,派发前先站到这一屏
+                                     // s 键在 validate 档轮转:单侧配方 → 单侧锁定集 → 双侧同给 → 回单侧配方
+        assert_eq!(app.hl_scope, ValidateScope::Recipe);
+        app.update(Message::Key(key('s')));
+        assert_eq!(app.hl_scope, ValidateScope::Lock);
+        app.update(Message::Key(key('s')));
+        assert_eq!(app.hl_scope, ValidateScope::Both);
+        app.update(Message::Key(key('s')));
+        assert_eq!(app.hl_scope, ValidateScope::Recipe, "切回单侧配方");
+        // 切回之后的 argv:与 #92 的单侧配方逐字节一致
+        app.run_health();
+        assert_eq!(
+            app.queue.last().unwrap(),
+            &vec![
+                "validate".to_string(),
+                "--recipe".into(),
+                format!("{}/recipes/research-desk/recipe.yaml", root.display()),
+                "--repo".into(),
+                root.display().to_string(),
+            ],
+            "切回单侧配方:argv 与 #92 逐字节一致"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -6301,6 +6852,106 @@ mod tests {
             app.log.iter().any(|l| l.contains("数据仓根切换")),
             "日志留证据"
         );
+    }
+
+    // ---- #93 烘焙两槽位(可选增强,一等设置) ----
+
+    #[test]
+    fn 烘焙两槽位_手填生效同链_持久化且两个槽位互不顶替() {
+        let (_g, _cfg) = env_locked();
+        let mut app = settings_app();
+        // 缺省未设:不落槽,也不拿当前目录兜底
+        assert_eq!(app.assets_dir, None, "资产目录缺省未设");
+        assert_eq!(app.bundle_repo, None, "bundle 取货仓缺省未设");
+        // a = 资产目录
+        app.update(Message::Key(key('a')));
+        assert_eq!(
+            app.slot_input,
+            Some(crate::app::BakeSlot::AssetsDir),
+            "a 进资产目录手填"
+        );
+        type_str(&mut app, "/data/assets");
+        assert_eq!(app.slot_buf, "/data/assets", "缓冲区回显");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.assets_dir.as_deref(),
+            Some("/data/assets"),
+            "新值落状态树"
+        );
+        assert!(
+            app.slot_input.is_none() && app.slot_buf.is_empty(),
+            "用完即退"
+        );
+        let (cfg, err) = crate::engine::config::load();
+        assert!(err.is_none());
+        assert_eq!(
+            cfg.assets_dir.as_deref(),
+            Some("/data/assets"),
+            "持久化进 config,重启(重读)仍生效"
+        );
+        // r = bundle 取货仓(与 a 同一套输入态,只差槽位)
+        app.update(Message::Key(key('r')));
+        assert_eq!(
+            app.slot_input,
+            Some(crate::app::BakeSlot::BundleRepo),
+            "r 进 bundle 取货仓手填"
+        );
+        type_str(&mut app, "git@github.com:me/bundles.git");
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.bundle_repo.as_deref(),
+            Some("git@github.com:me/bundles.git"),
+            "第二个槽位落状态树"
+        );
+        let (cfg2, _) = crate::engine::config::load();
+        assert_eq!(
+            cfg2.bundle_repo.as_deref(),
+            Some("git@github.com:me/bundles.git"),
+            "第二个槽位也持久化"
+        );
+        assert_eq!(
+            cfg2.assets_dir.as_deref(),
+            Some("/data/assets"),
+            "设一个不顶掉另一个"
+        );
+        // 这两个槽位不入队任何引擎命令:bake 是建议命令,面板不代跑(ADR-0003)
+        assert!(
+            !app.queue
+                .iter()
+                .any(|a| a.first().is_some_and(|s| s == "recipe")),
+            "槽位生效不下发引擎命令:{:?}",
+            app.queue
+        );
+    }
+
+    #[test]
+    fn 烘焙槽位_空值拒绝留驻_esc_放弃不改状态() {
+        let mut app = settings_app();
+        app.assets_dir = Some("/data/assets".into());
+        app.update(Message::Key(key('a')));
+        app.slot_buf = "   ".into();
+        app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.assets_dir.as_deref(),
+            Some("/data/assets"),
+            "空值拒绝,原值保持不变(与数据仓根手填同口径)"
+        );
+        assert!(app.slot_input.is_some(), "拒绝后留输入态可改");
+        // Esc 放弃:不退面板、不改状态
+        app.update(Message::Key(key('q')));
+        assert!(!app.quit, "输入态 q = 放弃,不是退出");
+        assert!(app.slot_input.is_none(), "放弃退输入态");
+        assert_eq!(app.assets_dir.as_deref(), Some("/data/assets"));
+        assert!(app.slot_buf.is_empty());
     }
 
     #[test]
@@ -9288,6 +9939,7 @@ mod tests {
         as_sel: usize,
         as_confirm: bool,
         hl_mode: HealthMode,
+        hl_scope: ValidateScope,
         hl_sel: usize,
         hl_integrity: Option<crate::datarepo::ReferenceScan>,
         rc_domain: Domain,
@@ -9324,6 +9976,7 @@ mod tests {
             as_history: a.as_history.clone(),
             ah_sel: a.ah_sel,
             hl_mode: a.hl_mode,
+            hl_scope: a.hl_scope,
             hl_sel: a.hl_sel,
             hl_integrity: a.hl_integrity.clone(),
             rc_domain: a.rc_domain,
@@ -9493,10 +10146,17 @@ mod tests {
     }
 
     /// 取 README 六屏表里某一屏的那一行(行首是屏名)。
+    ///
+    /// 按**屏名列**比对,不按「整行含不含这个字」——描述列可以合法提到别的屏
+    /// (健康屏的 validate 三档要提「配方侧 / 装配屏选中的锁定集」,#98),
+    /// 按 contains 找会把 配方 / 装配 的行错认成 健康 那一行。
     fn readme_row_for(readme: &str, cn: &str) -> String {
         readme
             .lines()
-            .find(|l| l.trim_start().starts_with('|') && l.contains(cn))
+            .find(|l| {
+                l.trim_start().starts_with('|')
+                    && l.split('|').nth(1).is_some_and(|c| c.trim() == cn)
+            })
             .unwrap_or_else(|| panic!("README 六屏表应有「{cn}」行"))
             .to_string()
     }

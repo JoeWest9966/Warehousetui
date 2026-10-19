@@ -290,10 +290,10 @@ pub fn hitmap(area: Rect, app: &App, class: SizeClass) -> Vec<(Rect, Target)> {
         ritual_hits(body, class, &mut hits);
         return hits;
     }
-    // 手填浮层(NW_HOME / 数据仓根)对鼠标惰性:打字仍走键盘;浮层打开
-    // 期间鼠标不分派任何命中区——点击只作用于浮层,不误触底层
-    // (spec #15 故事 14/16;数据仓根手填沿用同一条)。
-    if app.home_input || app.data_input {
+    // 手填浮层(NW_HOME / 数据仓根 / 烘焙两槽位)对鼠标惰性:打字仍走键盘;
+    // 浮层打开期间鼠标不分派任何命中区——点击只作用于浮层,不误触底层
+    // (spec #15 故事 14/16;数据仓根手填沿用同一条,#93 两槽位同族)。
+    if app.home_input || app.data_input || app.slot_input.is_some() {
         return hits;
     }
     // 全局命令面板(#119):叠加浮层,与帮助浮层同级的吞点击纪律——底层
@@ -750,6 +750,19 @@ pub(crate) fn integrity_cols(area: Rect) -> (Rect, Rect) {
     )
 }
 
+/// 健康屏 validate 档的正文分区(#98):顶部两行「校验范围」条(三档 + 两侧
+/// 现状)+ 其余。渲染侧 `screens::health::render_health` 与命中侧
+/// [`health_hits`] 共用这一处,几何零分歧(ADR-0005)——条子多高,27 项清单
+/// 就下移多高,鼠标点行才不会错位。
+pub(crate) fn health_validate_rows(area: Rect) -> (Rect, Rect) {
+    let rows = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(2),
+        ratatui::layout::Constraint::Min(1),
+    ])
+    .split(area);
+    (rows[0], rows[1])
+}
+
 /// 健康屏:validate 模式下「27 项」列表在 55% 左栏、带边框、首行即数据
 /// (doctor 模式是只读七面卡,无选中目标);外部源漂移模式(#40)的左栏是
 /// 「结论横幅 + 已登记外部源清单」,清单行在横幅之下,几何见
@@ -794,7 +807,10 @@ fn health_hits(area: Rect, app: &App, hits: &mut Vec<(Rect, Target)>) {
     if !matches!(app.hl_mode, crate::app::HealthMode::Validate) {
         return;
     }
-    let (cols, _) = h_split2(area, 55, 45);
+    // 校验范围条(#98)占掉顶部两行:清单几何随之下移,与渲染同一个
+    // `health_validate_rows`
+    let (_, rest) = health_validate_rows(area);
+    let (cols, _) = h_split2(rest, 55, 45);
     let lst = shrink_border(cols);
     let n = app
         .hl_result
@@ -1652,6 +1668,11 @@ mod tests {
             hits.is_empty(),
             "手填浮层对鼠标惰性:零命中区(#20 不分派,故事 16)"
         );
+        // 烘焙两槽位手填(#93):同一级浮层,同一条惰性纪律
+        app.home_input = false;
+        app.slot_input = Some(crate::app::BakeSlot::AssetsDir);
+        let hits = hitmap(a, &app, size_class(a));
+        assert!(hits.is_empty(), "槽位手填浮层同样对鼠标惰性:零命中区");
     }
 
     #[test]

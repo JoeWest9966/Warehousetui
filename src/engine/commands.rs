@@ -41,14 +41,60 @@ pub fn doctor_lock(lock: &str, nw_home: Option<&str>) -> Vec<String> {
     a
 }
 
-/// 校验:配方侧。
-pub fn validate_recipe(recipe: &str) -> Vec<String> {
-    vec!["validate".into(), "--recipe".into(), recipe.into()]
+/// 校验:配方侧(spec #89 工单 #92 的单侧两态之一)。
+///
+/// 槽位纪律与 [`ls`] / [`recipe_bake`] 同源:数据仓根**显式携带**,签名里
+/// 没有「不带 `--repo`、让引擎拿当前目录兜底」的写法。`quiet` 是留位槽位
+/// (见 [`validate_argv`]),缺省不落。
+pub fn validate_recipe(recipe: &str, repo: &str, quiet: bool) -> Vec<String> {
+    validate_argv(&[("--recipe", recipe)], repo, quiet)
 }
 
-/// 校验:锁定集侧。
-pub fn validate_lock(lock: &str) -> Vec<String> {
-    vec!["validate".into(), "--lock".into(), lock.into()]
+/// 校验:锁定集侧(spec #89 工单 #92 的单侧两态之二)。
+///
+/// `--repo` 在这一态尤其不是可选项:锁定集放在引擎推导不出的目录布局时,
+/// 配方与组件清单全靠它才发现(spec #89 工单 #92;上游语义:仅 `--lock`
+/// 单侧时 `--repo` 用于发现配方与组件清单)。`quiet` 留位槽位同
+/// [`validate_recipe`](fn.validate_recipe),缺省不落。
+pub fn validate_lock(lock: &str, repo: &str, quiet: bool) -> Vec<String> {
+    validate_argv(&[("--lock", lock)], repo, quiet)
+}
+
+/// 校验:两侧同给(spec #89 工单 #98 的第三态)。
+///
+/// 一次跑全 27 项里的**跨文件检查项**(1–19):单侧 `--lock` 在命令路径推导
+/// 不出数据仓根时发现不全配方与组件清单,配方与锁定集同给就不靠发现兜底
+/// (spec #89 用户故事 2)。`--repo` 恒落,纪律同两个单侧态——不假设引擎拿
+/// 当前目录兜底。`quiet` 留位槽位同两个单侧态,缺省不落。
+///
+/// 旗标顺序冻结:`validate` → `--recipe` → `--lock` → `--repo` → (`--quiet`)。
+pub fn validate_both(recipe: &str, lock: &str, repo: &str, quiet: bool) -> Vec<String> {
+    validate_argv(&[("--recipe", recipe), ("--lock", lock)], repo, quiet)
+}
+
+/// validate argv 的**唯一拼装处**(spec #89 工单 #92):两侧槽位按序落,
+/// `--repo` 恒落,`quiet` 留位**缺省不落**。
+///
+/// 三态(单侧配方 / 单侧锁定集 / 双侧同给)都从本函数出,**不另立第二条
+/// 拼装路径**:旗标一处真相,与 `ls` / `up` 同层(工单 #98 在两侧槽位上多
+/// 传一组即得双侧同给,见 [`validate_both`])。
+///
+/// `quiet` 是**留位槽位**:上游 `--quiet` 今天是压 stderr 进度行的 no-op
+/// (进度阶段没启用,警告永不被压),语义以上游激活为准;面板不摆 UI 入口,
+/// 只在 argv 构造函数的能力范围里留出这一枚——给了才落,落点固定在
+/// `--repo` 之后(argv 末尾),屏级断言不必猜位置。
+fn validate_argv(sides: &[(&str, &str)], repo: &str, quiet: bool) -> Vec<String> {
+    let mut a = vec!["validate".to_string()];
+    for (flag, value) in sides {
+        a.push((*flag).to_string());
+        a.push((*value).to_string());
+    }
+    a.push("--repo".to_string());
+    a.push(repo.to_string());
+    if quiet {
+        a.push("--quiet".to_string());
+    }
+    a
 }
 
 /// 版本探测。注意:`nw --version` 的裸版本号走 **stderr**。
@@ -595,13 +641,31 @@ pub fn bake_out_default(recipe: &str) -> String {
     format!("{recipe}.sh")
 }
 
+/// 烘焙的两个可选槽位旗标名(spec #89 工单 #93):argv 拼法一处真相,
+/// 设置屏的指路也照它说,不另写一串。形状实测自引擎
+/// `nw recipe bake --help` 的用法行(所配 0.1.0)。
+pub const ASSETS_DIR_FLAG: &str = "--assets-dir";
+pub const BUNDLE_REPO_FLAG: &str = "--bundle-repo";
+
 /// 烘焙:把配方烤成锁定集 + 一条 POSIX sh 装配命令。
 ///
 /// `version` 非空时位置参数带 `@版本`(与配方版本不符由引擎拒,rc 3)。
 /// 形状实测自引擎 `nw recipe bake --help` 的用法行(所配 0.1.0):
 /// `nw recipe bake <配方>[@版本] --out <命令文件> [--assets-dir <目录>] [--repo <目录>]`。
-pub fn recipe_bake(recipe: &str, version: Option<&str>, out: &str, repo: &str) -> Vec<String> {
-    vec![
+///
+/// #93 加的两个**可选增强槽位**:`assets_dir` 与 `bundle_repo` 非空才落,
+/// 空 = 让引擎自己算(资产目录缺省按 release 预设算 sha256;取货仓缺省从数据仓
+/// git origin 推导——面板**不复制**这个推导,见 spec #89 决策)。落点都钉在
+/// `--repo` 之后:两个可选槽位共用同一条尾巴顺序,旗标先后对引擎的旗标解析无影响。
+pub fn recipe_bake(
+    recipe: &str,
+    version: Option<&str>,
+    out: &str,
+    repo: &str,
+    assets_dir: Option<&str>,
+    bundle_repo: Option<&str>,
+) -> Vec<String> {
+    let mut a = vec![
         "recipe".into(),
         "bake".into(),
         recipe_arg(recipe, version),
@@ -609,7 +673,16 @@ pub fn recipe_bake(recipe: &str, version: Option<&str>, out: &str, repo: &str) -
         out.to_string(),
         "--repo".into(),
         repo.to_string(),
-    ]
+    ];
+    if let Some(d) = assets_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        a.push(ASSETS_DIR_FLAG.into());
+        a.push(d.to_string());
+    }
+    if let Some(b) = bundle_repo.map(str::trim).filter(|b| !b.is_empty()) {
+        a.push(BUNDLE_REPO_FLAG.into());
+        a.push(b.to_string());
+    }
+    a
 }
 
 /// 由「选中配方 + 数据仓根 + 出参默认值 + 引擎能力」算出建议命令。
@@ -617,16 +690,24 @@ pub fn recipe_bake(recipe: &str, version: Option<&str>, out: &str, repo: &str) -
 /// 纯函数:无 IO、不读环境、不碰能力账——`bake_capable` 由调用方从
 /// 能力探测门(#29)取来。任一前提不成立就走对应的 [`BakeGate`],
 /// **绝不返回半条命令**。
+///
+/// `assets_dir` / `bundle_repo`(#93)是**可选增强槽位**,由调用方从设置屏的
+/// 一等设置取来(未设传 `None`)。它们不参与前提判定:填了照旧过三道闸,
+/// 缺了也照旧给得出命令;进了 argv 的落点与 [`recipe_bake`] 一致(都在
+/// `--repo` 之后)。展示串永远由 argv 拼出(`"nw " + argv.join(" ")`),
+/// 复制去 shell 敲与面板算出来的是同一条命令。
 pub fn recipe_bake_suggest(
     recipe: Option<(&str, Option<&str>)>,
     data_root: Option<&str>,
     bake_capable: bool,
+    assets_dir: Option<&str>,
+    bundle_repo: Option<&str>,
 ) -> Result<BakeSuggest, BakeGate> {
     let (name, repo) =
         precondition(recipe.map(|(n, _)| n), data_root, bake_capable).map_err(BakeGate::of)?;
     let version = recipe.and_then(|(_, v)| v);
     let out = bake_out_default(name);
-    let argv = recipe_bake(name, version, &out, repo);
+    let argv = recipe_bake(name, version, &out, repo, assets_dir, bundle_repo);
     Ok(BakeSuggest {
         display: format!("nw {}", argv.join(" ")),
         argv,
@@ -1011,6 +1092,8 @@ mod tests {
             Some("1.0.0"),
             "research-desk.sh",
             "/data/repo",
+            None,
+            None,
         );
         assert_eq!(
             a,
@@ -1026,18 +1109,151 @@ mod tests {
         );
         // 版本缺失:不猜,只给配方名
         assert_eq!(
-            recipe_bake("desk", None, "desk.sh", "/data/repo")[2],
+            recipe_bake("desk", None, "desk.sh", "/data/repo", None, None)[2],
             "desk"
         );
         assert_eq!(bake_out_default("desk"), "desk.sh");
     }
 
     #[test]
+    fn bake_两槽位都缺_与现状逐字节一致() {
+        // 缺省态的 argv 就是 #93 之前那一条:七个元素,一个字节都不多。
+        // 期望值是 #93 之前实测的原文(不是拿新实现反推的),所以这条测试
+        // 钉的是「可选槽位的加入没有改动日常烘焙的命令」。
+        let none = recipe_bake(
+            "research-desk",
+            Some("1.0.0"),
+            "research-desk.sh",
+            "/data/repo",
+            None,
+            None,
+        );
+        assert_eq!(
+            none,
+            vec![
+                "recipe",
+                "bake",
+                "research-desk@1.0.0",
+                "--out",
+                "research-desk.sh",
+                "--repo",
+                "/data/repo"
+            ]
+        );
+        assert_eq!(
+            none.join(" "),
+            "recipe bake research-desk@1.0.0 --out research-desk.sh --repo /data/repo",
+            "空格拼接后的串也是原文:一个字节都不多"
+        );
+        // 空串 / 纯空白 / 没给,三种写法同一条 argv(可选槽位的「空」只有一种语义)
+        for (a, b) in [
+            (Some(""), None),
+            (Some("   "), None),
+            (None, Some("")),
+            (None, Some("  ")),
+            (Some(""), Some("")),
+        ] {
+            assert_eq!(
+                recipe_bake(
+                    "research-desk",
+                    Some("1.0.0"),
+                    "research-desk.sh",
+                    "/data/repo",
+                    a,
+                    b
+                ),
+                none,
+                "空槽位({a:?}, {b:?})不得给命令添一个字节"
+            );
+        }
+    }
+
+    #[test]
+    fn bake_资产目录_空不落_非空落() {
+        // 空值不落槽:让引擎按 release 预设算 sha256(面板不替引擎猜一份资产)
+        let none = recipe_bake("desk", None, "desk.sh", "/data/repo", None, None);
+        assert!(
+            !none.iter().any(|s| s == "--assets-dir"),
+            "没给就不落:{none:?}"
+        );
+        let blank = recipe_bake("desk", None, "desk.sh", "/data/repo", Some("  "), None);
+        assert!(
+            !blank.iter().any(|s| s == "--assets-dir"),
+            "纯空白等同没给:{blank:?}"
+        );
+        // 非空才落,落点钉在 --repo 之后
+        let with = recipe_bake(
+            "desk",
+            None,
+            "desk.sh",
+            "/data/repo",
+            Some("/data/assets"),
+            None,
+        );
+        assert_eq!(
+            with,
+            vec![
+                "recipe",
+                "bake",
+                "desk",
+                "--out",
+                "desk.sh",
+                "--repo",
+                "/data/repo",
+                "--assets-dir",
+                "/data/assets",
+            ]
+        );
+    }
+
+    #[test]
+    fn bake_取货仓_空不落_非空落() {
+        // 空 = 让引擎从数据仓 git origin 自己推导取货仓(面板不复制这个推导)
+        let none = recipe_bake("desk", None, "desk.sh", "/data/repo", None, None);
+        assert!(
+            !none.iter().any(|s| s == "--bundle-repo"),
+            "没给就不落:{none:?}"
+        );
+        let blank = recipe_bake("desk", None, "desk.sh", "/data/repo", None, Some("   "));
+        assert!(
+            !blank.iter().any(|s| s == "--bundle-repo"),
+            "纯空白等同没给:{blank:?}"
+        );
+        // 非空才落,落点在 --repo 之后(与资产目录同一条尾巴,顺序固定)
+        let with = recipe_bake(
+            "desk",
+            None,
+            "desk.sh",
+            "/data/repo",
+            None,
+            Some("git@github.com:me/bundles.git"),
+        );
+        assert_eq!(
+            with,
+            vec![
+                "recipe",
+                "bake",
+                "desk",
+                "--out",
+                "desk.sh",
+                "--repo",
+                "/data/repo",
+                "--bundle-repo",
+                "git@github.com:me/bundles.git",
+            ]
+        );
+    }
+
+    #[test]
     fn 建议命令_三前提齐备才算得出_且可复制() {
+        // 两个可选槽位都缺:展示串就是 #93 之前那一条(逐字节一致,见
+        // `bake_两槽位都缺_与现状逐字节一致`)——期望值是历史原文,不是反推的。
         let ok = recipe_bake_suggest(
             Some(("research-desk", Some("1.0.0"))),
             Some("/data/repo"),
             true,
+            None,
+            None,
         )
         .expect("三前提齐备必须给得出命令");
         assert_eq!(
@@ -1048,26 +1264,90 @@ mod tests {
             ok.argv.iter().all(|a| !a.contains("--yes")),
             "建议命令永不带确认闸"
         );
+        // 展示串永远由 argv 拼出:复制去 shell 敲与面板算出来的是同一条命令
         assert_eq!(ok.display, format!("nw {}", ok.argv.join(" ")));
+        // 缺省态一个字节都不多:七个元素、两个可选旗标都不在场
+        assert_eq!(ok.argv.len(), 7, "缺省态 argv 元素数不变:{:?}", ok.argv);
+        assert!(!ok.display.contains("--assets-dir"));
+        assert!(!ok.display.contains("--bundle-repo"));
+    }
+
+    #[test]
+    fn 建议命令_两槽位非空_进argv与展示串_落点仍在repo之后() {
+        // 资产目录 + 取货仓都设了:两条旗标按固定顺序接在 --repo 之后,
+        // 且展示串仍由 argv 拼出(同源同层,没有第二处「命令长什么样」)。
+        let ok = recipe_bake_suggest(
+            Some(("desk", None)),
+            Some("/data/repo"),
+            true,
+            Some("/data/assets"),
+            Some("git@github.com:me/bundles.git"),
+        )
+        .expect("三前提齐备必须给得出命令(可选槽位不是前提)");
+        assert_eq!(
+            ok.argv,
+            vec![
+                "recipe",
+                "bake",
+                "desk",
+                "--out",
+                "desk.sh",
+                "--repo",
+                "/data/repo",
+                "--assets-dir",
+                "/data/assets",
+                "--bundle-repo",
+                "git@github.com:me/bundles.git",
+            ]
+        );
+        assert_eq!(
+            ok.display,
+            "nw recipe bake desk --out desk.sh --repo /data/repo --assets-dir /data/assets \
+             --bundle-repo git@github.com:me/bundles.git"
+        );
+        assert_eq!(ok.display, format!("nw {}", ok.argv.join(" ")));
+        // 只设一个也成立:另一个照样不落(可选槽位各自独立)
+        let only_assets = recipe_bake_suggest(
+            Some(("desk", None)),
+            Some("/data/repo"),
+            true,
+            Some("/data/assets"),
+            None,
+        )
+        .expect("只设资产目录也算三前提齐备");
+        assert!(!only_assets.display.contains("--bundle-repo"));
+        assert!(only_assets.display.ends_with("--assets-dir /data/assets"));
     }
 
     #[test]
     fn 建议命令_三种缺前提各有可区分指路_绝不给半条命令() {
         // 选中行不是配方
         assert_eq!(
-            recipe_bake_suggest(None, Some("/data/repo"), true),
+            recipe_bake_suggest(None, Some("/data/repo"), true, None, None),
             Err(BakeGate::NotARecipe)
         );
         // 未设数据仓根(不拿当前目录兜底)
         assert_eq!(
-            recipe_bake_suggest(Some(("desk", None)), None, true),
+            recipe_bake_suggest(Some(("desk", None)), None, true, None, None),
             Err(BakeGate::NoDataRoot)
         );
         // 引擎没有 recipe bake 能力
         assert_eq!(
-            recipe_bake_suggest(Some(("desk", None)), Some("/data/repo"), false),
+            recipe_bake_suggest(Some(("desk", None)), Some("/data/repo"), false, None, None),
             Err(BakeGate::NoCapability)
         );
+        // #93:两个可选槽位都设了也不改变前提闸的结论——资产与取货仓是可选
+        // 增强,不是前提。数据仓根未设时照旧只给指路,一个新字节都不落。
+        for (a, b) in [
+            (Some("/data/assets"), Some("git@github.com:me/bundles.git")),
+            (Some("/data/assets"), None),
+        ] {
+            assert_eq!(
+                recipe_bake_suggest(Some(("desk", None)), None, true, a, b),
+                Err(BakeGate::NoDataRoot),
+                "可选槽位填了也不放行半条命令"
+            );
+        }
         // 三种指路两两不同,互不冒充
         let gates = [
             BakeGate::NoDataRoot,
@@ -1426,6 +1706,115 @@ mod tests {
                 "上游 rm 没有确认闸,面板不自己造一枚下发"
             );
         }
+    }
+
+    // ---- 工单 #92:validate argv 族补全(单侧两态显式带 --repo + quiet 留位) ----
+
+    #[test]
+    fn validate_单侧配方_显式带repo_不让引擎拿当前目录兜底() {
+        // 与 ls --repo / bake --repo 同源同纪律:数据仓根恒落,签名里没有
+        // 「不带 repo」的写法(与 ls 同一强制手法,见 ls_必带_repo_不给引擎当前目录兜底)
+        assert_eq!(
+            validate_recipe("recipes/research-desk/recipe.yaml", "/data/repo", false),
+            vec![
+                "validate",
+                "--recipe",
+                "recipes/research-desk/recipe.yaml",
+                "--repo",
+                "/data/repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_单侧锁定集_显式带repo_跨文件项靠它发现配方与组件清单() {
+        // 单侧 --lock 时上游用 --repo 发现配方与组件清单(spec #89 Further
+        // Notes):少了它,1–19 项跨文件检查在命令路径上跑不全
+        assert_eq!(
+            validate_lock("baked/nw-assemble.sh", "/data/repo", false),
+            vec![
+                "validate",
+                "--lock",
+                "baked/nw-assemble.sh",
+                "--repo",
+                "/data/repo"
+            ]
+        );
+        // 两态都不让 --repo 缺席:兜底当前目录是既有纪律明令排除的那条路
+        for a in [
+            validate_recipe("r.yaml", "/r", false),
+            validate_lock("x.nwlock", "/r", false),
+        ] {
+            assert!(a.contains(&"--repo".to_string()), "{a:?} 必须带 --repo");
+        }
+    }
+
+    #[test]
+    fn validate_双侧同给_配方与锁定集一次跑全_旗标顺序稳定可断言() {
+        // spec #89 工单 #98 的第三态:`--recipe` + `--lock` 同给,27 项里的
+        // 跨文件项(1–19)一次跑全,不靠单侧模式的发现兜底。旗标顺序冻结:
+        // validate → --recipe → --lock → --repo(quiet 留位仍在最末)。
+        assert_eq!(
+            validate_both(
+                "recipes/research-desk/recipe.yaml",
+                "/root/.nous-warehouse/locks/9f8e.nwlock",
+                "/data/repo",
+                false
+            ),
+            vec![
+                "validate",
+                "--recipe",
+                "recipes/research-desk/recipe.yaml",
+                "--lock",
+                "/root/.nous-warehouse/locks/9f8e.nwlock",
+                "--repo",
+                "/data/repo"
+            ]
+        );
+        // 顺序不是「恰好这七个元素」而已:--recipe 必在 --lock 之前、
+        // --repo 必在两侧之后(上游 usage 的形状,可断言所以不变)
+        let a = validate_both("r.yaml", "x.nwlock", "/r", false);
+        let i = |f: &str| a.iter().position(|s| s == f).expect("旗标在场");
+        assert!(i("--recipe") < i("--lock"), "配方侧在前:{a:?}");
+        assert!(i("--lock") < i("--repo"), "锁定集侧在数据仓根之前:{a:?}");
+        assert_eq!(a.len(), 7, "双侧七元素,quiet 留位缺省不落:{a:?}");
+        // quiet 留位槽位(#92)在双侧同给上同一纪律:缺省不落、给了才落,
+        // 落点仍在 --repo 之后(argv 末位)
+        assert!(!a.iter().any(|s| s == "--quiet"), "{a:?} 缺省不落 quiet");
+        let q = validate_both("r.yaml", "x.nwlock", "/r", true);
+        assert_eq!(q.last().map(String::as_str), Some("--quiet"), "{q:?}");
+        assert_eq!(q.len(), 8, "双侧给了 quiet 才多一枚:{q:?}");
+    }
+
+    #[test]
+    fn validate_quiet_缺省不落_给了才落_落点稳定在_repo_之后() {
+        // 缺省:一枚 --quiet 都不落(与加这个留位槽之前逐字节同形)
+        for a in [
+            validate_recipe("r.yaml", "/data/repo", false),
+            validate_lock("x.nwlock", "/data/repo", false),
+        ] {
+            assert!(!a.iter().any(|s| s == "--quiet"), "{a:?} 缺省不落 quiet");
+        }
+        // 显式给:恰好一枚,且落在 argv 末尾(--repo 之后)——位置稳定可断言
+        for a in [
+            validate_recipe("r.yaml", "/data/repo", true),
+            validate_lock("x.nwlock", "/data/repo", true),
+        ] {
+            assert_eq!(a.last().map(String::as_str), Some("--quiet"), "{a:?}");
+            assert_eq!(
+                a.iter().filter(|s| *s == "--quiet").count(),
+                1,
+                "quiet 恰好一枚:{a:?}"
+            );
+            let i = a.iter().position(|s| s == "--repo").expect("带了 repo");
+            assert_eq!(a[i + 1], "/data/repo", "--repo 的值紧随其后");
+            assert_eq!(a[i + 2], "--quiet", "quiet 落在 --repo 之后");
+        }
+        // quiet 只此一枚:给了不多带别的旗标,长度恰好多一个元素
+        assert_eq!(
+            validate_recipe("r.yaml", "/data/repo", true).len(),
+            validate_recipe("r.yaml", "/data/repo", false).len() + 1
+        );
     }
 
     #[test]

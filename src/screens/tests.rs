@@ -27,6 +27,23 @@ fn draw(app: &App, w: u16, h: u16) -> String {
     term.backend().to_string()
 }
 
+/// 整帧的**去掉空白与边框字符**的内容(#93):建议命令按内层宽折行是真的,
+/// 列断点随宽度变;跨词断言一律在扁平串上做,测的是操作者读到的内容而不是
+/// 某一行的断点。边框字符也要去掉——否则折行处夹着一串 `│`,跨行片段
+/// 就对不上了。
+fn flat_frame(app: &App, w: u16, h: u16) -> String {
+    crate::testutil::frame_display(app, w, h)
+        .chars()
+        .filter(|c| {
+            !c.is_whitespace()
+                && !matches!(
+                    c,
+                    '│' | '─' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼'
+                )
+        })
+        .collect()
+}
+
 fn feed(app: &mut App, out: EngineOutput) {
     app.update(Message::Engine(EngineEvent::Finished(Box::new(out))));
 }
@@ -228,6 +245,75 @@ fn 健康屏_validate_清单四态() {
     let s = draw(&app, 110, 30);
     assert!(s.contains("27 项"));
     assert!(s.contains("缺字段"));
+}
+
+/// 三档校验范围说得出、看得见(#98):屏顶那一行把三档名字都摊开,当前档带
+/// `▸`;切档键位 `s` 只在这一行与 HUD / 帮助浮层里出现,不另造一套选择。
+#[test]
+fn 健康屏_validate三档校验范围_摊开给操作者看() {
+    use crate::app::ValidateScope;
+    let mut app = fake_app();
+    app.screen = Screen::Health;
+    app.hl_mode = HealthMode::Validate;
+    app.data_root = Some(std::env::temp_dir().display().to_string());
+    app.ls = Some(serde_json::from_str(LS_FULL).unwrap());
+    // 有结论与无结论两种场都要看得见三档(切档不依赖上一次回音)
+    feed(
+        &mut app,
+        out(
+            &["validate", "--recipe", "x"],
+            3,
+            r#"{"schema":"nw/validate.v1","nw":"0.1.0","ok":false,"errors":[],"warnings":[],"data":{"target":"recipe.yaml","results":[{"id":"1","status":"pass","message":"schema 认"}],"summary":{"total":27,"pass":20,"warn":5,"fail":1,"skip":1}}}"#,
+        ),
+    );
+    for (scope, mark) in [
+        (ValidateScope::Recipe, "▸ 单侧配方"),
+        (ValidateScope::Lock, "▸ 单侧锁定集"),
+        (ValidateScope::Both, "▸ 双侧同给"),
+    ] {
+        app.hl_scope = scope;
+        let s = draw(&app, 110, 30);
+        // 三档名字一个都不少:操作者说得出自己在哪一档、还有哪两档
+        for name in ["单侧配方", "单侧锁定集", "双侧同给"] {
+            assert!(s.contains(name), "{scope:?} 三档都应上屏:{s}");
+        }
+        assert!(s.contains(mark), "{scope:?} 当前档带标记:{s}");
+        assert!(s.contains("s 切档"), "{scope:?} 切档键位在正文里:{s}");
+        // 27 项清单 + 证据五字段照旧呈现(不因新加一行而丢)
+        assert!(s.contains("27 项"), "{scope:?} 27 项清单在场:{s}");
+        assert!(s.contains("证据"), "{scope:?} 证据五字段在场:{s}");
+    }
+    // 紧凑态(66×50 保证最小)也不丢三档、不溢出行
+    app.splash = false; // frame_display 走整帧壳:splash 在场会画 logo,先交棒
+    app.hl_scope = ValidateScope::Both;
+    let f = crate::testutil::frame_display(&app, 66, 50);
+    for name in ["单侧配方", "单侧锁定集", "双侧同给"] {
+        assert!(f.contains(name), "66×50 三档仍在场:{f}");
+    }
+    for ln in f.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(ln) <= 66,
+            "66×50 有行超宽:{ln}"
+        );
+    }
+    // 第二行说清两侧各自指向谁;缺哪一侧就只说那一侧(LS_FULL 里选中派 desk
+    // 的配方不在仓 → 配方侧说不在仓,锁定集侧报选中的那条)
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("配方侧:派 desk 的配方不在当前数据仓"),
+        "配方侧按真因说话:{s}"
+    );
+    assert!(
+        s.contains("锁定集侧:装配屏选中的 9f8e"),
+        "锁定集侧报装配屏选中的那条:{s}"
+    );
+    // 缺锁定集那一侧:装配屏没选中任何一行 → 只说清缺锁定集侧
+    app.as_sel = 9; // 越界 = 没选中任何一行
+    let s = draw(&app, 110, 30);
+    assert!(
+        s.contains("锁定集侧:缺选中的锁定集(装配屏 ↑/↓ 选一条)"),
+        "缺哪一侧就说哪一侧:{s}"
+    );
 }
 
 #[test]
@@ -733,6 +819,96 @@ fn 设置屏_数据仓根手填浮层渲染() {
     assert!(s.contains("/data/repo"), "缓冲区回显");
     assert!(s.contains("█"), "块光标可见");
     assert!(s.contains("Enter 确认"), "键位提示");
+}
+
+// ---- #93 烘焙两槽位:一等设置(可见 / 可改 / 缺省未设 / 持久化) ----
+
+#[test]
+fn 设置屏_烘焙两槽位_缺省未设显式标出_设了就显示原值() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    // 缺省未设:显式标「未设置」,不说成空、也不拿当前目录兜底
+    let unset = draw(&app, 110, 30);
+    assert!(unset.contains("资产目录"), "行在场:{unset}");
+    assert!(unset.contains("bundle 取货仓"), "行在场:{unset}");
+    assert!(unset.contains("(a 手填)"), "键位提示:{unset}");
+    assert!(unset.contains("(r 手填)"), "键位提示:{unset}");
+    assert_eq!(
+        unset.matches("未设置").count(),
+        2,
+        "两个槽位都显式标未设:{unset}"
+    );
+    // 设了就显示原值(可见 = 操作者知道现在 bake 会带上什么)
+    app.assets_dir = Some("/data/assets".into());
+    app.bundle_repo = Some("git@github.com:me/bundles.git".into());
+    let set = draw(&app, 110, 30);
+    assert!(set.contains("资产目录  /data/assets"), "原值在场:{set}");
+    assert!(
+        set.contains("bundle 取货仓  git@github.com:me/bundles.git"),
+        "原值在场:{set}"
+    );
+    // config 状态仍在屏内(竖向预算:新行不许把末行挤出去)
+    assert!(set.contains("config 状态"), "末行没被挤出去:{set}");
+}
+
+#[test]
+fn 设置屏_烘焙槽位手填浮层渲染_点名旗标() {
+    let mut app = fake_app();
+    app.screen = Screen::Settings;
+    app.slot_input = Some(crate::app::BakeSlot::AssetsDir);
+    app.slot_buf = "/data/assets".into();
+    let s = draw(&app, 110, 30);
+    assert!(s.contains("手填资产目录"), "浮层标题:{s}");
+    assert!(s.contains("/data/assets"), "缓冲区回显:{s}");
+    assert!(s.contains("█"), "块光标可见:{s}");
+    assert!(s.contains("Enter 确认"), "键位提示:{s}");
+    assert!(s.contains("--assets-dir 落槽"), "末行点名 argv 旗标:{s}");
+    // bundle 取货仓:同一渲染件,只差标题与旗标
+    app.slot_input = Some(crate::app::BakeSlot::BundleRepo);
+    app.slot_buf = "git@github.com:me/bundles.git".into();
+    let s2 = draw(&app, 110, 30);
+    assert!(s2.contains("手填bundle 取货仓"), "另一个槽位同构:{s2}");
+    assert!(s2.contains("--bundle-repo 落槽"), "旗标各自点名:{s2}");
+}
+
+#[test]
+fn 配方域建议命令_两槽位设了才落_未设时与现状逐字节相同() {
+    let mut app = bake_app();
+    app.data_root = Some("/tmp".into());
+    // 未设:命令与 #93 之前逐字节相同(不多一个字节)。命令按内层宽折行,
+    // 所以断言在**去掉空白的扁平串**上做——测的是操作者读到的内容,
+    // 不是某一行的列断点。
+    let plain = flat_frame(&app, 110, 30);
+    assert!(
+        plain.contains("nwrecipebakeresearch-desk@1.0.0--outresearch-desk.sh--repo/tmp"),
+        "未设时命令原样:{plain}"
+    );
+    assert!(!plain.contains("--assets-dir"), "未设不落槽:{plain}");
+    assert!(!plain.contains("--bundle-repo"), "未设不落槽:{plain}");
+    // 设了:两槽位接在 --repo 之后,展示串仍由 argv 拼出(同源同层)
+    app.assets_dir = Some("/data/assets".into());
+    app.bundle_repo = Some("git@github.com:me/bundles.git".into());
+    let s = flat_frame(&app, 110, 30);
+    assert!(s.contains("--assets-dir/data/assets"), "资产目录落槽:{s}");
+    assert!(
+        s.contains("--bundle-repogit@github.com:me/bundles.git"),
+        "取货仓落槽:{s}"
+    );
+    // 落点顺序:两个可选槽位都在 --repo 之后
+    let repo_at = s.find("--repo/tmp").expect("--repo 在场");
+    let assets_at = s.find("--assets-dir").expect("资产目录在场");
+    let bundle_at = s.find("--bundle-repo").expect("取货仓在场");
+    assert!(repo_at < assets_at && assets_at < bundle_at, "顺序:{s}");
+    // 只设一个:另一个照样不落
+    let mut one = bake_app();
+    one.data_root = Some("/tmp".into());
+    one.assets_dir = Some("/data/assets".into());
+    let one_s = flat_frame(&one, 110, 30);
+    assert!(
+        one_s.contains("--assets-dir/data/assets"),
+        "设了的落:{one_s}"
+    );
+    assert!(!one_s.contains("--bundle-repo"), "没设的不落:{one_s}");
 }
 
 // ---- #22 纵向密度:50 行富余用满(常畅/紧凑两档共用同一 render_*) ----
@@ -3406,8 +3582,8 @@ async fn 配方编辑_加删槽改env_往返不丢未知字段() {
 }
 
 /// 规格验收 2:写回前预跑 argv 与健康屏 validate 同源(同一 `commands::validate_recipe`
-/// 构造函数,即 `["validate","--recipe",<路径>]`;路径指向 scratch 编辑态,因 recipe.yaml
-/// 确认前不动)。
+/// 构造函数,即 `["validate","--recipe",<路径>,"--repo",<数据仓根>]`;路径指向
+/// scratch 编辑态,因 recipe.yaml 确认前不动)。
 #[tokio::test]
 async fn 配方编辑_预跑argv与健康屏validate同源() {
     let (mut app, _runner) = recipe_app("argv", 0, VALIDATE_PASS);
@@ -3416,7 +3592,7 @@ async fn 配方编辑_预跑argv与健康屏validate同源() {
     drive_edits(&mut app);
     key(&mut app, crossterm::event::KeyCode::Char('s'));
     let argv = app.queue.last().expect("s 入队了 validate").clone();
-    // 与健康屏同一构造函数:commands::validate_recipe(abs)。绝对路径由写侧
+    // 与健康屏同一构造函数:commands::validate_recipe(abs, root)。绝对路径由写侧
     // 句柄的 abs_path 出(测试侧按同一形状独立拼一遍,不当「面板说对」的证据)。
     let scratch_abs = format!(
         "{}/{}",
@@ -3427,8 +3603,8 @@ async fn 配方编辑_预跑argv与健康屏validate同源() {
     );
     assert_eq!(
         argv,
-        crate::engine::commands::validate_recipe(&scratch_abs),
-        "预跑 argv = commands::validate_recipe(scratch),与健康屏 validate 同源(同一构造函数)"
+        crate::engine::commands::validate_recipe(&scratch_abs, &root, false),
+        "预跑 argv = commands::validate_recipe(scratch, root, quiet=false),与健康屏 validate 同源(同一构造函数)"
     );
     assert_eq!(argv[0], "validate", "命令族是 validate");
     assert_eq!(

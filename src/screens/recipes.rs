@@ -424,6 +424,8 @@ fn bake_suggest_lines(
         app.usable_data_root().as_deref(),
         app.capabilities
             .enabled(crate::engine::Capability::RecipeBake),
+        app.assets_dir.as_deref(),
+        app.bundle_repo.as_deref(),
     ) {
         Ok(s) => {
             for (i, ln) in wrap(&s.display, w.saturating_sub(4)).iter().enumerate() {
