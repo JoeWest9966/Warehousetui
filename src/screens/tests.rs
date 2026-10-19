@@ -3513,8 +3513,8 @@ async fn 配方编辑_加删槽改env_往返不丢未知字段() {
 }
 
 /// 规格验收 2:写回前预跑 argv 与健康屏 validate 同源(同一 `commands::validate_recipe`
-/// 构造函数,即 `["validate","--recipe",<路径>]`;路径指向 scratch 编辑态,因 recipe.yaml
-/// 确认前不动)。
+/// 构造函数,即 `["validate","--recipe",<路径>,"--repo",<数据仓根>]`;路径指向
+/// scratch 编辑态,因 recipe.yaml 确认前不动)。
 #[tokio::test]
 async fn 配方编辑_预跑argv与健康屏validate同源() {
     let (mut app, _runner) = recipe_app("argv", 0, VALIDATE_PASS);
@@ -3523,7 +3523,7 @@ async fn 配方编辑_预跑argv与健康屏validate同源() {
     drive_edits(&mut app);
     key(&mut app, crossterm::event::KeyCode::Char('s'));
     let argv = app.queue.last().expect("s 入队了 validate").clone();
-    // 与健康屏同一构造函数:commands::validate_recipe(abs)。绝对路径由写侧
+    // 与健康屏同一构造函数:commands::validate_recipe(abs, root)。绝对路径由写侧
     // 句柄的 abs_path 出(测试侧按同一形状独立拼一遍,不当「面板说对」的证据)。
     let scratch_abs = format!(
         "{}/{}",
@@ -3534,8 +3534,8 @@ async fn 配方编辑_预跑argv与健康屏validate同源() {
     );
     assert_eq!(
         argv,
-        crate::engine::commands::validate_recipe(&scratch_abs),
-        "预跑 argv = commands::validate_recipe(scratch),与健康屏 validate 同源(同一构造函数)"
+        crate::engine::commands::validate_recipe(&scratch_abs, &root, false),
+        "预跑 argv = commands::validate_recipe(scratch, root, quiet=false),与健康屏 validate 同源(同一构造函数)"
     );
     assert_eq!(argv[0], "validate", "命令族是 validate");
     assert_eq!(
