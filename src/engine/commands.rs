@@ -41,14 +41,47 @@ pub fn doctor_lock(lock: &str, nw_home: Option<&str>) -> Vec<String> {
     a
 }
 
-/// 校验:配方侧。
-pub fn validate_recipe(recipe: &str) -> Vec<String> {
-    vec!["validate".into(), "--recipe".into(), recipe.into()]
+/// 校验:配方侧(spec #89 工单 #92 的单侧两态之一)。
+///
+/// 槽位纪律与 [`ls`] / [`recipe_bake`] 同源:数据仓根**显式携带**,签名里
+/// 没有「不带 `--repo`、让引擎拿当前目录兜底」的写法。`quiet` 是留位槽位
+/// (见 [`validate_argv`]),缺省不落。
+pub fn validate_recipe(recipe: &str, repo: &str, quiet: bool) -> Vec<String> {
+    validate_argv(&[("--recipe", recipe)], repo, quiet)
 }
 
-/// 校验:锁定集侧。
-pub fn validate_lock(lock: &str) -> Vec<String> {
-    vec!["validate".into(), "--lock".into(), lock.into()]
+/// 校验:锁定集侧(spec #89 工单 #92 的单侧两态之二)。
+///
+/// `--repo` 在这一态尤其不是可选项:锁定集放在引擎推导不出的目录布局时,
+/// 配方与组件清单全靠它才发现(spec #89 工单 #92;上游语义:仅 `--lock`
+/// 单侧时 `--repo` 用于发现配方与组件清单)。`quiet` 留位槽位同
+/// [`validate_recipe`](fn.validate_recipe),缺省不落。
+pub fn validate_lock(lock: &str, repo: &str, quiet: bool) -> Vec<String> {
+    validate_argv(&[("--lock", lock)], repo, quiet)
+}
+
+/// validate argv 的**唯一拼装处**(spec #89 工单 #92):两侧槽位按序落,
+/// `--repo` 恒落,`quiet` 留位**缺省不落**。
+///
+/// 双侧同给(`--recipe` + `--lock`)归工单 #98 —— 到那时在本函数上多传一组
+/// 槽位即可,**不另立第二条拼装路径**(旗标一处真相,与 `ls` / `up` 同层)。
+///
+/// `quiet` 是**留位槽位**:上游 `--quiet` 今天是压 stderr 进度行的 no-op
+/// (进度阶段没启用,警告永不被压),语义以上游激活为准;面板不摆 UI 入口,
+/// 只在 argv 构造函数的能力范围里留出这一枚——给了才落,落点固定在
+/// `--repo` 之后(argv 末尾),屏级断言不必猜位置。
+fn validate_argv(sides: &[(&str, &str)], repo: &str, quiet: bool) -> Vec<String> {
+    let mut a = vec!["validate".to_string()];
+    for (flag, value) in sides {
+        a.push((*flag).to_string());
+        a.push((*value).to_string());
+    }
+    a.push("--repo".to_string());
+    a.push(repo.to_string());
+    if quiet {
+        a.push("--quiet".to_string());
+    }
+    a
 }
 
 /// 版本探测。注意:`nw --version` 的裸版本号走 **stderr**。
@@ -1426,6 +1459,78 @@ mod tests {
                 "上游 rm 没有确认闸,面板不自己造一枚下发"
             );
         }
+    }
+
+    // ---- 工单 #92:validate argv 族补全(单侧两态显式带 --repo + quiet 留位) ----
+
+    #[test]
+    fn validate_单侧配方_显式带repo_不让引擎拿当前目录兜底() {
+        // 与 ls --repo / bake --repo 同源同纪律:数据仓根恒落,签名里没有
+        // 「不带 repo」的写法(与 ls 同一强制手法,见 ls_必带_repo_不给引擎当前目录兜底)
+        assert_eq!(
+            validate_recipe("recipes/research-desk/recipe.yaml", "/data/repo", false),
+            vec![
+                "validate",
+                "--recipe",
+                "recipes/research-desk/recipe.yaml",
+                "--repo",
+                "/data/repo"
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_单侧锁定集_显式带repo_跨文件项靠它发现配方与组件清单() {
+        // 单侧 --lock 时上游用 --repo 发现配方与组件清单(spec #89 Further
+        // Notes):少了它,1–19 项跨文件检查在命令路径上跑不全
+        assert_eq!(
+            validate_lock("baked/nw-assemble.sh", "/data/repo", false),
+            vec![
+                "validate",
+                "--lock",
+                "baked/nw-assemble.sh",
+                "--repo",
+                "/data/repo"
+            ]
+        );
+        // 两态都不让 --repo 缺席:兜底当前目录是既有纪律明令排除的那条路
+        for a in [
+            validate_recipe("r.yaml", "/r", false),
+            validate_lock("x.nwlock", "/r", false),
+        ] {
+            assert!(a.contains(&"--repo".to_string()), "{a:?} 必须带 --repo");
+        }
+    }
+
+    #[test]
+    fn validate_quiet_缺省不落_给了才落_落点稳定在_repo_之后() {
+        // 缺省:一枚 --quiet 都不落(与加这个留位槽之前逐字节同形)
+        for a in [
+            validate_recipe("r.yaml", "/data/repo", false),
+            validate_lock("x.nwlock", "/data/repo", false),
+        ] {
+            assert!(!a.iter().any(|s| s == "--quiet"), "{a:?} 缺省不落 quiet");
+        }
+        // 显式给:恰好一枚,且落在 argv 末尾(--repo 之后)——位置稳定可断言
+        for a in [
+            validate_recipe("r.yaml", "/data/repo", true),
+            validate_lock("x.nwlock", "/data/repo", true),
+        ] {
+            assert_eq!(a.last().map(String::as_str), Some("--quiet"), "{a:?}");
+            assert_eq!(
+                a.iter().filter(|s| *s == "--quiet").count(),
+                1,
+                "quiet 恰好一枚:{a:?}"
+            );
+            let i = a.iter().position(|s| s == "--repo").expect("带了 repo");
+            assert_eq!(a[i + 1], "/data/repo", "--repo 的值紧随其后");
+            assert_eq!(a[i + 2], "--quiet", "quiet 落在 --repo 之后");
+        }
+        // quiet 只此一枚:给了不多带别的旗标,长度恰好多一个元素
+        assert_eq!(
+            validate_recipe("r.yaml", "/data/repo", true).len(),
+            validate_recipe("r.yaml", "/data/repo", false).len() + 1
+        );
     }
 
     #[test]
