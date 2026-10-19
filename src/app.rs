@@ -597,9 +597,6 @@ pub struct App {
     pub sub_rm_confirm: bool,
     /// 最近一次 `subscription rm` 回音(证据五字段原样呈现)。
     pub sub_rm_result: Option<EngineOutput>,
-    /// 取回链接本体的建议命令是否已收进日志(#56,键 `g`):命令可见可取用,
-    /// 但面板**不执行**它(ADR-0009 §1:get 一律只给建议命令)。
-    pub sub_get_logged: bool,
     /// 钥匙册(#57,ADR-0009):两段式登记流(复用骨架件 `crate::screens::RegisterFlow`;
     /// 本体只经 stdin 进,预审与落账各喂一次)。机密纪律最严的一本:投影无本体
     /// 槽也不印指纹,get 一律只给建议命令。
@@ -865,7 +862,6 @@ impl App {
             sub_sel: 0,
             sub_rm_confirm: false,
             sub_rm_result: None,
-            sub_get_logged: false,
             key_flow: crate::screens::RegisterFlow::new(),
             key_form: crate::screens::new_key_form(),
             key_ls: None,
@@ -1281,9 +1277,10 @@ impl App {
             // 输入态。鼠标只是叠加,不新增语义。
             Target::CatalogFilter => self.catalog_filter_on = true,
             // 点正文键位行的「g 取回」段(#73):与键盘 `g` 同一个函数、同一条
-            // 后果链——当前册选中订阅 / 钥匙的建议命令收进日志,面板不代跑 get、
-            // 不入队、不碰剪贴板(ADR-0009 §1)。路由只有这一处,且分叉的是「哪个
-            // 册」而不是「哪条路径」:查 `CatalogKind::action` 同一张表(与
+            // 后果链——开当前册选中订阅 / 钥匙的取回本体确认浮层(#97 / #99):
+            // 确认前一个字节都不下发、不碰剪贴板(ADR-0009 §1)。路由只有这一处,
+            // 且分叉的是「哪个册」而不是「哪条路径」:查 `CatalogKind::action`
+            // 同一张表(与
             // `key_catalog` 同一个),所以鼠标与键盘不可能给出两种后果。(过滤输入态
             // 里键入归输入态、鼠标照旧点得动,那是键位行所有可点段的共同边界。)
             Target::CatalogGet => self.catalog_get(),
@@ -3846,8 +3843,9 @@ impl App {
             Some("register") => self.on_echo_register(kind, out),
             Some("add") => self.on_echo_add(out),
             Some("rm") => self.on_echo_rm(kind, out),
-            // get 回音(#97):`key get` 的 stdout envelope 里那一格本体进揭示区
-            // (只此一条路;`subscription get` 归 #99,届时同一个分发臂)。
+            // get 回音(#97 立、#99 两册):`key get` / `subscription get` 的
+            // stdout envelope 里那一格本体进揭示区(只此一条路;取哪一格由
+            // 回音自己的命令组定,见 `catalog::get_body`)。
             Some("get") => self.on_echo_get(out),
             _ => {}
         }
@@ -3978,8 +3976,9 @@ impl App {
     ///
     /// 走 [`catalog::CatalogKind::action`] **同一张表**(与 `key_catalog` 受理
     /// `g` 的那一次查表同一个入口),由当前是哪一本决定落实方法:订阅册 →
-    /// [`App::log_sub_get_suggest`],钥匙册 → [`App::log_key_get_suggest`]。鼠标
-    /// 与键盘因此不可能给出两种后果,也不会有第二份「点下去发生什么」。
+    /// [`App::open_sub_get_reveal`],钥匙册 → [`App::open_key_get_reveal`],两册
+    /// 都是「开取回本体的确认浮层」(#97 立、#99 两册同用一份实现)。鼠标与
+    /// 键盘因此不可能给出两种后果,也不会有第二份「点下去发生什么」。
     ///
     /// 段只在订阅 / 钥匙册的非空册体变体在场(命中区的产地
     /// [`catalog::catalog_key_parts`]),所以这一处到达即确有命令可取;表里查不到
@@ -4520,10 +4519,10 @@ impl App {
         }
     }
 
-    /// 取回链接本体的**建议命令**(ADR-0009 §1:面板不代跑 `subscription get`)。
-    /// 纯函数层产 argv + 展示串(`engine::commands::subscription_get_suggest`,
-    /// 与 bake / recipe new 同源同层);`App` 只在这里读它,**没有任何路径会
-    /// 把它下发**——队列里永远不会出现 `subscription get`。
+    /// 取回链接本体的**建议命令**(与给人复制的 shell 退路同源同层)。纯函数层
+    /// 产 argv + 展示串(`engine::commands::subscription_get_suggest`,与 bake /
+    /// recipe new / key get 同一层);`App` 只在这里读它——**确认前没有任何路径
+    /// 把它下发**,确认后才经 [`Self::spawn_engine`] 这唯一入口出去。
     pub fn sub_get_suggest(&self) -> Option<crate::engine::commands::Suggest> {
         let name = self.selected_sub_name()?;
         let root = self.usable_data_root()?;
@@ -4532,17 +4531,27 @@ impl App {
         ))
     }
 
-    /// 把取回链接的建议命令收进日志(键 `g`):命令文案可取用,执行权留给操作者。
-    /// **只收命令不收本体**——这条命令本身不含链接,面板也从不代跑它。
-    pub fn log_sub_get_suggest(&mut self) {
-        match self.sub_get_suggest() {
-            Some(s) => {
-                self.push_log(format!("取回链接(面板不代跑,自己执行):{}", s.display));
-                self.push_log("get 是上游唯一回显本体的出口:别把它贴回面板(不进日志/配置/快照)。");
-                self.sub_get_logged = true;
-            }
-            None => self.push_log(format!("取回链接未给出:{}", self.sub_gate_hint())),
+    /// 订阅册的 `g`(#99):开**取回本体的确认浮层**。
+    ///
+    /// 与 [`Self::open_key_get_reveal`] 逐条同构(两册共用 [`Self::raise_get_reveal`]
+    /// 那一步),只换三件:能力门问 subscription 组、建议命令取订阅那一族、
+    /// 指路话术用订阅册自己的 [`Self::sub_gate_hint`]。三道门,任一不过即
+    /// **一个字节都不下发、连浮层都不开**,只留既有指路,不报错、不猜、不落
+    /// 半条命令:
+    /// ① 引擎缺 subscription 组能力(组级探针的答案,`get` 不进探针清单);
+    /// ② 数据仓根不可用;
+    /// ③ 没有选中的订阅。
+    pub fn open_sub_get_reveal(&mut self) {
+        if !self.capabilities.enabled(Capability::Subscription) {
+            self.push_log(format!("取回链接未下发:{}", self.sub_gate_hint()));
+            return;
         }
+        let Some(suggest) = self.sub_get_suggest() else {
+            self.push_log(format!("取回链接未给出:{}", self.sub_gate_hint()));
+            return;
+        };
+        let name = self.selected_sub_name().unwrap_or_default();
+        self.raise_get_reveal(name, suggest);
     }
 
     /// 读一次订阅编目册(只读;编目不存在 = 空数组 rc 0,合法空态)。
@@ -4676,11 +4685,13 @@ impl App {
         ));
     }
 
-    /// 取回回音落账(#97):`key get` 的 stdout envelope 里那一格本体进揭示区。
-    /// 取不到(rc≠0 / 契约守卫 / data 不可定型)一律回闲置并走既有指路
-    /// (日志),不画空揭示区、不按旧形状降级解析、不猜。
+    /// 取回回音落账(#97 立、#99 两册同用):`key get` / `subscription get` 的
+    /// stdout envelope 里那一格本体进揭示区。取哪一格由回音自己的命令组定
+    /// (`catalog::get_body`),状态里不带册别。取不到(rc≠0 / 契约守卫 / data
+    /// 不可定型)一律回闲置并走既有指路(日志),不画空揭示区、不按旧形状
+    /// 降级解析、不猜。
     fn on_echo_get(&mut self, out: EngineOutput) {
-        let body = catalog::key_get_body(&out);
+        let body = catalog::get_body(&out);
         let name = self.get_reveal.name().unwrap_or("—").to_string();
         match self.get_reveal.absorb(body) {
             Ok(()) => self.push_log(format!(

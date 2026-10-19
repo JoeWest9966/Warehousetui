@@ -22,8 +22,8 @@ use super::State;
 /// 本集合答的是「我听不听得懂这个 envelope」,与「面板会不会把这个命令
 /// 跑起来」是两件事:编目册 14 个 schema 全在集合里(契约对齐),而这两个
 /// 命令的**代跑边界另有一层裁定**(ADR-0009 §1:上游唯一回显本体的两个出
-/// 口)——工单 #97 起钥匙册的 `g` 代跑 `key get`(本体只在确认后的揭示区),
-/// 订阅册那一本仍只给建议命令(归 #99)。两层分工不被混淆。
+/// 口)——工单 #97 / #99 起两册的 `g` 各自代跑 `key get` / `subscription get`
+/// (本体只在确认后的揭示区)。两层分工不被混淆。
 ///
 /// 前 8 个是跟随引擎第 1–7 轮的既有面(调研底稿 §3 的 `nw/<cmd>.v1` 全集);
 /// 后 14 个是第 8 轮跟随同步(spec #50 / 工单 #51)补上的四组编目命令面,
@@ -1016,7 +1016,8 @@ pub type TagRmData = VpsRmData;
 /// 订阅册的一条(ls 投影):**没有 url 槽、也没有任何指纹字段**(上游
 /// `SubSummary` 六个键冻结;R1:链接即凭据,`ls` 永不回显本体,沿 #18
 /// 三不印)——分享清单、截图、贴日志都不泄密。这是**投影**不是引用:
-/// 想读链接本体只有 `nw subscription get` 一条路(且面板不代跑,ADR-0009)。
+/// 想读链接本体只有 `nw subscription get` 一条路(#99 起订阅册的 `g` 代跑它,
+/// 本体只进确认后的揭示区)。
 ///
 /// `status` / `days_left` 是**读取时算的到期标记**(上游 `status.go`):
 /// 不在文件里、也永不写回文件;三态按 UTC 日期与今天比,今天起 7 天内
@@ -1160,6 +1161,35 @@ impl SubRegisterData {
     }
 }
 
+/// `nw subscription get --name <名>` 的 data(工单 #99 起面板代跑 get、只吃这
+/// 一个形状):名字 + **唯一那一格链接本体**(`data.url`)。上游 `SubscriptionEntry`
+/// 的其余键(kind / client / expires)是登记元数据,面板不在这里消费——本体要
+/// 进面板只有这一条路,进来就只进揭示区(见
+/// [`crate::screens::catalog::RevealedBody`])。
+///
+/// 与 [`KeyGetData`] **同族**(两册共用揭示区,只差取哪一格):`Debug` 同样
+/// **刻意不打印本体**,只报名字与字节数——否则这个中转类型的 `{:?}` 就是
+/// 第二处泄漏面(ADR-0009 §3)。
+#[derive(Clone, Deserialize)]
+pub struct SubGetData {
+    #[serde(default)]
+    pub name: String,
+    /// 订阅链接本体。**唯一读者是揭示区渲染**(经 `RevealedBody`),别处不许读。
+    #[serde(default)]
+    pub url: String,
+}
+
+impl std::fmt::Debug for SubGetData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SubGetData {{ name: {:?}, url: <回显 {} 字节,不打印内容> }}",
+            self.name,
+            self.url.len()
+        )
+    }
+}
+
 /// `nw subscription rm <名>` 的 data 与 `nw vps rm` **逐字相同**——上游
 /// `entry.RmOutcome` 是四组共用的同一个类型。删不存在的名 → rc 3 且
 /// `subscriptions.json` 一个字节都不动;删光最后一条留空 `entries` 数组
@@ -1173,7 +1203,7 @@ pub type SubRmData = VpsRmData;
 /// `KeyEntry`** —— 投影结构上放不下本体,#18 三不印):分享清单、截图、贴
 /// 日志都不泄密,面板连「这像是哪把钥匙」都不该让人推断出来。这是**投影**
 /// 不是引用:想读本体只有 `nw key get` 一条路(工单 #97 起钥匙册的 `g` 代跑
-/// 它,本体只进确认后的揭示区;订阅册那一本归 #99)。
+/// 它,本体只进确认后的揭示区;订阅册那一本同口径,归 #99)。
 ///
 /// `scopes` 恒为数组(上游不用 omitempty,没给 = `[]`,一种形状);`rotatedAt`
 /// 恒在(新登记 = 登记日 UTC,机器写产物不该有「没有轮换日」的第三态)。
@@ -1292,7 +1322,7 @@ impl KeyRegisterData {
 ///
 /// `Debug` **刻意不打印本体**:与 `SecretBody` / `RevealedBody` 同一条纪律
 /// (ADR-0009 §3),只报名字与字节数——否则这个中转类型的 `{:?}` 就是第二处
-/// 泄漏面。订阅册那一格(`data.url`)由工单 #99 落同族类型,两册共用揭示区。
+/// 泄漏面。订阅册那一格(`data.url`)是同族的 [`SubGetData`],两册共用揭示区。
 #[derive(Clone, Deserialize)]
 pub struct KeyGetData {
     #[serde(default)]
@@ -1929,6 +1959,47 @@ mod tests {
         let wrong = envelope_with_schema("nw/key-get.v1", "0.1.0", json!({"name": 7, "key": []}));
         assert!(
             wrong.data_as::<KeyGetData>().is_none(),
+            "类型不匹配 = 不可定型,走指路"
+        );
+    }
+
+    // ---- #99 订阅册取回本体:同族形状(取 `data.url` 那一格)+ Debug 不打印 ----
+
+    /// `nw/subscription-get.v1` 的 data 只有名字与链接两格(#99 代跑 get 消费的
+    /// 既有形状,契约守卫零改动)。与 [`解析_key_get_data_只有名字与本体两格_形状不符不猜`]
+    /// 逐条同构,只换槽位:`Debug` 同样不打印本体。
+    #[test]
+    fn 解析_subscription_get_data_只有名字与链接两格_形状不符不猜() {
+        const URL: &str = "https://airport.example/subscribe?token=SUBSECRET99";
+        let ok = envelope_with_schema(
+            "nw/subscription-get.v1",
+            "0.1.0",
+            json!({"name": "airport", "url": URL}),
+        );
+        let d: SubGetData = ok.data_as().expect("既有形状,零改动");
+        assert_eq!(d.name, "airport");
+        assert_eq!(d.url, URL, "本体槽是 `data.url`(不是 `data.key`)");
+        // Debug 只说字节数:这个中转类型的 `{:?}` 不是第二处泄漏面
+        let dbg = format!("{d:?}");
+        assert!(!dbg.contains(URL), "Debug 不打印本体:{dbg}");
+        assert!(dbg.contains("不打印内容"), "Debug 只报字节数:{dbg}");
+        // 形状不符:不猜、不给 None 之外的第二条路
+        let bad = envelope_with_schema(
+            "nw/subscription-get.v1",
+            "0.1.0",
+            json!({"name": "airport"}),
+        );
+        assert!(
+            bad.data_as::<SubGetData>().is_some(),
+            "缺 url 槽 = 空串(上游不带这一格时面板按取不到处理,不按旧形状猜)"
+        );
+        let wrong = envelope_with_schema(
+            "nw/subscription-get.v1",
+            "0.1.0",
+            json!({"name": 7, "url": []}),
+        );
+        assert!(
+            wrong.data_as::<SubGetData>().is_none(),
             "类型不匹配 = 不可定型,走指路"
         );
     }
